@@ -71,7 +71,7 @@ fn mount_is_read_only(dentry: &Cap<DEntry>) -> bool {
     false
 }
 
-fn mount_identity_for_dentry(
+pub(super) fn mount_identity_for_dentry(
     ctx: &SyscallCtx<'_>,
     dentry: &Cap<DEntry>,
 ) -> Option<Cap<mount::MountIdentity>> {
@@ -123,97 +123,6 @@ pub(super) fn split_path(path: &[u8]) -> (&[u8], &[u8]) {
             let basename = &path[idx + 1..];
             (parent, basename)
         }
-    }
-}
-
-/// Helper for the `O_CREAT`-on-missing path inside `sys_openat`.
-/// Walks to the parent of `path`, calls `FsOps::create_inode` for the
-/// basename, then re-walks the full path to return a dentry over the
-/// freshly-installed RNode. The dentry (not the OpenFile) is the
-/// return shape because the syscall arm needs to apply `O_TRUNC`
-/// against `FsPageBacking` *before* materialising the OpenFile, and
-/// the dentry's parent-hint chain is what `fs_ops_for_dentry` /
-/// `fs_page_backing_for_dentry` consume to find the in-scope mount.
-///
-/// Synchronous — uses `poll_walker_synchronously` for the same
-/// Send-future reason `resolve_path_at` does (the `Guard` argument is
-/// `!Send + !Sync`, so cross-`.await` holds break the dispatch
-/// future's `Send` bound). Returns the positive-magnitude `-errno`
-/// on failure.
-pub(crate) fn create_then_walk<P: PmapIf>(
-    cwd: &Cap<DEntry>,
-    path: &[u8],
-    mode: u16,
-    cred: &Credential,
-) -> Result<Cap<DEntry>, i32> {
-    let _ = core::marker::PhantomData::<P>;
-    let (parent_path, basename) = split_path(path);
-    if basename.is_empty() {
-        // A path like `/` or `foo/` has an empty basename — can't
-        // create. Surface as -EISDIR (matches Linux's behaviour for
-        // `open("/", O_CREAT, ...)`).
-        return Err(EISDIR_VALUE);
-    }
-
-    // Walk to the parent. Empty `parent_path` means "use the cwd as
-    // the parent" (the basename was a single component with no
-    // slash). step_walk handles a leading `/` as "restart from mount
-    // root" and `b""` as "stay at rooted_at".
-    let parent_dentry: Cap<DEntry> = if parent_path.is_empty() {
-        cwd.clone()
-    } else {
-        let guard = step_engine::guard();
-        use StepOutcome as V3;
-        let outcome = step_walk(cwd.clone(), parent_path, cred, &guard);
-        drop(guard);
-        match outcome {
-            V3::Done(d) => d,
-            V3::Continue { .. } | V3::Yield { .. } => {
-                return Err(EIO_VALUE);
-            }
-            V3::Err(errno) => return Err(errno_to_i32(Errno::from(errno))),
-        }
-    };
-
-    // Resolve the FsOps in scope at `parent_dentry`. Mirrors the
-    // existing `fs_ops_for_dentry` shape used by the file-mode arms.
-    let fs_ops = match fs_ops_for_dentry(&parent_dentry) {
-        Some(ops) => ops,
-        None => return Err(EROFS_VALUE),
-    };
-
-    // Mint the new inode under the parent. The mode arrives from
-    // userspace as the bottom 12 bits (`rwxrwxrwx | S_ISUID/S_ISGID/
-    // S_ISVTX`); umask plumbing is deferred to a future slice
-    // (TODO(phase-umask)).
-    let parent_fs_object_id = parent_dentry.rnode().fs_object_id();
-    let new_mode = mode & 0o7777;
-    {
-        use StepOutcome as V3;
-        let guard = step_engine::guard();
-        let outcome = fs_ops.create_inode(parent_fs_object_id, basename, new_mode, cred, &guard);
-        match outcome {
-            V3::Done(_) => {
-                parent_dentry.remove_cached_child_by_name(basename);
-            }
-            V3::Continue { .. } | V3::Yield { .. } => {
-                return Err(EIO_VALUE);
-            }
-            V3::Err(errno) => return Err(errno_to_i32(Errno::from(errno))),
-        }
-    }
-
-    // Re-walk the full path. Lookup now resolves the freshly-created
-    // inode; the resulting dentry carries the proper parent-hint
-    // chain back to the mount root.
-    let guard = step_engine::guard();
-    use StepOutcome as V3;
-    let outcome = step_walk(cwd.clone(), path, cred, &guard);
-    drop(guard);
-    match outcome {
-        V3::Done(d) => Ok(d),
-        V3::Continue { .. } | V3::Yield { .. } => Err(EIO_VALUE),
-        V3::Err(errno) => Err(errno_to_i32(Errno::from(errno))),
     }
 }
 
@@ -293,7 +202,6 @@ pub(super) async fn sys_mkdirat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
         return SyscallResult::Error(EROFS_VALUE);
     }
     let parent_id = parent_dentry.rnode().fs_object_id();
-    use StepOutcome as V3;
     let fs_ops = match fs_ops_for_dentry(&parent_dentry) {
         Some(o) => o,
         None => return SyscallResult::Error(EROFS_VALUE),
@@ -311,17 +219,33 @@ pub(super) async fn sys_mkdirat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
     // (umask is the bottom 9 bits — `rwxrwxrwx`).
     let umask = ctx.process.umask();
     let effective_mode = mode & !umask & 0o7777;
-    let outcome = {
-        let guard = step_engine::guard();
-        fs_ops.mkdir(parent_id, basename, effective_mode, &cred, &guard)
+    use tx_scripts::drive;
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    let op = tx_subsystems::vfs::MkdirOp {
+        fs_ops: &fs_ops,
+        parent: parent_id,
+        name: basename,
+        mode: effective_mode,
+        cred: &cred,
     };
-    match outcome {
-        V3::Done(_) => {
+    match drive(
+        op,
+        &mut script_ctx,
+        step_engine::DriveMode::Waiting,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
+        timer_registrar_handle.as_ref(),
+    )
+    .await
+    {
+        Ok(()) => {
             parent_dentry.remove_cached_child_by_name(basename);
             SyscallResult::Return(0)
         }
-        V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        V3::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
+        Err(errno) => SyscallResult::error_from(Errno::from(errno)),
     }
 }
 
@@ -342,7 +266,7 @@ pub(super) async fn sys_unlinkat<'a, P: tx_hal::ConsoleIf>(
     if flags & !AT_REMOVEDIR != 0 {
         return SyscallResult::Error(EINVAL_VALUE);
     }
-    let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
+    let path = match read_user_cstr_wait(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX).await {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
         Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
@@ -445,22 +369,34 @@ pub(super) async fn sys_unlinkat<'a, P: tx_hal::ConsoleIf>(
     if let Err(e) = cred_checks::authorize_unlink(ctx.cred_snapshot(), &parent_meta, &child_meta) {
         return SyscallResult::error_from(e);
     }
-    let outcome = {
-        let guard = step_engine::guard();
-        if want_rmdir {
-            fs_ops.rmdir(parent_id, basename, target_id, &guard)
-        } else {
-            fs_ops.unlink(parent_id, basename, target_id, &guard)
-        }
+    use tx_scripts::drive;
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    let op = tx_subsystems::vfs::UnlinkFromParentOp {
+        fs_ops: &fs_ops,
+        parent: parent_id,
+        name: basename,
+        target: target_id,
+        remove_dir: want_rmdir,
     };
-    match outcome {
-        V3::Done(()) => {
+    match drive(
+        op,
+        &mut script_ctx,
+        step_engine::DriveMode::Waiting,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
+        timer_registrar_handle.as_ref(),
+    )
+    .await
+    {
+        Ok(()) => {
             parent_dentry.remove_cached_child_by_name(basename);
             drop(target_dentry);
             SyscallResult::Return(0)
         }
-        V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        V3::Err(errno) => {
+        Err(errno) => {
             let errno = Errno::from(errno);
             if errno == Errno::ENOTDIR {
                 let guard = step_engine::guard();
@@ -515,7 +451,7 @@ pub(super) async fn sys_symlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     let target_uaddr = args[0];
     let newdirfd = args[1] as i32;
     let linkpath_uaddr = args[2];
-    let target = match read_user_cstr(&ctx.aspace, target_uaddr, EXECVE_PATH_MAX) {
+    let target = match read_user_cstr_wait(&ctx.aspace, target_uaddr, EXECVE_PATH_MAX).await {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
         Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
@@ -523,7 +459,7 @@ pub(super) async fn sys_symlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     if target.is_empty() {
         return SyscallResult::Error(ENOENT_VALUE);
     }
-    let linkpath = match read_user_cstr(&ctx.aspace, linkpath_uaddr, EXECVE_PATH_MAX) {
+    let linkpath = match read_user_cstr_wait(&ctx.aspace, linkpath_uaddr, EXECVE_PATH_MAX).await {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
         Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
@@ -598,7 +534,7 @@ pub(super) async fn sys_linkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     if flags & !AT_SYMLINK_FOLLOW_U32 != 0 {
         return SyscallResult::Error(EINVAL_VALUE);
     }
-    let oldpath = match read_user_cstr(&ctx.aspace, oldpath_uaddr, EXECVE_PATH_MAX) {
+    let oldpath = match read_user_cstr_wait(&ctx.aspace, oldpath_uaddr, EXECVE_PATH_MAX).await {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
         Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
@@ -606,7 +542,7 @@ pub(super) async fn sys_linkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     if oldpath.is_empty() {
         return SyscallResult::Error(ENOENT_VALUE);
     }
-    let newpath = match read_user_cstr(&ctx.aspace, newpath_uaddr, EXECVE_PATH_MAX) {
+    let newpath = match read_user_cstr_wait(&ctx.aspace, newpath_uaddr, EXECVE_PATH_MAX).await {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
         Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
@@ -699,7 +635,7 @@ pub(super) async fn sys_linkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
 pub(super) async fn sys_truncate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let path_uaddr = args[0];
     let new_size = args[1];
-    let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
+    let path = match read_user_cstr_wait(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX).await {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
         Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
@@ -773,10 +709,7 @@ pub(super) async fn sys_ftruncate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     let timer_wheel_arc = script_ctx.timer_wheel().cloned();
     // Op acquires its own epoch guard inside `step()`; the syscall
     // handler holds no guard across `drive(...).await` (EBR-7).
-    let op = FdTruncateOp {
-        pc: &pc,
-        new_size: new_size as u64,
-    };
+    let op = FdTruncateOp::new(&pc, new_size as u64);
     match drive(
         op,
         &mut script_ctx,
@@ -873,7 +806,7 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     if buf_len == 0 {
         return SyscallResult::Error(EINVAL_VALUE);
     }
-    let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
+    let path = match read_user_cstr_wait(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX).await {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
         Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
@@ -911,7 +844,7 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
         let to_copy = core::cmp::min(link_bytes.len(), buf_len);
         if to_copy > 0 {
             if let Err(errno) =
-                bootstrap_copy_to_user(&ctx.aspace, buf_uaddr, &link_bytes[..to_copy])
+                bootstrap_copy_to_user_wait(&ctx.aspace, buf_uaddr, &link_bytes[..to_copy]).await
             {
                 return SyscallResult::error_from(errno);
             }
@@ -982,7 +915,9 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     };
     let to_copy = core::cmp::min(link_bytes.len(), buf_len);
     if to_copy > 0 {
-        if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, buf_uaddr, &link_bytes[..to_copy]) {
+        if let Err(errno) =
+            bootstrap_copy_to_user_wait(&ctx.aspace, buf_uaddr, &link_bytes[..to_copy]).await
+        {
             return SyscallResult::error_from(errno);
         }
     }
@@ -1044,7 +979,7 @@ pub(super) async fn sys_fsopen<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) 
         return SyscallResult::Error(EINVAL_VALUE);
     }
 
-    let fsname = match read_user_cstr(&ctx.aspace, fsname_uaddr, 64) {
+    let fsname = match read_user_cstr_wait(&ctx.aspace, fsname_uaddr, 64).await {
         Ok(name) => name,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
         Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
@@ -1083,7 +1018,7 @@ pub(super) async fn sys_fspick<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) 
         return SyscallResult::Error(EINVAL_VALUE);
     }
 
-    let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
+    let path = match read_user_cstr_wait(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX).await {
         Ok(path) => path,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
         Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
@@ -1145,7 +1080,7 @@ pub(super) async fn sys_open_tree<P: PmapIf>(
         return SyscallResult::Error(EINVAL_VALUE);
     }
 
-    let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
+    let path = match read_user_cstr_wait(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX).await {
         Ok(path) => path,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
         Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
@@ -1200,7 +1135,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
     let fstype_uaddr = args[2];
     let flags = args[3] as u64;
 
-    let target = match read_user_cstr(&ctx.aspace, target_uaddr, EXECVE_PATH_MAX) {
+    let target = match read_user_cstr_wait(&ctx.aspace, target_uaddr, EXECVE_PATH_MAX).await {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
         Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
@@ -1246,7 +1181,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
 
     if (flags & MS_BIND) != 0 {
         // Bind mount.
-        let source = match read_user_cstr(&ctx.aspace, source_uaddr, EXECVE_PATH_MAX) {
+        let source = match read_user_cstr_wait(&ctx.aspace, source_uaddr, EXECVE_PATH_MAX).await {
             Ok(p) => p,
             Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
             Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
@@ -1276,7 +1211,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
     if (flags & MS_MOVE) != 0 {
         // Relocate an existing mount: `source` is the current mountpoint
         // (walker crosses it → mounted root), `target` is the new mountpoint.
-        let source = match read_user_cstr(&ctx.aspace, source_uaddr, EXECVE_PATH_MAX) {
+        let source = match read_user_cstr_wait(&ctx.aspace, source_uaddr, EXECVE_PATH_MAX).await {
             Ok(p) => p,
             Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
             Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
@@ -1317,7 +1252,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
     }
 
     // New filesystem mount.
-    let fstype = match read_user_cstr(&ctx.aspace, fstype_uaddr, 64) {
+    let fstype = match read_user_cstr_wait(&ctx.aspace, fstype_uaddr, 64).await {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
         Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
@@ -1337,7 +1272,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
     let mut ext4_mount: Option<tx_fs::tx_ext4::MountedExt4<tx_fs::tx_ext4::BlockDeviceImage>> =
         None;
     let source_label_for_ext4: Option<alloc::vec::Vec<u8>> = if fstype_str == "ext4" {
-        let source = match read_user_cstr(&ctx.aspace, source_uaddr, EXECVE_PATH_MAX) {
+        let source = match read_user_cstr_wait(&ctx.aspace, source_uaddr, EXECVE_PATH_MAX).await {
             Ok(p) => p,
             Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
             Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
@@ -1546,7 +1481,7 @@ pub(super) async fn sys_umount2<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>)
         return SyscallResult::Error(EINVAL_VALUE);
     }
 
-    let target = match read_user_cstr(&ctx.aspace, target_uaddr, EXECVE_PATH_MAX) {
+    let target = match read_user_cstr_wait(&ctx.aspace, target_uaddr, EXECVE_PATH_MAX).await {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
         Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
@@ -1621,7 +1556,7 @@ pub(super) async fn sys_mknodat<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>)
     let mode = args[2] as u32;
     let _dev = args[3] as u64;
 
-    let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
+    let path = match read_user_cstr_wait(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX).await {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
         Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
@@ -1690,7 +1625,7 @@ pub(super) async fn sys_mknodat<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>)
 /// 64-bit `time_t`/`long` (`external/musl/include/alltypes.h.in`).
 /// This arm supports libc paths used by `utimensat(3)` and
 /// `futimens(3)`, including `pathname == NULL` and `AT_EMPTY_PATH`.
-pub(super) fn sys_utimensat<'a, P: tx_hal::TimeIf>(
+pub(super) async fn sys_utimensat<'a, P: tx_hal::TimeIf>(
     args: [u64; 6],
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult
@@ -1746,7 +1681,7 @@ where
             None => return SyscallResult::Error(EBADF_VALUE),
         }
     } else {
-        let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
+        let path = match read_user_cstr_wait(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX).await {
             Ok(path) => path,
             Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
             Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
@@ -1854,7 +1789,7 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     {
         return SyscallResult::Error(EINVAL_VALUE);
     }
-    let oldpath = match read_user_cstr(&ctx.aspace, oldpath_uaddr, EXECVE_PATH_MAX) {
+    let oldpath = match read_user_cstr_wait(&ctx.aspace, oldpath_uaddr, EXECVE_PATH_MAX).await {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
         Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
@@ -1862,7 +1797,7 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     if oldpath.is_empty() {
         return SyscallResult::Error(ENOENT_VALUE);
     }
-    let newpath = match read_user_cstr(&ctx.aspace, newpath_uaddr, EXECVE_PATH_MAX) {
+    let newpath = match read_user_cstr_wait(&ctx.aspace, newpath_uaddr, EXECVE_PATH_MAX).await {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
         Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),

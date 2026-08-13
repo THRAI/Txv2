@@ -7,9 +7,8 @@ use tx_platform_adapter::notification_adapter;
 
 pub(crate) use wait_source::{
     is_wait_source, new_page_ready_wait, notify_page_ready_with_post, page_ready_endpoint,
-    page_ready_source_id, page_ready_weak_notifier, reset_page_ready, upgrade_page_ready_notifier,
-    wait_source_parts, yield_on_page_ready_source, yield_on_wait_source, PageReadyNotifier,
-    PageReadyWait, PageReadyWeakNotifier,
+    page_ready_source_id, wait_source_parts, yield_on_page_ready_source, yield_on_wait_source,
+    PageReadyNotifier, PageReadyWait,
 };
 
 #[notification_adapter(
@@ -18,40 +17,28 @@ pub(crate) use wait_source::{
     reason = "page_backed notification.rs owns wait-source yield relay helpers"
 )]
 mod wait_source {
-    use alloc::sync::{Arc, Weak};
+    use alloc::sync::Arc;
 
     use crate::page_backed::adapter::step_engine::{StepOutcome, StepProgress, YieldShape};
-    use crate::page_backed::adapter::wait_routing::{
-        self, MailboxEvent, RawQueue, TaskMailbox, WaitSource,
-    };
+    use crate::page_backed::adapter::wait_routing::{self, MailboxEvent, TaskMailbox, WaitSource};
 
     const PAGE_READY: u64 = 0x1;
 
     pub(crate) struct PageReadyWait {
         source_id: u64,
         source: Arc<WaitSource>,
-        readiness: RawQueue,
     }
 
     pub(crate) struct PageReadyNotifier {
         source: Arc<WaitSource>,
-        readiness: RawQueue,
-    }
-
-    pub(crate) struct PageReadyWeakNotifier {
-        source_id: u64,
-        source: Weak<WaitSource>,
-        readiness: RawQueue,
     }
 
     impl PageReadyWait {
         fn new() -> Self {
             let source_id = crate::allocate_notification_source_id();
-            Self {
-                source_id,
-                source: wait_routing::new_wait_source(source_id),
-                readiness: wait_routing::new_readiness_queue(source_id),
-            }
+            let source = wait_routing::new_wait_source(source_id);
+            crate::wait_source::register_wait_source_with_id(source_id, Arc::clone(&source));
+            Self { source_id, source }
         }
 
         pub(crate) fn ready_endpoint(&self) -> &Arc<WaitSource> {
@@ -61,7 +48,6 @@ mod wait_source {
         pub(crate) fn notifier(&self) -> PageReadyNotifier {
             PageReadyNotifier {
                 source: Arc::clone(&self.source),
-                readiness: self.readiness.clone(),
             }
         }
     }
@@ -74,16 +60,9 @@ mod wait_source {
         }
     }
 
-    impl core::fmt::Debug for PageReadyWeakNotifier {
-        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-            f.debug_struct("PageReadyWeakNotifier")
-                .field("source_id", &self.source_id)
-                .finish_non_exhaustive()
-        }
-    }
-
     impl Drop for PageReadyWait {
         fn drop(&mut self) {
+            crate::wait_source::release_wait_source(self.source_id);
             wait_routing::unregister_source(self.source_id);
         }
     }
@@ -100,36 +79,11 @@ mod wait_source {
         wait.ready_endpoint()
     }
 
-    pub(crate) fn page_ready_weak_notifier(wait: &PageReadyWait) -> PageReadyWeakNotifier {
-        PageReadyWeakNotifier {
-            source_id: wait.source_id,
-            source: Arc::downgrade(wait.ready_endpoint()),
-            readiness: wait.readiness.clone(),
-        }
-    }
-
-    pub(crate) fn upgrade_page_ready_notifier(
-        notifier: &PageReadyWeakNotifier,
-    ) -> Option<PageReadyNotifier> {
-        notifier.source.upgrade().map(|source| PageReadyNotifier {
-            source,
-            readiness: notifier.readiness.clone(),
-        })
-    }
-
     pub(crate) fn notify_page_ready_with_post<F>(notifier: &PageReadyNotifier, post: F)
     where
         F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
     {
-        // Latch readiness before publishing the edge. A waiter arriving after
-        // completion observes the queue bit; an already parked waiter receives
-        // the owner-aware WaitSource notification below.
-        wait_routing::notify_readiness(&notifier.readiness, PAGE_READY);
         wait_routing::notify_source_with_post(&notifier.source, PAGE_READY, post);
-    }
-
-    pub(crate) fn reset_page_ready(wait: &PageReadyWait) {
-        wait_routing::clear_readiness(&wait.readiness, PAGE_READY);
     }
 
     pub(crate) fn wait_source_parts(shape: &YieldShape) -> Option<(u64, u64)> {
@@ -162,6 +116,9 @@ mod wait_source {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use alloc::boxed::Box;
+        use core::future::Future;
+        use core::task::{Context, Poll, Waker};
 
         #[test]
         fn page_ready_endpoint_matches_source_id() {
@@ -171,6 +128,24 @@ mod wait_source {
                 tx_substrate::wake::WaitEndpoint::source_id(page_ready_endpoint(&wait)).raw(),
                 page_ready_source_id(&wait)
             );
+        }
+
+        #[test]
+        fn page_ready_wait_is_registered_for_token_driven_async_retry() {
+            let wait = new_page_ready_wait();
+            let source_id = page_ready_source_id(&wait);
+            let mut future = Box::pin(
+                crate::wait_source::wait_on_registered_source_id(source_id, PAGE_READY)
+                    .expect("page-ready source must resolve from its yielded token"),
+            );
+            let waker = Waker::noop().clone();
+            let mut cx = Context::from_waker(&waker);
+
+            assert!(matches!(future.as_mut().poll(&mut cx), Poll::Pending));
+
+            notify_page_ready_with_post(&wait.notifier(), |mailbox, event| mailbox.post(event));
+
+            assert!(matches!(future.as_mut().poll(&mut cx), Poll::Ready(_)));
         }
     }
 }

@@ -333,7 +333,7 @@ This does not starve faults: once a writer completes and releases, faults unbloc
 
 **A reservation protects only the synchronous publication or rewrite phase of an operation. It must not be held across unbounded asynchronous waits.**
 
-If a step yields while preparing publication (e.g., the fault handler blocking on `materialize_page` for a disk read), it **must drop the reservation** before yielding. Upon resume, it **must reacquire** the reservation and **must re-observe all authoritative state** from the beginning of the step.
+If a step yields while preparing publication (e.g., the fault handler blocking on `materialize_page` for a disk read), it **must drop the reservation** before yielding. Upon resume, it **must reacquire** the reservation. A waitable fault script may then continue materialization with its owned `VmFaultOutcome`; publication performs the stamped-generation fast check and falls back to the full target-field comparison. Only a stale target requires restarting recipe resolution; a wake from the page-I/O source does not force a redundant recipe lookup.
 
 Rationale. Holding a RangeLock reservation across disk I/O would serialize an entire range against every concurrent operation for the duration of the I/O — potentially tens of milliseconds. The reservation is for synchronous coordination of binding-and-materialization consistency, not for blocking other threads while waiting on hardware.
 

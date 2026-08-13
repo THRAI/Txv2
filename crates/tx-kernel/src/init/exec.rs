@@ -70,6 +70,49 @@ fn final_testcode_autorun_enabled<P: tx_hal::TxPlatform>() -> bool {
 const RUNSH_EXEC_POLL_BUDGET: usize = 1 << 16;
 
 impl<P: TxPlatform> CoreInit<P> {
+    /// Drive bootstrap exec while file pages are populated through the async
+    /// page/block I/O graph. A deferred result is still before exec's commit
+    /// point, so service the reactor and restart preparation; completed pages
+    /// remain resident and each restart advances toward the final commit.
+    fn bootstrap_exec_with_file_io(
+        process: &Cap<tx_subsystems::process::ProcessIdentity>,
+        thread: &Cap<tx_subsystems::thread_runtime::ThreadIdentity>,
+        path: &[u8],
+        argv: &[&[u8]],
+        envp: &[&[u8]],
+        cred: &tx_subsystems::vfs::Credential,
+    ) -> Result<(), tx_scripts::process::exec::ExecError> {
+        use tx_scripts::process::exec::ExecError;
+
+        const MAX_BOOTSTRAP_EXEC_RESTARTS: usize = 16 * 1024;
+        for _ in 0..MAX_BOOTSTRAP_EXEC_RESTARTS {
+            let outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
+                process, thread, path, argv, envp, cred,
+            ));
+            match outcome {
+                Err(ExecError::Deferred(shape)) => {
+                    let cpu = <P as tx_hal::SmpIf>::current_cpu_id();
+                    P::service_pending_tlb_shootdown();
+                    let _ = step_engine::drain_requested_with_budget(64);
+                    crate::zones::try_bounded_maintenance_tick();
+                    let _ = Self::drain_device_irq_bottom_halves();
+                    if Self::boot_reactor_once(cpu).is_none() {
+                        return Err(ExecError::Deferred(shape));
+                    }
+                    let _ = Self::drain_device_irq_bottom_halves();
+                }
+                Err(ExecError::Retry) => {
+                    let cpu = <P as tx_hal::SmpIf>::current_cpu_id();
+                    if Self::boot_reactor_once(cpu).is_none() {
+                        return Err(ExecError::Retry);
+                    }
+                }
+                result => return result,
+            }
+        }
+        Err(ExecError::Retry)
+    }
+
     /// Initramfs slice: walk `BootInfo::initrd` if present and
     /// reproduce its file tree inside the rootfs. Warn-and-skip on
     /// any per-entry failure. A corrupt or missing initramfs leaves
@@ -334,14 +377,8 @@ impl<P: TxPlatform> CoreInit<P> {
                 default_envp
             };
             let argv: &[&[u8]] = &[b"bash", b"-c", FINAL_TESTCODE];
-            let outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
-                &init,
-                &thread,
-                b"/bin/bash",
-                argv,
-                envp,
-                &cred,
-            ));
+            let outcome =
+                Self::bootstrap_exec_with_file_io(&init, &thread, b"/bin/bash", argv, envp, &cred);
             Self::write_board_sentinel_prefix();
             match outcome {
                 Ok(()) => {
@@ -938,6 +975,15 @@ impl<P: TxPlatform> CoreInit<P> {
                 Self::note_reactor_hart_idle(loop_cpu);
                 let wait_state = P::prepare_interrupt_wait();
                 if Self::boot_reactor_has_runnable_work(boot_runtime::HartId(loop_cpu.0)) {
+                    Self::note_reactor_hart_active(loop_cpu);
+                    P::cancel_interrupt_wait(wait_state);
+                    continue;
+                }
+                // Pair the final runnable-work check with the durable EBR
+                // request while interrupt delivery is masked. Otherwise a
+                // maintenance IPI acknowledged just before WFI can lose the
+                // only wake that lets this hart drain its local retire bags.
+                if service_pending_reactor_epoch_maintenance() {
                     Self::note_reactor_hart_active(loop_cpu);
                     P::cancel_interrupt_wait(wait_state);
                     continue;

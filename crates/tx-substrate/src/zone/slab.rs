@@ -9,6 +9,7 @@ use core::ptr::{self, NonNull};
 
 use tx_hal::{PhysAddr, Ppn};
 
+use crate::epoch::RcuHead;
 use crate::page_allocator::{self, ZeroPolicy};
 
 use super::registry::SlotKey;
@@ -16,6 +17,43 @@ use super::slot::Slot;
 use super::{runtime, Zone, ZoneError};
 
 const MAX_SLAB_SLOTS: usize = 64;
+
+struct SlabLayout {
+    header_size: usize,
+    slot_count: usize,
+}
+
+fn slab_layout<T: 'static>(page_size: usize) -> Option<SlabLayout> {
+    let header_size = align_up(mem::size_of::<ZoneSlab<T>>(), mem::align_of::<Slot<T>>())?;
+    let slot_size = mem::size_of::<Slot<T>>().max(1);
+    let slot_count = page_size.checked_sub(header_size)? / slot_size;
+    let slot_count = slot_count.min(MAX_SLAB_SLOTS);
+    (slot_count != 0).then_some(SlabLayout {
+        header_size,
+        slot_count,
+    })
+}
+
+#[cfg(any(test, feature = "layout-probe"))]
+pub struct ZoneLayoutProbe {
+    pub value_offset: usize,
+    pub slot_size: usize,
+    pub slab_header_size: usize,
+    pub slots_per_slab: usize,
+}
+
+#[cfg(any(test, feature = "layout-probe"))]
+impl ZoneLayoutProbe {
+    pub fn for_type<T: 'static>() -> Self {
+        let layout = slab_layout::<T>(4096).expect("test page must fit one zone slot");
+        Self {
+            value_offset: layout.header_size,
+            slot_size: mem::size_of::<Slot<T>>().max(1),
+            slab_header_size: layout.header_size,
+            slots_per_slab: layout.slot_count,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SlabList {
@@ -33,7 +71,10 @@ pub(crate) enum SlabList {
 ///
 /// The descriptor and typed slots live inside a backing page obtained directly
 /// from the frame allocator. It does not allocate through the kernel heap.
+#[repr(C)]
 pub struct ZoneSlab<T: 'static> {
+    /// One-shot intrusive retirement header. Kept separate from Keg linkage.
+    retire_head: RcuHead,
     /// Per-zone slab ID used in `SlotKey`.
     id: usize,
     /// Owning zone. Stored once per slab instead of once per slot.
@@ -60,23 +101,15 @@ impl<T: 'static> ZoneSlab<T> {
     pub(crate) fn allocate(zone: &'static Zone<T>, id: usize) -> Result<NonNull<Self>, ZoneError> {
         let page_size = runtime::page_size();
         // The slot array starts immediately after an aligned slab header.
-        let header_size = align_up(mem::size_of::<Self>(), mem::align_of::<Slot<T>>())
-            .ok_or(ZoneError::AllocationFailed)?;
-        let slot_size = mem::size_of::<Slot<T>>().max(1);
-        let slot_capacity = page_size
-            .checked_sub(header_size)
-            .ok_or(ZoneError::AllocationFailed)?
-            / slot_size;
-        let slot_count = slot_capacity.min(MAX_SLAB_SLOTS);
-        if slot_count == 0 {
-            return Err(ZoneError::AllocationFailed);
-        }
+        let layout = slab_layout::<T>(page_size).ok_or(ZoneError::AllocationFailed)?;
+        let header_size = layout.header_size;
+        let slot_count = layout.slot_count;
 
-        // Commit the frame and intentionally keep the raw PPN. The slab header
-        // becomes the lifetime owner until `reclaim_slab` releases the frame.
+        // Keep the owned run live across all fallible address calculations so
+        // an early error returns the frame automatically. The slab header takes
+        // ownership only after it and every slot are fully initialized.
         let run = page_allocator::reserve_run(1, 1, ZeroPolicy::UninitFullOverwrite)?.commit();
         let backing_ppn = run.base();
-        core::mem::forget(run);
 
         let phys = PhysAddr(
             backing_ppn
@@ -96,6 +129,7 @@ impl<T: 'static> ZoneSlab<T> {
 
         unsafe {
             slab_ptr.write(Self {
+                retire_head: RcuHead::new(reclaim_slab_head::<T>),
                 id,
                 zone,
                 backing_ppn,
@@ -113,11 +147,17 @@ impl<T: 'static> ZoneSlab<T> {
             }
         }
 
+        core::mem::forget(run);
+
         Ok(slab)
     }
 
     pub(crate) fn id(&self) -> usize {
         self.id
+    }
+
+    pub(crate) fn retire_head(&mut self) -> NonNull<RcuHead> {
+        NonNull::from(&mut self.retire_head)
     }
 
     pub fn backing_ppn(&self) -> Ppn {
@@ -244,12 +284,36 @@ pub(crate) unsafe fn reclaim_slab<T: 'static>(ptr: *mut u8) {
     }
 }
 
+unsafe fn reclaim_slab_head<T: 'static>(
+    head: *mut RcuHead,
+    _guard: &mut crate::epoch::LocalRetireGuard,
+) {
+    unsafe { reclaim_slab::<T>(head.cast::<u8>()) }
+}
+
 fn align_up(value: usize, align: usize) -> Option<usize> {
     if align == 0 || !align.is_power_of_two() {
         return None;
     }
     let mask = align - 1;
     value.checked_add(mask).map(|v| v & !mask)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layout_probe_matches_allocator_formula_with_64_slot_cap() {
+        let probe = ZoneLayoutProbe::for_type::<u8>();
+        assert_eq!(
+            probe.value_offset,
+            align_up(mem::size_of::<ZoneSlab<u8>>(), mem::align_of::<Slot<u8>>()).unwrap()
+        );
+        assert_eq!(probe.slot_size, mem::size_of::<Slot<u8>>().max(1));
+        assert_eq!(probe.slab_header_size, probe.value_offset);
+        assert_eq!(probe.slots_per_slab, 64);
+    }
 }
 
 fn initial_free_bitmap(slot_count: usize) -> u64 {

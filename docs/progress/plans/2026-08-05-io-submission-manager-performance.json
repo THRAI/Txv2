@@ -1,0 +1,391 @@
+{
+  "schema": "tx.progress.plan.v1",
+  "id": "2026-08-05-io-submission-manager-performance",
+  "title": "I/O SubmissionManager and file-data performance rollout",
+  "status": "proposed",
+  "created": "2026-08-05",
+  "updated": "2026-08-05",
+  "owner": "codex/root",
+  "summary": "Replace the coarse filesystem-I/O staging path with independent L4 and device-scoped L6 owners, separated page-cache synchronization domains, bounded resident publication, multi-page reads, device-aware request shaping, real readahead, and candidate-bound correctness and performance receipts. Multi-queue remains conditional on accepted single-queue saturation evidence.",
+  "scope": {
+    "in": [
+      "docs/design/03_memory-vm/MEMORY_IO_ARCHITECTURE_v1.md",
+      "docs/design/03_memory-vm/PAGE_BACKED_v1.md",
+      "docs/design/05_filesystem/EXT4_LIFECYCLE_v1.md",
+      "docs/design/05_filesystem/IO_MANAGER_v1.md",
+      "docs/design/06_devices/DEVICE.md",
+      "crates/tx-substrate/src/epoch/",
+      "crates/tx-substrate/src/publication/",
+      "crates/tx-subsystems/src/io_manager/",
+      "crates/tx-subsystems/src/page_backed/",
+      "crates/tx-subsystems/src/fs_iface/plan.rs",
+      "crates/tx-subsystems/src/device.rs",
+      "crates/tx-subsystems/src/vfs/",
+      "crates/tx-ext4/",
+      "crates/tx-fs/src/bdevfs/",
+      "crates/tx-shims/src/linux_syscall/io.rs",
+      "crates/tx-shims/src/linux_syscall/tests/high_stakes_syscalls.rs",
+      "crates/tx-kernel/src/init.rs",
+      "crates/tx-kernel/src/init/",
+      "crates/tx-drivers/src/virtio/",
+      "schema/txobserve.toml",
+      "tools/io-submission-perf.py",
+      "tools/io-submission-baseline.json",
+      "tools/io-submission-candidate.json",
+      "tools/io-submission-multiqueue.json",
+      "tools/shell-tests/io-submission-witness.c",
+      "tools/tests/test_io_submission_perf.py",
+      "xtask/src/test.rs",
+      "docs/progress/research/2026-08-05-io-submission-performance-baseline.md",
+      "docs/progress/STATUS.md"
+    ],
+    "out": [
+      "full-ext4-direct-io-product-admission",
+      "concurrent-jbd2-transactions",
+      "ext4-delayed-allocation",
+      "filesystem-owned-page-cache",
+      "parallel-page-request-or-completion-family",
+      "parallel-backend-graph-family",
+      "journal-pageslot-range-rcu",
+      "complex-bfq-kyber-style-schedulers",
+      "unmeasured-multi-queue",
+      "numa-storage-policy"
+    ],
+    "write_sets": []
+  },
+  "context": {
+    "design_docs": [
+      "docs/superpowers/specs/2026-08-05-io-submission-manager-performance-design.md",
+      "docs/superpowers/plans/2026-08-05-io-submission-manager-performance.md",
+      "docs/design/03_memory-vm/MEMORY_IO_ARCHITECTURE_v1.md",
+      "docs/design/03_memory-vm/PAGE_BACKED_v1.md",
+      "docs/design/05_filesystem/EXT4_LIFECYCLE_v1.md",
+      "docs/design/05_filesystem/IO_MANAGER_v1.md",
+      "docs/design/06_devices/DEVICE.md"
+    ],
+    "progress_refs": [
+      "docs/progress/plans/2026-07-11-io-manager-phase0-landing.json",
+      "docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json",
+      "docs/progress/research/2026-07-30-ext4-tier1-acceptance.md",
+      "docs/progress/STATUS.md"
+    ],
+    "external_refs": []
+  },
+  "steps": [
+    {
+      "id": "canonical-contracts",
+      "title": "Align canonical I/O ownership and publication contracts",
+      "status": "pending",
+      "depends_on": [],
+      "paths": [
+        "docs/design/03_memory-vm/MEMORY_IO_ARCHITECTURE_v1.md",
+        "docs/design/03_memory-vm/PAGE_BACKED_v1.md",
+        "docs/design/05_filesystem/EXT4_LIFECYCLE_v1.md",
+        "docs/design/05_filesystem/IO_MANAGER_v1.md",
+        "docs/design/06_devices/DEVICE.md"
+      ],
+      "verification": [
+        "cargo xtask lint docs",
+        "cargo xtask progress validate"
+      ],
+      "notes": "Markdown Task 1. Move the approved owner, custody, publication, readahead, and measurement contracts into active docs before changing implementation behavior."
+    },
+    {
+      "id": "c0-ext4-frontier",
+      "title": "Repair ext4 production frontier settlement prerequisite",
+      "status": "pending",
+      "depends_on": [
+        "canonical-contracts"
+      ],
+      "paths": [
+        "crates/tx-ext4/src/mutation_lifecycle.rs",
+        "crates/tx-ext4/src/journal.rs",
+        "crates/tx-ext4/src/pager.rs",
+        "crates/tx-ext4/tests/mutation_lifecycle.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-ext4 --test mutation_lifecycle -- --nocapture",
+        "cargo test -p tx-ext4 --lib -- --nocapture",
+        "cargo xtask ext4 tier1 --verify-receipt target/ext4/tier1/task16-live-retry-20260804/acceptance-receipt.json"
+      ],
+      "notes": "Markdown Task 2. Close the real transaction-frontier and supported fsync settlement path before performance extraction. Verify the existing immutable Tier 1 receipt only; do not run a fresh crash campaign here."
+    },
+    {
+      "id": "p0-observation-baseline",
+      "title": "Add bounded observation and capture the locked single-page baseline",
+      "status": "pending",
+      "depends_on": [
+        "c0-ext4-frontier"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/io_manager/runtime/observe.rs",
+        "schema/txobserve.toml",
+        "tools/shell-tests/io-submission-witness.c",
+        "tools/io-submission-perf.py",
+        "tools/io-submission-baseline.json",
+        "tools/tests/test_io_submission_perf.py",
+        "xtask/src/test.rs",
+        "docs/progress/research/2026-08-05-io-submission-performance-baseline.md"
+      ],
+      "verification": [
+        "cargo test -p tx-subsystems --lib io_submission_observe -- --nocapture",
+        "python3 -m unittest tools.tests.test_io_submission_perf",
+        "cargo xtask observe-schema check",
+        "cargo xtask observe-discipline",
+        "python3 tools/io-submission-perf.py verify --receipt target/perf/io-submission/p0-locked-single-page/acceptance-receipt.json"
+      ],
+      "notes": "Markdown Tasks 3-4. Instrument the current staging path without policy changes, bind fixed geometry and trace-loss accounting, and retain the result as the locked/single-page/single-queue baseline."
+    },
+    {
+      "id": "p1-l4-manager",
+      "title": "Extract and cut over the shared L4 PageIoSubmissionManager",
+      "status": "pending",
+      "depends_on": [
+        "p0-observation-baseline"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/io_manager/page/manager.rs",
+        "crates/tx-subsystems/src/io_manager/page/mod.rs",
+        "crates/tx-subsystems/src/io_manager/page/service.rs",
+        "crates/tx-subsystems/src/page_backed/mod.rs",
+        "crates/tx-kernel/src/init.rs",
+        "crates/tx-kernel/src/init/"
+      ],
+      "verification": [
+        "cargo test -p tx-subsystems --lib page_io_manager_ -- --nocapture",
+        "cargo test -p tx-subsystems --lib page_backed -- --nocapture",
+        "cargo test -p tx-kernel-riscv64-qemu-virt init_tests -- --nocapture"
+      ],
+      "notes": "Markdown Tasks 5-6. Introduce neutral owned-bundle admission first, then make one shared L4 manager the sole production owner with exactly one terminal settlement."
+    },
+    {
+      "id": "p2-l6-limits-manager",
+      "title": "Add typed device limits and extract device-scoped L6 ownership",
+      "status": "pending",
+      "depends_on": [
+        "p1-l4-manager"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/device.rs",
+        "crates/tx-subsystems/src/io_manager/block/manager.rs",
+        "crates/tx-subsystems/src/io_manager/block/mod.rs",
+        "crates/tx-fs/src/bdevfs/mod.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-subsystems --lib block_io_limits_ -- --nocapture",
+        "cargo test -p tx-subsystems --lib block_submission_manager_ -- --nocapture",
+        "cargo test -p tx-fs --lib bdevfs -- --nocapture"
+      ],
+      "notes": "Markdown Tasks 7-8. Physical devices own immutable finite limits and one L6 manager; partitions share that manager while retaining bounds in their handles."
+    },
+    {
+      "id": "p3-owner-domains",
+      "title": "Split PageState and Range owner domains from resident state",
+      "status": "pending",
+      "depends_on": [
+        "p2-l6-limits-manager"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/page_backed/state_domain.rs",
+        "crates/tx-subsystems/src/page_backed/range_domain.rs",
+        "crates/tx-subsystems/src/page_backed/mod.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-subsystems --lib page_state_domain_ -- --nocapture",
+        "cargo test -p tx-subsystems --lib range_domain_ -- --nocapture",
+        "cargo xtask lint invariants"
+      ],
+      "notes": "Markdown Task 9. Keep PageSlot FSM and range reservation serialized under separate owners; no lock or claim crosses planner, device, yield, or wait boundaries."
+    },
+    {
+      "id": "p4-resident-publication",
+      "title": "Strengthen bounded publication and cut over persistent ResidentRoot",
+      "status": "pending",
+      "depends_on": [
+        "p3-owner-domains"
+      ],
+      "paths": [
+        "crates/tx-substrate/src/epoch/",
+        "crates/tx-substrate/src/publication/",
+        "crates/tx-subsystems/src/page_backed/resident.rs",
+        "crates/tx-subsystems/src/page_backed/mod.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-substrate --test publication -- --nocapture",
+        "cargo test -p tx-subsystems --lib resident_root_ -- --nocapture",
+        "cargo test -p tx-subsystems --lib resident_publication_smp4 -- --nocapture"
+      ],
+      "notes": "Markdown Tasks 10-12. Reserve retirement capacity during prepare, keep commit bounded and infallible, then publish a path-copy persistent root with active/generation/pin revalidation."
+    },
+    {
+      "id": "p5-multi-page-read",
+      "title": "Extend the canonical lease and graph path to multi-page reads",
+      "status": "pending",
+      "depends_on": [
+        "p4-resident-publication"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/page_backed/lifecycle.rs",
+        "crates/tx-subsystems/src/fs_iface/plan.rs",
+        "crates/tx-ext4/src/planner.rs",
+        "crates/tx-ext4/src/read_backend.rs",
+        "crates/tx-fs/src/bdevfs/mod.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-subsystems --lib multi_page_read -- --nocapture",
+        "cargo test -p tx-ext4 planner -- --nocapture",
+        "cargo test -p tx-fs --lib bdevfs -- --nocapture"
+      ],
+      "notes": "Markdown Tasks 13-14. Extend the existing PageDataLease, PageIoCompletion, and BackendBioGraph families; preserve holes, extent boundaries, per-page generations, and partial-failure settlement."
+    },
+    {
+      "id": "p6-split-merge-plug",
+      "title": "Add device-limit splitting, compatible merging, and short plugging",
+      "status": "pending",
+      "depends_on": [
+        "p5-multi-page-read"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/io_manager/block/manager.rs",
+        "crates/tx-subsystems/src/io_manager/block/mod.rs",
+        "crates/tx-subsystems/src/io_manager/page/manager.rs",
+        "crates/tx-subsystems/src/io_manager/runtime/observe.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-subsystems --lib split_ -- --nocapture",
+        "cargo test -p tx-subsystems --lib plug_ -- --nocapture",
+        "cargo test -p tx-subsystems --lib backend_graph -- --nocapture"
+      ],
+      "notes": "Markdown Task 15. Split before mutable admission, merge only within immutable device and ordering limits, aggregate pieces once, and flush bounded plugs at service-turn and barrier boundaries."
+    },
+    {
+      "id": "p7-readahead",
+      "title": "Add bounded adaptive and explicit file-data readahead",
+      "status": "pending",
+      "depends_on": [
+        "p6-split-merge-plug"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/io_manager/page/readahead.rs",
+        "crates/tx-subsystems/src/io_manager/page/manager.rs",
+        "crates/tx-subsystems/src/page_backed/mod.rs",
+        "crates/tx-subsystems/src/vfs/structure.rs",
+        "crates/tx-shims/src/linux_syscall/io.rs",
+        "tools/shell-tests/io-submission-witness.c"
+      ],
+      "verification": [
+        "cargo test -p tx-subsystems --lib readahead_ -- --nocapture",
+        "cargo test -p tx-shims --lib dispatch_file_advice_readahead_and_sync_file_range_validate_inputs -- --nocapture",
+        "cargo xtask test io-submission-witness --target rv64-qemu --case readahead --smp 4 --timeout-ms 120000"
+      ],
+      "notes": "Markdown Task 16. Key bounded sequential history by PageContainer and open-file stream, reuse the canonical request family, preserve demand priority, and make readahead(2) a real advisory admission path."
+    },
+    {
+      "id": "p8-final-receipt",
+      "title": "Run final correctness campaign and select the performance candidate",
+      "status": "pending",
+      "depends_on": [
+        "p7-readahead"
+      ],
+      "paths": [
+        "tools/io-submission-perf.py",
+        "tools/io-submission-candidate.json",
+        "tools/tests/test_io_submission_perf.py",
+        "docs/progress/research/2026-08-05-io-submission-performance-baseline.md",
+        "target/ext4/tier1/",
+        "target/perf/io-submission/"
+      ],
+      "verification": [
+        "cargo -q xtask unit",
+        "cargo xtask ext4 tier1 --run-id io-submission-p8-$(git rev-parse --short=12 HEAD)",
+        "cargo xtask ext4 tier1 --verify-receipt target/ext4/tier1/io-submission-p8-$(git rev-parse --short=12 HEAD)/acceptance-receipt.json",
+        "python3 tools/io-submission-perf.py verify --receipt target/perf/io-submission/p8-final/acceptance-receipt.json"
+      ],
+      "notes": "Markdown Task 17. Run short gates first, then exactly one fresh candidate-bound Tier 1 campaign with failure-point resume, and require five interleaved matched A/B pairs before production selection."
+    },
+    {
+      "id": "p9-multi-queue",
+      "title": "Close or implement the evidence-gated device multi-queue candidate",
+      "status": "pending",
+      "depends_on": [
+        "p8-final-receipt"
+      ],
+      "paths": [
+        "tools/io-submission-perf.py",
+        "tools/tests/test_io_submission_perf.py",
+        "tools/io-submission-multiqueue.json",
+        "crates/tx-subsystems/src/io_manager/block/manager.rs",
+        "crates/tx-subsystems/src/device.rs",
+        "crates/tx-drivers/src/virtio/"
+      ],
+      "verification": [
+        "python3 tools/io-submission-perf.py multi-queue-trigger --receipt target/perf/io-submission/p8-final/acceptance-receipt.json",
+        "cargo test -p tx-subsystems --lib block_queue_shards_ -- --nocapture"
+      ],
+      "notes": "Markdown Task 18. A false trigger is a valid completed negative result and creates no shard set. A true trigger permits only an L6/driver candidate that passes the declared throughput, latency, trace-loss, barrier, and exactly-once A/B gates."
+    },
+    {
+      "id": "final-closeout",
+      "title": "Reconcile active contracts and close immutable progress evidence",
+      "status": "pending",
+      "depends_on": [
+        "p9-multi-queue"
+      ],
+      "paths": [
+        "docs/design/03_memory-vm/MEMORY_IO_ARCHITECTURE_v1.md",
+        "docs/design/03_memory-vm/PAGE_BACKED_v1.md",
+        "docs/design/05_filesystem/EXT4_LIFECYCLE_v1.md",
+        "docs/design/05_filesystem/IO_MANAGER_v1.md",
+        "docs/design/06_devices/DEVICE.md",
+        "docs/progress/research/2026-08-05-io-submission-performance-baseline.md",
+        "docs/progress/STATUS.md"
+      ],
+      "verification": [
+        "cargo -q xtask unit",
+        "cargo xtask check",
+        "cargo xtask observe-schema codegen --check",
+        "cargo xtask observe-schema check",
+        "cargo xtask observe-discipline",
+        "cargo xtask lint docs",
+        "cargo xtask lint invariants",
+        "cargo xtask progress validate",
+        "git diff --check"
+      ],
+      "notes": "Markdown Task 19. Document only receipt-proven production behavior, bind both immutable receipts and the P9 decision, close every stage, and remove no staging language without production callsite evidence."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo xtask lint docs",
+      "status": "passed",
+      "notes": "Passed on 2026-08-05; seven pre-existing active-doc stale-vocabulary discussion warnings remain non-fatal."
+    },
+    {
+      "command": "cargo xtask progress validate",
+      "status": "passed",
+      "notes": "Passed on 2026-08-05 for 43 progress JSON records including this proposed plan and the canceled Phase 0 ledger."
+    },
+    {
+      "command": "git diff --check -- docs/superpowers/plans/2026-08-05-io-submission-manager-performance.md docs/progress/plans/2026-08-05-io-submission-manager-performance.json docs/progress/plans/2026-07-11-io-manager-phase0-landing.json docs/progress/STATUS.md",
+      "status": "passed",
+      "notes": "Scoped whitespace validation passed for exactly the four planning artifacts."
+    }
+  ],
+  "risks": [
+    "Custody extraction can leave two live owners if compatibility fallbacks survive production cutover; every cutover task must prove one authority and exactly-one settlement.",
+    "Resident publication can become unsafe if prepare does not reserve retire capacity or if a reader treats immutable lookup as frame-lifetime evidence without pin revalidation.",
+    "Multi-page and split completion can double-settle or leak custody under partial failure unless parent and per-page generation accounting are tested together.",
+    "Readahead can hide random-read regression through unreported amplification; requested, useful, unused, canceled, duplicate, demand bytes, and device bytes remain separate receipt facts.",
+    "Performance selection is invalid under geometry drift, missing trace-loss accounting, fewer than five interleaved pairs, or an unverified candidate-bound Tier 1 receipt.",
+    "Multi-queue can add complexity without benefit; it remains absent unless the accepted single-queue receipt triggers it and the sharded A/B gate passes."
+  ],
+  "blockers": [
+    "Implementation has not started; activate and claim only the current stage after choosing an execution workflow.",
+    "The final fresh ext4 Tier 1 campaign is deferred to P8 so multi-hour prefixes are not rerun after every intermediate stage.",
+    "BlockQueueShardSet is conditional and may remain absent when P8 evidence does not prove hardware and L6 saturation."
+  ],
+  "handoff": {
+    "needed": false,
+    "path": null
+  }
+}

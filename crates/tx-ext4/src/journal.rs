@@ -7,7 +7,7 @@
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
 use tx_ext4_format::journal::{
     Jbd2MetadataUpdate, Jbd2Revoke, Jbd2TransactionImage, JBD2_BLOCK_SIZE,
@@ -20,17 +20,87 @@ use tx_subsystems::execution::{Errno, Guard, StepOutcome};
 use tx_subsystems::fs_iface::{
     BackendBioDependency, BackendBioGraph, BackendBioGraphError, BackendBioNode, BackendBioNodeId,
     BackendPageCompletion, BackendPageRequest, BackendPlan, IoDataLeaseId, IoDataSource,
-    PageFrameRef,
+    PageFrameRef, WaitSourceId,
 };
 use tx_subsystems::io_manager::block::{BioPlan, BioVec, BlockFlags, BlockOp, DeviceKey, LbaRange};
-use tx_subsystems::io_manager::page::{PageIoOp, PageIoRequestId, PageIoResult};
+use tx_subsystems::io_manager::page::PageIoOp;
+use tx_subsystems::mount::MountTransactionFrontier;
 use tx_subsystems::page_backed::{
     AnonSwapPolicy, MaterializeAccess, PageCacheError, PageContainer, PageContainerKind, PageIndex,
     PageLease,
 };
 
-use crate::planner::{Ext4FsyncPlanSource, Ext4WritePlanSource};
+pub use crate::mutation_lifecycle::{JournalFsyncSource, JournalSettlementObserver};
+use crate::planner::Ext4WritePlanSource;
 use crate::sync::SpinMutex;
+use crate::{adapter::wait_routing, adapter::wait_routing::WaitSource};
+
+pub(crate) const METADATA_MUTATION_READY: u64 = 0x1;
+
+/// One mount-local owner for ext4 metadata planning and journal admission.
+///
+/// Ownership is atomic rather than a borrowed spin-lock guard because L4
+/// writeback retains it across asynchronous block-I/O completion.
+pub struct JournalMetadataMutationAdmission {
+    busy: AtomicBool,
+    ready: Arc<WaitSource>,
+}
+
+impl JournalMetadataMutationAdmission {
+    pub fn new() -> Self {
+        Self {
+            busy: AtomicBool::new(false),
+            ready: wait_routing::new_wait_source(),
+        }
+    }
+
+    pub(crate) fn try_acquire(self: &Arc<Self>) -> Option<JournalMetadataMutationPermit> {
+        self.busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| JournalMetadataMutationPermit {
+                admission: Some(Arc::clone(self)),
+            })
+    }
+
+    pub(crate) fn wait_source_id(&self) -> u64 {
+        self.ready.id().raw()
+    }
+}
+
+impl Default for JournalMetadataMutationAdmission {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for JournalMetadataMutationAdmission {
+    fn drop(&mut self) {
+        wait_routing::unregister_source(&self.ready);
+    }
+}
+
+/// Owned proof that one foreground mutation or asynchronous writeback owns
+/// the mount-local metadata admission point.
+pub struct JournalMetadataMutationPermit {
+    admission: Option<Arc<JournalMetadataMutationAdmission>>,
+}
+
+impl JournalMetadataMutationPermit {
+    const fn detached() -> Self {
+        Self { admission: None }
+    }
+}
+
+impl Drop for JournalMetadataMutationPermit {
+    fn drop(&mut self) {
+        let Some(admission) = self.admission.take() else {
+            return;
+        };
+        admission.busy.store(false, Ordering::Release);
+        wait_routing::notify_all(&admission.ready, METADATA_MUTATION_READY);
+    }
+}
 
 /// One L5-owned write buffer retained until its L6 completion.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -64,8 +134,9 @@ impl From<BackendBioGraphError> for JournalTransactionPlanError {
 /// A closed ordered-mode transaction before it is submitted to L6.
 ///
 /// The caller owns every supplied `JournalBio` lease. `commit_graph` consumes
-/// none of those leases and makes the commit write FUA-backed. A checkpoint is
-/// intentionally emitted as a separate graph after durable commit completion.
+/// none of those leases and emits explicit device flushes around the commit.
+/// A checkpoint is intentionally emitted as a separate graph after durable
+/// commit completion.
 #[derive(Debug)]
 pub struct JournalTransactionPlan {
     sequence: u32,
@@ -73,6 +144,7 @@ pub struct JournalTransactionPlan {
     data_writes: Vec<JournalBio>,
     descriptor: JournalBio,
     metadata_writes: Vec<JournalBio>,
+    revokes: Vec<JournalBio>,
     commit: JournalBio,
     checkpoint_writes: Vec<JournalBio>,
     activation: Option<JournalBio>,
@@ -88,6 +160,46 @@ impl JournalTransactionPlan {
         commit: JournalBio,
         checkpoint_writes: Vec<JournalBio>,
     ) -> Result<Self, JournalTransactionPlanError> {
+        Self::with_revokes(
+            sequence,
+            data_writes,
+            descriptor,
+            metadata_writes,
+            Vec::new(),
+            commit,
+            checkpoint_writes,
+        )
+    }
+
+    pub fn with_revoke(
+        sequence: u32,
+        data_writes: Vec<JournalBio>,
+        descriptor: JournalBio,
+        metadata_writes: Vec<JournalBio>,
+        revoke: Option<JournalBio>,
+        commit: JournalBio,
+        checkpoint_writes: Vec<JournalBio>,
+    ) -> Result<Self, JournalTransactionPlanError> {
+        Self::with_revokes(
+            sequence,
+            data_writes,
+            descriptor,
+            metadata_writes,
+            revoke.into_iter().collect(),
+            commit,
+            checkpoint_writes,
+        )
+    }
+
+    pub fn with_revokes(
+        sequence: u32,
+        data_writes: Vec<JournalBio>,
+        descriptor: JournalBio,
+        metadata_writes: Vec<JournalBio>,
+        revokes: Vec<JournalBio>,
+        commit: JournalBio,
+        checkpoint_writes: Vec<JournalBio>,
+    ) -> Result<Self, JournalTransactionPlanError> {
         if metadata_writes.is_empty() {
             return Err(JournalTransactionPlanError::EmptyMetadata);
         }
@@ -98,6 +210,7 @@ impl JournalTransactionPlan {
             data_writes,
             descriptor,
             metadata_writes,
+            revokes,
             commit,
             checkpoint_writes,
             activation: None,
@@ -115,6 +228,10 @@ impl JournalTransactionPlan {
 
     pub const fn sequence(&self) -> u32 {
         self.sequence
+    }
+
+    pub fn contains_data_writes(&self) -> bool {
+        !self.data_writes.is_empty()
     }
 
     pub const fn device(&self) -> DeviceKey {
@@ -135,8 +252,10 @@ impl JournalTransactionPlan {
         builder.finish()
     }
 
-    /// Submit journal descriptor, metadata after-images, and FUA commit only
-    /// after [`Self::data_graph`] has completed successfully.
+    /// Submit journal descriptor, metadata after-images, and an explicit-flush
+    /// commit sequence only after [`Self::data_graph`] has completed
+    /// successfully. The mount has not yet admitted a device that proves FUA,
+    /// so the graph deliberately uses the flush fallback.
     pub fn commit_graph_after_data(&self) -> Result<BackendBioGraph, JournalTransactionPlanError> {
         let mut builder = GraphBuilder::new();
         let activation_fence = self
@@ -158,14 +277,17 @@ impl JournalTransactionPlan {
         for write in &self.metadata_writes {
             journal_ids.push(builder.push(write.clone())?);
         }
+        for revoke in &self.revokes {
+            journal_ids.push(builder.push(revoke.clone())?);
+        }
         let journal_fence = builder.push(fence(self.device))?;
         for journal in journal_ids {
             builder.depends_on(journal, journal_fence);
         }
-        let mut commit = self.commit.clone();
-        commit.plan.flags = commit.plan.flags.union(BlockFlags::FUA);
-        let commit = builder.push(commit)?;
+        let commit = builder.push(self.commit.clone())?;
         builder.depends_on(journal_fence, commit);
+        let commit_flush = builder.push(fence(self.device))?;
+        builder.depends_on(commit, commit_flush);
         builder.finish()
     }
 
@@ -202,16 +324,21 @@ impl JournalTransactionPlan {
             builder.depends_on(data_fence, node);
             journal_ids.push(node);
         }
+        for revoke in &self.revokes {
+            let node = builder.push(revoke.clone())?;
+            builder.depends_on(data_fence, node);
+            journal_ids.push(node);
+        }
 
         let journal_fence = builder.push(fence(self.device))?;
         for journal in journal_ids {
             builder.depends_on(journal, journal_fence);
         }
 
-        let mut commit = self.commit.clone();
-        commit.plan.flags = commit.plan.flags.union(BlockFlags::FUA);
-        let commit = builder.push(commit)?;
+        let commit = builder.push(self.commit.clone())?;
         builder.depends_on(journal_fence, commit);
+        let commit_flush = builder.push(fence(self.device))?;
+        builder.depends_on(commit, commit_flush);
         builder.finish()
     }
 
@@ -231,15 +358,15 @@ impl JournalTransactionPlan {
         for write in &self.checkpoint_writes {
             home_ids.push(builder.push(write.clone())?);
         }
-        let fence = builder.push(fence(self.device))?;
+        let checkpoint_fence = builder.push(fence(self.device))?;
         for home in home_ids {
-            builder.depends_on(home, fence);
+            builder.depends_on(home, checkpoint_fence);
         }
         if let Some(clean) = &self.clean {
-            let mut clean = clean.clone();
-            clean.plan.flags = clean.plan.flags.union(BlockFlags::FUA);
-            let clean = builder.push(clean)?;
-            builder.depends_on(fence, clean);
+            let clean = builder.push(clean.clone())?;
+            builder.depends_on(checkpoint_fence, clean);
+            let clean_flush = builder.push(fence(self.device))?;
+            builder.depends_on(clean, clean_flush);
         }
         builder.finish().map(Some)
     }
@@ -250,6 +377,7 @@ impl JournalTransactionPlan {
             .iter()
             .chain(core::iter::once(&self.descriptor))
             .chain(self.metadata_writes.iter())
+            .chain(self.revokes.iter())
             .chain(core::iter::once(&self.commit))
             .chain(self.checkpoint_writes.iter())
         {
@@ -378,17 +506,24 @@ impl JournalRecordLease {
 /// through graph completion before allowing the record to be recycled.
 pub struct JournalPagePool {
     pages: Cap<PageContainer>,
+    initialization: AtomicU8,
     next_page: AtomicU64,
     free: Arc<SpinMutex<Vec<PageIndex>>>,
 }
 
 impl JournalPagePool {
+    const UNINITIALIZED: u8 = 0;
+    const INITIALIZING: u8 = 1;
+    const READY: u8 = 2;
+
     /// Pages needed to stage one owned mutation through checkpoint completion.
-    /// Metadata has one journal copy and one home-checkpoint copy; data is
-    /// staged only when it is not retained by an L4-owned source.
+    /// Metadata has one journal copy and one home-checkpoint copy. Revoke
+    /// records have only their journal copy; data is staged only when it is
+    /// not retained by an L4-owned source.
     pub fn required_pages(
         owned_data_pages: usize,
         metadata_pages: usize,
+        revoke_pages: usize,
         has_superblock_state: bool,
     ) -> Result<u64, JournalPagePoolError> {
         let superblock_state_pages = usize::from(has_superblock_state) * 2;
@@ -398,6 +533,7 @@ impl JournalPagePool {
                     .checked_mul(2)
                     .ok_or(JournalPagePoolError::Capacity)?,
             )
+            .and_then(|pages| pages.checked_add(revoke_pages))
             .and_then(|pages| pages.checked_add(2))
             .and_then(|pages| pages.checked_add(superblock_state_pages))
             .ok_or(JournalPagePoolError::Capacity)?;
@@ -417,9 +553,39 @@ impl JournalPagePool {
         .map_err(|_| JournalPagePoolError::Zone)?;
         Ok(Self {
             pages,
+            initialization: AtomicU8::new(Self::UNINITIALIZED),
             next_page: AtomicU64::new(0),
             free: Arc::new(SpinMutex::new(Vec::new())),
         })
+    }
+
+    fn ensure_initialized(&self) -> Result<(), JournalPagePoolError> {
+        if self.initialization.load(Ordering::Acquire) == Self::READY {
+            return Ok(());
+        }
+        if self
+            .initialization
+            .compare_exchange(
+                Self::UNINITIALIZED,
+                Self::INITIALIZING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return Err(JournalPagePoolError::WouldBlock);
+        }
+        match self.pages.materialize_private_anon_pages_batch() {
+            Ok(()) => {
+                self.initialization.store(Self::READY, Ordering::Release);
+                Ok(())
+            }
+            Err(error) => {
+                self.initialization
+                    .store(Self::UNINITIALIZED, Ordering::Release);
+                Err(JournalPagePoolError::Page(error))
+            }
+        }
     }
 
     fn ensure_capacity(&self, required: u64) -> Result<(), JournalPagePoolError> {
@@ -439,6 +605,7 @@ impl JournalPagePool {
         bytes: &[u8; JBD2_BLOCK_SIZE],
         guard: &Guard<'_>,
     ) -> Result<JournalRecordLease, JournalPagePoolError> {
+        self.ensure_initialized()?;
         let page = self
             .free
             .lock()
@@ -497,6 +664,11 @@ impl JournalRecordLayout {
             revokes: Vec::new(),
             commit,
         }
+    }
+
+    pub fn with_revoke(mut self, revoke: LbaRange) -> Self {
+        self.revokes.push(revoke);
+        self
     }
 
     pub fn with_revokes(mut self, revokes: Vec<LbaRange>) -> Self {
@@ -658,6 +830,14 @@ impl JournalRing {
         metadata_blocks: usize,
     ) -> Result<JournalRingReservation, JournalRingError> {
         self.reserve_with_revoke_pages(metadata_blocks, 0)
+    }
+
+    pub fn reserve_for(
+        &self,
+        metadata_blocks: usize,
+        has_revoke: bool,
+    ) -> Result<JournalRingReservation, JournalRingError> {
+        self.reserve_with_revoke_pages(metadata_blocks, usize::from(has_revoke))
     }
 
     pub fn reserve_with_revoke_pages(
@@ -831,7 +1011,6 @@ impl MutationJournalImage {
         }
 
         let mut updates = Vec::new();
-        let mut revoked_blocks = Vec::new();
         let mut checkpoint_writes = Vec::new();
         for metadata in &mutation.metadata {
             let home = u32::try_from(metadata.home)
@@ -842,13 +1021,15 @@ impl MutationJournalImage {
                 bytes: metadata.after,
             });
         }
-        for revoke in &mutation.revokes {
-            revoked_blocks.push(
-                u32::try_from(revoke.physical_block)
-                    .map_err(|_| MutationJournalImageError::RevokeHomeOutOfRange)?,
-            );
-        }
 
+        let revoked_blocks = mutation
+            .revokes
+            .iter()
+            .map(|revoke| {
+                u32::try_from(revoke.physical_block)
+                    .map_err(|_| MutationJournalImageError::RevokeHomeOutOfRange)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             image: Jbd2TransactionImage::encode_legacy_with_revokes(
                 layout.sequence,
@@ -981,6 +1162,14 @@ impl<T> Default for JournalTransactionState<T> {
 }
 
 impl PreparedJournalTransaction {
+    pub fn sequence(&self) -> u32 {
+        self.plan.sequence()
+    }
+
+    pub fn contains_data_writes(&self) -> bool {
+        self.plan.contains_data_writes()
+    }
+
     pub fn stage_mutation_with_data_sources(
         pool: &JournalPagePool,
         mutation: MutationJournalImage,
@@ -995,7 +1184,8 @@ impl PreparedJournalTransaction {
         }
         let required_pages = JournalPagePool::required_pages(
             0,
-            mutation.image.metadata_blocks.len() + mutation.image.revokes.len(),
+            mutation.image.metadata_blocks.len(),
+            mutation.image.revokes.len(),
             mutation.layout.superblock_state.is_some(),
         )
         .map_err(PreparedJournalTransactionError::Pool)?;
@@ -1026,6 +1216,7 @@ impl PreparedJournalTransaction {
             metadata_writes.push(record.as_journal_bio(device, lba));
             records.push(record);
         }
+        let mut revokes = Vec::new();
         for (bytes, lba) in mutation
             .image
             .revokes
@@ -1035,7 +1226,7 @@ impl PreparedJournalTransaction {
             let record = pool
                 .stage(bytes, guard)
                 .map_err(PreparedJournalTransactionError::Pool)?;
-            metadata_writes.push(record.as_journal_bio(device, lba));
+            revokes.push(record.as_journal_bio(device, lba));
             records.push(record);
         }
         let commit = pool
@@ -1062,11 +1253,12 @@ impl PreparedJournalTransaction {
             .map_err(|_| PreparedJournalTransactionError::Layout)?
             .header
             .sequence;
-        let mut plan = JournalTransactionPlan::new(
+        let mut plan = JournalTransactionPlan::with_revokes(
             sequence,
             data_writes,
             descriptor_bio,
             metadata_writes,
+            revokes,
             commit_bio,
             checkpoint_writes,
         )
@@ -1094,7 +1286,8 @@ impl PreparedJournalTransaction {
         }
         let required_pages = JournalPagePool::required_pages(
             mutation.data_writes.len(),
-            mutation.image.metadata_blocks.len() + mutation.image.revokes.len(),
+            mutation.image.metadata_blocks.len(),
+            mutation.image.revokes.len(),
             mutation.layout.superblock_state.is_some(),
         )
         .map_err(PreparedJournalTransactionError::Pool)?;
@@ -1131,6 +1324,7 @@ impl PreparedJournalTransaction {
             metadata_writes.push(record.as_journal_bio(device, lba));
             records.push(record);
         }
+        let mut revokes = Vec::new();
         for (bytes, lba) in mutation
             .image
             .revokes
@@ -1140,7 +1334,7 @@ impl PreparedJournalTransaction {
             let record = pool
                 .stage(bytes, guard)
                 .map_err(PreparedJournalTransactionError::Pool)?;
-            metadata_writes.push(record.as_journal_bio(device, lba));
+            revokes.push(record.as_journal_bio(device, lba));
             records.push(record);
         }
 
@@ -1170,11 +1364,12 @@ impl PreparedJournalTransaction {
             .map_err(|_| PreparedJournalTransactionError::Layout)?
             .header
             .sequence;
-        let mut plan = JournalTransactionPlan::new(
+        let mut plan = JournalTransactionPlan::with_revokes(
             sequence,
             data_writes,
             descriptor_bio,
             metadata_writes,
+            revokes,
             commit_bio,
             checkpoint_writes,
         )
@@ -1215,11 +1410,12 @@ impl PreparedJournalTransaction {
             metadata_writes.push(record.as_journal_bio(device, lba));
             records.push(record);
         }
+        let mut revokes = Vec::new();
         for (bytes, lba) in image.revokes.iter().zip(layout.revokes.iter().copied()) {
             let record = pool
                 .stage(bytes, guard)
                 .map_err(PreparedJournalTransactionError::Pool)?;
-            metadata_writes.push(record.as_journal_bio(device, lba));
+            revokes.push(record.as_journal_bio(device, lba));
             records.push(record);
         }
         let commit = pool
@@ -1228,7 +1424,7 @@ impl PreparedJournalTransaction {
         let descriptor_bio = records[0].as_journal_bio(device, layout.descriptor);
         let commit_bio = commit.as_journal_bio(device, layout.commit);
         records.push(commit);
-        let plan = JournalTransactionPlan::new(
+        let plan = JournalTransactionPlan::with_revokes(
             tx_ext4_format::journal::Jbd2Commit::parse(&image.commit)
                 .map_err(|_| PreparedJournalTransactionError::Layout)?
                 .header
@@ -1236,6 +1432,7 @@ impl PreparedJournalTransaction {
             data_writes,
             descriptor_bio,
             metadata_writes,
+            revokes,
             commit_bio,
             checkpoint_writes,
         )
@@ -1290,159 +1487,13 @@ fn journal_bio_from_l4_source(
         _ => {
             return Err(PreparedJournalTransactionError::Plan(
                 JournalTransactionPlanError::EmptyWrite,
-            ))
+            ));
         }
     };
     Ok(JournalBio::new(
         BioPlan::new(device, BlockOp::Write, lba, vecs, BlockFlags::EMPTY),
         source,
     ))
-}
-
-/// Ext4 mount-owned bridge from fsync requests to retained JBD2 transactions.
-///
-/// The source owns the prepared transaction and hence every journal-record
-/// lease until the matching L4 graph completion makes the commit durable.
-pub struct JournalFsyncSource {
-    state: SpinMutex<JournalFsyncSourceState>,
-}
-
-struct JournalFsyncSourceState {
-    transaction: JournalTransactionState<PreparedJournalTransaction>,
-    data_submitted: Option<PageIoRequestId>,
-    commit_submitted: Option<PageIoRequestId>,
-    checkpoint_submitted: bool,
-    ring_reservation: Option<(Arc<JournalRing>, JournalRingReservation)>,
-}
-
-impl JournalFsyncSource {
-    pub const fn new() -> Self {
-        Self {
-            state: SpinMutex::new(JournalFsyncSourceState {
-                transaction: JournalTransactionState::new(),
-                data_submitted: None,
-                commit_submitted: None,
-                checkpoint_submitted: false,
-                ring_reservation: None,
-            }),
-        }
-    }
-
-    pub fn begin(
-        &self,
-        transaction: PreparedJournalTransaction,
-    ) -> Result<(), JournalTransactionStateError> {
-        self.state.lock().transaction.begin(transaction)
-    }
-
-    pub fn begin_with_ring(
-        &self,
-        transaction: PreparedJournalTransaction,
-        ring: Arc<JournalRing>,
-        reservation: JournalRingReservation,
-    ) -> Result<(), JournalTransactionStateError> {
-        let mut state = self.state.lock();
-        state.transaction.begin(transaction)?;
-        state.ring_reservation = Some((ring, reservation));
-        Ok(())
-    }
-
-    pub fn plan_data(&self, request: &BackendPageRequest) -> BackendPlan {
-        if request.op != PageIoOp::Writeback {
-            return BackendPlan::Err(tx_subsystems::execution::Errno::EINVAL);
-        }
-        let mut state = self.state.lock();
-        if state.data_submitted.is_some() || state.commit_submitted.is_some() {
-            return BackendPlan::Err(tx_subsystems::execution::Errno::EBUSY);
-        }
-        let Some(transaction) = state.transaction.active() else {
-            return BackendPlan::Err(tx_subsystems::execution::Errno::EAGAIN);
-        };
-        let graph = match transaction.plan().data_graph() {
-            Ok(graph) => graph,
-            Err(_) => return BackendPlan::Err(tx_subsystems::execution::Errno::EIO),
-        };
-        state.data_submitted = Some(request.id);
-        BackendPlan::SubmitGraph(graph)
-    }
-
-    pub fn complete_data(&self, completion: BackendPageCompletion) {
-        if completion.op != PageIoOp::Writeback {
-            return;
-        }
-        let mut state = self.state.lock();
-        if state.data_submitted != Some(completion.id) {
-            return;
-        }
-        state.data_submitted = None;
-        match completion.result {
-            PageIoResult::Done => {
-                let _ = state.transaction.mark_data_durable();
-            }
-            PageIoResult::Err(_) => {
-                let _ = state.transaction.discard();
-            }
-        }
-    }
-
-    /// Build the post-commit checkpoint graph while retaining transaction leases.
-    pub fn take_checkpoint_graph(
-        &self,
-    ) -> Result<Option<BackendBioGraph>, JournalTransactionStateError> {
-        let mut state = self.state.lock();
-        if state.checkpoint_submitted {
-            return Err(JournalTransactionStateError::Busy);
-        }
-        let Some(transaction) = state.transaction.checkpoint_ready()? else {
-            return Ok(None);
-        };
-        let graph = transaction
-            .plan()
-            .checkpoint_graph_after_commit()
-            .map_err(|_| JournalTransactionStateError::NotCommitted)?;
-        state.checkpoint_submitted = graph.is_some();
-        Ok(graph)
-    }
-
-    /// Record one checkpoint graph terminal result.
-    ///
-    /// An I/O error leaves the committed transaction and its record leases
-    /// intact for a later checkpoint retry. Only a successful home-write graph
-    /// releases journal space.
-    pub fn complete_checkpoint_result(
-        &self,
-        result: Result<(), Errno>,
-    ) -> Result<(), JournalTransactionStateError> {
-        let mut state = self.state.lock();
-        if !state.checkpoint_submitted {
-            return Err(JournalTransactionStateError::NotCommitted);
-        }
-        state.checkpoint_submitted = false;
-        if result.is_err() {
-            return Ok(());
-        }
-        let _ = state.transaction.complete_checkpoint()?;
-        let ring_reservation = state.ring_reservation.take();
-        state.data_submitted = None;
-        state.commit_submitted = None;
-        drop(state);
-        if let Some((ring, reservation)) = ring_reservation {
-            ring.complete(&reservation, true)
-                .map_err(|_| JournalTransactionStateError::NotCommitted)?;
-        }
-        Ok(())
-    }
-
-    /// Release retained transaction leases only after checkpoint I/O completes.
-    pub fn complete_checkpoint(&self) -> Result<(), JournalTransactionStateError> {
-        self.complete_checkpoint_result(Ok(()))
-    }
-}
-
-impl Default for JournalFsyncSource {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 /// Mount-owned admission path from immutable ext4 mutations into JBD2 state.
@@ -1461,6 +1512,7 @@ pub enum JournalMutationRuntimeError {
     Image(MutationJournalImageError),
     Stage(PreparedJournalTransactionError),
     Busy(JournalTransactionStateError),
+    Settlement(Errno),
 }
 
 /// L5 metadata owner for a single immutable ext4 writeback mutation.
@@ -1468,10 +1520,33 @@ pub enum JournalMutationRuntimeError {
 /// The provider may inspect its own inode/extent/bitmap state to build a
 /// plan, but it never receives an L4 frame or page-cache lease.
 pub trait Ext4MutationPlanSource: Send + Sync + 'static {
+    /// Acquire the mount-wide metadata owner. Test and compatibility sources
+    /// without a live mount use a detached permit.
+    fn try_acquire_writeback_admission(
+        &self,
+    ) -> Result<JournalMetadataMutationPermit, WaitSourceId> {
+        Ok(JournalMetadataMutationPermit::detached())
+    }
+
+    /// Finish a preceding transaction after its ordered-data graph completed
+    /// and before admitting another writeback mutation.
+    fn settle_prior_writeback_mutation(
+        &self,
+        _runtime: &JournalMutationRuntime,
+    ) -> Result<(), Errno> {
+        Err(Errno::EBUSY)
+    }
+
     fn plan_writeback_mutation(
         &self,
         request: &BackendPageRequest,
     ) -> Result<Ext4MutationPlan, Errno>;
+
+    /// Publish the same immutable metadata after-images used by foreground
+    /// namespace mutations once journal admission succeeds.
+    fn stage_writeback_after_images(&self, _mutation: &Ext4MutationPlan) -> Result<(), Errno> {
+        Ok(())
+    }
 }
 
 /// Bridges a pure ext4 mutation planner to the mount-local JBD2 runtime.
@@ -1482,11 +1557,21 @@ pub trait Ext4MutationPlanSource: Send + Sync + 'static {
 pub struct JournalMutationWriteSource<P> {
     planner: P,
     runtime: Arc<JournalMutationRuntime>,
+    active_admission: SpinMutex<
+        Option<(
+            tx_subsystems::io_manager::page::PageIoRequestId,
+            JournalMetadataMutationPermit,
+        )>,
+    >,
 }
 
 impl<P> JournalMutationWriteSource<P> {
     pub const fn new(planner: P, runtime: Arc<JournalMutationRuntime>) -> Self {
-        Self { planner, runtime }
+        Self {
+            planner,
+            runtime,
+            active_admission: SpinMutex::new(None),
+        }
     }
 }
 
@@ -1494,15 +1579,12 @@ impl<P: Ext4MutationPlanSource> Ext4WritePlanSource for JournalMutationWriteSour
     fn prepare_writeback(
         &self,
         request: &BackendPageRequest,
-        guard: &Guard<'_>,
+        _guard: &Guard<'_>,
     ) -> Result<(), Errno> {
         if request.op != PageIoOp::Writeback || matches!(request.source, IoDataSource::None) {
             return Err(Errno::EINVAL);
         }
-        let mutation = self.planner.plan_writeback_mutation(request)?;
-        self.runtime
-            .begin_mutation_with_data_sources(&mutation, vec![request.source.clone()], guard)
-            .map_err(journal_mutation_runtime_errno)
+        split_writeback_data_sources(&request.source, request.range.page_count()).map(|_| ())
     }
 
     fn plan_writeback(
@@ -1511,11 +1593,68 @@ impl<P: Ext4MutationPlanSource> Ext4WritePlanSource for JournalMutationWriteSour
         request: &BackendPageRequest,
         _mapping: crate::planner::Ext4ReadMapping,
     ) -> BackendPlan {
-        self.runtime.plan_data(request)
+        let permit = match self.planner.try_acquire_writeback_admission() {
+            Ok(permit) => permit,
+            Err(wait) => return BackendPlan::Yield(wait),
+        };
+        let mutation = match self.planner.plan_writeback_mutation(request) {
+            Ok(mutation) => mutation,
+            Err(errno) => return BackendPlan::Err(errno),
+        };
+        let data_sources =
+            match split_writeback_data_sources(&request.source, request.range.page_count()) {
+                Ok(sources) => sources,
+                Err(errno) => return BackendPlan::Err(errno),
+            };
+        let guard = tx_substrate::epoch::borrow_current_guard()
+            .unwrap_or_else(crate::adapter::step_engine::guard);
+        match self
+            .runtime
+            .begin_mutation_with_data_sources(&mutation, data_sources.clone(), &guard)
+        {
+            Ok(()) => {}
+            Err(JournalMutationRuntimeError::Busy(_)) => {
+                if let Err(errno) = self.planner.settle_prior_writeback_mutation(&self.runtime) {
+                    return BackendPlan::Err(errno);
+                }
+                if let Err(error) =
+                    self.runtime
+                        .begin_mutation_with_data_sources(&mutation, data_sources, &guard)
+                {
+                    return BackendPlan::Err(journal_mutation_runtime_errno(error));
+                }
+            }
+            Err(error) => return BackendPlan::Err(journal_mutation_runtime_errno(error)),
+        }
+        if let Err(errno) = self.planner.stage_writeback_after_images(&mutation) {
+            self.runtime.abort_unsubmitted_data(errno);
+            return BackendPlan::Err(errno);
+        }
+        {
+            let mut active = self.active_admission.lock();
+            if active.is_some() {
+                self.runtime.abort_unsubmitted_data(Errno::EBUSY);
+                return BackendPlan::Err(Errno::EBUSY);
+            }
+            *active = Some((request.id, permit));
+        }
+        let plan = self.runtime.plan_data(request);
+        if matches!(plan, BackendPlan::Err(_)) {
+            self.runtime.abort_unsubmitted_data(Errno::EIO);
+            self.active_admission.lock().take();
+        }
+        plan
     }
 
     fn complete_writeback(&self, completion: BackendPageCompletion) {
         self.runtime.complete_data(completion);
+        let mut active = self.active_admission.lock();
+        if active
+            .as_ref()
+            .is_some_and(|(request, _)| *request == completion.id)
+        {
+            active.take();
+        }
     }
 }
 
@@ -1523,6 +1662,60 @@ fn journal_mutation_runtime_errno(error: JournalMutationRuntimeError) -> Errno {
     match error {
         JournalMutationRuntimeError::Busy(_) => Errno::EBUSY,
         JournalMutationRuntimeError::Image(_) | JournalMutationRuntimeError::Stage(_) => Errno::EIO,
+        JournalMutationRuntimeError::Settlement(errno) => errno,
+    }
+}
+
+fn split_writeback_data_sources(
+    source: &IoDataSource,
+    page_count: u64,
+) -> Result<Vec<IoDataSource>, Errno> {
+    if page_count == 0 {
+        return Err(Errno::EINVAL);
+    }
+    match source {
+        IoDataSource::PageCache {
+            lease,
+            frame,
+            offset,
+            len,
+        } if page_count == 1 && *len == JBD2_BLOCK_SIZE as u32 => {
+            Ok(vec![IoDataSource::page_cache(
+                *lease, *frame, *offset, *len,
+            )])
+        }
+        IoDataSource::PageCacheSegments { lease, segments } => {
+            if segments.len() != usize::try_from(page_count).map_err(|_| Errno::EINVAL)? {
+                return Err(Errno::EINVAL);
+            }
+            let mut out = Vec::new();
+            for segment in segments {
+                if segment.offset != 0 || segment.len != JBD2_BLOCK_SIZE as u32 {
+                    return Err(Errno::EINVAL);
+                }
+                out.push(IoDataSource::page_cache(
+                    *lease,
+                    segment.frame,
+                    segment.offset,
+                    segment.len,
+                ));
+            }
+            Ok(out)
+        }
+        IoDataSource::Direct { lease, vecs } => {
+            if vecs.len() != usize::try_from(page_count).map_err(|_| Errno::EINVAL)? {
+                return Err(Errno::EINVAL);
+            }
+            let mut out = Vec::new();
+            for vec in vecs {
+                if vec.offset != 0 || vec.len != JBD2_BLOCK_SIZE as u32 {
+                    return Err(Errno::EINVAL);
+                }
+                out.push(IoDataSource::direct(*lease, alloc::vec![*vec]));
+            }
+            Ok(out)
+        }
+        _ => Err(Errno::EINVAL),
     }
 }
 
@@ -1595,6 +1788,10 @@ impl JournalMutationRuntime {
         Arc::clone(&self.source)
     }
 
+    pub fn snapshot_transaction_frontier(&self) -> MountTransactionFrontier {
+        self.source.active_transaction_frontier()
+    }
+
     pub fn begin_mutation(
         &self,
         mutation: &Ext4MutationPlan,
@@ -1605,7 +1802,7 @@ impl JournalMutationRuntime {
             Ok(image) => image,
             Err(error) => {
                 return Err(self
-                    .release_reservation(reservation, JournalMutationRuntimeError::Image(error)))
+                    .release_reservation(reservation, JournalMutationRuntimeError::Image(error)));
             }
         };
         let transaction = match PreparedJournalTransaction::stage_mutation(&self.pool, image, guard)
@@ -1613,10 +1810,10 @@ impl JournalMutationRuntime {
             Ok(transaction) => transaction,
             Err(error) => {
                 return Err(self
-                    .release_reservation(reservation, JournalMutationRuntimeError::Stage(error)))
+                    .release_reservation(reservation, JournalMutationRuntimeError::Stage(error)));
             }
         };
-        self.begin_transaction(transaction, reservation)
+        self.begin_transaction(transaction, reservation, mutation.deferred_frees.clone())
     }
 
     pub fn begin_mutation_with_data_sources(
@@ -1630,7 +1827,7 @@ impl JournalMutationRuntime {
             Ok(image) => image,
             Err(error) => {
                 return Err(self
-                    .release_reservation(reservation, JournalMutationRuntimeError::Image(error)))
+                    .release_reservation(reservation, JournalMutationRuntimeError::Image(error)));
             }
         };
         let transaction = match PreparedJournalTransaction::stage_mutation_with_data_sources(
@@ -1642,10 +1839,10 @@ impl JournalMutationRuntime {
             Ok(transaction) => transaction,
             Err(error) => {
                 return Err(self
-                    .release_reservation(reservation, JournalMutationRuntimeError::Stage(error)))
+                    .release_reservation(reservation, JournalMutationRuntimeError::Stage(error)));
             }
         };
-        self.begin_transaction(transaction, reservation)
+        self.begin_transaction(transaction, reservation, mutation.deferred_frees.clone())
     }
 
     pub fn plan_data(&self, request: &BackendPageRequest) -> BackendPlan {
@@ -1654,6 +1851,10 @@ impl JournalMutationRuntime {
 
     pub fn complete_data(&self, completion: BackendPageCompletion) {
         self.source.complete_data(completion);
+    }
+
+    pub(crate) fn abort_unsubmitted_data(&self, error: Errno) {
+        self.source.abort_unsubmitted_data(error);
     }
 
     fn layout_for(
@@ -1686,12 +1887,14 @@ impl JournalMutationRuntime {
         &self,
         transaction: PreparedJournalTransaction,
         reservation: Option<(Arc<JournalRing>, JournalRingReservation)>,
+        deferred_frees: Vec<tx_ext4_format::mutation::DeferredFreeClaim>,
     ) -> Result<(), JournalMutationRuntimeError> {
         match reservation {
             Some((ring, reservation)) => match self.source.begin_with_ring(
                 transaction,
                 Arc::clone(&ring),
                 reservation.clone(),
+                deferred_frees,
             ) {
                 Ok(()) => Ok(()),
                 Err(error) => {
@@ -1699,7 +1902,9 @@ impl JournalMutationRuntime {
                     Err(error)
                 }
             },
-            None => self.source.begin(transaction),
+            None => self
+                .source
+                .begin_with_deferred_frees(transaction, deferred_frees),
         }
         .map_err(JournalMutationRuntimeError::Busy)
     }
@@ -1716,78 +1921,6 @@ impl JournalMutationRuntime {
     }
 }
 
-impl Ext4FsyncPlanSource for JournalFsyncSource {
-    fn plan_fsync(&self, request: &BackendPageRequest) -> BackendPlan {
-        if request.op != PageIoOp::Fsync {
-            return BackendPlan::Err(tx_subsystems::execution::Errno::EINVAL);
-        }
-        let mut state = self.state.lock();
-        if state.data_submitted.is_some() || state.commit_submitted.is_some() {
-            return BackendPlan::Err(tx_subsystems::execution::Errno::EBUSY);
-        }
-        let Some(transaction) = state.transaction.active() else {
-            return BackendPlan::Err(tx_subsystems::execution::Errno::EAGAIN);
-        };
-        let graph = match transaction.plan().commit_graph_after_data() {
-            Ok(graph) => graph,
-            Err(_) => return BackendPlan::Err(tx_subsystems::execution::Errno::EIO),
-        };
-        if state.transaction.mark_commit_submitted().is_err() {
-            return BackendPlan::Err(tx_subsystems::execution::Errno::EBUSY);
-        }
-        state.commit_submitted = Some(request.id);
-        BackendPlan::SubmitGraph(graph)
-    }
-
-    fn complete_fsync(&self, completion: BackendPageCompletion) {
-        if completion.op != PageIoOp::Fsync {
-            return;
-        }
-        let mut state = self.state.lock();
-        if state.commit_submitted != Some(completion.id) {
-            return;
-        }
-        state.commit_submitted = None;
-        match completion.result {
-            PageIoResult::Done => {
-                let _ = state.transaction.mark_commit_durable();
-            }
-            PageIoResult::Err(_) => {
-                let _ = state.transaction.discard();
-            }
-        }
-    }
-
-    fn take_background_graph(&self) -> Result<Option<BackendBioGraph>, Errno> {
-        self.take_checkpoint_graph().map_err(|error| match error {
-            JournalTransactionStateError::Busy => Errno::EBUSY,
-            _ => Errno::EIO,
-        })
-    }
-
-    fn complete_background_graph(&self, result: Result<(), Errno>) {
-        let _ = self.complete_checkpoint_result(result);
-    }
-}
-
-impl Ext4FsyncPlanSource for Arc<JournalFsyncSource> {
-    fn plan_fsync(&self, request: &BackendPageRequest) -> BackendPlan {
-        self.as_ref().plan_fsync(request)
-    }
-
-    fn complete_fsync(&self, completion: BackendPageCompletion) {
-        self.as_ref().complete_fsync(completion);
-    }
-
-    fn take_background_graph(&self) -> Result<Option<BackendBioGraph>, Errno> {
-        self.as_ref().take_background_graph()
-    }
-
-    fn complete_background_graph(&self, result: Result<(), Errno>) {
-        self.as_ref().complete_background_graph(result);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1797,11 +1930,60 @@ mod tests {
         Ext4MutationPlan, FsyncStamp, MetaRole, MetadataBlock, MutationOrigin, SealedDataWrite,
     };
     use tx_ext4_format::pager::JournalGeometry;
+    use tx_hal::Ppn;
+    use tx_subsystems::fs_iface::PageCacheSegment;
+
+    #[test]
+    fn split_writeback_page_cache_segments_preserves_order_frames_and_lease() {
+        let lease = IoDataLeaseId::new(17);
+        let first = PageCacheSegment::new(PageFrameRef::new(Ppn(0x41)), 0, 4096);
+        let second = PageCacheSegment::new(PageFrameRef::new(Ppn(0x42)), 0, 4096);
+        let source = IoDataSource::page_cache_segments(lease, [first, second].into());
+
+        assert_eq!(
+            split_writeback_data_sources(&source, 2),
+            Ok(vec![
+                IoDataSource::page_cache(lease, first.frame, first.offset, first.len),
+                IoDataSource::page_cache(lease, second.frame, second.offset, second.len),
+            ])
+        );
+    }
+
+    #[test]
+    fn split_writeback_page_cache_segments_rejects_invalid_shapes() {
+        let lease = IoDataLeaseId::new(18);
+        let valid = PageCacheSegment::new(PageFrameRef::new(Ppn(0x51)), 0, 4096);
+        let cases = [
+            (2, IoDataSource::page_cache_segments(lease, [valid].into())),
+            (
+                1,
+                IoDataSource::page_cache_segments(
+                    lease,
+                    [PageCacheSegment::new(valid.frame, 1, 4096)].into(),
+                ),
+            ),
+            (
+                1,
+                IoDataSource::page_cache_segments(
+                    lease,
+                    [PageCacheSegment::new(valid.frame, 0, 4095)].into(),
+                ),
+            ),
+        ];
+
+        for (page_count, source) in cases {
+            assert_eq!(
+                split_writeback_data_sources(&source, page_count),
+                Err(Errno::EINVAL)
+            );
+        }
+    }
 
     #[test]
     fn journal_pool_sizing_counts_owned_data_metadata_checkpoint_and_state_pages() {
-        assert_eq!(JournalPagePool::required_pages(1, 2, true).unwrap(), 9);
-        assert_eq!(JournalPagePool::required_pages(0, 1, false).unwrap(), 4);
+        assert_eq!(JournalPagePool::required_pages(1, 2, 0, true).unwrap(), 9);
+        assert_eq!(JournalPagePool::required_pages(0, 1, 0, false).unwrap(), 4);
+        assert_eq!(JournalPagePool::required_pages(0, 1, 2, false).unwrap(), 6);
     }
 
     #[test]
@@ -1862,7 +2044,7 @@ mod tests {
     }
 
     #[test]
-    fn journal_ring_places_revoke_pages_before_commit() {
+    fn journal_ring_places_every_revoke_page_before_commit() {
         let geometry = JournalGeometry {
             superblock: Jbd2Superblock {
                 block_type: 4,
@@ -1879,8 +2061,8 @@ mod tests {
         let ring = JournalRing::new(DeviceKey::new(9), 8, geometry).expect("valid journal ring");
 
         let reservation = ring
-            .reserve_with_revoke_pages(1, 1)
-            .expect("reserve metadata and revoke record");
+            .reserve_with_revoke_pages(1, 2)
+            .expect("reserve metadata and two revoke records");
 
         assert_eq!(
             reservation.layout.records.descriptor,
@@ -1892,9 +2074,9 @@ mod tests {
         );
         assert_eq!(
             reservation.layout.records.revokes,
-            vec![LbaRange::new(50 * 8, 8)]
+            vec![LbaRange::new(50 * 8, 8), LbaRange::new(51 * 8, 8)]
         );
-        assert_eq!(reservation.layout.records.commit, LbaRange::new(51 * 8, 8));
+        assert_eq!(reservation.layout.records.commit, LbaRange::new(52 * 8, 8));
     }
 
     #[test]

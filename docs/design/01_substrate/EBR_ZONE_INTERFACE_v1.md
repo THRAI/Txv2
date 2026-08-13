@@ -2,7 +2,10 @@
 
 <!-- txdoc:01-SUBSTRATE-EBR-ZONE-INTERFACE-V1 -->
 
-**Status.** Draft design decision.
+**Status.** Target design decision. The live Rust implementation still uses
+the five-state Zone lifecycle and fixed retired-node pools; the four-state
+intrusive-bag protocol below is the migration contract, not a claim about the
+current implementation.
 
 **Purpose.** Adapt the imported EBR and Zone/Cap implementation sketches
 ([`02_EBR_design.en-US.md`](../../ebr-zone/02_EBR_design.en-US.md),
@@ -88,7 +91,7 @@ This keeps the upper layers aligned with `OBL-*`, `WIT-*`, and `BIF-*`:
 | `ReservedSlot<T>::init` | `zone::sign` | Signing consumes a reservation, writes the value, publishes the slot, and returns `Cap<T>`. |
 | `ReservedSlot<T>` | `ZoneReservation<T>` | Linear reserve token with Drop rollback. |
 | `Cap::get() -> &T` | `Cap<T>` deref / `Cap::ident_ref(&Guard)` | Direct deref is allowed only while a live `Cap` exists. Guarded observation should use `IdentRef`. |
-| `Tombstone` | `SENTINEL_DEAD` / dead slot state | Use sentinel wording for no-upgrade barrier. |
+| `Tombstone` | `Retiring` slot state | The full metadata CAS installs the no-upgrade barrier and intrusive next link together. |
 
 ---
 
@@ -303,7 +306,7 @@ The reference hierarchy remains:
 Weak<T>
     -> observe under Guard
 IdentRef<'g, T>
-    -> upgrade by SENTINEL_DEAD-guarded CAS
+    -> upgrade by Live-state and generation-guarded CAS
 Cap<T>
     -> upgrade payload/contribution
 T::OperationalEvidence
@@ -336,12 +339,29 @@ impl<T> Weak<T> {
 1. Resolve `ZoneKey` through the zone directory while `guard` is held.
 2. If the backing slab/slot is no longer present, return `None`.
 3. Load slot metadata.
-4. Check generation and live/dead state.
+4. Check generation and require `state == Live`.
 5. Produce `IdentRef<'g, T>` only if the slot still names the same live entity.
 
 This differs from the imported design, where weak references increment
 `weak_count` and keep slot reclamation waiting. That behavior conflicts with
 `object_model_v2`: resolution-only evidence must not promise retention.
+
+### 4.1.1 Fixed-Depth Slot Resolution
+<!-- txdoc:EBR-ZONE-LOCK-FREE-SLOT-RESOLUTION-1 -->
+
+`SlotKey -> Slot<T>` resolution is a reader-side substrate operation. The
+target implementation uses a stable fixed-depth slab directory indexed from
+the key's 18-bit slab ID. Resolution performs only a constant number of atomic
+pointer loads, validates the slab ID, and computes the slot address directly.
+It does not acquire the Keg lock and does not walk the partial, full, or empty
+slab lists.
+
+The Keg lock and slab lists remain allocation/reclaim metadata. They may create,
+classify, publish, unpublish, and retire slabs, but they are forbidden from the
+`Weak::observe`, `Cap::deref`, clone, and non-final Drop read paths. A directory
+entry is Release-published before a `SlotKey` escapes and Release-cleared before
+the slab is EBR-retired; guarded readers that observed the old pointer may
+therefore finish before physical slab reuse.
 
 ### 4.2 `IdentRef<'g, T>` Is EBR Observation
 <!-- txdoc:EBR-ZONE-REFERENCE-SEMANTICS-IDENTREF-G-T-IS-EBR-OBSERVATION-1 -->
@@ -350,9 +370,9 @@ This differs from the imported design, where weak references increment
 retention and cannot cross guard, step, thread, or async boundaries.
 
 `IdentRef` may read stable identity fields while the slot is live. Once a slot
-is marked dead, new `IdentRef` construction fails. Existing `IdentRef`s remain
-memory-safe until the guard drops because physical reclamation and destructor
-execution are deferred past epoch quiescence.
+enters `Retiring`, new `IdentRef` construction fails. Existing `IdentRef`s
+remain memory-safe until the guard drops because physical reclamation and
+destructor execution are deferred past epoch quiescence.
 
 ### 4.3 `Cap<T>` Is Identity Retention
 <!-- txdoc:EBR-ZONE-REFERENCE-SEMANTICS-CAP-T-IS-IDENTITY-RETENTION-1 -->
@@ -364,7 +384,6 @@ Upgrade from `IdentRef<'g, T>` uses one metadata CAS that checks:
 
 - generation still matches;
 - state is live;
-- retention has not reached `SENTINEL_DEAD`;
 - retention increment does not overflow.
 
 On success it returns `Cap<T>`. On failure, the operation degrades to clean
@@ -407,12 +426,23 @@ Metadata:
 
 ```text
 generation
-state: Free | Reserved | Live | Dead | Retired
-retain: identity-retention count or SENTINEL_DEAD
+state: Free | Reserved | Live | Retiring
+Live:      retain[31:0] is the identity-retention count
+Retiring:  retain[31:0] is the intrusive next SlotKey
+spare[0]:  Retiring has_next
+spare[1]:  Free generation_exhausted
 ```
 
 No `weak_count`. `Weak<T>` is a stale-tolerant handle, not a lifecycle
 contributor.
+
+`SlotKey` remains the existing compact 32-bit registry key: the upper 8 bits
+encode `ZoneId - 1` and the lower 24 bits encode the zone-local slot ID. The
+target therefore supports at most 256 registered zones and `2^24` logical
+slots per zone. Raw key zero is valid for zone 1 slot 0, so list termination
+must use `has_next`; it cannot reserve zero as a null key. The registry entry
+for each zone also carries a crate-private erased reclaim callback so a mixed
+Zone bag can dispatch destruction from `SlotKey.zone_id()`.
 
 Lifecycle:
 
@@ -426,9 +456,17 @@ Free
 ```
 
 The last retention holder does **not** run `T::drop` immediately if guarded
-readers may still hold `IdentRef<'g, T>`. It marks the slot dead and enqueues
-retirement. The reclaim queue runs the destructor only after the epoch-safe
-window. Large destructors split their work under bounded-work reclamation.
+readers may still hold `IdentRef<'g, T>`. Under the epoch module's
+`LocalRetireGuard`, it first CASes `Live(retain = 1)` to
+`Retiring(next = none)`. That CAS is the no-new-observer linearization point.
+It then coherently samples the global epoch through the domain's AcqRel
+read-modify observation, loads that tagged bag's old Zone head, installs the
+intrusive next key and `has_next` in metadata, and publishes the slot as the new
+bag head before releasing the guard. The full metadata CAS resolves races with
+clone or upgrade: either the retention increment wins and final retirement
+retries, or the `Retiring` transition wins and later upgrades fail. Once
+`Retiring` wins, only the local-retire owner may mutate the next bits until the
+bag head is published.
 
 Retire enqueue failure is fail-fast in the five-state design. After
 `Dead -> Retired/Retiring` is claimed, there is no sixth state where the slot
@@ -536,14 +574,16 @@ upper subsystem chooses a binding obligation; the evidence type does the rest.
 The epoch module owns traversal safety and physical reclamation delay:
 
 ```rust
-pub fn guard() -> Guard;
+pub fn guard() -> Guard<'static>;
+pub fn borrow_current_guard() -> Option<Guard<'static>>;
+pub fn try_drain(budget: DrainBudget) -> DrainStats;
 
-pub(crate) unsafe fn retire(
-    ptr: NonNull<()>,
-    reclaim: unsafe fn(NonNull<()>),
-);
+pub(crate) struct LocalRetireGuard { /* CPU-local exclusion */ }
 
-pub fn try_drain(budget: DrainBudget);
+impl LocalRetireGuard {
+    unsafe fn enqueue_slot_after_barrier(&mut self, key: SlotKey, epoch: u64);
+    unsafe fn enqueue_head_after_barrier(&mut self, head: NonNull<RcuHead>, epoch: u64);
+}
 ```
 
 The executable implementation uses the Crossbeam collection shape:
@@ -670,7 +710,7 @@ The explicit manifest is deliberately chosen over linker-section collection:
 
 Keep:
 
-- per-CPU epoch state and bounded retired-list draining;
+- per-CPU epoch state and bounded intrusive-bag draining;
 - packed metadata for generation/state/retention CAS;
 - generation-tagged weak handles for ABA prevention;
 - linear zone reservations with Drop rollback;
@@ -683,8 +723,9 @@ Change:
 - `pin()` to `guard()`;
 - `WeakCap<T>` to non-retaining `Weak<T>`;
 - remove `weak_count` from semantic reclamation;
-- replace `strong == 0 && weak == 0 && Tombstone` with
-  `retain == 0 -> SENTINEL_DEAD -> retire`;
+- replace `strong == 0 && weak == 0 && Tombstone` with the compound
+  `Live(retain = 1) -> Retiring(next = none) -> post-barrier epoch sample ->
+  bag push` transition;
 - run destructors after epoch quiescence for EBR-observed slot contents;
 - express split lifetimes with identity/payload zones and obligation evidence,
   not weak retention.

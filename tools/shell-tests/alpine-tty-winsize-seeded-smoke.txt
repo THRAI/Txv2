@@ -1,0 +1,18 @@
+# alpine-tty-winsize-seeded-smoke.txt - verify boot cmdline seeded TTY winsize.
+
+wait ":bootstrap-exec:ok" within 60000
+wait "/ # " within 60000
+sleep 500
+
+send "cat /proc/cmdline\n"
+expect "tx.tty.rows=33" within 10000
+expect "tx.tty.cols=101" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "stty size\n"
+expect "33 101" within 10000
+expect "/ # " within 10000
+
+sleep 500
+quit

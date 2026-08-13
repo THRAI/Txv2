@@ -6,6 +6,9 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 pub mod adapter;
+pub mod settlement;
+
+pub use settlement::{MountSettlementOp, MountTransactionFrontier, SettlementScope};
 
 use adapter::runtime::{
     self, Cap, Dead, Entity, IdentitySlot, PayloadBinding, PayloadCap, PayloadPolicy, SlotKey,
@@ -20,7 +23,7 @@ use crate::fs_iface::{
     IoDataTarget,
 };
 use crate::io_manager::page::{service::PageServiceBackendContext, PageIoRequest};
-use crate::page_backed::{FsPageBacking, PageContainer};
+use crate::page_backed::{ErrorCursor, FsPageBacking, PageContainer};
 use crate::vfs::{
     adapter::step_engine::{Guard, NoProgress, StepOutcome},
     render_dentry_path, DEntry, FsObjectId, FsOps, InlineName, InodeMeta, RNode,
@@ -30,6 +33,8 @@ static MOUNT_IDENTITY_ZONE: Zone<MountIdentity> = Zone::const_new();
 static MOUNT_PAYLOAD_ZONE: Zone<MountPayload> = Zone::const_new();
 static MOUNT_NAMESPACE_ZONE: Zone<MountNamespace> = Zone::const_new();
 static MOUNT_API_FILE_ZONE: Zone<MountApiFile> = Zone::const_new();
+static BACKGROUND_MOUNT_SETTLEMENT_QUEUE: SpinMutex<Vec<MountSettlementOp>> =
+    SpinMutex::new(Vec::new());
 
 unsafe impl ZoneAllocated for MountIdentity {
     fn zone() -> &'static Zone<Self> {
@@ -297,9 +302,9 @@ pub enum SourceLabel {
 
 pub struct MountPayload {
     payload_pin_count: AtomicU32,
-    /// Weak per-mount index that gives every holder of one persistent object
-    /// the same lifetime token without making the index itself retain it.
+    /// 同一挂载内持久对象共享的弱生命周期索引。
     object_lifetimes: SpinMutex<BTreeMap<FsObjectId, ArcWeak<FsObjectLifetime>>>,
+    runtime_cell: SpinMutex<settlement::MountRuntimeCell>,
     pub fs_ops: Arc<dyn FsOps>,
     pub fs_page_backing: Arc<dyn FsPageBacking>,
     backend_planner: Option<Arc<dyn BackendPlanner>>,
@@ -347,6 +352,7 @@ impl MountPayload {
         Self {
             payload_pin_count: AtomicU32::new(0),
             object_lifetimes: SpinMutex::new(BTreeMap::new()),
+            runtime_cell: SpinMutex::new(settlement::MountRuntimeCell::new()),
             fs_ops,
             fs_page_backing,
             backend_planner,
@@ -406,12 +412,52 @@ impl MountPayload {
         self.payload_pin_count.load(Ordering::Acquire)
     }
 
-    pub fn fs_ops(&self) -> &Arc<dyn FsOps> {
-        &self.fs_ops
+    pub fn runtime_state(&self) -> settlement::MountRuntimeState {
+        self.runtime_cell.lock().state()
     }
 
-    pub fn fs_page_backing(&self) -> &Arc<dyn FsPageBacking> {
-        &self.fs_page_backing
+    pub fn begin_lazy_detach(&self) -> Result<bool, Errno> {
+        self.runtime_cell.lock().begin_lazy_detach()
+    }
+
+    pub fn try_claim_settlement(&self, scope: settlement::SettlementScope) -> Result<(), Errno> {
+        self.runtime_cell.lock().try_claim_settlement(scope)
+    }
+
+    pub fn complete_settlement(&self, result: Result<(), Errno>) {
+        self.runtime_cell.lock().complete_settlement(result);
+    }
+
+    pub fn observe_mount_error(&self) -> Option<Errno> {
+        self.runtime_cell.lock().observe_mount_error()
+    }
+
+    pub fn observe_payload_error(&self) -> Option<Errno> {
+        self.runtime_cell.lock().observe_payload_error()
+    }
+
+    pub fn snapshot_error_cursor(&self) -> ErrorCursor {
+        self.runtime_cell.lock().snapshot_error_cursor()
+    }
+
+    pub fn observe_mount_error_with_cursor(&self, cursor: &mut ErrorCursor) -> Option<Errno> {
+        self.runtime_cell
+            .lock()
+            .observe_mount_error_with_cursor(cursor)
+    }
+
+    pub fn observe_payload_error_with_cursor(&self, cursor: &mut ErrorCursor) -> Option<Errno> {
+        self.runtime_cell
+            .lock()
+            .observe_payload_error_with_cursor(cursor)
+    }
+
+    pub fn snapshot_transaction_frontier(&self) -> MountTransactionFrontier {
+        self.fs_ops.snapshot_mount_transaction_frontier()
+    }
+
+    pub fn fs_ops(&self) -> &Arc<dyn FsOps> {
+        &self.fs_ops
     }
 
     fn object_pin_from_mount(
@@ -429,6 +475,10 @@ impl MountPayload {
         });
         objects.insert(fs_object_id, Arc::downgrade(&lifetime));
         FsObjectPin(lifetime)
+    }
+
+    pub fn fs_page_backing(&self) -> &Arc<dyn FsPageBacking> {
+        &self.fs_page_backing
     }
 
     pub fn backend_planner(&self) -> Option<&dyn BackendPlanner> {
@@ -563,6 +613,40 @@ impl PageServiceBackendContext for MountPayloadBackendContext<'_> {
     }
 }
 
+fn queue_background_mount_settlement(payload: &Cap<MountPayload>) {
+    let pin = MountPayloadPin::acquire_cap(payload);
+    if let Ok(op) = MountSettlementOp::new(pin, SettlementScope::Detach) {
+        BACKGROUND_MOUNT_SETTLEMENT_QUEUE.lock().push(op);
+    }
+}
+
+pub fn background_mount_settlement_queue_len() -> usize {
+    BACKGROUND_MOUNT_SETTLEMENT_QUEUE.lock().len()
+}
+
+pub fn drive_background_mount_settlement_once(guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
+    let Some(mut op) = BACKGROUND_MOUNT_SETTLEMENT_QUEUE.lock().pop() else {
+        return StepOutcome::done(());
+    };
+
+    match op.drive(guard) {
+        StepOutcome::Done(()) => StepOutcome::done(()),
+        StepOutcome::Err(errno) if Errno::from(errno) == Errno::EAGAIN => {
+            BACKGROUND_MOUNT_SETTLEMENT_QUEUE.lock().push(op);
+            StepOutcome::err(Errno::EAGAIN.into())
+        }
+        StepOutcome::Err(errno) => StepOutcome::err(errno),
+        StepOutcome::Continue { progress } => {
+            BACKGROUND_MOUNT_SETTLEMENT_QUEUE.lock().push(op);
+            StepOutcome::Continue { progress }
+        }
+        StepOutcome::Yield { progress, shape } => {
+            BACKGROUND_MOUNT_SETTLEMENT_QUEUE.lock().push(op);
+            StepOutcome::Yield { progress, shape }
+        }
+    }
+}
+
 impl core::fmt::Debug for MountPayload {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("MountPayload")
@@ -584,9 +668,14 @@ pub struct MountPayloadPin {
 impl MountPayloadPin {
     pub fn acquire(payload: &PayloadCap<MountPayload>) -> Self {
         payload.payload_pin_count.fetch_add(1, Ordering::AcqRel);
+        payload.runtime_cell.lock().note_payload_pin_acquired();
         Self {
             payload: payload.clone().into_cap(),
         }
+    }
+
+    pub fn acquire_cap(payload: &Cap<MountPayload>) -> Self {
+        Self::acquire(&PayloadCap::from_cap(payload.clone()))
     }
 
     pub fn payload(&self) -> &Cap<MountPayload> {
@@ -613,14 +702,14 @@ impl Drop for MountPayloadPin {
         self.payload
             .payload_pin_count
             .fetch_sub(1, Ordering::AcqRel);
+        let should_queue = self.payload.runtime_cell.lock().note_payload_pin_released();
+        if should_queue {
+            queue_background_mount_settlement(&self.payload);
+        }
     }
 }
 
-/// Shared lifetime evidence for one persistent filesystem object.
-///
-/// RNodes and page containers share this token.  Consequently an unlinked
-/// inode is offered to the backend for destruction only after its final
-/// namespace/open/mapping/cache holder disappears.
+/// 同一文件系统对象的共享生命周期凭据。
 pub struct FsObjectLifetime {
     mount: MountPayloadPin,
     fs_object_id: FsObjectId,
@@ -894,19 +983,7 @@ impl MountNamespace {
         None
     }
 
-    /// Object-identity fallback for [`Self::mount_for`]: match by the
-    /// mountpoint's (parent-mount payload, fs_object_id) instead of the
-    /// DEntry cap key.
-    ///
-    /// The registered mountpoint DEntry is held only WEAKLY, by its parent
-    /// directory's child cache. Any mutation invalidation on the parent —
-    /// the guest's first `mkdir -p /etc` invalidating "/" — drops it, and
-    /// the next walk materialises a fresh instance whose cap key no longer
-    /// matches the one registered here: the mount silently vanishes
-    /// (observed as `/musl` resolving to the empty tmpfs skeleton dir,
-    /// killing every git path mid-run). Matching by (parent payload,
-    /// object id) survives dentry-cache churn while staying
-    /// namespace-local.
+    /// DEntry 缓存失效后，按父挂载对象与文件对象号重新识别挂载点。
     pub fn mount_for_mountpoint_object(
         &self,
         parent_payload: &Cap<MountPayload>,
@@ -968,6 +1045,32 @@ impl MountNamespace {
                 })
             })
             .collect()
+    }
+
+    /// Capture the root payload plus each visible mounted payload in this
+    /// namespace. Mount stacks contribute only their top-most visible row.
+    pub fn snapshot_payload_pins(&self) -> alloc::vec::Vec<MountPayloadPin> {
+        let mut pins = Vec::new();
+        let mut seen = Vec::new();
+
+        if let Ok(root_payload) = self.root.payload_cap() {
+            seen.push(root_payload.key());
+            pins.push(MountPayloadPin::acquire(&root_payload));
+        }
+
+        for entry in self.mounts.lock().iter().rev() {
+            let payload = match entry.mount.clone_cap().payload_cap() {
+                Ok(payload) => payload,
+                Err(_) => continue,
+            };
+            if seen.iter().any(|key| *key == payload.key()) {
+                continue;
+            }
+            seen.push(payload.key());
+            pins.push(MountPayloadPin::acquire(&payload));
+        }
+
+        pins
     }
 
     pub fn umount(&self, target: &Cap<DEntry>) -> Result<Cap<MountIdentity>, Errno> {
@@ -1263,13 +1366,7 @@ pub fn mount_for(
     None
 }
 
-/// The mountpoint dentry a mounted filesystem's root is attached to, from
-/// the global table. Sibling of [`dotdot_parent_for_mount_root`] (which
-/// returns the mountpoint's *parent* for `..` semantics); this returns the
-/// mountpoint itself so a namespace-less walk can climb across a mount
-/// boundary toward the real root — without it, a walk rooted inside a
-/// mounted fs treats that fs's root as "/" and every absolute path
-/// resolves against the wrong tree.
+/// 返回某个已挂载文件系统根目录所连接的挂载点。
 pub fn mountpoint_for_mount_root(root: &Cap<DEntry>) -> Option<Cap<DEntry>> {
     let root_key = root.key();
     for entry in MOUNT_TABLE.lock().iter().rev() {
@@ -2400,6 +2497,148 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_payload_pins_captures_root_and_visible_mount_payloads() {
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        crate::zones::register_all().expect("kernel zones");
+
+        let fs = Arc::new(MockFs);
+        let payload = MountPayload::new_cap(
+            fs.clone() as Arc<dyn FsOps>,
+            fs as Arc<dyn FsPageBacking>,
+            None,
+            DevId::new(40),
+            MountOptions::default(),
+            "mockfs",
+            SourceLabel::Static("snapshot-root"),
+        )
+        .expect("root payload");
+        let root_rnode = RNode::new_cap_in_mount(
+            FsObjectId::ROOT,
+            InodeMeta::new(InodeKind::Directory, 0o040755),
+            RNodeBacking::Directory,
+            &payload,
+        )
+        .expect("root rnode");
+        let root_mount = MountIdentity::new_cap(
+            MountId::new(40),
+            None,
+            root_rnode,
+            None,
+            payload.clone(),
+            MountFlags::empty(),
+        )
+        .expect("root mount");
+        let namespace = MountNamespace::new_cap(root_mount.clone()).expect("namespace");
+
+        let mountpoint_rnode = RNode::new_cap_in_mount(
+            FsObjectId::new(401),
+            InodeMeta::new(InodeKind::Directory, 0o040755),
+            RNodeBacking::Directory,
+            &payload,
+        )
+        .expect("mountpoint rnode");
+        let mountpoint = DEntry::new_cap(
+            InlineName::new(b"snap").expect("mountpoint name"),
+            mountpoint_rnode,
+        )
+        .expect("mountpoint");
+
+        let child_fs = Arc::new(MockFs);
+        let child_payload = MountPayload::new_cap(
+            child_fs.clone() as Arc<dyn FsOps>,
+            child_fs as Arc<dyn FsPageBacking>,
+            None,
+            DevId::new(41),
+            MountOptions::default(),
+            "mockfs",
+            SourceLabel::Static("snapshot-child"),
+        )
+        .expect("child payload");
+        let child_root = RNode::new_cap_in_mount(
+            FsObjectId::ROOT,
+            InodeMeta::new(InodeKind::Directory, 0o040755),
+            RNodeBacking::Directory,
+            &child_payload,
+        )
+        .expect("child root");
+        let child_mount = MountIdentity::new_cap(
+            MountId::new(41),
+            Some(mountpoint.clone()),
+            child_root,
+            None,
+            child_payload.clone(),
+            MountFlags::empty(),
+        )
+        .expect("child mount");
+        namespace.register_mount(&mountpoint, child_mount.clone());
+
+        // The mainline VFS gives each live RNode a shared object-lifetime pin.
+        // The root payload owns the root and mountpoint objects; the child
+        // payload owns its root object before the namespace snapshot begins.
+        assert_eq!(payload.payload_pin_count(), 2);
+        assert_eq!(child_payload.payload_pin_count(), 1);
+
+        let pins = namespace.snapshot_payload_pins();
+        assert_eq!(pins.len(), 2);
+        assert_eq!(payload.payload_pin_count(), 3);
+        assert_eq!(child_payload.payload_pin_count(), 2);
+        assert!(pins.iter().any(|pin| pin.payload().key() == payload.key()));
+        assert!(pins
+            .iter()
+            .any(|pin| pin.payload().key() == child_payload.key()));
+
+        drop(pins);
+        assert_eq!(payload.payload_pin_count(), 2);
+        assert_eq!(child_payload.payload_pin_count(), 1);
+    }
+
+    #[test]
+    fn umount_busy_check_leaves_runtime_open_when_payloads_are_active() {
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        crate::zones::register_all().expect("kernel zones");
+
+        let fs = Arc::new(MockFs);
+        let payload = MountPayload::new_cap(
+            fs.clone() as Arc<dyn FsOps>,
+            fs as Arc<dyn FsPageBacking>,
+            None,
+            DevId::new(42),
+            MountOptions::default(),
+            "mockfs",
+            SourceLabel::Static("busy-root"),
+        )
+        .expect("root payload");
+        assert_eq!(payload.runtime_state(), settlement::MountRuntimeState::Open);
+        let pin = MountPayloadPin::acquire(&PayloadCap::from_cap(payload.clone()));
+
+        assert_eq!(payload.begin_lazy_detach(), Ok(false));
+        assert_eq!(
+            payload.runtime_state(),
+            settlement::MountRuntimeState::DetachedPending
+        );
+        drop(pin);
+        assert_eq!(
+            payload.runtime_state(),
+            settlement::MountRuntimeState::Quiescing
+        );
+        let guard = crate::vfs::adapter::step_engine::guard();
+        assert_eq!(
+            super::drive_background_mount_settlement_once(&guard),
+            StepOutcome::done(())
+        );
+        assert_eq!(
+            payload.runtime_state(),
+            settlement::MountRuntimeState::Detached
+        );
+    }
+
+    #[test]
     fn cloned_mount_namespaces_move_independent_identity_trees() {
         use core::sync::atomic::AtomicBool;
 
@@ -3049,5 +3288,529 @@ mod tests {
             StepOutcome::Err(V3Errno::ENOSYS) => {}
             _ => panic!("expected v3 Err(ENOSYS), got {outcome:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod settlement_lifecycle_tests {
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+
+    use super::{DevId, MountOptions, MountPayload, MountPayloadPin, SourceLabel};
+    use crate::execution::{Errno, Guard};
+    use crate::io_manager::page::PageGeneration;
+    use crate::mount::settlement::{
+        MountRuntimeCell, MountRuntimeState, MountSettlementOp, MountTransactionFrontier,
+        SettlementScope,
+    };
+    use crate::page_backed::{
+        ErrorCursor, ErrorSeq, FileFsyncFrontier, Frame, FsPageBacking, PageIndex,
+    };
+    use crate::sync::SpinMutex;
+    use crate::vfs::adapter::step_engine::{Cap, NoProgress, PayloadCap, StepOutcome};
+    use crate::vfs::{Credential, DirCursor, DirEntry, FsObjectId, FsOps, InodeKind, InodeMeta};
+
+    struct SettlementFs {
+        shutdown_count: AtomicU32,
+        file_settlement_count: AtomicU32,
+        mount_settlement_count: AtomicU32,
+        last_file_settlement_object: AtomicU64,
+        last_file_settlement_frontier: SpinMutex<Option<FileFsyncFrontier>>,
+        last_mount_settlement_frontier: SpinMutex<Option<MountTransactionFrontier>>,
+        fail_shutdown: AtomicBool,
+        eagain_before_done: AtomicU32,
+    }
+
+    impl SettlementFs {
+        fn new(fail_shutdown: bool) -> Self {
+            Self {
+                shutdown_count: AtomicU32::new(0),
+                file_settlement_count: AtomicU32::new(0),
+                mount_settlement_count: AtomicU32::new(0),
+                last_file_settlement_object: AtomicU64::new(0),
+                last_file_settlement_frontier: SpinMutex::new(None),
+                last_mount_settlement_frontier: SpinMutex::new(None),
+                fail_shutdown: AtomicBool::new(fail_shutdown),
+                eagain_before_done: AtomicU32::new(0),
+            }
+        }
+
+        fn shutdown_count(&self) -> u32 {
+            self.shutdown_count.load(Ordering::Acquire)
+        }
+
+        fn file_settlement_count(&self) -> u32 {
+            self.file_settlement_count.load(Ordering::Acquire)
+        }
+
+        fn mount_settlement_count(&self) -> u32 {
+            self.mount_settlement_count.load(Ordering::Acquire)
+        }
+
+        fn last_file_settlement_object(&self) -> FsObjectId {
+            FsObjectId::new(self.last_file_settlement_object.load(Ordering::Acquire))
+        }
+
+        fn last_file_settlement_frontier(&self) -> Option<FileFsyncFrontier> {
+            self.last_file_settlement_frontier.lock().clone()
+        }
+
+        fn last_mount_settlement_frontier(&self) -> Option<MountTransactionFrontier> {
+            *self.last_mount_settlement_frontier.lock()
+        }
+
+        fn set_eagain_before_done(&self, count: u32) {
+            self.eagain_before_done.store(count, Ordering::Release);
+        }
+    }
+
+    impl FsOps for SettlementFs {
+        fn lookup(
+            &self,
+            _parent: FsObjectId,
+            _name: &[u8],
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<FsObjectId, NoProgress> {
+            StepOutcome::err(Errno::ENOENT.into())
+        }
+
+        fn load_inode_meta(
+            &self,
+            _fs_object_id: FsObjectId,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<InodeMeta, NoProgress> {
+            StepOutcome::done(InodeMeta::new(InodeKind::Directory, 0o040755))
+        }
+
+        fn serialize_inode_meta(
+            &self,
+            _fs_object_id: FsObjectId,
+            _meta: &InodeMeta,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<(), NoProgress> {
+            StepOutcome::err(Errno::EROFS.into())
+        }
+
+        fn create_inode(
+            &self,
+            _parent: FsObjectId,
+            _name: &[u8],
+            _mode: u16,
+            _cred: &Credential,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
+            StepOutcome::err(Errno::EROFS.into())
+        }
+
+        fn unlink(
+            &self,
+            _parent: FsObjectId,
+            _name: &[u8],
+            _target: FsObjectId,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<(), NoProgress> {
+            StepOutcome::err(Errno::EROFS.into())
+        }
+
+        fn rename(
+            &self,
+            _old_parent: FsObjectId,
+            _old_name: &[u8],
+            _new_parent: FsObjectId,
+            _new_name: &[u8],
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<(), NoProgress> {
+            StepOutcome::err(Errno::EROFS.into())
+        }
+
+        fn link(
+            &self,
+            _parent: FsObjectId,
+            _name: &[u8],
+            _target: FsObjectId,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<(), NoProgress> {
+            StepOutcome::err(Errno::EROFS.into())
+        }
+
+        fn mkdir(
+            &self,
+            _parent: FsObjectId,
+            _name: &[u8],
+            _mode: u16,
+            _cred: &Credential,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
+            StepOutcome::err(Errno::EROFS.into())
+        }
+
+        fn rmdir(
+            &self,
+            _parent: FsObjectId,
+            _name: &[u8],
+            _target: FsObjectId,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<(), NoProgress> {
+            StepOutcome::err(Errno::EROFS.into())
+        }
+
+        fn symlink(
+            &self,
+            _parent: FsObjectId,
+            _name: &[u8],
+            _link_target: &[u8],
+            _cred: &Credential,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
+            StepOutcome::err(Errno::EROFS.into())
+        }
+
+        fn readdir(
+            &self,
+            _fs_object_id: FsObjectId,
+            _cursor: DirCursor,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<Option<(DirEntry, DirCursor)>, NoProgress> {
+            StepOutcome::done(None)
+        }
+
+        fn destroy_inode(
+            &self,
+            _fs_object_id: FsObjectId,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<(), NoProgress> {
+            StepOutcome::done(())
+        }
+
+        fn settle_file(
+            &self,
+            fs_object_id: FsObjectId,
+            generation_frontier: &FileFsyncFrontier,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<(), NoProgress> {
+            self.file_settlement_count.fetch_add(1, Ordering::AcqRel);
+            self.last_file_settlement_object
+                .store(fs_object_id.as_u64(), Ordering::Release);
+            *self.last_file_settlement_frontier.lock() = Some(generation_frontier.clone());
+            StepOutcome::done(())
+        }
+
+        fn settle_mount(
+            &self,
+            transaction_frontier: MountTransactionFrontier,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<(), NoProgress> {
+            self.mount_settlement_count.fetch_add(1, Ordering::AcqRel);
+            *self.last_mount_settlement_frontier.lock() = Some(transaction_frontier);
+            StepOutcome::done(())
+        }
+
+        fn shutdown(&self, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
+            self.shutdown_count.fetch_add(1, Ordering::AcqRel);
+            let mut remaining = self.eagain_before_done.load(Ordering::Acquire);
+            while remaining != 0 {
+                match self.eagain_before_done.compare_exchange_weak(
+                    remaining,
+                    remaining - 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => return StepOutcome::continue_with(NoProgress),
+                    Err(next) => remaining = next,
+                }
+            }
+            if self.fail_shutdown.load(Ordering::Acquire) {
+                StepOutcome::err(Errno::EIO.into())
+            } else {
+                StepOutcome::done(())
+            }
+        }
+    }
+
+    impl FsPageBacking for SettlementFs {
+        fn fetch_page(
+            &self,
+            _fs_object_id: FsObjectId,
+            _offset: u64,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<Frame, NoProgress> {
+            StepOutcome::err(Errno::ENOSYS.into())
+        }
+
+        fn flush_page(
+            &self,
+            _fs_object_id: FsObjectId,
+            _offset: u64,
+            _frame: &Frame,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<(), NoProgress> {
+            StepOutcome::err(Errno::EROFS.into())
+        }
+
+        fn truncate(
+            &self,
+            _fs_object_id: FsObjectId,
+            _new_size: u64,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<(), NoProgress> {
+            StepOutcome::err(Errno::EROFS.into())
+        }
+
+        fn fsync_file(
+            &self,
+            _fs_object_id: FsObjectId,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<(), NoProgress> {
+            StepOutcome::done(())
+        }
+    }
+
+    fn settlement_payload(fail_shutdown: bool) -> (Cap<MountPayload>, Arc<SettlementFs>) {
+        crate::zones::register_all().expect("kernel zones");
+        let fs = Arc::new(SettlementFs::new(fail_shutdown));
+        let payload = MountPayload::new_cap(
+            fs.clone() as Arc<dyn FsOps>,
+            fs.clone() as Arc<dyn FsPageBacking>,
+            None,
+            DevId::new(71),
+            MountOptions::default(),
+            "settlementfs",
+            SourceLabel::Static("settlement"),
+        )
+        .expect("mount payload");
+        (payload, fs)
+    }
+
+    #[test]
+    fn syncfs_reports_old_unobserved_error_once() {
+        let seq = ErrorSeq::new();
+        let mut cursor = ErrorCursor::new();
+
+        seq.record(Errno::EIO);
+
+        assert_eq!(seq.observe(&mut cursor), Some(Errno::EIO));
+        assert_eq!(seq.observe(&mut cursor), None);
+    }
+
+    #[test]
+    fn normal_umount_busy_check_prevents_partial_quiesce() {
+        let mut cell = MountRuntimeCell::new();
+
+        assert_eq!(cell.try_claim_settlement(SettlementScope::Detach), Ok(()));
+        assert_eq!(cell.state(), MountRuntimeState::Quiescing);
+        assert_eq!(
+            cell.try_claim_settlement(SettlementScope::Detach),
+            Err(Errno::EBUSY)
+        );
+        cell.complete_settlement(Ok(()));
+        assert_eq!(cell.state(), MountRuntimeState::Detached);
+    }
+
+    #[test]
+    fn lazy_detach_retains_payload_until_background_settlement() {
+        let mut cell = MountRuntimeCell::new();
+
+        cell.note_payload_pin_acquired();
+        assert_eq!(cell.begin_lazy_detach(), Ok(false));
+        assert_eq!(cell.state(), MountRuntimeState::DetachedPending);
+
+        cell.note_payload_pin_released();
+        assert_eq!(cell.try_claim_settlement(SettlementScope::Detach), Ok(()));
+        cell.complete_settlement(Ok(()));
+        assert_eq!(cell.state(), MountRuntimeState::Detached);
+    }
+
+    #[test]
+    fn lazy_detach_release_queues_and_drives_background_settlement() {
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        let (payload, fs) = settlement_payload(false);
+        let pin = MountPayloadPin::acquire(&PayloadCap::from_cap(payload.clone()));
+
+        assert_eq!(payload.begin_lazy_detach(), Ok(false));
+        assert_eq!(payload.runtime_state(), MountRuntimeState::DetachedPending);
+
+        drop(pin);
+        assert_eq!(payload.runtime_state(), MountRuntimeState::Quiescing);
+        assert_eq!(payload.payload_pin_count(), 1);
+        assert_eq!(super::background_mount_settlement_queue_len(), 1);
+
+        let guard = crate::vfs::adapter::step_engine::guard();
+        assert_eq!(
+            super::drive_background_mount_settlement_once(&guard),
+            StepOutcome::done(())
+        );
+
+        assert_eq!(fs.shutdown_count(), 1);
+        assert_eq!(payload.runtime_state(), MountRuntimeState::Detached);
+        assert_eq!(payload.payload_pin_count(), 0);
+        assert_eq!(super::background_mount_settlement_queue_len(), 0);
+    }
+
+    #[test]
+    fn background_mount_settlement_requeues_retryable_detach() {
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        let (payload, fs) = settlement_payload(false);
+        fs.set_eagain_before_done(1);
+        let pin = MountPayloadPin::acquire(&PayloadCap::from_cap(payload.clone()));
+
+        assert_eq!(payload.begin_lazy_detach(), Ok(false));
+        drop(pin);
+        assert_eq!(super::background_mount_settlement_queue_len(), 1);
+
+        let guard = crate::vfs::adapter::step_engine::guard();
+        assert_eq!(
+            super::drive_background_mount_settlement_once(&guard),
+            StepOutcome::err(Errno::EAGAIN.into())
+        );
+        assert_eq!(payload.runtime_state(), MountRuntimeState::Quiescing);
+        assert_eq!(payload.payload_pin_count(), 1);
+        assert_eq!(super::background_mount_settlement_queue_len(), 1);
+
+        assert_eq!(
+            super::drive_background_mount_settlement_once(&guard),
+            StepOutcome::done(())
+        );
+        assert_eq!(fs.shutdown_count(), 2);
+        assert_eq!(payload.runtime_state(), MountRuntimeState::Detached);
+        assert_eq!(payload.payload_pin_count(), 0);
+        assert_eq!(super::background_mount_settlement_queue_len(), 0);
+    }
+
+    #[test]
+    fn file_settlement_drives_backend_file_hook_with_object_frontier() {
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        let (payload, fs) = settlement_payload(false);
+        let generation_frontier = FileFsyncFrontier::from_pages_for_test(alloc::vec![
+            (PageIndex::new(3), PageGeneration::new(7)),
+            (PageIndex::new(9), PageGeneration::new(11)),
+        ]);
+        let pin = MountPayloadPin::acquire(&PayloadCap::from_cap(payload.clone()));
+        let mut op = MountSettlementOp::new(
+            pin,
+            SettlementScope::File {
+                object: FsObjectId::new(12),
+                generation_frontier: generation_frontier.clone(),
+            },
+        )
+        .expect("claim file");
+
+        let guard = crate::vfs::adapter::step_engine::guard();
+        assert_eq!(op.drive(&guard), StepOutcome::done(()));
+
+        assert_eq!(fs.file_settlement_count(), 1);
+        assert_eq!(fs.last_file_settlement_object(), FsObjectId::new(12));
+        assert_eq!(
+            fs.last_file_settlement_frontier(),
+            Some(generation_frontier)
+        );
+        assert_eq!(fs.mount_settlement_count(), 0);
+        assert_eq!(fs.shutdown_count(), 0);
+        assert_eq!(payload.runtime_state(), MountRuntimeState::Open);
+    }
+
+    #[test]
+    fn mount_settlement_drives_backend_mount_hook() {
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        let (payload, fs) = settlement_payload(false);
+        let pin = MountPayloadPin::acquire(&PayloadCap::from_cap(payload.clone()));
+        let transaction_frontier = MountTransactionFrontier::new(55);
+        let mut op = MountSettlementOp::new(
+            pin,
+            SettlementScope::Mount {
+                transaction_frontier,
+            },
+        )
+        .expect("claim mount");
+
+        let guard = crate::vfs::adapter::step_engine::guard();
+        assert_eq!(op.drive(&guard), StepOutcome::done(()));
+
+        assert_eq!(fs.file_settlement_count(), 0);
+        assert_eq!(fs.mount_settlement_count(), 1);
+        assert_eq!(
+            fs.last_mount_settlement_frontier(),
+            Some(transaction_frontier)
+        );
+        assert_eq!(fs.shutdown_count(), 0);
+        assert_eq!(payload.runtime_state(), MountRuntimeState::Open);
+    }
+
+    #[test]
+    fn default_shutdown_returns_done() {
+        tx_test_support::init_host();
+        let guard = crate::vfs::adapter::step_engine::guard();
+        let fs = SettlementFs::new(false);
+
+        assert_eq!(fs.shutdown(&guard), StepOutcome::done(()));
+    }
+
+    #[test]
+    fn mount_settlement_op_owns_payload_pin_while_active() {
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        let (payload, _fs) = settlement_payload(false);
+        assert_eq!(payload.payload_pin_count(), 0);
+
+        let pin = MountPayloadPin::acquire(&PayloadCap::from_cap(payload.clone()));
+        let mut op = MountSettlementOp::new(pin, SettlementScope::Detach).expect("claim detach");
+        assert_eq!(op.payload_pin_count(), 1);
+        assert_eq!(payload.runtime_state(), MountRuntimeState::Quiescing);
+
+        let guard = crate::vfs::adapter::step_engine::guard();
+        assert_eq!(op.drive(&guard), StepOutcome::done(()));
+        assert_eq!(payload.runtime_state(), MountRuntimeState::Detached);
+
+        drop(op);
+        assert_eq!(payload.payload_pin_count(), 0);
+    }
+
+    #[test]
+    fn detach_settlement_calls_backend_shutdown() {
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        let (payload, fs) = settlement_payload(false);
+        let pin = MountPayloadPin::acquire(&PayloadCap::from_cap(payload.clone()));
+        let mut op = MountSettlementOp::new(pin, SettlementScope::Detach).expect("claim detach");
+
+        let guard = crate::vfs::adapter::step_engine::guard();
+        assert_eq!(op.drive(&guard), StepOutcome::done(()));
+
+        assert_eq!(fs.shutdown_count(), 1);
+        assert_eq!(payload.runtime_state(), MountRuntimeState::Detached);
+    }
+
+    #[test]
+    fn detach_settlement_error_records_errseq_and_enters_recovery_only() {
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        let (payload, fs) = settlement_payload(true);
+        let pin = MountPayloadPin::acquire(&PayloadCap::from_cap(payload.clone()));
+        let mut op = MountSettlementOp::new(pin, SettlementScope::Detach).expect("claim detach");
+
+        let guard = crate::vfs::adapter::step_engine::guard();
+        assert_eq!(op.drive(&guard), StepOutcome::err(Errno::EIO.into()));
+
+        assert_eq!(fs.shutdown_count(), 1);
+        assert_eq!(payload.runtime_state(), MountRuntimeState::RecoveryOnly);
+        assert_eq!(payload.observe_mount_error(), Some(Errno::EIO));
+        assert_eq!(payload.observe_mount_error(), None);
     }
 }

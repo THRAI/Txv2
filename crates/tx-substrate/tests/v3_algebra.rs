@@ -98,7 +98,6 @@ fn errno_mirrors_v4_catalog() {
         Errno::EEXIST,
         Errno::EFBIG,
         Errno::EIDRM,
-        Errno::ELIBBAD,
         Errno::EFAULT,
         Errno::EINVAL,
         Errno::EINPROGRESS,
@@ -133,7 +132,7 @@ fn errno_mirrors_v4_catalog() {
         Errno::EMLINK,
         Errno::ESOCKTNOSUPPORT,
     ];
-    assert_eq!(cases.len(), 50);
+    assert_eq!(cases.len(), 49);
     for errno in cases {
         match errno {
             Errno::E2BIG
@@ -152,7 +151,6 @@ fn errno_mirrors_v4_catalog() {
             | Errno::EEXIST
             | Errno::EFBIG
             | Errno::EIDRM
-            | Errno::ELIBBAD
             | Errno::EFAULT
             | Errno::EINVAL
             | Errno::EINPROGRESS

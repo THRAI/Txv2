@@ -45,7 +45,13 @@ pub mod zones;
 
 static NEXT_NOTIFICATION_SOURCE_ID: AtomicU64 = AtomicU64::new(1 << 32);
 
-pub(crate) fn allocate_notification_source_id() -> u64 {
+/// Allocate a process-wide identifier for an object-owned wait source.
+///
+/// Filesystem backends also own semantic wait points (for example a
+/// mount-local transaction-admission point), so this allocator is public
+/// across workspace crates rather than scoped to `tx-subsystems` modules.
+#[doc(hidden)]
+pub fn allocate_notification_source_id() -> u64 {
     NEXT_NOTIFICATION_SOURCE_ID.fetch_add(1, Ordering::Relaxed)
 }
 

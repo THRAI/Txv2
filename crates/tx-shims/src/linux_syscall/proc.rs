@@ -148,16 +148,14 @@ fn emit_clone_path_count(name: &[u8], value: u64) {
 /// step_process_exit"), the dispatcher therefore calls **only**
 /// `step_thread_exit`. Calling `step_exit_group` here would
 /// double-zombify the payload and corrupt the recorded exit status.
-/// PR-3 migration: `ThreadExitOp` is a `OneShotStepOp` — dispatched
-/// via `drive_oneshot` (no reactor, no yield).
-pub(super) fn sys_exit<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_exit<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let status = args[0] as i32;
-    let mut script_ctx = build_subject_script_ctx(ctx);
-    let mut op = ThreadExitOp {
-        thread: ctx.thread.clone(),
-        status,
-    };
-    match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+    let posts = ThreadExitPosts::new(
+        ctx.mailbox_post,
+        ctx.mailbox_ref_post,
+        ctx.mailbox_ref_post_with_hint,
+    );
+    match drive_thread_exit_with_posts(ctx.thread.clone(), status, posts).await {
         Ok(()) => SyscallResult::NoReturn,
         Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
@@ -287,7 +285,13 @@ pub(super) fn sys_exit_group<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
         &ctx.process,
         ExitStatus::Exited(status),
         |mailbox, event| ctx.post_mailbox_event(mailbox, event),
-        |mailbox, event| ctx.post_mailbox_ref_event(mailbox, event),
+        |mailbox, event| {
+            ctx.post_mailbox_ref_event_with_hint(
+                mailbox,
+                event,
+                tx_substrate::wake::MailboxSchedulerHint::LifecycleWake,
+            )
+        },
     );
     match outcome {
         tx_subsystems::process::ProcessExitOutcome::Completed => SyscallResult::NoReturn,
@@ -536,7 +540,13 @@ pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf + AuxvIf + tx_hal::Cons
             &ctx.process,
             ExitStatus::Exited(0),
             |mailbox, event| ctx.post_mailbox_event(mailbox, event),
-            |mailbox, event| ctx.post_mailbox_ref_event(mailbox, event),
+            |mailbox, event| {
+                ctx.post_mailbox_ref_event_with_hint(
+                    mailbox,
+                    event,
+                    tx_substrate::wake::MailboxSchedulerHint::LifecycleWake,
+                )
+            },
         ) {
             tx_subsystems::process::ProcessExitOutcome::Completed => SyscallResult::NoReturn,
             tx_subsystems::process::ProcessExitOutcome::Retry => SyscallResult::Error(EAGAIN_VALUE),

@@ -10,6 +10,7 @@ use crate::thread_runtime::adapter::step_engine::{
     self, Cap, MailboxEvent, OneShotStepOp, OperationalCapExt, PayloadCap, SignalRouting,
     TaskMailbox,
 };
+use tx_substrate::wake::MailboxSchedulerHint;
 
 use crate::futex::step_futex_lifecycle_wake_in;
 use crate::signal::{refresh_deliverable_signal_summary_with_payload, SignalMask, Signum};
@@ -24,6 +25,7 @@ static THREAD_EXIT_PHASE_SAMPLE: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Copy)]
 struct ThreadExitUserCleanup {
     ctid: Option<u64>,
+    ctid_cleared: bool,
     robust: Option<(u64, usize)>,
 }
 
@@ -32,6 +34,7 @@ fn snapshot_thread_exit_user_cleanup(thread: &Cap<ThreadIdentity>) -> ThreadExit
     let Some(payload) = payload_guard.as_ref() else {
         return ThreadExitUserCleanup {
             ctid: None,
+            ctid_cleared: false,
             robust: None,
         };
     };
@@ -41,13 +44,17 @@ fn snapshot_thread_exit_user_cleanup(thread: &Cap<ThreadIdentity>) -> ThreadExit
         let len = *payload.robust_list_len.lock();
         head.map(|h| (h, len))
     };
-    ThreadExitUserCleanup { ctid, robust }
+    ThreadExitUserCleanup {
+        ctid,
+        ctid_cleared: false,
+        robust,
+    }
 }
 
-fn apply_thread_exit_user_cleanup(
+fn step_thread_exit_user_cleanup(
     aspace: &crate::vm::AddressSpace,
-    cleanup: ThreadExitUserCleanup,
-) {
+    cleanup: &mut ThreadExitUserCleanup,
+) -> step_engine::StepOutcome<(), step_engine::NoProgress> {
     // This cleanup can run from a context that already holds an epoch guard
     // (e.g. a fatal signal that tears the process down mid-syscall reaches
     // the group-exit transition while the delivering path's guard is still active).
@@ -56,19 +63,23 @@ fn apply_thread_exit_user_cleanup(
     let guard = crate::thread_runtime::adapter::step_engine::borrow_current_guard()
         .unwrap_or_else(crate::thread_runtime::adapter::step_engine::guard);
     if let Some(ctid_ptr) = cleanup.ctid {
-        clear_and_wake_child_tid(aspace, ctid_ptr, &guard);
+        match step_clear_and_wake_child_tid(aspace, ctid_ptr, &mut cleanup.ctid_cleared, &guard) {
+            step_engine::StepOutcome::Done(()) => cleanup.ctid = None,
+            step_engine::StepOutcome::Continue { progress } => {
+                return step_engine::StepOutcome::Continue { progress };
+            }
+            step_engine::StepOutcome::Yield { progress, shape } => {
+                return step_engine::StepOutcome::Yield { progress, shape };
+            }
+            step_engine::StepOutcome::Err(errno) => {
+                return step_engine::StepOutcome::Err(errno);
+            }
+        }
     }
-    if let Some((head, len)) = cleanup.robust {
+    if let Some((head, len)) = cleanup.robust.take() {
         walk_robust_list_in_aspace(aspace, head, len, &guard);
     }
-}
-
-pub(crate) fn notify_thread_exit_userspace_in_aspace(
-    thread: &Cap<ThreadIdentity>,
-    aspace: &crate::vm::AddressSpace,
-) {
-    let cleanup = snapshot_thread_exit_user_cleanup(thread);
-    apply_thread_exit_user_cleanup(aspace, cleanup);
+    step_engine::StepOutcome::Done(())
 }
 
 pub(crate) const THREAD_RUNTIME_LOCK_SERVICE_TRACE_NAMES: &[&[u8]] = &[
@@ -248,36 +259,91 @@ pub enum ThreadExitOutcome {
     Retry,
 }
 
-pub fn step_thread_exit(thread: Cap<ThreadIdentity>, status: i32) -> ThreadExitOutcome {
-    step_thread_exit_inner(
-        thread,
-        status,
-        crate::process::structure::ExitStatus::Exited(status),
-        || {},
-        || {},
-    )
+pub type ThreadExitSignalPost = fn(ArcWeak<TaskMailbox>, MailboxEvent);
+pub type ThreadExitWakePost = fn(&TaskMailbox, MailboxEvent) -> bool;
+pub type ThreadExitWakePostWithHint = fn(&TaskMailbox, MailboxEvent, MailboxSchedulerHint) -> bool;
+
+/// Owner-aware wake routes retained by a resumable thread-exit operation.
+///
+/// The last-thread cascade can wake a parent parked on `wait4(2)`. Keeping
+/// these callbacks with the exit state ensures that publication still goes
+/// through the reactor's cross-hart route after the originating syscall
+/// future has returned its terminal intent.
+#[derive(Clone, Copy, Default)]
+pub struct ThreadExitPosts {
+    signal: Option<ThreadExitSignalPost>,
+    wake: Option<ThreadExitWakePost>,
+    wake_with_hint: Option<ThreadExitWakePostWithHint>,
 }
 
-pub fn step_thread_exit_with_status(
-    thread: Cap<ThreadIdentity>,
-    status: crate::process::structure::ExitStatus,
-) -> ThreadExitOutcome {
-    step_thread_exit_inner(thread, status.wait_status_word(), status, || {}, || {})
+impl ThreadExitPosts {
+    pub const fn new(
+        signal: Option<ThreadExitSignalPost>,
+        wake: Option<ThreadExitWakePost>,
+        wake_with_hint: Option<ThreadExitWakePostWithHint>,
+    ) -> Self {
+        Self {
+            signal,
+            wake,
+            wake_with_hint,
+        }
+    }
+
+    fn post_signal(self, mailbox: ArcWeak<TaskMailbox>, event: MailboxEvent) {
+        if let Some(post) = self.signal {
+            post(mailbox, event);
+            return;
+        }
+        let Some(mailbox) = mailbox.upgrade() else {
+            return;
+        };
+        let _ = mailbox.post(event);
+    }
+
+    fn post_wake(self, mailbox: &TaskMailbox, event: MailboxEvent) -> bool {
+        if let Some(post) = self.wake_with_hint {
+            // A thread-exit publication releases lifecycle waiters such as a
+            // parent blocked in wait4/pclose.  Treating this as ordinary work
+            // lets the SMP scheduler defer the parent indefinitely behind
+            // CPU-heavy runnable tasks, even though the child has already
+            // reached its final-thread cascade.
+            return post(mailbox, event, MailboxSchedulerHint::LifecycleWake);
+        }
+        if let Some(post) = self.wake {
+            return post(mailbox, event);
+        }
+        mailbox.post(event)
+    }
 }
 
-fn step_thread_exit_inner<H, Z>(
-    thread: Cap<ThreadIdentity>,
-    status: i32,
+struct PreparedThreadExit {
+    parent: Option<Cap<crate::process::ProcessIdentity>>,
+    process_payload: Option<PayloadCap<crate::process::ProcessPayload>>,
+    aspace: Option<Cap<crate::vm::AddressSpace>>,
+    exit_permit: Option<crate::process::structure::ThreadExitPermit>,
+    cleanup: ThreadExitUserCleanup,
+    thread_status: i32,
     process_status: crate::process::structure::ExitStatus,
+    trace: bool,
+}
+
+enum PrepareThreadExitOutcome {
+    Completed,
+    Retry,
+    Prepared(PreparedThreadExit),
+}
+
+fn prepare_thread_exit_state<H>(
+    thread: &Cap<ThreadIdentity>,
+    requested_thread_status: i32,
+    requested_process_status: crate::process::structure::ExitStatus,
     after_lane_check: H,
-    after_zombify: Z,
-) -> ThreadExitOutcome
+) -> PrepareThreadExitOutcome
 where
     H: FnOnce(),
-    Z: FnOnce(),
 {
     if thread.is_zombie() {
-        return ThreadExitOutcome::Completed;
+        return PrepareThreadExitOutcome::Completed;
     }
     let parent = {
         let guard = crate::thread_runtime::adapter::step_engine::guard();
@@ -285,60 +351,103 @@ where
         drop(guard);
         parent
     };
-    // Pin the process payload before changing thread state.  The last-thread
-    // path tears that payload (and therefore the address-space slot) down, but
-    // Linux requires clear_child_tid and robust-futex repair to complete while
-    // the old address space is still live.
+    // Pin the process payload and its current address space before claiming
+    // the lifecycle lane. Both must remain stable while cleanup is suspended.
     let process_payload = parent
         .as_ref()
         .and_then(|parent| parent.payload.lock().as_ref().cloned());
     let exit_permit = if let Some(payload) = process_payload.as_ref() {
-        match payload.prepare_thread_exit(thread.tid.0) {
+        match payload.prepare_thread_exit(thread.tid.0, requested_process_status) {
             Some(permit) => Some(permit),
-            None => return ThreadExitOutcome::Retry,
+            None => return PrepareThreadExitOutcome::Retry,
         }
     } else {
         None
     };
+    let (thread_status, process_status) = exit_permit
+        .as_ref()
+        .map(|permit| {
+            (
+                permit.thread_status(requested_thread_status),
+                permit.status(),
+            )
+        })
+        .unwrap_or((requested_thread_status, requested_process_status));
     after_lane_check();
     let trace = thread_exit_debug_sample();
     if trace {
         emit_thread_exit_debug(b"debug.thread_exit.enter", thread.tid.0 as i64);
     }
+    let (aspace, cleanup) = if let Some(payload) = process_payload.as_ref() {
+        (
+            Some(payload.aspace_cap()),
+            snapshot_thread_exit_user_cleanup(thread),
+        )
+    } else {
+        (
+            None,
+            ThreadExitUserCleanup {
+                ctid: None,
+                ctid_cleared: false,
+                robust: None,
+            },
+        )
+    };
+    PrepareThreadExitOutcome::Prepared(PreparedThreadExit {
+        parent,
+        process_payload,
+        aspace,
+        exit_permit,
+        cleanup,
+        thread_status,
+        process_status,
+        trace,
+    })
+}
 
-    if let Some(payload) = process_payload.as_ref() {
-        let aspace = payload.aspace_cap();
-        notify_thread_exit_userspace_in_aspace(&thread, &aspace);
-    }
+fn finish_prepared_thread_exit_with_posts<Z, F, G>(
+    thread: &Cap<ThreadIdentity>,
+    prepared: PreparedThreadExit,
+    after_zombify: Z,
+    signal_post: &mut F,
+    wake_post: &mut G,
+) where
+    Z: FnOnce(),
+    F: FnMut(ArcWeak<TaskMailbox>, MailboxEvent),
+    G: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
+    let PreparedThreadExit {
+        parent,
+        process_payload,
+        exit_permit,
+        thread_status,
+        process_status,
+        trace,
+        ..
+    } = prepared;
     if trace {
         emit_thread_exit_debug(b"debug.thread_exit.snapshot.after", thread.tid.0 as i64);
     }
 
-    // observe
-    // upgrade
-    // reserve
-    // commit
-    // publish
-    set_thread_zombie(&thread, status);
+    set_thread_zombie(thread, thread_status);
     after_zombify();
     if trace {
         emit_thread_exit_debug(b"debug.thread_exit.zombie.after", thread.tid.0 as i64);
     }
 
     let Some(parent) = parent else {
-        return ThreadExitOutcome::Completed;
+        return;
     };
     if trace {
         emit_thread_exit_debug(b"debug.thread_exit.parent.after", thread.tid.0 as i64);
     }
-
     let Some(payload) = process_payload else {
-        return ThreadExitOutcome::Completed;
+        return;
     };
 
     let removed = crate::process::execution::measure_process_lock_service(
         b"debug.lock_service.process.payload.thread_exit.threads_detach.duration_ns",
-        || payload.threads.detach(&thread),
+        || payload.threads.detach(thread),
     );
     if trace {
         emit_thread_exit_debug(b"debug.thread_exit.retain.after", thread.tid.0 as i64);
@@ -368,7 +477,7 @@ where
     if let Some(permit) = exit_permit {
         let finished = crate::process::execution::measure_process_lock_service(
             b"debug.lock_service.process.payload.thread_exit.group_exit.duration_ns",
-            || payload.finish_thread_exit(permit, was_last, process_status),
+            || payload.finish_thread_exit(permit, was_last),
         );
         debug_assert!(
             finished,
@@ -376,21 +485,18 @@ where
         );
     }
     if was_last {
-        // Thread side carries `i32` per `THREAD_RUNTIME_v1` §7.2;
-        // the cascade promotes that to `ExitStatus::Exited` because
-        // signal-driven termination doesn't reach this path (it goes
-        // through the fatal group-exit transition which records
-        // `ExitStatus::Signaled` directly before zombifying threads).
-        crate::process::execution::step_process_exit(&parent, process_status);
+        crate::process::execution::step_process_exit_with_posts(
+            &parent,
+            process_status,
+            signal_post,
+            wake_post,
+        );
     }
 
     if trace {
         emit_thread_exit_debug(b"debug.thread_exit.ctid.after", thread.tid.0 as i64);
-    }
-    if trace {
         emit_thread_exit_debug(b"debug.thread_exit.robust.after", thread.tid.0 as i64);
     }
-
     if thread
         .owner_proc
         .upgrade(&crate::thread_runtime::adapter::step_engine::guard())
@@ -402,6 +508,98 @@ where
     if trace {
         emit_thread_exit_debug(b"debug.thread_exit.end", thread.tid.0 as i64);
     }
+}
+
+pub fn step_thread_exit(thread: Cap<ThreadIdentity>, status: i32) -> ThreadExitOutcome {
+    let mut op = ThreadExitOp::new(thread, status);
+    match op.step_exit() {
+        step_engine::StepOutcome::Done(()) => ThreadExitOutcome::Completed,
+        step_engine::StepOutcome::Continue { .. }
+        | step_engine::StepOutcome::Yield { .. }
+        | step_engine::StepOutcome::Err(_) => ThreadExitOutcome::Retry,
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn step_thread_exit_with_status_and_posts<F, G>(
+    thread: Cap<ThreadIdentity>,
+    status: crate::process::structure::ExitStatus,
+    signal_post: &mut F,
+    wake_post: &mut G,
+) -> ThreadExitOutcome
+where
+    F: FnMut(ArcWeak<TaskMailbox>, MailboxEvent),
+    G: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
+    let mut prepared =
+        match prepare_thread_exit_state(&thread, status.wait_status_word(), status, || {}) {
+            PrepareThreadExitOutcome::Completed => return ThreadExitOutcome::Completed,
+            PrepareThreadExitOutcome::Retry => return ThreadExitOutcome::Retry,
+            PrepareThreadExitOutcome::Prepared(prepared) => prepared,
+        };
+    if let Some(aspace) = prepared.aspace.as_ref() {
+        loop {
+            match step_thread_exit_user_cleanup(aspace, &mut prepared.cleanup) {
+                step_engine::StepOutcome::Done(()) | step_engine::StepOutcome::Err(_) => break,
+                step_engine::StepOutcome::Continue { .. }
+                | step_engine::StepOutcome::Yield { .. } => core::hint::spin_loop(),
+            }
+        }
+    }
+    finish_prepared_thread_exit_with_posts(&thread, prepared, || {}, signal_post, wake_post);
+    ThreadExitOutcome::Completed
+}
+
+pub fn step_thread_exit_with_status(
+    thread: Cap<ThreadIdentity>,
+    status: crate::process::structure::ExitStatus,
+) -> ThreadExitOutcome {
+    let mut op = ThreadExitOp::with_status(thread, status);
+    match op.step_exit() {
+        step_engine::StepOutcome::Done(()) => ThreadExitOutcome::Completed,
+        step_engine::StepOutcome::Continue { .. }
+        | step_engine::StepOutcome::Yield { .. }
+        | step_engine::StepOutcome::Err(_) => ThreadExitOutcome::Retry,
+    }
+}
+
+#[cfg(test)]
+fn step_thread_exit_inner<H, Z>(
+    thread: Cap<ThreadIdentity>,
+    status: i32,
+    process_status: crate::process::structure::ExitStatus,
+    after_lane_check: H,
+    after_zombify: Z,
+) -> ThreadExitOutcome
+where
+    H: FnOnce(),
+    Z: FnOnce(),
+{
+    let mut prepared =
+        match prepare_thread_exit_state(&thread, status, process_status, after_lane_check) {
+            PrepareThreadExitOutcome::Completed => return ThreadExitOutcome::Completed,
+            PrepareThreadExitOutcome::Retry => return ThreadExitOutcome::Retry,
+            PrepareThreadExitOutcome::Prepared(prepared) => prepared,
+        };
+    if let Some(aspace) = prepared.aspace.as_ref() {
+        loop {
+            match step_thread_exit_user_cleanup(aspace, &mut prepared.cleanup) {
+                step_engine::StepOutcome::Done(()) | step_engine::StepOutcome::Err(_) => break,
+                step_engine::StepOutcome::Continue { .. }
+                | step_engine::StepOutcome::Yield { .. } => core::hint::spin_loop(),
+            }
+        }
+    }
+    let posts = ThreadExitPosts::default();
+    let mut signal_post = |mailbox, event| posts.post_signal(mailbox, event);
+    let mut wake_post = |mailbox: &TaskMailbox, event| posts.post_wake(mailbox, event);
+    finish_prepared_thread_exit_with_posts(
+        &thread,
+        prepared,
+        after_zombify,
+        &mut signal_post,
+        &mut wake_post,
+    );
     ThreadExitOutcome::Completed
 }
 
@@ -441,39 +639,42 @@ where
     )
 }
 
-fn clear_and_wake_child_tid(
+fn step_clear_and_wake_child_tid(
     aspace: &crate::vm::AddressSpace,
     tid_ptr: u64,
+    cleared: &mut bool,
     guard: &step_engine::Guard<'_>,
-) {
+) -> step_engine::StepOutcome<(), step_engine::NoProgress> {
     let trace = clear_child_tid_debug_sample();
     if trace {
         emit_clear_child_tid_debug(b"debug.futex.clear_child_tid.uaddr", tid_ptr as i64);
     }
 
-    // `copy_to_user` can yield while another hart owns the TCB page's range
-    // transaction.  The clear-child-tid contract is synchronous: publishing
-    // the futex wake before the zero is visible loses the only wake available
-    // to pthread_join.  This mapping is the exiting thread's resident private
-    // anonymous TCB, so Yield/Continue here is transient SMP contention rather
-    // than page-backed I/O and may be retried in place.
-    loop {
+    if !*cleared {
         match aspace.copy_to_user(
             UserPtr::<u8>::new(tid_ptr as usize),
             &[0u8; core::mem::size_of::<u32>()],
             guard,
         ) {
             step_engine::StepOutcome::Done(written) if written == core::mem::size_of::<u32>() => {
-                break;
+                *cleared = true;
             }
-            step_engine::StepOutcome::Yield { .. } | step_engine::StepOutcome::Continue { .. } => {
-                core::hint::spin_loop();
+            step_engine::StepOutcome::Yield { shape, .. } => {
+                return step_engine::StepOutcome::Yield {
+                    progress: step_engine::NoProgress,
+                    shape,
+                };
+            }
+            step_engine::StepOutcome::Continue { .. } => {
+                return step_engine::StepOutcome::Continue {
+                    progress: step_engine::NoProgress,
+                };
             }
             step_engine::StepOutcome::Done(_) | step_engine::StepOutcome::Err(_) => {
                 if trace {
                     emit_clear_child_tid_debug(b"debug.futex.clear_child_tid.err", -1);
                 }
-                return;
+                return step_engine::StepOutcome::Done(());
             }
         }
     }
@@ -483,6 +684,7 @@ fn clear_and_wake_child_tid(
             if trace {
                 emit_clear_child_tid_debug(b"debug.futex.clear_child_tid.woken", i64::from(woken));
             }
+            step_engine::StepOutcome::Done(())
         }
         step_engine::StepOutcome::Err(errno) => {
             if trace {
@@ -491,10 +693,23 @@ fn clear_and_wake_child_tid(
                     i64::from(errno as i32),
                 );
             }
+            step_engine::StepOutcome::Done(())
         }
-        step_engine::StepOutcome::Yield { .. } | step_engine::StepOutcome::Continue { .. } => {
+        step_engine::StepOutcome::Yield { shape, .. } => {
             if trace {
                 emit_clear_child_tid_debug(b"debug.futex.clear_child_tid.pending", 1);
+            }
+            step_engine::StepOutcome::Yield {
+                progress: step_engine::NoProgress,
+                shape,
+            }
+        }
+        step_engine::StepOutcome::Continue { .. } => {
+            if trace {
+                emit_clear_child_tid_debug(b"debug.futex.clear_child_tid.pending", 1);
+            }
+            step_engine::StepOutcome::Continue {
+                progress: step_engine::NoProgress,
             }
         }
     }
@@ -875,15 +1090,142 @@ pub fn prepare_userspace_entry_payload(payload: &PayloadCap<ThreadPayload>) -> U
 // re-run if needed); `step_sigprocmask` borrows `&Cap` (the wrap
 // stores `Cap` by value per the cred-pilot convention).
 
-/// `StepOp` wrap for [`step_thread_exit`]. PR-2 wave 2.
+/// Resumable current-thread exit operation.
 ///
-/// `step_thread_exit` returns `()`; the wrap lifts that into
-/// `StepOutcome::Done(())`. The `Cap` is stored by value (`Cap` is
-/// `Clone`) and the wrap clones into the free fn so the `step` method
-/// remains `&mut self`-shaped.
+/// The operation owns the lifecycle permit, old address space and userspace
+/// cleanup snapshot across a `clear_child_tid` wait. No zombie/detach state is
+/// published until that cleanup has completed.
 pub struct ThreadExitOp {
-    pub thread: Cap<ThreadIdentity>,
-    pub status: i32,
+    thread: Cap<ThreadIdentity>,
+    thread_status: i32,
+    process_status: crate::process::structure::ExitStatus,
+    posts: ThreadExitPosts,
+    prepared: Option<PreparedThreadExit>,
+    completed: bool,
+}
+
+impl ThreadExitOp {
+    pub fn new(thread: Cap<ThreadIdentity>, status: i32) -> Self {
+        Self {
+            thread,
+            thread_status: status,
+            process_status: crate::process::structure::ExitStatus::Exited(status),
+            posts: ThreadExitPosts::default(),
+            prepared: None,
+            completed: false,
+        }
+    }
+
+    pub fn with_status(
+        thread: Cap<ThreadIdentity>,
+        process_status: crate::process::structure::ExitStatus,
+    ) -> Self {
+        Self {
+            thread,
+            thread_status: process_status.wait_status_word(),
+            process_status,
+            posts: ThreadExitPosts::default(),
+            prepared: None,
+            completed: false,
+        }
+    }
+
+    pub fn with_posts(mut self, posts: ThreadExitPosts) -> Self {
+        self.posts = posts;
+        self
+    }
+
+    pub fn step_exit(&mut self) -> step_engine::StepOutcome<(), step_engine::NoProgress> {
+        self.step_exit_with_cleanup(&mut step_thread_exit_user_cleanup)
+    }
+
+    fn step_exit_with_cleanup<F>(
+        &mut self,
+        cleanup_step: &mut F,
+    ) -> step_engine::StepOutcome<(), step_engine::NoProgress>
+    where
+        F: FnMut(
+            &crate::vm::AddressSpace,
+            &mut ThreadExitUserCleanup,
+        ) -> step_engine::StepOutcome<(), step_engine::NoProgress>,
+    {
+        if self.completed {
+            return step_engine::StepOutcome::Done(());
+        }
+        if self.prepared.is_none() {
+            match prepare_thread_exit_state(
+                &self.thread,
+                self.thread_status,
+                self.process_status,
+                || {},
+            ) {
+                PrepareThreadExitOutcome::Completed => {
+                    self.completed = true;
+                    return step_engine::StepOutcome::Done(());
+                }
+                PrepareThreadExitOutcome::Retry => {
+                    return step_engine::StepOutcome::Continue {
+                        progress: step_engine::NoProgress,
+                    };
+                }
+                PrepareThreadExitOutcome::Prepared(prepared) => {
+                    self.prepared = Some(prepared);
+                }
+            }
+        }
+
+        let prepared = self.prepared.as_mut().expect("exit state prepared");
+        if let Some(aspace) = prepared.aspace.as_ref() {
+            match cleanup_step(aspace, &mut prepared.cleanup) {
+                step_engine::StepOutcome::Done(()) => {}
+                other => return other,
+            }
+        }
+
+        let prepared = self.prepared.take().expect("exit state prepared");
+        let posts = self.posts;
+        let mut signal_post = |mailbox, event| posts.post_signal(mailbox, event);
+        let mut wake_post = |mailbox: &TaskMailbox, event| posts.post_wake(mailbox, event);
+        finish_prepared_thread_exit_with_posts(
+            &self.thread,
+            prepared,
+            || {},
+            &mut signal_post,
+            &mut wake_post,
+        );
+        self.completed = true;
+        step_engine::StepOutcome::Done(())
+    }
+
+    #[cfg(test)]
+    fn step_exit_with_cleanup_for_test<F>(
+        &mut self,
+        cleanup_step: &mut F,
+    ) -> step_engine::StepOutcome<(), step_engine::NoProgress>
+    where
+        F: FnMut(
+            &crate::vm::AddressSpace,
+            &mut ThreadExitUserCleanup,
+        ) -> step_engine::StepOutcome<(), step_engine::NoProgress>,
+    {
+        self.step_exit_with_cleanup(cleanup_step)
+    }
+}
+
+impl Drop for ThreadExitOp {
+    fn drop(&mut self) {
+        let Some(prepared) = self.prepared.as_mut() else {
+            return;
+        };
+        let (Some(payload), Some(permit)) = (
+            prepared.process_payload.as_ref(),
+            prepared.exit_permit.take(),
+        ) else {
+            return;
+        };
+        let aborted = payload.abort_thread_exit(self.thread.tid.0, permit);
+        debug_assert!(aborted, "prepared thread-exit permit remains abortable");
+    }
 }
 
 impl<I: crate::thread_runtime::adapter::step_engine::SubjectIdentity>
@@ -896,20 +1238,9 @@ impl<I: crate::thread_runtime::adapter::step_engine::SubjectIdentity>
         _ctx: &mut crate::thread_runtime::adapter::step_engine::ScriptCtx<I>,
     ) -> crate::thread_runtime::adapter::step_engine::StepOutcome<Self::Output, Self::Progress>
     {
-        match step_thread_exit(self.thread.clone(), self.status) {
-            ThreadExitOutcome::Completed => {
-                crate::thread_runtime::adapter::step_engine::StepOutcome::Done(())
-            }
-            ThreadExitOutcome::Retry => {
-                crate::thread_runtime::adapter::step_engine::StepOutcome::err(
-                    crate::thread_runtime::adapter::step_engine::Errno::EAGAIN,
-                )
-            }
-        }
+        self.step_exit()
     }
 }
-
-impl OneShotStepOp<ProcessIdentity> for ThreadExitOp {}
 
 /// `StepOp` wrap for [`step_sigprocmask`]. PR-2 wave 2.
 pub struct SigprocmaskOp {
@@ -1050,16 +1381,35 @@ mod step_op_wraps {
         threads[0].clone()
     }
 
+    fn assert_lifecycle_wake_post(
+        mailbox: &TaskMailbox,
+        event: MailboxEvent,
+        hint: MailboxSchedulerHint,
+    ) -> bool {
+        assert_eq!(hint, MailboxSchedulerHint::LifecycleWake);
+        mailbox.post_with_scheduler_hint(event, hint)
+    }
+
+    #[test]
+    fn thread_exit_posts_classify_parent_wake_as_lifecycle() {
+        let mailbox = TaskMailbox::new();
+        let event = MailboxEvent::SignalDelivered {
+            signum: Signum::SIGCHLD.raw() as u32,
+            routing: SignalRouting::ProcessDirected,
+        };
+        let posts = ThreadExitPosts::new(None, None, Some(assert_lifecycle_wake_post));
+
+        assert!(posts.post_wake(&mailbox, event));
+        assert_eq!(mailbox.poll(), Some(event));
+    }
+
     #[test]
     fn thread_exit_op_delegates_to_step_thread_exit() {
         let _g = setup();
         let proc_cap = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
         let leader = first_thread(&proc_cap);
         assert!(!leader.is_zombie());
-        let mut op = ThreadExitOp {
-            thread: leader.clone(),
-            status: 7,
-        };
+        let mut op = ThreadExitOp::new(leader.clone(), 7);
         let mut ctx = ScriptCtx::<
             crate::thread_runtime::adapter::step_engine::PlaceholderProcessSubject,
         >::new();
@@ -1067,6 +1417,127 @@ mod step_op_wraps {
         assert_eq!(outcome, StepOutcome::Done(()));
         assert!(leader.is_zombie());
         assert_eq!(leader.exit_status(), Some(7));
+    }
+
+    #[test]
+    fn thread_exit_op_retains_permit_across_cleanup_yield() {
+        let _g = setup();
+        let proc_cap = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
+        let ctid = 0x8000_1000;
+        let sibling = crate::process::execution::step_clone_thread(
+            &proc_cap,
+            &tx_hal::UserTrapContext::empty(),
+            SignalMask::EMPTY,
+            0,
+            0,
+            ctid,
+        )
+        .expect("sibling");
+        assert_eq!(proc_cap.live_thread_count(), 2);
+
+        let mut op = ThreadExitOp::new(sibling.clone(), 9);
+        let mut first = true;
+        let mut cleanup_step = |_aspace: &AddressSpace, cleanup: &mut ThreadExitUserCleanup| {
+            assert_eq!(cleanup.ctid, Some(ctid));
+            if core::mem::replace(&mut first, false) {
+                StepOutcome::yield_on_wait_source(step_engine::NoProgress, 0xfeed, 1)
+            } else {
+                StepOutcome::Done(())
+            }
+        };
+
+        assert_eq!(
+            op.step_exit_with_cleanup_for_test(&mut cleanup_step),
+            StepOutcome::yield_on_wait_source(step_engine::NoProgress, 0xfeed, 1)
+        );
+        assert!(!sibling.is_zombie());
+        assert_eq!(sibling.exit_status(), None);
+        assert_eq!(proc_cap.live_thread_count(), 2);
+        assert!(proc_cap.thread_by_tid(sibling.tid.0).is_some());
+
+        assert_eq!(
+            op.step_exit_with_cleanup_for_test(&mut cleanup_step),
+            StepOutcome::Done(())
+        );
+        assert!(sibling.is_zombie());
+        assert_eq!(sibling.exit_status(), Some(9));
+        assert_eq!(proc_cap.live_thread_count(), 1);
+        assert!(proc_cap.thread_by_tid(sibling.tid.0).is_none());
+    }
+
+    #[test]
+    fn dropping_suspended_thread_exit_releases_lifecycle_claim() {
+        let _g = setup();
+        let proc_cap = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
+        let sibling = crate::process::execution::step_clone_thread(
+            &proc_cap,
+            &tx_hal::UserTrapContext::empty(),
+            SignalMask::EMPTY,
+            0,
+            0,
+            0x8000_2000,
+        )
+        .expect("sibling");
+
+        let mut suspended = ThreadExitOp::new(sibling.clone(), 11);
+        let mut yield_cleanup = |_aspace: &AddressSpace, _cleanup: &mut ThreadExitUserCleanup| {
+            StepOutcome::yield_on_wait_source(step_engine::NoProgress, 0xbeef, 1)
+        };
+        assert!(matches!(
+            suspended.step_exit_with_cleanup_for_test(&mut yield_cleanup),
+            StepOutcome::Yield { .. }
+        ));
+        drop(suspended);
+
+        let mut retry = ThreadExitOp::new(sibling.clone(), 11);
+        let mut complete_cleanup =
+            |_aspace: &AddressSpace, _cleanup: &mut ThreadExitUserCleanup| StepOutcome::Done(());
+        assert_eq!(
+            retry.step_exit_with_cleanup_for_test(&mut complete_cleanup),
+            StepOutcome::Done(())
+        );
+        assert!(sibling.is_zombie());
+        assert_eq!(proc_cap.live_thread_count(), 1);
+    }
+
+    #[test]
+    fn group_exit_status_overrides_concurrent_local_thread_exit() {
+        let _g = setup();
+        let proc_cap = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
+        let sibling = crate::process::execution::step_clone_thread(
+            &proc_cap,
+            &tx_hal::UserTrapContext::empty(),
+            SignalMask::EMPTY,
+            0,
+            0,
+            0,
+        )
+        .expect("sibling");
+        let payload = proc_cap
+            .payload
+            .lock()
+            .as_ref()
+            .cloned()
+            .expect("process alive");
+        assert!(payload.reserve_group_exit(crate::process::structure::ExitStatus::Exited(7)));
+
+        let mut op = ThreadExitOp::new(sibling.clone(), 99);
+        let mut complete_cleanup =
+            |_aspace: &AddressSpace, _cleanup: &mut ThreadExitUserCleanup| StepOutcome::Done(());
+        assert_eq!(
+            op.step_exit_with_cleanup_for_test(&mut complete_cleanup),
+            StepOutcome::Done(())
+        );
+
+        assert_eq!(
+            sibling.exit_status(),
+            Some(crate::process::structure::ExitStatus::Exited(7).wait_status_word())
+        );
+        assert_eq!(proc_cap.live_thread_count(), 1);
+        assert_eq!(
+            crate::process::execution::group_exit_status(&proc_cap),
+            Some(crate::process::structure::ExitStatus::Exited(7))
+        );
     }
 
     #[test]

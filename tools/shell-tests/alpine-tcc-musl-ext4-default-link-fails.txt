@@ -1,0 +1,31 @@
+# alpine-tcc-musl-ext4-default-link-fails.txt - pin unrelocated TCC path gap.
+#
+# TCC's compiled-in default runtime paths are rooted under /usr. When the
+# development rootfs is mounted under /musl without /usr compatibility symlinks,
+# this still fails even though the image now carries a synthesized
+# /usr/lib/tcc/libtcc1.a. The positive path is covered by
+# alpine-tcc-normal-ext4-mount-default-link-smoke.txt.
+
+wait ":mount:sdcard:ext4:ok" within 90000
+wait "/ # " within 90000
+sleep 500
+
+send "echo tcc-musl-default-link-gap-start\n"
+expect "tcc-musl-default-link-gap-start" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "printf 'int main(void) { return 7; }\\n' > /tmp/tccmain.c\n"
+expect "/ # " within 10000
+
+sleep 500
+send "/musl/lib/ld-musl-riscv64.so.1 --library-path /musl/lib:/musl/usr/lib /musl/usr/bin/tcc -B/musl/usr/lib -I/musl/usr/include -L/musl/usr/lib /tmp/tccmain.c -o /tmp/tccmain; echo default-link-status:$?\n"
+expect "tcc: error: file 'crt1.o' not found" within 30000
+expect "tcc: error: file 'crti.o' not found" within 30000
+expect "tcc: error: file 'libtcc1.a' not found" within 30000
+expect "tcc: error: file 'crtn.o' not found" within 30000
+expect "default-link-status:1" within 30000
+expect "/ # " within 30000
+
+sleep 500
+quit

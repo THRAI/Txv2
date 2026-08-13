@@ -4,13 +4,11 @@
 //! discovered [`JournalGeometry`]. It has no mount, page-cache, or scheduling
 //! state, so callers can replay the image before exposing the filesystem.
 
-use alloc::collections::BTreeMap;
-use alloc::vec::Vec;
-
 use crate::journal::{
-    Jbd2Commit, Jbd2Descriptor, Jbd2Header, Jbd2Revoke, Jbd2Tag, JBD2_BLOCK_COMMIT,
-    JBD2_BLOCK_DESCRIPTOR, JBD2_BLOCK_REVOKE, JBD2_MAGIC,
+    Jbd2Commit, Jbd2Descriptor, Jbd2Header, Jbd2Revoke, JBD2_BLOCK_COMMIT, JBD2_BLOCK_DESCRIPTOR,
+    JBD2_BLOCK_REVOKE, JBD2_MAGIC,
 };
+use crate::ondisk::Superblock;
 use crate::pager::{BlockImage, JournalGeometry, Page4K};
 use crate::{Ext4FormatError, Result};
 
@@ -26,13 +24,36 @@ pub struct JournalReplayReport {
     pub next_sequence: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryReport {
+    NotRequired,
+    Replayed(JournalReplayReport),
+}
+
+/// Replay and clean a discovered journal only when ext4's recovery-required
+/// bit says that the mount did not complete a clean detach.
+pub fn recover_if_required<I: BlockImage>(
+    image: &mut I,
+    superblock: &Superblock,
+    geometry: &JournalGeometry,
+) -> Result<RecoveryReport> {
+    if !superblock.needs_recovery() {
+        return Ok(RecoveryReport::NotRequired);
+    }
+    let replay = replay_journal(image, geometry)?;
+    clean_replayed_journal(image, geometry, replay.next_sequence)?;
+    Ok(RecoveryReport::Replayed(replay))
+}
+
 /// Replay consecutive, committed legacy JBD2 transactions from `geometry`.
 ///
 /// A descriptor is never applied until every tagged metadata page and its
 /// matching commit record have been read. An incomplete tail is normal after a
 /// power loss and terminates the scan without modifying home blocks for that
-/// transaction. Recovery first records every committed transaction and revoke
-/// page, then applies payloads that were not superseded by a later revoke.
+/// transaction. A transaction may contain zero or more revoke pages between
+/// the metadata copies and commit record. Its revokes suppress matching stale
+/// after-images from that transaction; allocator reuse remains a higher-layer
+/// lifecycle responsibility.
 pub fn replay_journal<I: BlockImage>(
     image: &mut I,
     geometry: &JournalGeometry,
@@ -52,9 +73,8 @@ pub fn replay_journal<I: BlockImage>(
     let limit = geometry.blocks.len() - geometry.superblock.first as usize;
     let mut transactions = 0u32;
     let mut blocks_replayed = 0u32;
-    let mut recovered = Vec::new();
 
-    while scanned < limit {
+    'scan: while scanned < limit {
         let descriptor_page = read_log_page(image, geometry, cursor)?;
         let header = match Jbd2Header::parse(&descriptor_page) {
             Ok(header) if header.block_type == JBD2_BLOCK_DESCRIPTOR => header,
@@ -81,91 +101,71 @@ pub fn replay_journal<I: BlockImage>(
             payloads.push(read_log_page(image, geometry, payload_cursor)?);
             payload_cursor = advance(geometry, payload_cursor);
         }
-        let mut revoked_blocks = Vec::new();
-        loop {
-            let record_page = read_log_page(image, geometry, payload_cursor)?;
-            let record_header = match Jbd2Header::parse(&record_page) {
+        let mut commit_cursor = payload_cursor;
+        let mut revoked_blocks = alloc::vec::Vec::new();
+        let commit = loop {
+            let record_page = read_log_page(image, geometry, commit_cursor)?;
+            let header = match Jbd2Header::parse(&record_page) {
                 Ok(header) => header,
-                Err(Ext4FormatError::BadMagic) | Err(Ext4FormatError::Corrupt) => break,
+                Err(Ext4FormatError::BadMagic) | Err(Ext4FormatError::Corrupt) => break 'scan,
                 Err(error) => return Err(error),
             };
-            if record_header.sequence != descriptor.header.sequence {
-                break;
-            }
-            match record_header.block_type {
+            match header.block_type {
+                JBD2_BLOCK_COMMIT => match Jbd2Commit::parse(&record_page) {
+                    Ok(commit) => break commit,
+                    Err(Ext4FormatError::BadMagic) | Err(Ext4FormatError::Corrupt) => break 'scan,
+                    Err(error) => return Err(error),
+                },
                 JBD2_BLOCK_REVOKE => {
-                    revoked_blocks.extend(Jbd2Revoke::parse(&record_page)?.blocks);
                     record_blocks = record_blocks
                         .checked_add(1)
                         .ok_or(Ext4FormatError::OutOfBounds)?;
                     if record_blocks > limit - scanned {
-                        break;
+                        break 'scan;
                     }
-                    payload_cursor = advance(geometry, payload_cursor);
-                }
-                JBD2_BLOCK_COMMIT => {
-                    let commit = Jbd2Commit::parse(&record_page)?;
-                    if commit.header.sequence != descriptor.header.sequence {
-                        break;
+                    let revoke = match Jbd2Revoke::parse(&record_page) {
+                        Ok(revoke) => revoke,
+                        Err(Ext4FormatError::BadMagic) | Err(Ext4FormatError::Corrupt) => {
+                            break 'scan;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    if revoke.header.sequence != descriptor.header.sequence {
+                        break 'scan;
                     }
-                    recovered.push(ReplayTransaction {
-                        sequence: descriptor.header.sequence,
-                        tags: descriptor.tags,
-                        payloads,
-                        revoked_blocks,
-                    });
-                    transactions = transactions
-                        .checked_add(1)
-                        .ok_or(Ext4FormatError::OutOfBounds)?;
-                    expected_sequence = expected_sequence.wrapping_add(1).max(1);
-                    cursor = advance(geometry, payload_cursor);
-                    scanned = scanned
-                        .checked_add(record_blocks)
-                        .ok_or(Ext4FormatError::OutOfBounds)?;
-                    break;
+                    revoked_blocks.extend(revoke.blocks);
+                    commit_cursor = advance(geometry, commit_cursor);
                 }
-                _ => break,
+                _ => break 'scan,
             }
-        }
-        if expected_sequence != header.sequence.wrapping_add(1).max(1) {
+        };
+        if commit.header.sequence != descriptor.header.sequence {
             break;
         }
-    }
+        validate_commit_checksum(&commit)?;
 
-    let mut revoke_sequences: BTreeMap<u32, u32> = BTreeMap::new();
-    for transaction in &recovered {
-        for block in &transaction.revoked_blocks {
-            revoke_sequences
-                .entry(*block)
-                .and_modify(|sequence| {
-                    if sequence_after(transaction.sequence, *sequence) {
-                        *sequence = transaction.sequence;
-                    }
-                })
-                .or_insert(transaction.sequence);
-        }
-    }
-    for transaction in recovered {
-        let mut applied = false;
-        for (tag, mut payload) in transaction.tags.iter().zip(transaction.payloads) {
-            if revoke_sequences
-                .get(&tag.target_block)
-                .is_some_and(|sequence| sequence_after_or_equal(*sequence, transaction.sequence))
-            {
+        for (tag, mut payload) in descriptor.tags.iter().zip(payloads) {
+            if revoked_blocks.contains(&tag.target_block) {
                 continue;
             }
             if tag.escaped {
                 payload[..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
             }
             image.write_block(tag.target_block as u64, &payload)?;
+            image.invalidate_block(tag.target_block as u64);
             blocks_replayed = blocks_replayed
                 .checked_add(1)
                 .ok_or(Ext4FormatError::OutOfBounds)?;
-            applied = true;
         }
-        if applied {
-            image.barrier()?;
-        }
+        image.barrier()?;
+        transactions = transactions
+            .checked_add(1)
+            .ok_or(Ext4FormatError::OutOfBounds)?;
+        expected_sequence = expected_sequence.wrapping_add(1).max(1);
+        cursor = advance(geometry, commit_cursor);
+        scanned = scanned
+            .checked_add(record_blocks)
+            .ok_or(Ext4FormatError::OutOfBounds)?;
     }
 
     Ok(JournalReplayReport {
@@ -175,22 +175,17 @@ pub fn replay_journal<I: BlockImage>(
     })
 }
 
-struct ReplayTransaction {
-    sequence: u32,
-    tags: Vec<Jbd2Tag>,
-    payloads: Vec<Page4K>,
-    revoked_blocks: Vec<u32>,
-}
-
-/// JBD2 transaction identifiers form a wrapping sequence space. A valid
-/// recovery window is far smaller than half that space, so this establishes a
-/// stable before/after order across one wrap.
-fn sequence_after(candidate: u32, reference: u32) -> bool {
-    candidate != reference && candidate.wrapping_sub(reference) < 0x8000_0000
-}
-
-fn sequence_after_or_equal(candidate: u32, reference: u32) -> bool {
-    candidate == reference || sequence_after(candidate, reference)
+/// The bounded legacy journal profile has no transaction checksum fields. A
+/// journal that declares checksums uses a different record layout and cannot
+/// be accepted until that format and its CRC contract are implemented.
+fn validate_commit_checksum(commit: &Jbd2Commit) -> Result<()> {
+    if commit.checksum_type == 0
+        && commit.checksum_size == 0
+        && commit.checksums.iter().all(|checksum| *checksum == 0)
+    {
+        return Ok(());
+    }
+    Err(Ext4FormatError::Unsupported)
 }
 
 /// Publish the clean journal state after replay has made recovered home blocks
@@ -210,6 +205,7 @@ pub fn clean_replayed_journal<I: BlockImage>(
         .write_state(&mut page, next_sequence.max(1), 0)?;
     let superblock_block = *geometry.blocks.first().ok_or(Ext4FormatError::Corrupt)?;
     image.write_block(superblock_block, &page)?;
+    image.invalidate_block(superblock_block);
     image.barrier()
 }
 

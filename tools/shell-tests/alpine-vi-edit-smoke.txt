@@ -1,0 +1,21 @@
+# alpine-vi-edit-smoke.txt - edit a file with BusyBox vi in the Alpine guest.
+
+wait ":bootstrap-exec:ok" within 60000
+wait "/ # " within 60000
+sleep 500
+
+send "TERM=vt100 vi /tmp/vi-edit.txt\n"
+expect "- /tmp/vi-edit.txt" within 30000
+
+sleep 500
+send "iguest-vi-edit-ok\n\e:wq\n"
+expect "/ # " within 30000
+
+sleep 500
+send "cat /tmp/vi-edit.txt; echo vi-edit-status-$?\n"
+expect "guest-vi-edit-ok" within 10000
+expect "vi-edit-status-0" within 10000
+expect "/ # " within 10000
+
+sleep 500
+quit

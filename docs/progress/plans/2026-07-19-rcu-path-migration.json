@@ -1,0 +1,319 @@
+{
+  "schema": "tx.progress.plan.v1",
+  "id": "2026-07-19-rcu-path-migration",
+  "title": "Bounded intrusive RCU path migration",
+  "status": "complete",
+  "created": "2026-07-19",
+  "updated": "2026-07-20",
+  "owner": "codex",
+  "summary": "Make Zone observation lock-free and fixed-depth, replace fixed-pool EBR with three intrusive per-CPU bags, implement backend-only Published<T>, and migrate VM RecipeIndex without changing owner APIs.",
+  "scope": {
+    "in": [
+      "crates/tx-hal/src/lib.rs",
+      "boards/tx-hal-riscv64-qemu-virt",
+      "boards/tx-hal-loongarch64-qemu-virt",
+      "boards/tx-hal-riscv64-m1dock-mock",
+      "crates/tx-kernel/src/trap.rs",
+      "crates/tx-kernel/src/init.rs",
+      "crates/tx-substrate/src/epoch",
+      "crates/tx-substrate/src/zone",
+      "crates/tx-substrate/src/publication",
+      "crates/tx-substrate/src/bus/owner.rs",
+      "crates/tx-subsystems/src/vm/structure",
+      "xtask/src/lint_invariants_zone.rs",
+      "xtask/src/lint_invariants_api_language.rs",
+      "docs/design/00_meta-framework/OBJECT_API_LANES_v1.md",
+      "docs/design/01_substrate/EBR_ZONE_INTERFACE_v1.md"
+    ],
+    "out": [
+      "RecipeTree-node-Zone-storage",
+      "public-node-capability-or-bag-types",
+      "AddressSpace-facade-changes",
+      "default-RecipeTree-backend-switch",
+      "post-VM-owner-migrations"
+    ],
+    "write_sets": [
+      {
+        "owner": "rcu-path-coordinator",
+        "paths": [
+          "docs/superpowers/plans/2026-07-19-rcu-path-migration.md",
+          "docs/progress/plans/2026-07-19-rcu-path-migration.json"
+        ],
+        "notes": "Owns migration sequencing and progress only; implementation workers receive disjoint phase write sets. STATUS.md remains a shared index and must be merged with concurrent edits."
+      }
+    ]
+  },
+  "context": {
+    "design_docs": [
+      "docs/design/00_meta-framework/OBJECT_API_LANES_v1.md",
+      "docs/design/01_substrate/EBR_ZONE_INTERFACE_v1.md",
+      "docs/design/01_substrate/HAL_v1.md",
+      "docs/design/03_memory-vm/VM_v1_2.md",
+      "docs/Txv3/02_INVARIANTS_v5.md"
+    ],
+    "progress_refs": [
+      "docs/progress/decisions/2026-07-14-object-api-lanes-rcu-publication.md",
+      "docs/progress/research/2026-07-15-rcu-lock-replacement-candidate-audit.md"
+    ],
+    "external_refs": []
+  },
+  "steps": [
+    {
+      "id": "complexity-ratchets",
+      "title": "Freeze path complexity and visibility ratchets",
+      "status": "complete",
+      "depends_on": [],
+      "paths": [
+        "docs/design/00_meta-framework/OBJECT_API_LANES_v1.md",
+        "docs/design/01_substrate/EBR_ZONE_INTERFACE_v1.md",
+        "xtask/src/lint_invariants_zone.rs",
+        "xtask/src/lint_invariants_api_language.rs",
+        "xtask/Cargo.toml"
+      ],
+      "verification": [
+        "cargo xtask lint docs",
+        "cargo test -p xtask lint_invariants_zone --lib",
+        "cargo test -p xtask 'lint_invariants_api_language::tests::rcu_ratchet_' --lib",
+        "cargo xtask lint invariants api-language"
+      ],
+      "notes": "Complete. Ratchets name the required O(1) reader and retire paths while permitting O(CPU) advance and output-sensitive walks. The AST gate reports exactly one direct raw-retire baseline at VM RecipeIndex and no publication or epoch-module leakage. Cross-file parent macro expansion remains outside this source-AST gate and is reserved for a future rustc-expanded/public-API check."
+    },
+    {
+      "id": "lock-free-slot-directory",
+      "title": "Replace Keg reader lookup with a fixed-depth slab directory",
+      "status": "complete",
+      "depends_on": ["complexity-ratchets"],
+      "paths": [
+        "crates/tx-substrate/src/zone/directory.rs",
+        "crates/tx-substrate/src/zone/keg.rs",
+        "crates/tx-substrate/src/zone/slab.rs",
+        "crates/tx-substrate/src/zone/registry.rs",
+        "crates/tx-substrate/tests/zone.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-substrate --test zone",
+        "cargo test -p tx-substrate --test ap_init"
+      ],
+      "notes": "Complete. Two fixed 9-bit directory levels cover the 18-bit slab id implied by SlotKey; root, leaf, and slab pointers are Acquire-read and Release/AcqRel-published. Keg locks and three slab lists remain allocation/reclaim-only. The 65-slab collision regression covers Weak observe, Cap deref, clone, and non-final Drop with zero Keg-lock acquisitions. Scoped Zone/AP tests and tx-substrate check pass; the workspace unit gate remains blocked by unrelated dirty tx-reactor timer/deadline/task API drift."
+    },
+    {
+      "id": "local-retire-exclusion",
+      "title": "Implement real CPU-local retire exclusion",
+      "status": "complete",
+      "depends_on": ["complexity-ratchets"],
+      "paths": [
+        "crates/tx-hal/src/lib.rs",
+        "boards/tx-hal-riscv64-qemu-virt",
+        "boards/tx-hal-loongarch64-qemu-virt",
+        "boards/tx-hal-riscv64-m1dock-mock",
+        "crates/tx-substrate/src/epoch",
+        "crates/tx-substrate/tests/epoch.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-substrate --test epoch local_retire_guard_",
+        "cargo check -p tx-hal"
+      ],
+      "notes": "Complete. HAL exposes one non-transferable LocalExecutionGuard and requires every IrqIf implementation to provide exclude_local_execution explicitly. RV64 uses csrrci/csrsi/csrci and LA64 uses masked csrxchg. Epoch's crate-private LocalRetireGuard combines CPU pinning with maskable-IRQ exclusion, publishes retire_active, samples the epoch with an AcqRel RMW, blocks advance while active, and reopens IRQ admission around reclaim callbacks while retaining the CPU pin. No spinlock fallback was added. Epoch tests include two-CPU remote-active and recursive callback retire/drain witnesses."
+    },
+    {
+      "id": "intrusive-epoch-bags",
+      "title": "Add three intrusive bags per CPU",
+      "status": "complete",
+      "depends_on": ["local-retire-exclusion"],
+      "paths": [
+        "crates/tx-substrate/src/epoch/bag.rs",
+        "crates/tx-substrate/src/epoch/local.rs",
+        "crates/tx-substrate/src/epoch/domain.rs",
+        "crates/tx-substrate/tests/epoch.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-substrate --test epoch intrusive_bag_",
+        "cargo test -p tx-substrate --test epoch drain_examines_only_budgeted_nodes"
+      ],
+      "notes": "Complete. Each CPU owns three tagged bags plus a per-CPU fixed compatibility pool. Generic RcuHead enqueue is O(1), no-allocation, and available through a crate-private same-guard barrier/sample/enqueue boundary for Task 5. Bounded detach examines at most budget plus three bag heads, preserves remainder ownership, and runs callbacks with retire_active and local IRQ exclusion released while retaining the no-yield CPU-affinity witness. Detached heads remain marked queued through callback execution, so recursive duplicate retirement cannot corrupt the batch. Remote advance and summaries read Release/Acquire occupied-epoch and lane-count atomics instead of another CPU's UnsafeCell. Stats separate compatibility and intrusive reclaimed/remaining counts. Epoch 19/19, the compatibility failure-atomicity unit test, Zone 12/12, AP init 2/2, and tx-substrate/HAL checks pass; two review rounds closed the remote aliasing, detached-marker, stale remaining, and guarded-enqueue findings."
+    },
+    {
+      "id": "zone-intrusive-retirement",
+      "title": "Migrate Zone slots and slabs to intrusive bags",
+      "status": "complete",
+      "depends_on": ["lock-free-slot-directory", "intrusive-epoch-bags"],
+      "paths": [
+        "crates/tx-substrate/src/zone/meta.rs",
+        "crates/tx-substrate/src/zone/cap.rs",
+        "crates/tx-substrate/src/zone/slot.rs",
+        "crates/tx-substrate/src/zone/registry.rs",
+        "crates/tx-substrate/src/zone/slab.rs",
+        "crates/tx-substrate/src/zone/keg.rs",
+        "crates/tx-substrate/src/zone/reservation.rs",
+        "crates/tx-substrate/src/zone/mod.rs",
+        "crates/tx-substrate/src/epoch/bag.rs",
+        "crates/tx-substrate/src/epoch/domain.rs",
+        "crates/tx-substrate/src/epoch/local.rs",
+        "crates/tx-substrate/tests/zone.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-substrate --test zone",
+        "cargo test -p tx-substrate --test bus"
+      ],
+      "notes": "Complete. SlotWord is four-state and reuses its 32-bit payload as retain or intrusive next, with explicit has_next and generation_exhausted flags. Final Cap Drop uses one LocalRetireGuard for the Live(1)->Retiring CAS, post-barrier sample, link, and infallible publish. Epoch detaches mixed SlotKey bags and registry callbacks dispatch typed destruction by ZoneId; raw key zero is covered. Reclaim quarantines generation MAX slots. ZoneSlab embeds a first-field RcuHead; Keg unpublishes and unlinks before generic enqueue, and frames release only after grace. Zone production retire_raw callsites are zero. Deterministic tests cover lifecycle, guarded Weak observation, mixed-zone dispatch, key zero, compatibility-pool exhaustion, quarantine, and delayed slab-frame release; SMP clone/upgrade and stale-reader races remain Task 6 witnesses."
+    },
+    {
+      "id": "smp-maintenance-offline",
+      "title": "Close remote maintenance and CPU offline ownership",
+      "status": "complete",
+      "depends_on": ["intrusive-epoch-bags"],
+      "paths": [
+        "crates/tx-hal/src/lib.rs",
+        "boards",
+        "crates/tx-substrate/src/epoch",
+        "crates/tx-substrate/src/zone/runtime.rs",
+        "crates/tx-substrate/src/zone/mod.rs",
+        "crates/tx-kernel/src/adapter.rs",
+        "crates/tx-kernel/src/trap.rs",
+        "crates/tx-kernel/src/init.rs",
+        "crates/tx-kernel/src/init/exec.rs",
+        "crates/tx-substrate/tests/ap_init.rs",
+        "crates/tx-substrate/tests/epoch.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-substrate --test ap_init",
+        "cargo test -p tx-substrate --test epoch",
+        "cargo test -p tx-substrate --test zone",
+        "cargo test -p tx-hal-riscv64-qemu-virt --lib",
+        "cargo test -p tx-hal-loongarch64-qemu-virt --lib",
+        "cargo test -p tx-hal-riscv64-m1dock-mock --lib",
+        "cargo test -p tx-substrate --test epoch cpu_offline_transfers_all_bag_heads",
+        "cargo xtask full-build --target rv64-qemu --no-image"
+      ],
+      "notes": "Complete with scoped verification. BSP/AP admission and offline transitions share the membership lock. Membership plus EBR pin count occupy one CAS-updated atomic word, so Draining rejects new Guard and LocalRetireGuard admission before remote UnsafeCell ownership transfers. Advance scans without the lock, then performs the final membership-version check and epoch CAS under the short membership critical section. Ring reuse sets one owner request and sends one Maintenance IPI; trap handling only acknowledges and reschedules, while BSP/AP reactor loops drain in normal context. Offline waits outside the lock for local_epoch, retire_active, and pin quiescence, then failure-atomically transfers compatibility, Zone SlotKey, and generic RcuHead bags into the coordinator. Tests cover in-progress BSP/AP serialization, version restart, duplicate AP admission, request de-duplication, three generic bags, three real Zone bags, compatibility transfer, and epoch/capacity failure atomicity. Host and board suites pass; RV64 full-build is blocked in the unrelated dirty tx-reactor tree by the same nine missing timer/task APIs. No files were staged or committed."
+    },
+    {
+      "id": "published-backend",
+      "title": "Implement backend-only Published<T>",
+      "status": "complete",
+      "depends_on": ["zone-intrusive-retirement", "smp-maintenance-offline"],
+      "paths": [
+        "crates/tx-substrate/src/publication",
+        "crates/tx-substrate/src/lib.rs",
+        "crates/tx-substrate/src/epoch/domain.rs",
+        "crates/tx-substrate/src/epoch/mod.rs",
+        "crates/tx-substrate/src/zone/slab.rs",
+        "crates/tx-substrate/tests/publication.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-substrate --test publication",
+        "cargo test -p tx-substrate --test epoch",
+        "cargo test -p tx-substrate --test zone",
+        "cargo test -p tx-substrate --doc",
+        "cargo check -p tx-substrate --lib",
+        "cargo xtask lint invariants api-language"
+      ],
+      "notes": "Complete. The crate root exports only Published, PublishReservation, and PublishError; publication nodes, RcuHead, and deferred lists stay private. T is Send + 'static because retired nodes may outlive the owner and transfer CPUs during offline. PublishedNode has a first-field 16-byte RcuHead followed by T and uses checked alloc/dealloc with allocation-failure injection. prepare_replace initializes before taking the private writer claim; reservation Drop rolls back allocation and releases the claim. Commit acquires one LocalRetireGuard, preflights both the current epoch bag and the one possible in-flight next epoch before the AcqRel root swap, samples after swap, and performs an infallible intrusive link with no allocation or drain. Epoch reclaim only repurposes the callback and pushes O(1) into the publication-owned per-CPU unbounded list. Budgeted maintenance drops one node at a time outside local exclusion while retaining the callback pin; allocation and list tails remain unwind-safe. Offline transfers deferred publication ownership with other per-CPU bags. Tests cover allocation failures, rollback, writer serialization, Acquire visibility, grace delay, concurrent reader/writer, exclusive Drop, no post-swap allocation, budget accounting, 1088-node growth, CPU-offline transfer, destructor panic recovery, and compile-fail Send/lifetime bounds. Publication 15/15, epoch 23/23, Zone 18/18, doc tests 2/2, substrate check, formatting, diff-check, and API-language 404 pass. No files were staged or committed."
+    },
+    {
+      "id": "vm-recipe-pilot",
+      "title": "Migrate RecipeIndex behind the existing AddressSpace API",
+      "status": "complete",
+      "depends_on": ["published-backend"],
+      "paths": [
+        "crates/tx-subsystems/src/vm/structure/recipe.rs",
+        "crates/tx-subsystems/src/vm/structure/address_space.rs",
+        "crates/tx-subsystems/src/vm/structure/recipe_tree.rs",
+        "crates/tx-subsystems/src/vm/mod.rs",
+        "crates/tx-subsystems/src/vm/tests.rs",
+        "crates/tx-subsystems/src/process/execution.rs",
+        "crates/tx-kernel/src/init/exec.rs",
+        "crates/tx-kernel/src/init/reactor_submit.rs",
+        "crates/tx-fs/src/devfs/adapter.rs",
+        "crates/tx-fs/src/bdevfs/adapter.rs",
+        "xtask/src/lint_invariants_api_language.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-subsystems --lib vm::structure::recipe",
+        "cargo test -p tx-subsystems --lib vm::structure::recipe_tree",
+        "cargo test -p tx-subsystems --lib vm::"
+      ],
+      "notes": "Complete. RecipeIndex privately owns Published<RecipeTree>; every mutator retains the semantic lock across guarded current-root read, immutable derive, prepare_replace, and infallible commit. Allocation failure folds into the existing NoFreeRange/ENOMEM terminal class and leaves root/stats unchanged, so AddressSpace and ForkError language do not expand. The VM-specific raw-pointer Drop, retire_raw callback, fixed deferred ring, reclaim metrics, and public drain hook are removed; maintenance callsites consume epoch DrainStats publication fields instead. range_is_fully_mapped is one ordered O(height + output) overlap walk. Tests cover allocation rollback, real barrier-controlled Guard-held reader/writer overlap, and first-gap rejection without partial tagging. The three focused Recipe/RecipeTree commands, full VM 176/176 suite, cargo -q xtask unit, static raw-root scans, rustfmt, and diff-check pass. No files were staged or committed."
+    },
+    {
+      "id": "compatibility-retirement",
+      "title": "Delete fixed-pool and raw-retire compatibility",
+      "status": "complete",
+      "depends_on": ["vm-recipe-pilot"],
+      "paths": [
+        "crates/tx-substrate/src/epoch",
+        "crates/tx-substrate/src/bus",
+        "crates/tx-substrate/tests",
+        "xtask/src/lint_invariants_api_language.rs",
+        "crates/tx-kernel/src/init.rs",
+        "xtask/src/qemu.rs",
+        "xtask/src/test.rs",
+        "docs/progress"
+      ],
+      "verification": [
+        "cargo -q xtask unit",
+        "cargo xtask lint docs",
+        "cargo xtask lint invariants",
+        "cargo xtask progress validate",
+        "cargo xtask full-build --target rv64-qemu --no-image",
+        "cargo xtask test smoke --target rv64-qemu --timeout-ms 30000",
+        "git diff --check"
+      ],
+      "notes": "Complete. Removed bus owner.rs, WireOwnerManifest, retire_owner_storage, bus_wire_owner_manifest!, and owner-only tests without adding a generic retire carrier. Removed retired.rs, the fixed descriptor pool, retire_raw, pool/null failure vocabulary, and obsolete compatibility counters; epoch 21/21, zone 17/17, publication 15/15, and bus 24/24 pass. The RCU ratchet is zero across 20 production roots, its 53 tests pass, and api-language reports 403 adapter/wait findings with zero RCU findings. The RV64 SMP witness uses four harts and a 30-second bound: an AP holds a real Guard during a BSP Recipe rewrite, early drain reclaims/drops zero, Maintenance receives a real ACK, and budget-one drains complete the old-root callback and destructor. Full unit, docs lint, progress validate, RV64 full-build, QEMU smoke, rustfmt, and diff-check pass. Aggregate invariants remains red only on unrelated dirty-tree STEP, SUBJ, sys_openat cred, fd_ready Guard-field, notification-boundary, and syscall-no-await ratchets. Staging and commit were not authorized."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo xtask progress validate",
+      "status": "passed",
+      "notes": "Passed after final plan and STATUS catch-up."
+    },
+    {
+      "command": "cargo xtask lint docs",
+      "status": "passed",
+      "notes": "Passed with seven stale-vocabulary warnings for docs that discuss retired terms."
+    },
+    {
+      "command": "cargo -q xtask unit",
+      "status": "passed",
+      "notes": "Passed: tx-shims 637, tx-kernel 114, tx-ext4 31, tx-scripts 166."
+    },
+    {
+      "command": "cargo xtask full-build --target rv64-qemu --no-image",
+      "status": "passed",
+      "notes": "Passed for rv64-qemu; the subsequent four-hart 30-second smoke observed all RCU markers."
+    },
+    {
+      "command": "cargo xtask lint invariants",
+      "status": "failed",
+      "notes": "RCU/API-language passes, but the aggregate command is blocked by unrelated dirty-tree STEP stage-comment, SUBJ ignored-context, sys_openat cred-gate, fd_ready Guard-field, notification-boundary, and syscall-no-await ratchets."
+    },
+    {
+      "command": "cargo xtask lint invariants api-language",
+      "status": "passed",
+      "notes": "403 adapter/wait report-only findings; zero RCU findings."
+    },
+    {
+      "command": "cargo xtask test smoke --target rv64-qemu --timeout-ms 30000",
+      "status": "passed",
+      "notes": "Four-hart witness observed initialized CPUs, guarded overlap, no early reclaim, Maintenance ACK, bounded drain, and final RCU marker."
+    }
+  ],
+  "risks": [
+    "A fake CPU pin or spinlock-based LocalRetireGuard can deadlock on same-CPU IRQ reentry.",
+    "A slab directory entry cleared without EBR-delayed slab storage can create a reader use-after-free.",
+    "Running callbacks while local exclusion is held can deadlock on recursive Cap Drop.",
+    "Mixing old raw retirement with new bags without separate accounting can hide an O(retired) compatibility scan.",
+    "Published<T> migration cannot move Recipe rewrite outside its semantic writer claim without version validation or CAS retry.",
+    "RecipeTree destruction remains proportional to released nodes even after epoch callbacks become O(1); maintenance must report this cost separately.",
+    "The dirty shared checkout contains unrelated edits; each phase needs a narrow write set and scoped commits."
+  ],
+  "blockers": [
+    "The shared dirty checkout still fails aggregate invariants on unrelated STEP stage-comment, SUBJ ignored-context, sys_openat cred-gate, fd_ready Guard-field, notification-boundary, and syscall-no-await ratchets.",
+    "Staging and commit remain deferred until explicitly authorized for this heavily dirty shared checkout."
+  ],
+  "handoff": {
+    "needed": false,
+    "path": null
+  }
+}

@@ -201,14 +201,14 @@ pub(super) fn fs_ops_for_dentry(
 /// silently — chmod doesn't follow symlinks at this layer in the
 /// slice anyway. Mode is masked to the bottom 12 bits (preserving
 /// `S_ISUID`, `S_ISGID`, `S_ISVTX` plus `rwxrwxrwx`).
-pub(super) fn sys_fchmodat<P: PmapIf>(
+pub(super) async fn sys_fchmodat<P: PmapIf>(
     dirfd: i32,
     path_uaddr: u64,
     mode: u32,
     _flags: i32,
     ctx: &SyscallCtx<'_>,
 ) -> SyscallResult {
-    let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
+    let path = match read_user_cstr_wait(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX).await {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
         Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
@@ -314,7 +314,7 @@ fn chmod_mode_after_linux_fsetid_clear(
 /// `decode_uid_arg` / `decode_gid_arg`). Non-privileged callers may
 /// only chown to their own uid/gid; arbitrary changes require
 /// `CAP_FOWNER`.
-pub(super) fn sys_fchownat<P: PmapIf>(
+pub(super) async fn sys_fchownat<P: PmapIf>(
     dirfd: i32,
     path_uaddr: u64,
     uid_arg: u32,
@@ -322,7 +322,7 @@ pub(super) fn sys_fchownat<P: PmapIf>(
     _flags: i32,
     ctx: &SyscallCtx<'_>,
 ) -> SyscallResult {
-    let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
+    let path = match read_user_cstr_wait(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX).await {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
         Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
@@ -408,26 +408,26 @@ pub(super) fn sys_fchown(
 /// `access(2)` shape: the access check uses the caller's **real**
 /// uid/gid (not effective). Implemented in terms of
 /// [`sys_faccessat2_impl`] with `flags = 0`.
-pub(super) fn sys_faccessat<P: PmapIf>(
+pub(super) async fn sys_faccessat<P: PmapIf>(
     dirfd: i32,
     path_uaddr: u64,
     mode: i32,
     ctx: &SyscallCtx<'_>,
 ) -> SyscallResult {
-    sys_faccessat2_impl::<P>(dirfd, path_uaddr, mode, 0, ctx)
+    sys_faccessat2_impl::<P>(dirfd, path_uaddr, mode, 0, ctx).await
 }
 
 /// `faccessat2(dirfd, path, mode, flags)`. Linux RV64 generic ABI.
 /// Adds the `flags` argument over `faccessat`; `AT_EACCESS` switches
 /// the check from real uid/gid to effective uid/gid.
-pub(super) fn sys_faccessat2<P: PmapIf>(
+pub(super) async fn sys_faccessat2<P: PmapIf>(
     dirfd: i32,
     path_uaddr: u64,
     mode: i32,
     flags: i32,
     ctx: &SyscallCtx<'_>,
 ) -> SyscallResult {
-    sys_faccessat2_impl::<P>(dirfd, path_uaddr, mode, flags, ctx)
+    sys_faccessat2_impl::<P>(dirfd, path_uaddr, mode, flags, ctx).await
 }
 
 /// Shared implementation for `faccessat` / `faccessat2`. The split
@@ -447,14 +447,14 @@ pub(super) fn sys_faccessat2<P: PmapIf>(
 ///
 /// `F_OK` (mode == 0) is the existence check: the syscall returns 0
 /// after path resolution succeeds (no permission-bit check).
-pub(super) fn sys_faccessat2_impl<P: PmapIf>(
+pub(super) async fn sys_faccessat2_impl<P: PmapIf>(
     dirfd: i32,
     path_uaddr: u64,
     mode: i32,
     flags: i32,
     ctx: &SyscallCtx<'_>,
 ) -> SyscallResult {
-    let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
+    let path = match read_user_cstr_wait(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX).await {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
         Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
@@ -574,7 +574,7 @@ pub(super) fn decode_access_mode(flags: u32) -> (bool, bool) {
 pub(super) async fn sys_chdir<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let path_uaddr = args[0];
 
-    let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
+    let path = match read_user_cstr_wait(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX).await {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
         Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),

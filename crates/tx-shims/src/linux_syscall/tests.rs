@@ -28,7 +28,7 @@ use crate::adapter::reactor_entry::userspace::SyscallRequest;
 use crate::adapter::step_engine::{self as step_engine, guard, Cap, StepOutcome};
 use crate::linux_syscall::reset_uts_nodename_for_test;
 use tx_substrate::step::InterestMask;
-use tx_substrate::wake::{MailboxEvent, TaskMailbox};
+use tx_substrate::wake::{MailboxEvent, MailboxSchedulerHint, TaskMailbox};
 use tx_subsystems::cross_crate_test_support::{
     reset_init_process, reset_pid_counter, reset_reactor_affinity_seam, reset_tid_counter,
 };
@@ -195,9 +195,14 @@ const SHIMS_TEST_NS_BASE: u64 = 5_000_000_000;
 static EXIT_GROUP_REF_POST_COUNT: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
-fn counting_mailbox_ref_post(mailbox: &TaskMailbox, event: MailboxEvent) -> bool {
+fn counting_mailbox_ref_post(
+    mailbox: &TaskMailbox,
+    event: MailboxEvent,
+    hint: MailboxSchedulerHint,
+) -> bool {
+    assert_eq!(hint, MailboxSchedulerHint::LifecycleWake);
     EXIT_GROUP_REF_POST_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
-    mailbox.post(event)
+    mailbox.post_with_scheduler_hint(event, hint)
 }
 
 impl tx_hal::MonotonicCounterIf for ShimsTestPmap {
@@ -668,7 +673,7 @@ fn dispatch_exit_group_marks_process_zombie() {
 
     let proc_cap = bootstrap();
     let thread = first_thread(&proc_cap);
-    let ctx = make_ctx(proc_cap.clone(), thread);
+    let ctx = make_ctx(proc_cap.clone(), thread.clone());
 
     let req = SyscallRequest::new(NR_EXIT_GROUP, [0, 0, 0, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
@@ -704,7 +709,8 @@ fn dispatch_exit_group_uses_syscall_ctx_mailbox_ref_post_for_parent_exit_source(
         .expect("registered parent exit wait-source subscriber");
 
     let thread = first_thread(&child);
-    let ctx = make_ctx(child.clone(), thread).with_mailbox_ref_post(counting_mailbox_ref_post);
+    let ctx =
+        make_ctx(child.clone(), thread).with_mailbox_ref_post_with_hint(counting_mailbox_ref_post);
     let req = SyscallRequest::new(NR_EXIT_GROUP, [0, 0, 0, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
 
@@ -740,7 +746,7 @@ fn dispatch_exit_for_single_thread_chains_to_exit_group() {
 
     let proc_cap = bootstrap();
     let thread = first_thread(&proc_cap);
-    let ctx = make_ctx(proc_cap.clone(), thread);
+    let ctx = make_ctx(proc_cap.clone(), thread.clone());
 
     let req = SyscallRequest::new(NR_EXIT, [7, 0, 0, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
@@ -751,6 +757,7 @@ fn dispatch_exit_for_single_thread_chains_to_exit_group() {
         "single-threaded exit should zombify the process via step_thread_exit's last-thread cascade"
     );
     assert_eq!(proc_cap.exit_status(), Some(ExitStatus::Exited(7)));
+    assert_eq!(thread.exit_status(), Some(7));
     assert_eq!(proc_cap.live_thread_count(), 0);
 }
 

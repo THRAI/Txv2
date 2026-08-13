@@ -725,11 +725,21 @@ impl PipePayload {
     /// `pub(crate)` because the only legitimate caller is
     /// process fd-table accounting.
     pub(crate) fn decr_reader(&self) {
+        self.decr_reader_with_post(|mailbox, event| mailbox.post(event));
+    }
+
+    /// Reader-end fd close with an owner-aware wake route supplied by the
+    /// caller. Process-exit and syscall close paths use this form so a peer
+    /// sleeping on another hart is placed back on its owning run queue.
+    pub(crate) fn decr_reader_with_post<F>(&self, mut post: F)
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+    {
         let Some(prev) = decrement_nonzero(&self.reader_count) else {
             return;
         };
         if prev == 1 {
-            notification::notify_writable(&self.writer_wait_source);
+            notification::notify_writable_with_post(&self.writer_wait_source, &mut post);
         }
     }
 
@@ -738,11 +748,20 @@ impl PipePayload {
     /// blocked reader observes the closed-writer state on its next iteration
     /// and surfaces `Done(0)` (EOF).
     pub(crate) fn decr_writer(&self) {
+        self.decr_writer_with_post(|mailbox, event| mailbox.post(event));
+    }
+
+    /// Writer-end companion of [`Self::decr_reader_with_post`]. The last
+    /// writer publishes EOF through the caller's owner-aware scheduler route.
+    pub(crate) fn decr_writer_with_post<F>(&self, mut post: F)
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+    {
         let Some(prev) = decrement_nonzero(&self.writer_count) else {
             return;
         };
         if prev == 1 {
-            notification::notify_readable(&self.reader_wait_source);
+            notification::notify_readable_with_post(&self.reader_wait_source, &mut post);
         }
     }
 

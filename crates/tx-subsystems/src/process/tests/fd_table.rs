@@ -381,7 +381,44 @@ fn child_exit_drains_inherited_pipe_writer_fd_and_publishes_eof() {
     parent.set_fd(4, None);
     assert_pipe_read_blocks(&payload);
 
-    finish_process_group_for_test(&child, ExitStatus::Exited(0));
+    // Model the real cross-hart reader: install a mailbox subscription before
+    // the child's last writer disappears. The exit fd-drain must use the
+    // caller-provided owner-aware route rather than PipePayload's direct
+    // no-reactor fallback.
+    let mailbox = Arc::new(TaskMailbox::new());
+    let generation = mailbox.next_generation();
+    let _registration = payload
+        .reader_endpoint()
+        .prepare(
+            Arc::downgrade(&mailbox),
+            generation,
+            tx_substrate::step::InterestMask::new(crate::pipe::PIPE_READABLE),
+        )
+        .install_if(|| true)
+        .expect("pipe reader subscription");
+    let mut owner_aware_posts = 0usize;
+    step_exit_group_with_posts(
+        &child,
+        ExitStatus::Exited(0),
+        direct_process_task_post,
+        |mailbox, event| {
+            owner_aware_posts += 1;
+            mailbox.post_with_scheduler_hint(
+                event,
+                tx_substrate::wake::MailboxSchedulerHint::LifecycleWake,
+            )
+        },
+    );
+
+    assert_eq!(
+        owner_aware_posts, 1,
+        "exit-time EOF uses injected wake route"
+    );
+    assert!(matches!(
+        mailbox.poll(),
+        Some(MailboxEvent::SourceFired { source, .. })
+            if source.raw() == payload.reader_source_id()
+    ));
     assert_pipe_read_eof(&payload);
     parent.set_fd(3, None);
 }

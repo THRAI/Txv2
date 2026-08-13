@@ -1,0 +1,47 @@
+{
+  "schema": "tx.ext4.crash_cut_catalog.v1",
+  "status": "acceptance-ready",
+  "expanded_cut_count": 1000,
+  "campaign": {
+    "workload_script": "tools/ext4/tier1/crash-workload.scn",
+    "replay_script": "tools/ext4/tier1/crash-replay.scn",
+    "kill_policy": "deterministic-phase-marker-v1",
+    "e2fsck_mode": "immutable-copy"
+  },
+  "families": [
+    {"id": "D0", "label": "before ordered-data submission", "group": "data", "phase_marker": "tx.ext4.crash.phase.D0"},
+    {"id": "D1", "label": "ordered data complete, before its flush", "group": "data", "phase_marker": "tx.ext4.crash.phase.D1"},
+    {"id": "D2", "label": "after ordered-data flush", "group": "data", "phase_marker": "tx.ext4.crash.phase.D2"},
+    {"id": "D3", "label": "partial descriptor/metadata/revoke journal body", "group": "journal", "phase_marker": "tx.ext4.crash.phase.D3"},
+    {"id": "D4", "label": "journal body complete, before its flush", "group": "journal", "phase_marker": "tx.ext4.crash.phase.D4"},
+    {"id": "D5", "label": "after journal-body flush, before commit", "group": "journal", "phase_marker": "tx.ext4.crash.phase.D5"},
+    {"id": "D6", "label": "commit submitted with unknown completion", "group": "commit", "phase_marker": "tx.ext4.crash.phase.D6"},
+    {"id": "D7", "label": "commit durable, before checkpoint", "group": "checkpoint", "phase_marker": "tx.ext4.crash.phase.D7"},
+    {"id": "D8", "label": "partial checkpoint", "group": "checkpoint", "phase_marker": "tx.ext4.crash.phase.D8"},
+    {"id": "D9", "label": "checkpoint durable, before tail advancement", "group": "checkpoint", "phase_marker": "tx.ext4.crash.phase.D9"},
+    {"id": "D10", "label": "tail advanced, before cache settlement/publication", "group": "settlement", "phase_marker": "tx.ext4.crash.phase.D10"},
+    {"id": "D11", "label": "detach drained, before clean-state write", "group": "detach", "phase_marker": "tx.ext4.crash.phase.D11"},
+    {"id": "D12", "label": "clean-state write complete, before final flush", "group": "detach", "phase_marker": "tx.ext4.crash.phase.D12"}
+  ],
+  "overlays": [
+    {
+      "name": "revoke-durability",
+      "applies_to": ["destroy", "unlink", "rename-overwrite", "truncate"]
+    },
+    {
+      "name": "first-reuse",
+      "applies_to": ["destroy", "truncate"]
+    }
+  ],
+  "readiness_evidence": {
+    "expanded_cut_count": 1000,
+    "family_count": 13,
+    "phase_marker_count": 13,
+    "phase_markers_sha256": "7b440cbef725d936ec6ebcada178cc2a2397e6311e332f46368af23678e19ade",
+    "workload_script_sha256": "49f034c9d90975d12db84f7b68538afbc3a7b134cfbfbdcedb7c4e57d65a0ff2",
+    "replay_script_sha256": "2d373199349a209bc91681876ecb7ae580bff719a079d5b31f0f5abd55bde69e",
+    "kill_policy": "deterministic-phase-marker-v1",
+    "e2fsck_mode": "immutable-copy"
+  },
+  "notes": "Deterministic crash-cut catalog authority for live runner admission. This ledger is input authority only; final acceptance still requires same-run expansion, QEMU crash/replay execution, immutable e2fsck evidence, artifact hashing, and receipt verification."
+}

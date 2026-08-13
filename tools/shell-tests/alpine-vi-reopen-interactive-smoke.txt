@@ -1,0 +1,26 @@
+# alpine-vi-reopen-interactive-smoke.txt - open, quit, then reopen the same BusyBox vi file.
+
+wait ":bootstrap-exec:ok" within 60000
+wait "/ # " within 60000
+sleep 500
+
+send "stty size\n"
+expect " " within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "TERM=vt100 vi /tmp/vi-reopen.txt\n"
+expect "- /tmp/vi-reopen.txt" within 30000
+sleep 500
+send ":q!\n"
+expect "/ # " within 30000
+
+sleep 500
+send "TERM=vt100 vi /tmp/vi-reopen.txt\n"
+expect "- /tmp/vi-reopen.txt" within 30000
+sleep 500
+send ":q!\n"
+expect "/ # " within 30000
+
+sleep 500
+quit

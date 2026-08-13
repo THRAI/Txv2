@@ -1584,6 +1584,19 @@ impl OpenFile {
     /// Exec's post-PoNR CLOEXEC commit uses the decrement form, so this method
     /// must remain allocation-free and infallible.
     pub(crate) fn adjust_process_fd_reference(&self, increment: bool) {
+        self.adjust_process_fd_reference_with_post(increment, &mut |mailbox, event| {
+            mailbox.post(event)
+        });
+    }
+
+    /// Adjust fd-table-visible endpoint counts while routing any last-close
+    /// wake through the caller. This is required for exit-time pipe EOF: the
+    /// reader may be parked on a different scheduler hart from the exiting
+    /// writer.
+    pub(crate) fn adjust_process_fd_reference_with_post<F>(&self, increment: bool, post: &mut F)
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+    {
         // final-smp tracks descriptor ownership explicitly for network
         // sockets. Cap clones are lifetime pins and cannot be used to decide
         // when close(2) must publish FIN/EOF.
@@ -1605,8 +1618,12 @@ impl OpenFile {
                 match (*side, increment) {
                     (crate::pipe::PipeSide::Reader, true) => payload.incr_reader(),
                     (crate::pipe::PipeSide::Writer, true) => payload.incr_writer(),
-                    (crate::pipe::PipeSide::Reader, false) => payload.decr_reader(),
-                    (crate::pipe::PipeSide::Writer, false) => payload.decr_writer(),
+                    (crate::pipe::PipeSide::Reader, false) => {
+                        payload.decr_reader_with_post(&mut *post)
+                    }
+                    (crate::pipe::PipeSide::Writer, false) => {
+                        payload.decr_writer_with_post(&mut *post)
+                    }
                 }
             }
             OpenFileBacking::SocketPair { rx, tx } => {
@@ -1614,8 +1631,8 @@ impl OpenFile {
                     rx.incr_reader();
                     tx.incr_writer();
                 } else {
-                    rx.decr_reader();
-                    tx.decr_writer();
+                    rx.decr_reader_with_post(&mut *post);
+                    tx.decr_writer_with_post(&mut *post);
                 }
             }
             _ => {}

@@ -1,6 +1,8 @@
 # txKernel v3 migration — remaining work
 
-**Status:** proposed; supersedes the forward-looking sections of
+**Status:** historical baseline. The architecture migration was completed by
+the 2026-05-14 decision; the 2026-07-21 reactor closeout completed the
+remaining non-`step-discipline` invariant ratchets. This plan supersedes the forward-looking sections of
 [`2026-05-09-v3-tdd-migration.md`](2026-05-09-v3-tdd-migration.md).
 **Date:** 2026-05-11.
 **Scope:** Plan the work that remains to retire v4 vocabulary and

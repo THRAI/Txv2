@@ -55,6 +55,7 @@ fn mark_replied_posts_agent_replied_to_bound_mailbox() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         Arc::downgrade(&mailbox),
+        None,
     );
     let id = guard.id();
     assert!(mailbox.is_empty());
@@ -86,6 +87,7 @@ fn mark_canceled_posts_abort_with_canceled_reason() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         Arc::downgrade(&mailbox),
+        None,
     );
     let id = guard.id();
     assert_eq!(
@@ -113,6 +115,7 @@ fn mark_agent_died_posts_abort_with_agent_died_reason() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         Arc::downgrade(&mailbox),
+        None,
     );
     let id = guard.id();
     assert_eq!(
@@ -140,6 +143,7 @@ fn mark_timed_out_posts_abort_with_timed_out_reason() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         Arc::downgrade(&mailbox),
+        None,
     );
     let id = guard.id();
     assert_eq!(
@@ -171,6 +175,7 @@ fn late_no_op_does_not_post_a_second_event() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         Arc::downgrade(&mailbox),
+        None,
     );
     let id = guard.id();
     // First writer wins, posts an event.
@@ -216,6 +221,7 @@ fn dtok_2_reply_then_timeout_only_posts_one_event() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         Arc::downgrade(&mailbox),
+        None,
     );
     let id = guard.id();
 
@@ -248,6 +254,7 @@ fn dtok_2_timeout_then_reply_only_posts_one_event() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         Arc::downgrade(&mailbox),
+        None,
     );
     let id = guard.id();
 
@@ -288,6 +295,7 @@ fn weak_upgrade_failure_drops_event_silently() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         weak,
+        None,
     );
     let id = guard.id();
 
@@ -319,6 +327,7 @@ fn never_bound_mailbox_install_with_weak_new_silently_drops() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         std::sync::Weak::new(),
+        None,
     );
     let id = guard.id();
     let outcome = registry.mark_replied_with_post(
@@ -378,6 +387,7 @@ fn one_mailbox_receives_events_from_many_tokens_in_order() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         Arc::downgrade(&mailbox),
+        None,
     );
     let g2 = registry.install_request(
         DelegateRequest::Placeholder,
@@ -385,6 +395,7 @@ fn one_mailbox_receives_events_from_many_tokens_in_order() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         Arc::downgrade(&mailbox),
+        None,
     );
     let id1 = g1.id();
     let id2 = g2.id();
@@ -433,6 +444,7 @@ fn mark_endpoint_died_routes_abort_to_each_bound_mailbox() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         Arc::downgrade(&mb_a),
+        None,
     );
     let g_b = registry.install_request(
         DelegateRequest::Placeholder,
@@ -440,6 +452,7 @@ fn mark_endpoint_died_routes_abort_to_each_bound_mailbox() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         Arc::downgrade(&mb_b),
+        None,
     );
 
     let n = registry.mark_endpoint_died_with_post(marker, direct_delegate_mailbox_post);
@@ -454,14 +467,14 @@ fn mark_endpoint_died_routes_abort_to_each_bound_mailbox() {
             assert_eq!(token_id, g_a.id());
             assert_eq!(reason, AbortReason::AgentDied);
         }
-        other => panic!("expected Abort, got {other:?}"),
+        other => panic!("expected Abort, got {:?}", other),
     }
     match e_b {
         MailboxEvent::Abort { token_id, reason } => {
             assert_eq!(token_id, g_b.id());
             assert_eq!(reason, AbortReason::AgentDied);
         }
-        other => panic!("expected Abort, got {other:?}"),
+        other => panic!("expected Abort, got {:?}", other),
     }
     let _ = g_a.forget();
     let _ = g_b.forget();
@@ -482,6 +495,7 @@ fn guard_drop_with_cancel_on_drop_posts_abort_canceled() {
             AgentCancelPolicy::BestEffort,
             TokenDropPolicy::CancelOnDrop,
             Arc::downgrade(&mailbox),
+            None,
         );
         guard.id()
         // guard drops here → delegate cancel transition CAS → MailboxEvent::Abort

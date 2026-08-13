@@ -159,21 +159,31 @@ pub(in crate::linux_syscall) fn fs_ops_for_rnode(
 }
 
 /// `statfs(path, buf)`. Linux RV64 ABI `__NR_statfs = 43`.
-pub(in crate::linux_syscall) async fn sys_statfs<P: PmapIf>(
+pub(in crate::linux_syscall) async fn sys_statfs<P: PmapIf + tx_hal::ConsoleIf>(
     args: [u64; 6],
     ctx: &SyscallCtx<'_>,
 ) -> SyscallResult {
-    let path = match read_user_cstr(&ctx.aspace, args[0], EXECVE_PATH_MAX) {
+    let path = match read_user_cstr_wait(&ctx.aspace, args[0], EXECVE_PATH_MAX).await {
         Ok(path) => path,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
-        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
+        Err(ReadCStrError::Fault(errno)) => {
+            if errno == Errno::EIO {
+                tx_hal::console_write_str::<P>("txkernel:statfs-eio:stage=path-copy\n");
+            }
+            return SyscallResult::error_from(errno);
+        }
     };
     if path.is_empty() {
         return SyscallResult::Error(ENOENT_VALUE);
     }
     let dentry = match resolve_path_at::<P>(AT_FDCWD, &path, &ctx.walker_cred(), ctx) {
         Ok(dentry) => dentry,
-        Err(errno) => return SyscallResult::Error(errno),
+        Err(errno) => {
+            if errno == EIO_VALUE {
+                tx_hal::console_write_str::<P>("txkernel:statfs-eio:stage=path-resolve\n");
+            }
+            return SyscallResult::Error(errno);
+        }
     };
     let payload = match mount_payload_for_dentry(&dentry) {
         Some(payload) => payload,
@@ -182,16 +192,24 @@ pub(in crate::linux_syscall) async fn sys_statfs<P: PmapIf>(
     let buf_uaddr = args[1];
     let statfs = match statfs_for_mount(&payload) {
         Ok(statfs) => statfs,
-        Err(result) => return result,
+        Err(result) => {
+            if result == SyscallResult::Error(EIO_VALUE) {
+                tx_hal::console_write_str::<P>("txkernel:statfs-eio:stage=filesystem-stats\n");
+            }
+            return result;
+        }
     };
-    if let Err(e) = bootstrap_write_user::<StatfsLayout>(&ctx.aspace, buf_uaddr, statfs) {
+    if let Err(e) = write_statfs_user_wait(&ctx.aspace, buf_uaddr, &statfs).await {
+        if e == Errno::EIO {
+            tx_hal::console_write_str::<P>("txkernel:statfs-eio:stage=user-copy\n");
+        }
         return SyscallResult::error_from(e);
     }
     SyscallResult::Return(0)
 }
 
 /// `fstatfs(fd, buf)`. Linux RV64 ABI `__NR_fstatfs = 44`.
-pub(in crate::linux_syscall) async fn sys_fstatfs<P: PmapIf>(
+pub(in crate::linux_syscall) async fn sys_fstatfs<P: PmapIf + tx_hal::ConsoleIf>(
     args: [u64; 6],
     ctx: &SyscallCtx<'_>,
 ) -> SyscallResult {
@@ -201,24 +219,49 @@ pub(in crate::linux_syscall) async fn sys_fstatfs<P: PmapIf>(
         Some(open_file) => open_file,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
-    let guard = step_engine::guard();
-    let payload = match open_file
-        .rnode()
-        .containing_mount_weak()
-        .and_then(|weak| weak.upgrade(&guard))
-    {
-        Some(payload) => payload,
-        None => return SyscallResult::Error(ENODEV_VALUE),
+    let payload = {
+        let guard = step_engine::guard();
+        match open_file
+            .rnode()
+            .containing_mount_weak()
+            .and_then(|weak| weak.upgrade(&guard))
+        {
+            Some(payload) => payload,
+            None => return SyscallResult::Error(ENODEV_VALUE),
+        }
     };
-    drop(guard);
     let statfs = match statfs_for_mount(&payload) {
         Ok(statfs) => statfs,
-        Err(result) => return result,
+        Err(result) => {
+            if result == SyscallResult::Error(EIO_VALUE) {
+                tx_hal::console_write_str::<P>("txkernel:fstatfs-eio:stage=filesystem-stats\n");
+            }
+            return result;
+        }
     };
-    if let Err(e) = bootstrap_write_user::<StatfsLayout>(&ctx.aspace, args[1], statfs) {
+    if let Err(e) = write_statfs_user_wait(&ctx.aspace, args[1], &statfs).await {
+        if e == Errno::EIO {
+            tx_hal::console_write_str::<P>("txkernel:fstatfs-eio:stage=user-copy\n");
+        }
         return SyscallResult::error_from(e);
     }
     SyscallResult::Return(0)
+}
+
+async fn write_statfs_user_wait(
+    aspace: &AddressSpace,
+    uaddr: u64,
+    statfs: &StatfsLayout,
+) -> Result<(), Errno> {
+    // SAFETY: `statfs` is a live `#[repr(C)] Copy` value.  The byte slice is
+    // read-only and remains valid until the wait-capable copy future returns.
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            statfs as *const StatfsLayout as *const u8,
+            core::mem::size_of::<StatfsLayout>(),
+        )
+    };
+    bootstrap_copy_to_user_wait(aspace, uaddr, bytes).await
 }
 
 fn statfs_for_mount(
@@ -331,6 +374,7 @@ pub(in crate::linux_syscall) async fn sys_fsync<P: PmapIf>(
         page_backing,
         fs_object_id,
         page_container,
+        raw_block_device: rnode.meta().kind() == tx_subsystems::vfs::InodeKind::BlockDevice,
         state: tx_subsystems::page_backed::FileFsyncState::new(),
     };
     match drive(

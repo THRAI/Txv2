@@ -93,6 +93,7 @@ fn install_request_returns_a_pending_token() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         std::sync::Weak::new(),
+        None,
     );
     assert_eq!(guard.state(), Some(DelegateState::Pending));
     assert_eq!(registry.tracked_count(), 1);
@@ -110,6 +111,7 @@ fn install_request_round_trips_policies() {
         AgentCancelPolicy::Synchronous,
         TokenDropPolicy::CancelOnDrop,
         std::sync::Weak::new(),
+        None,
     );
     assert_eq!(guard.cancel_policy(), AgentCancelPolicy::Synchronous);
     assert_eq!(guard.drop_policy(), TokenDropPolicy::CancelOnDrop);
@@ -125,6 +127,7 @@ fn install_request_issues_monotonic_ids() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         std::sync::Weak::new(),
+        None,
     );
     let g2 = registry.install_request(
         DelegateRequest::Placeholder,
@@ -132,6 +135,7 @@ fn install_request_issues_monotonic_ids() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         std::sync::Weak::new(),
+        None,
     );
     assert_ne!(g1.id(), g2.id());
     assert!(g2.id().raw() > g1.id().raw());
@@ -152,6 +156,7 @@ fn pending_to_replied_path_installs_reply() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         std::sync::Weak::new(),
+        None,
     );
     let id = guard.id();
 
@@ -183,6 +188,7 @@ fn pending_to_timed_out_is_legal() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         std::sync::Weak::new(),
+        None,
     );
     let id = guard.id();
     let outcome = registry.mark_timed_out_with_post(id, direct_delegate_mailbox_post);
@@ -200,6 +206,7 @@ fn pending_to_canceled_is_legal() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         std::sync::Weak::new(),
+        None,
     );
     let id = guard.id();
     let outcome = registry.mark_canceled_with_post(id, direct_delegate_mailbox_post);
@@ -217,6 +224,7 @@ fn pending_to_agent_died_is_legal() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         std::sync::Weak::new(),
+        None,
     );
     let id = guard.id();
     let outcome = registry.mark_agent_died_with_post(id, direct_delegate_mailbox_post);
@@ -241,6 +249,7 @@ fn replied_to_timed_out_is_not_permitted() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         std::sync::Weak::new(),
+        None,
     );
     let id = guard.id();
 
@@ -272,6 +281,7 @@ fn timed_out_blocks_subsequent_reply_as_late() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         std::sync::Weak::new(),
+        None,
     );
     let id = guard.id();
 
@@ -302,6 +312,7 @@ fn canceled_blocks_subsequent_terminal_transitions() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         std::sync::Weak::new(),
+        None,
     );
     let id = guard.id();
     assert_eq!(
@@ -336,6 +347,7 @@ fn agent_died_blocks_subsequent_terminal_transitions() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         std::sync::Weak::new(),
+        None,
     );
     let id = guard.id();
     assert_eq!(
@@ -377,6 +389,7 @@ fn reply_wins_when_reply_fires_first_then_timeout_late() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         std::sync::Weak::new(),
+        None,
     );
     let id = guard.id();
 
@@ -408,6 +421,7 @@ fn timeout_wins_when_timeout_fires_first_then_reply_late() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         std::sync::Weak::new(),
+        None,
     );
     let id = guard.id();
 
@@ -442,6 +456,7 @@ fn drop_with_cancel_on_drop_triggers_mark_canceled() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::CancelOnDrop,
         std::sync::Weak::new(),
+        None,
     );
     let id = guard.id();
     assert_eq!(registry.state(id), Some(DelegateState::Pending));
@@ -462,6 +477,7 @@ fn drop_with_cancel_on_drop_synchronous_still_triggers_cancel_cas() {
         AgentCancelPolicy::Synchronous,
         TokenDropPolicy::CancelOnDrop,
         std::sync::Weak::new(),
+        None,
     );
     let id = guard.id();
     drop(guard);
@@ -477,6 +493,7 @@ fn drop_with_cancel_on_drop_detached_still_triggers_cancel_cas() {
         AgentCancelPolicy::Detached,
         TokenDropPolicy::CancelOnDrop,
         std::sync::Weak::new(),
+        None,
     );
     let id = guard.id();
     drop(guard);
@@ -492,6 +509,7 @@ fn drop_with_abandon_leaves_state_pending() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         std::sync::Weak::new(),
+        None,
     );
     let id = guard.id();
     drop(guard);
@@ -509,6 +527,7 @@ fn drop_with_abandon_synchronous_leaves_state_pending() {
         AgentCancelPolicy::Synchronous,
         TokenDropPolicy::Abandon,
         std::sync::Weak::new(),
+        None,
     );
     let id = guard.id();
     drop(guard);
@@ -524,6 +543,7 @@ fn drop_with_abandon_detached_leaves_state_pending() {
         AgentCancelPolicy::Detached,
         TokenDropPolicy::Abandon,
         std::sync::Weak::new(),
+        None,
     );
     let id = guard.id();
     drop(guard);
@@ -543,6 +563,7 @@ fn drop_after_terminal_is_no_op() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::CancelOnDrop,
         std::sync::Weak::new(),
+        None,
     );
     let id = guard.id();
     assert_eq!(
@@ -567,6 +588,7 @@ fn forget_suppresses_drop_time_cas() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::CancelOnDrop,
         std::sync::Weak::new(),
+        None,
     );
     let id = guard.id();
     // forget() returns the raw id and suppresses the drop-time
@@ -619,6 +641,7 @@ fn mark_endpoint_died_walks_all_tokens_with_matching_marker() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         std::sync::Weak::new(),
+        None,
     );
     let g_a2 = registry.install_request(
         DelegateRequest::Placeholder,
@@ -626,6 +649,7 @@ fn mark_endpoint_died_walks_all_tokens_with_matching_marker() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         std::sync::Weak::new(),
+        None,
     );
     let g_b1 = registry.install_request(
         DelegateRequest::Placeholder,
@@ -633,6 +657,7 @@ fn mark_endpoint_died_walks_all_tokens_with_matching_marker() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         std::sync::Weak::new(),
+        None,
     );
 
     let transitioned =
@@ -659,6 +684,7 @@ fn mark_endpoint_died_skips_already_terminal_tokens() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         std::sync::Weak::new(),
+        None,
     );
     let g2 = registry.install_request(
         DelegateRequest::Placeholder,
@@ -666,6 +692,7 @@ fn mark_endpoint_died_skips_already_terminal_tokens() {
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::Abandon,
         std::sync::Weak::new(),
+        None,
     );
 
     // Pre-terminalize g1 via reply.

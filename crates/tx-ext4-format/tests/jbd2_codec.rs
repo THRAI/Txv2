@@ -133,6 +133,9 @@ fn superblock_state_update_preserves_unknown_bytes_and_recomputes_crc32c() {
     bytes[48..64].copy_from_slice(&[0x5a; 16]);
     bytes[80] = 4;
     bytes[84..252].fill(0xC3);
+    bytes[1024..].fill(0xA5);
+    let initial_checksum = crc32c_append(0xFFFF_FFFF, &bytes[..1024]);
+    bytes[252..256].copy_from_slice(&initial_checksum.to_be_bytes());
 
     let superblock = Jbd2Superblock::parse(&bytes).unwrap();
     superblock.write_state(&mut bytes, 19, 0).unwrap();
@@ -143,5 +146,5 @@ fn superblock_state_update_preserves_unknown_bytes_and_recomputes_crc32c() {
     assert_eq!(&bytes[84..252], &[0xC3; 168]);
     let recorded = u32::from_be_bytes(bytes[252..256].try_into().unwrap());
     bytes[252..256].fill(0);
-    assert_eq!(recorded, crc32c_append(0xFFFF_FFFF, &bytes));
+    assert_eq!(recorded, crc32c_append(0xFFFF_FFFF, &bytes[..1024]));
 }

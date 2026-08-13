@@ -1,0 +1,126 @@
+{
+  "schema": "tx.progress.plan.v1",
+  "id": "2026-07-14-vdso-migration",
+  "title": "Linux-compatible vDSO time ABI migration",
+  "status": "complete",
+  "created": "2026-07-14",
+  "updated": "2026-07-15",
+  "owner": "codex",
+  "summary": "Connect the existing RV64 vDSO image and VVAR publisher to VM special mappings, exec auxv, libc ABI, and guest proof without introducing a second timekeeper.",
+  "scope": {
+    "in": [
+      "crates/tx-time/src/vdso",
+      "crates/tx-vdso",
+      "crates/tx-subsystems/src/{vdso,vm}",
+      "crates/tx-scripts/src/process/exec/script.rs",
+      "crates/tx-kernel/src/vdso",
+      "crates/tx-hal/src/lib.rs",
+      "boards/tx-hal-riscv64-qemu-virt/src/time.rs",
+      "docs/design/03_memory-vm/VDSO_TIME_ABI_v1.md"
+    ],
+    "out": [
+      "crates/tx-subsystems/src/net",
+      "crates/tx-scripts/src/process/exec/dynamic_linker.rs",
+      "boards/tx-hal-loongarch64-qemu-virt",
+      "crates/tx-shims/src/linux_syscall/time.rs"
+    ],
+    "write_sets": [
+      {
+        "owner": "abi-worker",
+        "paths": ["crates/tx-vdso"],
+        "notes": "ELF, linker, assembly, and ABI tests only."
+      },
+      {
+        "owner": "time-worker",
+        "paths": ["crates/tx-time/src/vdso", "crates/tx-time/src/{lib.rs,keeper.rs,hal.rs}", "crates/tx-hal/src/lib.rs", "boards/tx-hal-riscv64-qemu-virt/src/time.rs"],
+        "notes": "VVAR contract and static HAL counter descriptor only."
+      },
+      {
+        "owner": "vm-worker",
+        "paths": ["crates/tx-subsystems/src/{vdso,vm}", "crates/tx-scripts/src/process/exec/script.rs", "crates/tx-kernel/src/vdso"],
+        "notes": "Special mapping, boot/exec and auxv integration after ABI and time contracts settle."
+      }
+    ]
+  },
+  "context": {
+    "design_docs": [
+      "docs/design/03_memory-vm/VDSO_TIME_ABI_v1.md",
+      "docs/design/03_memory-vm/VDSO_TLS_BOOTSTRAP_v1.md",
+      "docs/design/03_memory-vm/VM_v1_2.md",
+      "docs/design/01_substrate/HAL_v1.md"
+    ],
+    "progress_refs": [
+      "docs/progress/plans/2026-07-13-tx-time-module-migration.json"
+    ],
+    "external_refs": [
+      "Linux RISC-V vDSO ABI",
+      "musl RISC-V vDSO resolver",
+      "glibc LINUX_4.15 vDSO symbol contract"
+    ]
+  },
+  "steps": [
+    {
+      "id": "phase-1-abi-contract",
+      "title": "Make the RV64 vDSO ELF and versioned symbol ABI mechanically valid",
+      "status": "complete",
+      "depends_on": [],
+      "paths": ["crates/tx-vdso"],
+      "verification": ["cargo test -p tx-vdso", "RV64 ELF parser contract test"],
+      "notes": "Completed 2026-07-14: real RV64 image passes 5 host ELF contract tests with correct dynamic tags, LINUX_4.15 versions, no relocation tags, and PC-relative VVAR delta."
+    },
+    {
+      "id": "phase-2-time-vvar-contract",
+      "title": "Move VVAR ABI and counter eligibility into tx-time",
+      "status": "complete",
+      "depends_on": ["phase-1-abi-contract"],
+      "paths": ["crates/tx-time/src/vdso", "crates/tx-hal/src/lib.rs", "boards/tx-hal-riscv64-qemu-virt/src/time.rs"],
+      "verification": ["cargo test -p tx-time --lib", "counter and VVAR publication tests"],
+      "notes": "Completed 2026-07-14: tx-time owns the 4 KiB VVAR ABI and calibration/eligibility contract; RV64 QEMU advertises raw rdtime facts; timekeeper no longer reads rdtime directly."
+    },
+    {
+      "id": "phase-3-special-vm-mapping",
+      "title": "Map permanent vDSO/VVAR frames as VM special mappings",
+      "status": "complete",
+      "depends_on": ["phase-1-abi-contract", "phase-2-time-vvar-contract"],
+      "paths": ["crates/tx-subsystems/src/{vdso,vm}"],
+      "verification": ["cargo test -p tx-subsystems --lib vdso", "VM PTE/fork/protection tests"],
+      "notes": "Completed 2026-07-15: the permanent VVAR/vDSO frames map as R/RX special shared recipes, roll back as one transaction, and fork as shared frames. Focused tx-subsystems vDSO tests pass."
+    },
+    {
+      "id": "phase-4-exec-auxv",
+      "title": "Publish mapped vDSO through exec auxv before PoNR",
+      "status": "complete",
+      "depends_on": ["phase-3-special-vm-mapping"],
+      "paths": ["crates/tx-scripts/src/process/exec", "crates/tx-kernel/src/vdso"],
+      "verification": ["cargo test -p tx-scripts --lib exec", "auxv/mapping equivalence tests"],
+      "notes": "Completed 2026-07-15: exec maps before stack construction and emits AT_SYSINFO_EHDR only from a successful VdsoMapping. The user-stack mapping is reduced to RW when the mapped vDSO restorer is available."
+    },
+    {
+      "id": "phase-5-rv64-libc-witness",
+      "title": "Prove musl and glibc resolve and execute the time fast path",
+      "status": "complete",
+      "depends_on": ["phase-4-exec-auxv"],
+      "paths": ["tools/test-init", "tools/shell-tests", "xtask"],
+      "verification": ["cargo xtask test vdso --target rv64-qemu", "guest syscall/trap evidence"],
+      "notes": "Completed 2026-07-15: RV64 QEMU musl and dynamic-glibc witnesses reach auxv/ELF/version parsing; CLOCK_REALTIME and CLOCK_MONOTONIC avoid syscall 113, while an unsupported clock issues exactly one fallback syscall. The glibc witness uses the real /glibc dynamic loader path and observes the completion marker before QEMU teardown."
+    },
+    {
+      "id": "phase-6-signal-restorer-and-smp",
+      "title": "Add rt_sigreturn restorer and stress the VVAR publication contract",
+      "status": "complete",
+      "depends_on": ["phase-5-rv64-libc-witness"],
+      "paths": ["crates/tx-vdso", "crates/tx-subsystems/src/{vm,signal}", "crates/tx-kernel", "tools"],
+      "verification": ["signal return with non-executable stack", "SMP VVAR reader/writer stress"],
+      "notes": "Completed 2026-07-15: the image exports __vdso_rt_sigreturn, VM resolves it only from a live VdsoText mapping, and RV64 signal frames use it so the stack stays non-executable. The RV64 guest witness proves handler RA equals the mapped restorer and ecall 139 executes from restorer + 4. The four-hart guest-SMP witness pins a 1024-update realtime writer to CPU1 and 500000 calls through the resolved direct-vDSO address to CPU0, with disjoint affinity masks, both completions, and zero reader errors. The single-hart fast-path witness retains the syscall-113 trace assertion. The owner-wake boot smoke holds its explicit deadline 60 seconds ahead so AP timer driving cannot consume it before the BSP's deliberate advance. Current boot installs the hook before vDSO frame initialization and the final init publication reaches that frame. Remaining release repetition is tied to the supported libc/toolchain matrix, not missing signal or SMP functionality."
+    }
+  ],
+  "verification": [],
+  "risks": [
+    "Malformed ET_DYN metadata can make libc silently fall back or misparse the image.",
+    "Special mapping must not enter private CoW or publish auxv before PTE success.",
+    "A counter source without stability/user-read guarantees can return incorrect time.",
+    "The dirty worktree can produce unrelated broad-gate failures."
+  ],
+  "blockers": [],
+  "handoff": {"needed": false, "path": null}
+}

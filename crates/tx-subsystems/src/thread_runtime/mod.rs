@@ -14,7 +14,7 @@ mod tests;
 
 pub use execution::{
     prepare_userspace_entry_payload, step_thread_exit, step_thread_exit_with_status, SigprocmaskOp,
-    ThreadExitOp, ThreadExitOutcome, ThreadKillOp, ThreadKillWithPostOp,
+    ThreadExitOp, ThreadExitOutcome, ThreadExitPosts, ThreadKillOp, ThreadKillWithPostOp,
 };
 pub use structure::{
     allocate_tid, clear_current_thread_identity, clear_current_thread_payload,

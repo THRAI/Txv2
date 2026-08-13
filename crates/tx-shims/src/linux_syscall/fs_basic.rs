@@ -692,12 +692,9 @@ pub(super) fn sys_close_range<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
 /// honoured iff the open mode itself was permitted (which already
 /// went through `check_open_perm` inside `step_open`).
 //
-// PR-9 phase 3b: not yet StepOp-driven — pending. `sys_openat`
-// orchestrates resolution via the free fns `step_walk` and
-// `step_open` (no `*Op` wrap exists for either today); creation
-// goes through `FsOps::create_inode`, also free-fn. When walker /
-// open / create gain StepOp wraps, thread `&mut KernelScriptCtx`
-// here and replace the synchronous-poll dance with the wrap form.
+// Resolve/create, truncate and final open are driven as waitable StepOps.
+// This is required by ext4's mount-local metadata admission: contention is
+// an internal scheduling event and must not escape from openat as EBUSY/EIO.
 pub(super) async fn sys_openat<'a, P: PmapIf + tx_hal::ConsoleIf>(
     dirfd: i32,
     path_uaddr: u64,
@@ -847,10 +844,19 @@ pub(super) async fn sys_openat<'a, P: PmapIf + tx_hal::ConsoleIf>(
     // → the `opendir_dentry` of its OpenFile (an O_DIRECTORY open of
     // that directory). Invalid / non-directory fds surface as EBADF /
     // ENOTDIR.
-    let cwd: Cap<DEntry> = if path.starts_with(b"/") || dirfd == AT_FDCWD {
-        match ctx.process.cwd() {
-            Some(d) => d,
-            None => return SyscallResult::Error(ENOENT_VALUE),
+    let (cwd, origin_mount): (
+        Cap<DEntry>,
+        Option<Cap<tx_subsystems::mount::MountIdentity>>,
+    ) = if path.starts_with(b"/") || dirfd == AT_FDCWD {
+        match ctx.process.cwd_binding() {
+            Some(binding) => (binding.dentry, Some(binding.mount)),
+            None => match ctx.process.cwd() {
+                Some(dentry) => {
+                    let mount = mount_identity_for_dentry(ctx, &dentry);
+                    (dentry, mount)
+                }
+                None => return SyscallResult::Error(ENOENT_VALUE),
+            },
         }
     } else if dirfd < 0 {
         return SyscallResult::Error(EBADF_VALUE);
@@ -860,7 +866,10 @@ pub(super) async fn sys_openat<'a, P: PmapIf + tx_hal::ConsoleIf>(
             None => return SyscallResult::Error(EBADF_VALUE),
         };
         match open_file.opendir_dentry() {
-            Some(d) => d,
+            Some(dentry) => {
+                let mount = mount_identity_for_dentry(ctx, &dentry);
+                (dentry, mount)
+            }
             None => return SyscallResult::Error(ENOTDIR_VALUE),
         }
     };
@@ -968,26 +977,48 @@ pub(super) async fn sys_openat<'a, P: PmapIf + tx_hal::ConsoleIf>(
         use step_engine::DriveMode;
         use tx_scripts::drive;
         let mut script_ctx = build_subject_script_ctx(ctx);
-        let op = OpenOp {
-            rooted_at: cwd.clone(),
-            path: path.clone(),
-            flags: open_flags,
-            mode: mode as u16,
-            cred: ctx.walker_cred(),
-        };
         let mailbox_arc = script_ctx.mailbox().cloned();
         let timer_registrar_handle = script_ctx.timer_registrar().cloned();
         let delegate_registry_arc = script_ctx.delegate_registry().cloned();
-        let openfile = match drive(
-            op,
-            &mut script_ctx,
-            DriveMode::Waiting,
-            mailbox_arc.as_ref(),
-            delegate_registry_arc.as_deref(),
-            timer_registrar_handle.as_ref(),
-        )
-        .await
+        let opened = if let (Some(namespace), Some(origin_mount)) =
+            (ctx.process.mount_namespace_cap(), origin_mount.clone())
         {
+            drive(
+                OpenInMountNamespaceOp {
+                    rooted_at: cwd.clone(),
+                    origin_mount,
+                    mount_namespace: namespace,
+                    path: path.clone(),
+                    flags: open_flags,
+                    mode: mode as u16,
+                    cred: walker_cred.clone(),
+                },
+                &mut script_ctx,
+                DriveMode::Waiting,
+                mailbox_arc.as_ref(),
+                delegate_registry_arc.as_deref(),
+                timer_registrar_handle.as_ref(),
+            )
+            .await
+            .map(|opened| opened.open_file)
+        } else {
+            drive(
+                OpenOp {
+                    rooted_at: cwd.clone(),
+                    path: path.clone(),
+                    flags: open_flags,
+                    mode: mode as u16,
+                    cred: walker_cred.clone(),
+                },
+                &mut script_ctx,
+                DriveMode::Waiting,
+                mailbox_arc.as_ref(),
+                delegate_registry_arc.as_deref(),
+                timer_registrar_handle.as_ref(),
+            )
+            .await
+        };
+        let openfile = match opened {
             Ok(file) => file,
             Err(v3errno) => {
                 let errno = Errno::from(v3errno);
@@ -1014,53 +1045,57 @@ pub(super) async fn sys_openat<'a, P: PmapIf + tx_hal::ConsoleIf>(
         return SyscallResult::Return(fd as i64);
     }
 
-    // Step 1: walk the path to a terminal dentry. Three outcomes:
-    //   - success: the file exists. Handle O_EXCL collision; otherwise
-    //     fall through to the open + (optional) truncate phase.
-    //   - ENOENT + O_CREAT: split into (parent_path, basename), walk
-    //     the parent, call `FsOps::create_inode`, then re-walk to
-    //     materialise the dentry over the freshly-created inode.
-    //   - other errno: forward.
-    //
-    // We use the dentry (not the OpenFile) as the truncate-anchor so
-    // `fs_ops_for_dentry`'s parent-hint ascend can find the in-scope
-    // mount payload (freshly-resolved child rnodes don't carry the
-    // mount weak; only mount-root rnodes do, per the walker's
-    // `current_fs_ops` discipline).
-    //
-    // Send-future discipline (`txdoc:VM-3-6-CROSS-ASYNC-WAIT-DISCIPLINE`):
-    // `Guard` is `!Send + !Sync` so we cannot hold one across this
-    // function's `.await`s — the `dispatch` future feeds
-    // `Reactor::submit_task` which requires `Send`. Use the
-    // `poll_walker_synchronously` helper that the file-mode arms also
-    // use; every in-tree walker backend resolves immediately so the
-    // noop-waker poll always returns `Ready`.
-    use step_engine::{Errno as V3Errno, StepOutcome as V3};
-    let walk_first = {
-        let guard = step_engine::guard();
-        let outcome = step_walk(cwd.clone(), &path, &walker_cred, &guard);
-        drop(guard);
-        outcome
+    // Resolve/create is a waitable VFS operation.  ext4's Tier-1 mount owner
+    // may yield while another hart checkpoints a mutation; that scheduling
+    // condition must never escape to userspace as EBUSY or EIO.
+    use step_engine::DriveMode;
+    use tx_scripts::drive;
+    let create_mode = want_create.then(|| (mode as u16) & !ctx.process.umask() & 0o7777);
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    let resolved = if let (Some(namespace), Some(origin_mount)) =
+        (ctx.process.mount_namespace_cap(), origin_mount.clone())
+    {
+        drive(
+            ResolveOpenTargetInMountNamespaceOp::new(
+                cwd.clone(),
+                origin_mount,
+                namespace,
+                path.clone(),
+                walker_cred.clone(),
+                create_mode,
+                want_excl,
+            ),
+            &mut script_ctx,
+            DriveMode::Waiting,
+            mailbox_arc.as_ref(),
+            delegate_registry_arc.as_deref(),
+            timer_registrar_handle.as_ref(),
+        )
+        .await
+        .map(|resolved| resolved.dentry)
+    } else {
+        drive(
+            ResolveOpenTargetOp::new(
+                cwd.clone(),
+                path.clone(),
+                walker_cred.clone(),
+                create_mode,
+                want_excl,
+            ),
+            &mut script_ctx,
+            DriveMode::Waiting,
+            mailbox_arc.as_ref(),
+            delegate_registry_arc.as_deref(),
+            timer_registrar_handle.as_ref(),
+        )
+        .await
     };
-
-    let dentry: Cap<DEntry> = match walk_first {
-        V3::Done(d) => {
-            if want_create && want_excl {
-                return SyscallResult::Error(EEXIST_VALUE);
-            }
-            d
-        }
-        V3::Continue { .. } | V3::Yield { .. } => {
-            return SyscallResult::Error(EIO_VALUE);
-        }
-        V3::Err(V3Errno::ENOENT) if want_create => {
-            let create_mode = (mode as u16) & !ctx.process.umask() & 0o7777;
-            match create_then_walk::<P>(&cwd, &path, create_mode, &walker_cred) {
-                Ok(d) => d,
-                Err(e) => return SyscallResult::Error(e),
-            }
-        }
-        V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
+    let dentry: Cap<DEntry> = match resolved {
+        Ok(dentry) => dentry,
+        Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
     };
     let dentry_meta = dentry.rnode().meta();
     if want_directory && dentry_meta.kind() != InodeKind::Directory {
@@ -1084,31 +1119,47 @@ pub(super) async fn sys_openat<'a, P: PmapIf + tx_hal::ConsoleIf>(
         if dentry_meta.kind() == InodeKind::CharDevice {
             // Linux treats O_TRUNC on character devices as a no-op.
         } else {
-            use StepOutcome as V3Trunc;
             let fs_object_id = dentry.rnode().fs_object_id();
-            let guard = step_engine::guard();
-            let truncate_result: Result<(), Errno> = match dentry.rnode().backing() {
+            let mut script_ctx = build_subject_script_ctx(ctx);
+            let mailbox_arc = script_ctx.mailbox().cloned();
+            let timer_registrar_handle = script_ctx.timer_registrar().cloned();
+            let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+            let truncate_result: Result<(), step_engine::Errno> = match dentry.rnode().backing() {
                 RNodeBacking::PageBacked { pc } => {
-                    match tx_subsystems::page_backed::step_truncate(pc, 0, &guard) {
-                        V3Trunc::Done(()) => Ok(()),
-                        V3Trunc::Continue { .. } | V3Trunc::Yield { .. } => Err(Errno::EIO),
-                        V3Trunc::Err(errno) => Err(Errno::from(errno)),
-                    }
+                    let op = FdTruncateOp::new(pc, 0);
+                    drive(
+                        op,
+                        &mut script_ctx,
+                        DriveMode::Waiting,
+                        mailbox_arc.as_ref(),
+                        delegate_registry_arc.as_deref(),
+                        timer_registrar_handle.as_ref(),
+                    )
+                    .await
                 }
                 _ => {
                     let fs_page_backing = match fs_page_backing_for_dentry(&dentry) {
                         Some(b) => b,
                         None => return SyscallResult::Error(ENOSYS_VALUE),
                     };
-                    match fs_page_backing.truncate(fs_object_id, 0, &guard) {
-                        V3Trunc::Done(()) => Ok(()),
-                        V3Trunc::Continue { .. } | V3Trunc::Yield { .. } => Err(Errno::EIO),
-                        V3Trunc::Err(errno) => Err(Errno::from(errno)),
-                    }
+                    let op = TruncateFsObjectOp {
+                        page_backing: fs_page_backing,
+                        fs_object_id,
+                        new_size: 0,
+                    };
+                    drive(
+                        op,
+                        &mut script_ctx,
+                        DriveMode::Waiting,
+                        mailbox_arc.as_ref(),
+                        delegate_registry_arc.as_deref(),
+                        timer_registrar_handle.as_ref(),
+                    )
+                    .await
                 }
             };
             if let Err(errno) = truncate_result {
-                return SyscallResult::error_from(errno);
+                return SyscallResult::error_from(Errno::from(errno));
             }
         }
     }
@@ -1122,17 +1173,51 @@ pub(super) async fn sys_openat<'a, P: PmapIf + tx_hal::ConsoleIf>(
     // bits, and tmpfs's create_inode honoured those bits at create
     // time, so the perms apply equally to the just-created file.
     //
-    let openfile: Cap<OpenFile> = {
-        let guard = step_engine::guard();
-        let outcome = step_open(cwd, &path, open_flags, mode as u16, &walker_cred, &guard);
-        drop(guard);
-        match outcome {
-            V3::Done(file) => file,
-            V3::Continue { .. } | V3::Yield { .. } => {
-                return SyscallResult::Error(EIO_VALUE);
-            }
-            V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
-        }
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    let opened = if let (Some(namespace), Some(origin_mount)) =
+        (ctx.process.mount_namespace_cap(), origin_mount)
+    {
+        drive(
+            OpenInMountNamespaceOp {
+                rooted_at: cwd,
+                origin_mount,
+                mount_namespace: namespace,
+                path,
+                flags: open_flags,
+                mode: mode as u16,
+                cred: walker_cred,
+            },
+            &mut script_ctx,
+            DriveMode::Waiting,
+            mailbox_arc.as_ref(),
+            delegate_registry_arc.as_deref(),
+            timer_registrar_handle.as_ref(),
+        )
+        .await
+        .map(|opened| opened.open_file)
+    } else {
+        drive(
+            OpenOp {
+                rooted_at: cwd,
+                path,
+                flags: open_flags,
+                mode: mode as u16,
+                cred: walker_cred,
+            },
+            &mut script_ctx,
+            DriveMode::Waiting,
+            mailbox_arc.as_ref(),
+            delegate_registry_arc.as_deref(),
+            timer_registrar_handle.as_ref(),
+        )
+        .await
+    };
+    let openfile: Cap<OpenFile> = match opened {
+        Ok(file) => file,
+        Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
     };
 
     // Step 4: install at the lowest unused fd ≥ 0. Per fd-ops Wave 1
@@ -1162,7 +1247,10 @@ pub(super) async fn sys_openat<'a, P: PmapIf + tx_hal::ConsoleIf>(
 // StepOp wrap, thread `&mut KernelScriptCtx` here.
 /// PR-3 migration: `CloseOp` is a `OneShotStepOp` — dispatched via
 /// `drive_oneshot` (no reactor, no yield).
-pub(super) fn sys_close<'a>(fd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_close<'a>(fd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
+    use step_engine::DriveMode;
+    use tx_scripts::drive;
+
     let mut script_ctx = build_subject_script_ctx(ctx);
     let mut op = CloseOp {
         process: ctx.process.clone(),
@@ -1172,8 +1260,20 @@ pub(super) fn sys_close<'a>(fd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
         Ok(file) => {
             file.flock_release();
             fcntl_release_process_locks_for_file(ctx.process.pid.0, &file);
-            let guard = step_engine::guard();
-            match tx_subsystems::process::finalize_detached_open_files([&file], &guard) {
+            let mut script_ctx = build_subject_script_ctx(ctx);
+            let mailbox_arc = script_ctx.mailbox().cloned();
+            let timer_registrar_handle = script_ctx.timer_registrar().cloned();
+            let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+            match drive(
+                tx_subsystems::process::FinalizeDetachedOpenFileOp::new(file),
+                &mut script_ctx,
+                DriveMode::Waiting,
+                mailbox_arc.as_ref(),
+                delegate_registry_arc.as_deref(),
+                timer_registrar_handle.as_ref(),
+            )
+            .await
+            {
                 Ok(()) => SyscallResult::Return(0),
                 Err(errno) => SyscallResult::error_from(Errno::from(errno)),
             }
@@ -2503,7 +2603,7 @@ pub(super) async fn sys_statx<'a, P: tx_hal::ConsoleIf>(
         return SyscallResult::Error(EINVAL_VALUE);
     }
 
-    let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
+    let path = match read_user_cstr_wait(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX).await {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
         Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
@@ -2639,7 +2739,7 @@ pub(super) async fn sys_newfstatat<'a, P: tx_hal::ConsoleIf>(
         return SyscallResult::Error(EINVAL_VALUE);
     }
 
-    let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
+    let path = match read_user_cstr_wait(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX).await {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
         Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),

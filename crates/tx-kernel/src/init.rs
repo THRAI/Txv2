@@ -62,6 +62,36 @@ const SMP_STALL_DIAG_NS: u64 = 15_000_000_000;
 /// Return from the reactor after each future poll so task-context device IRQ
 /// work runs promptly on the hart that claimed the interrupt.
 const REACTOR_POLLS_PER_DEVICE_IRQ_CHECK: usize = 1;
+/// Maximum EBR callbacks reclaimed at one reactor quiescent boundary.
+const REACTOR_EPOCH_MAINTENANCE_BUDGET: usize = 64;
+
+/// Service one bounded EBR pass between reactor task polls.
+///
+/// A continuously runnable workload does not necessarily enter the idle-only
+/// zone-maintenance path. Resident-root publication and other RCU writers can
+/// therefore fill a hart's local retire storage even though every task poll
+/// releases its epoch guard correctly. The poll boundary is the common
+/// quiescent seam for userspace threads, file-I/O services, and other kernel
+/// tasks, so service a pending remote request there or run one ordinary pass
+/// when no request is armed.
+fn service_reactor_epoch_boundary() {
+    debug_assert!(step_engine::borrow_current_guard().is_none());
+    if !service_pending_reactor_epoch_maintenance() {
+        let _ = step_engine::drain_with_budget(REACTOR_EPOCH_MAINTENANCE_BUDGET);
+    }
+}
+
+/// Consume a remotely requested EBR pass on the current hart.
+///
+/// Besides the ordinary poll boundary, callers use this in the final
+/// interrupt-masked window before WFI. A maintenance IPI can be acknowledged
+/// by the trap path after the reactor's earlier work check; the domain request
+/// is the durable condition that must prevent the hart from going back to
+/// sleep before it has drained its own retire storage.
+fn service_pending_reactor_epoch_maintenance() -> bool {
+    debug_assert!(step_engine::borrow_current_guard().is_none());
+    step_engine::epoch::service_local_drain_request(REACTOR_EPOCH_MAINTENANCE_BUDGET).is_some()
+}
 
 fn platform_rtc_read_time_ns<P>() -> Result<u64, TimeError>
 where
@@ -119,10 +149,7 @@ struct FileIoRuntimeTaskSpawner<P: TxPlatform>(PhantomData<fn() -> P>);
 impl<P: TxPlatform> tx_subsystems::device::FileIoServiceRuntimeSpawner
     for FileIoRuntimeTaskSpawner<P>
 {
-    fn spawn_file_io_service(
-        &self,
-        runtime: tx_subsystems::device::PageContainerFileIoServiceRuntime,
-    ) {
+    fn spawn_file_io_service(&self, runtime: tx_subsystems::device::FileIoManagerRuntimeClaim) {
         let mut submitted_task = None;
         let submitted = CoreInit::<P>::submit_file_io_runtime_task_with(
             runtime,
@@ -356,6 +383,15 @@ static ROOT_MOUNT: SpinMutex<Option<Cap<MountIdentity>>> =
 
 /// True when boot media is mounted directly as `/`.
 static ROOTFS_FROM_BOOT_MEDIA: AtomicBool = AtomicBool::new(false);
+
+/// True when the default QEMU disk was recognised as an OSComp preliminary
+/// image. Preliminary media keeps the compatibility layout: tmpfs at `/`,
+/// with the image mounted read-only at `/musl`.
+static PRELIMINARY_OSCOMP_MEDIA: AtomicBool = AtomicBool::new(false);
+
+pub(super) fn preliminary_oscomp_media_detected() -> bool {
+    PRELIMINARY_OSCOMP_MEDIA.load(Ordering::Acquire)
+}
 
 /// Accumulated real `/proc/mounts` lines. Each boot mount helper appends
 /// its line on success via `note_mount_line`; `publish_proc_mounts` hands
@@ -624,6 +660,8 @@ pub fn reset_boot_state_for_test() {
     *PROC_MOUNT.lock() = None;
     *SYS_MOUNT.lock() = None;
     *MUSL_MOUNT.lock() = None;
+    ROOTFS_FROM_BOOT_MEDIA.store(false, Ordering::Release);
+    PRELIMINARY_OSCOMP_MEDIA.store(false, Ordering::Release);
     *CONSOLE_TTY.lock() = None;
     *ROOT_DENTRY.lock() = None;
 }
@@ -898,12 +936,12 @@ impl<P: TxPlatform> CoreInit<P> {
     }
 
     fn submit_file_io_runtime_task_with<F>(
-        runtime: tx_subsystems::device::PageContainerFileIoServiceRuntime,
+        runtime: tx_subsystems::device::FileIoManagerRuntimeClaim,
         mut submit: F,
     ) -> bool
     where
         F: FnMut(
-            tx_subsystems::device::PageContainerFileIoServiceRuntime,
+            tx_subsystems::device::FileIoManagerRuntimeClaim,
             tx_subsystems::device::PageContainerFileIoServiceTaskConfig,
             tx_reactor::InitialSchedMeta,
         ) -> bool,
@@ -919,13 +957,13 @@ impl<P: TxPlatform> CoreInit<P> {
     fn submit_file_io_runtime_tasks_with<F>(mut submit: F) -> usize
     where
         F: FnMut(
-            tx_subsystems::device::PageContainerFileIoServiceRuntime,
+            tx_subsystems::device::FileIoManagerRuntimeClaim,
             tx_subsystems::device::PageContainerFileIoServiceTaskConfig,
             tx_reactor::InitialSchedMeta,
         ) -> bool,
     {
         let mut submitted = 0;
-        for runtime in tx_subsystems::device::page_container_file_io_service_runtimes_snapshot() {
+        for runtime in tx_subsystems::device::claim_pending_file_io_service_runtimes_for_test() {
             if Self::submit_file_io_runtime_task_with(runtime, &mut submit) {
                 submitted += 1;
             }
@@ -1199,8 +1237,12 @@ impl<P: TxPlatform> CoreInit<P> {
         };
 
         tx_ext4::install_diagnostic_sink(ext4_writeback_diagnostic::<P>);
-        use tx_fs::tx_ext4::{mount_ext4_read_write, BlockDeviceImage};
-        use tx_subsystems::device::block_device_by_name;
+        use tx_fs::tx_ext4::{
+            mount_ext4_read_only, mount_ext4_read_write_with_discovered_journal, BlockDeviceImage,
+            Ext4FileIoRuntimeBinder, JournalPagePool,
+        };
+        use tx_subsystems::device::{block_device_by_name, BlockDeviceHandle};
+        use tx_subsystems::io_manager::block::DeviceKey;
 
         let Some(reg) = block_device_by_name(dev_name.as_bytes()) else {
             Self::write_board_sentinel_prefix();
@@ -1210,19 +1252,70 @@ impl<P: TxPlatform> CoreInit<P> {
             return false;
         };
 
+        let boot_info = <P as tx_hal::BootInfoIf>::boot_info();
+        if dev_name == "vda"
+            && Self::should_autodetect_boot_media_layout(
+                boot_info.cmdline.unwrap_or(""),
+                boot_info.initrd.is_some(),
+            )
+        {
+            let probe = match mount_ext4_read_only(BlockDeviceImage::new(reg.ops)) {
+                Ok(out) => out,
+                Err(_) => {
+                    Self::write_board_sentinel_prefix();
+                    tx_hal::console_write_str::<P>(":mount:rootfs:ext4:vda:probe-err\n");
+                    return false;
+                }
+            };
+            if Self::mounted_media_is_preliminary_suite(
+                probe.fs_ops().as_ref(),
+                probe.root_fs_object_id,
+            ) {
+                PRELIMINARY_OSCOMP_MEDIA.store(true, Ordering::Release);
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":boot-media:layout:preliminary\n");
+                return false;
+            }
+
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":boot-media:layout:final\n");
+        }
+
+        let device = DeviceKey::new(reg.devt.raw());
         let image = BlockDeviceImage::new(reg.ops);
-        let mount_output = match mount_ext4_read_write(image) {
-            Ok(out) => out,
+        let Some(geometry) = image.block_geometry(device) else {
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":mount:rootfs:ext4:");
+            tx_hal::console_write_str::<P>(dev_name);
+            tx_hal::console_write_str::<P>(":geometry-err\n");
+            return false;
+        };
+        let pool = match JournalPagePool::new(32) {
+            Ok(pool) => pool,
             Err(_) => {
                 Self::write_board_sentinel_prefix();
                 tx_hal::console_write_str::<P>(":mount:rootfs:ext4:");
                 tx_hal::console_write_str::<P>(dev_name);
-                tx_hal::console_write_str::<P>(":err\n");
+                tx_hal::console_write_str::<P>(":journal-pool-err\n");
                 return false;
             }
         };
+        let mount_output =
+            match mount_ext4_read_write_with_discovered_journal(image, geometry, device, pool) {
+                Ok(out) => out,
+                Err(_) => {
+                    Self::write_board_sentinel_prefix();
+                    tx_hal::console_write_str::<P>(":mount:rootfs:ext4:");
+                    tx_hal::console_write_str::<P>(dev_name);
+                    tx_hal::console_write_str::<P>(":err\n");
+                    return false;
+                }
+            };
+        mount_output.set_file_page_container_binder(Some(alloc::sync::Arc::new(
+            Ext4FileIoRuntimeBinder::new(BlockDeviceHandle::whole(reg)),
+        )));
 
-        let ext4_payload = MountPayload::new_cap(
+        let ext4_payload = MountPayload::new_cap_with_backend_planner(
             mount_output.fs_ops().clone(),
             mount_output.fs_page_backing().clone(),
             None,
@@ -1230,6 +1323,7 @@ impl<P: TxPlatform> CoreInit<P> {
             MountOptions::default(),
             "ext4",
             SourceLabel::Static(dev_name),
+            mount_output.backend_planner(),
         )
         .expect("mount_sdcard_as_root_if_requested: payload reservation");
 
@@ -1273,6 +1367,40 @@ impl<P: TxPlatform> CoreInit<P> {
         tx_hal::console_write_str::<P>(dev_name);
         tx_hal::console_write_str::<P>(":ok\n");
         true
+    }
+
+    fn should_autodetect_boot_media_layout(cmdline: &str, has_initrd: bool) -> bool {
+        !has_initrd
+            && !cmdline.split_ascii_whitespace().any(|token| {
+                token.starts_with("tx.root=")
+                    || token.starts_with("tx.profile=")
+                    || token.starts_with("tx.runsh=")
+                    || token.starts_with("init=")
+            })
+    }
+
+    fn mounted_media_is_preliminary_suite(
+        fs_ops: &dyn tx_subsystems::vfs::FsOps,
+        root_fs_object_id: tx_subsystems::vfs::FsObjectId,
+    ) -> bool {
+        use step_engine::StepOutcome as V3;
+
+        let guard = step_engine::guard();
+        for suite_dir in [b"musl".as_slice(), b"glibc".as_slice()] {
+            let suite_id = match fs_ops.lookup(root_fs_object_id, suite_dir, &guard) {
+                V3::Done(id) => id,
+                _ => continue,
+            };
+            let has_busybox = matches!(fs_ops.lookup(suite_id, b"busybox", &guard), V3::Done(_));
+            let has_basic_script = matches!(
+                fs_ops.lookup(suite_id, b"basic_testcode.sh", &guard),
+                V3::Done(_)
+            );
+            if has_busybox && has_basic_script {
+                return true;
+            }
+        }
+        false
     }
 
     /// Resolve the root block device to mount from the boot cmdline, the way
@@ -1980,32 +2108,15 @@ impl<P: TxPlatform> CoreInit<P> {
             return;
         }
 
-        tx_ext4::install_diagnostic_sink(ext4_writeback_diagnostic::<P>);
-        use tx_fs::tx_ext4::{mount_ext4_read_write, BlockDeviceImage};
-        use tx_subsystems::device::block_device_by_name;
+        use tx_fs::tx_ext4::{mount_ext4_read_only, BlockDeviceImage, Ext4FileIoRuntimeBinder};
+        use tx_subsystems::device::{block_device_by_name, BlockDeviceHandle};
 
         let Some(reg) = block_device_by_name(b"vda") else {
             return;
         };
 
         let image = BlockDeviceImage::new(reg.ops);
-        // Plain read-write mount, NOT the journal-discovering variant.
-        //
-        // `mount_ext4_read_write_with_discovered_journal` attaches a backend
-        // planner, which routes page fetches through the async io_manager
-        // (`try_materialize_file_page_from_backend_plan`). That path only
-        // completes once block-completion interrupts are being serviced,
-        // which is not true during bootstrap exec: the fetch for the first
-        // userspace image parks forever, `exec_script` never resolves, and
-        // boot falls through to `/init` -> ENOENT -> panic.
-        //
-        // Without the planner the fetch falls back to ext4's synchronous
-        // `fetch_page` (`tx-ext4/src/pager.rs`). That is what the pre-merge
-        // tree did and what `tools/verify-git-net.sh` passes 8/8 on.
-        // Journalled writeback for this mount is given up in exchange; the
-        // sdcard image is a test fixture, and the pre-merge tree ran the
-        // same way.
-        let mount_output = match mount_ext4_read_write(image) {
+        let mount_output = match mount_ext4_read_only(image) {
             Ok(out) => out,
             Err(_) => {
                 Self::write_board_sentinel_prefix();
@@ -2013,10 +2124,9 @@ impl<P: TxPlatform> CoreInit<P> {
                 return;
             }
         };
-        // No file-I/O service binder either, for the same reason as the
-        // missing backend planner below: the per-container service task it
-        // registers only makes progress once block completions are being
-        // delivered, which is not the case during bootstrap exec.
+        mount_output.set_file_page_container_binder(Some(alloc::sync::Arc::new(
+            Ext4FileIoRuntimeBinder::new(BlockDeviceHandle::whole(reg)),
+        )));
 
         let root_mount = ROOT_MOUNT
             .lock()
@@ -2050,23 +2160,9 @@ impl<P: TxPlatform> CoreInit<P> {
         let musl_dentry_on_root =
             publish_boot_mountpoint_dentry(root_mount.root_dentry(), b"musl", musl_rnode_in_root);
 
-        // Build the ext4 mount payload.
-        //
-        // NO backend planner on this mount, deliberately. A planner routes
-        // page fetches through the async io_manager
-        // (`try_materialize_file_page_from_backend_plan`), whose completion
-        // depends on a block-completion interrupt. The bootstrap exec that
-        // loads the first userspace image runs before any of that can be
-        // serviced: the fetch parks forever and `exec_script` never resolves,
-        // so `/musl/...` binaries are unloadable and boot falls through to
-        // `/init` -> ENOENT -> panic. Without a planner the fetch falls back
-        // to ext4's synchronous `fetch_page` (`tx-ext4/src/pager.rs`), which
-        // is what the pre-merge tree did and what `tools/verify-git-net.sh`
-        // passes 8/8 on.
-        //
-        // Scoped to this mount only: mounts created later, once the reactor
-        // and block IRQs are live, may attach a planner normally.
-        let ext4_payload = MountPayload::new_cap(
+        // Plain read-only mounts have no async backend planner, so preliminary
+        // bootstrap reads retain the established synchronous path.
+        let ext4_payload = MountPayload::new_cap_with_backend_planner(
             mount_output.fs_ops().clone(),
             mount_output.fs_page_backing().clone(),
             None,
@@ -2074,6 +2170,7 @@ impl<P: TxPlatform> CoreInit<P> {
             MountOptions::default(),
             "ext4",
             SourceLabel::Static("vda"),
+            mount_output.backend_planner(),
         )
         .expect("mount_sdcard_at_musl: ext4 payload reservation");
 
@@ -2583,15 +2680,33 @@ impl<P: TxPlatform> CoreInit<P> {
 
         P::clear_ipi_ack_cpus(IpiKind::Reschedule, targets);
         let mut signal = SmpRescheduleSignal::<P>::new();
-        let (timer_fired, timer_report) = BOOT_REACTOR
-            .with(|reactor| {
-                reactor.advance_time_to_from_hart_with_reschedule(
-                    deadline_ns,
-                    current_hart,
-                    &mut signal,
-                )
-            })
-            .expect("boot reactor must be initialized for owner-wake timer post");
+        // Every hart advances the shared deadline domain from its reactor
+        // loop. `advance_time_to_from_hart_with_reschedule` deliberately
+        // returns an empty result when another hart briefly owns the timer
+        // driver, so a one-shot probe here can mistake driver contention for
+        // a lost timer. The smoke owns a live TimerGuard and placed its
+        // deadline sixty seconds in the future, therefore retry until this
+        // hart obtains the driver; the strict fire-count/IPI assertions below
+        // still verify the timer and cross-hart wake exactly once.
+        let mut timer_result = None;
+        for _ in 0..AP_REACTOR_WAIT_SPINS {
+            let attempt = BOOT_REACTOR
+                .with(|reactor| {
+                    reactor.advance_time_to_from_hart_with_reschedule(
+                        deadline_ns,
+                        current_hart,
+                        &mut signal,
+                    )
+                })
+                .expect("boot reactor must be initialized for owner-wake timer post");
+            if attempt.0 != 0 {
+                timer_result = Some(attempt);
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        let (timer_fired, timer_report) =
+            timer_result.expect("owner-wake timer driver contention did not clear");
         assert_eq!(timer_fired, 1, "owner-wake timer fire count");
         assert_eq!(timer_report.remote_ipis, 1, "owner-wake timer remote IPI");
         Self::wait_for_owner_wake_stage(OWNER_WAKE_STAGE_TIMER);
@@ -2858,6 +2973,15 @@ impl<P: TxPlatform> CoreInit<P> {
                 P::cancel_interrupt_wait(wait_state);
                 continue;
             }
+            // Close the maintenance-IPI/WFI race after interrupt delivery is
+            // masked. If the trap path already acknowledged the IPI, the EBR
+            // request remains set and is consumed here. If the request races
+            // after this check, its IPI remains pending and wakes WFI.
+            if service_pending_reactor_epoch_maintenance() {
+                Self::note_reactor_hart_active(cpu_id);
+                P::cancel_interrupt_wait(wait_state);
+                continue;
+            }
             P::wait_for_interrupt_prepared(wait_state);
             P::service_pending_tlb_shootdown();
             Self::note_reactor_hart_active(cpu_id);
@@ -2940,6 +3064,7 @@ impl<P: TxPlatform> CoreInit<P> {
                 boot_runtime::HartPollBudget::up_to(REACTOR_POLLS_PER_DEVICE_IRQ_CHECK),
             )
         })?;
+        service_reactor_epoch_boundary();
         if step.ran_work() {
             Self::note_reactor_progress(cpu_id, now_ns);
         }
@@ -2983,6 +3108,7 @@ impl<P: TxPlatform> CoreInit<P> {
             &mut slice_clock,
             boot_runtime::HartPollBudget::up_to(REACTOR_POLLS_PER_DEVICE_IRQ_CHECK),
         )?;
+        service_reactor_epoch_boundary();
         if step.ran_work() {
             Self::note_reactor_progress(cpu_id, now_ns);
         }
@@ -3105,31 +3231,13 @@ impl<P: TxPlatform> CoreInit<P> {
 
             for runtime in tx_subsystems::device::page_container_file_io_service_runtimes_snapshot()
             {
-                let (source, subscribers, pending, io) = runtime.diagnostic();
                 tx_hal::console_write_str::<P>("txkernel:smp-stall:file-io:source=");
-                Self::write_u64(source);
-                tx_hal::console_write_str::<P>(":subscribers=");
-                Self::write_u64(subscribers as u64);
-                tx_hal::console_write_str::<P>(":pending_mask=");
-                Self::write_u64(pending);
-                tx_hal::console_write_str::<P>(":submissions=");
-                Self::write_u64(io.page.submissions as u64);
-                tx_hal::console_write_str::<P>(":completions=");
-                Self::write_u64(io.page.completions as u64);
-                tx_hal::console_write_str::<P>(":resumes=");
-                Self::write_u64(io.page.backend_resumes as u64);
-                tx_hal::console_write_str::<P>(":metadata=");
-                Self::write_u64(io.page.metadata_waits as u64);
-                tx_hal::console_write_str::<P>(":graphs=");
-                Self::write_u64(io.page.graphs as u64);
-                tx_hal::console_write_str::<P>(":waiters=");
-                Self::write_u64(io.page.waiters as u64);
-                tx_hal::console_write_str::<P>(":fsyncs=");
-                Self::write_u64(io.fsync_submissions as u64);
-                tx_hal::console_write_str::<P>(":block_queue=");
-                Self::write_u64(io.block_queue as u64);
-                tx_hal::console_write_str::<P>(":background=");
-                Self::write_u64(io.background_graphs as u64);
+                Self::write_u64(runtime.source_id());
+                tx_hal::console_write_str::<P>(":device=");
+                Self::write_u64(runtime.handle().registration().devt.raw());
+                let guard = step_engine::guard();
+                tx_hal::console_write_str::<P>(":live=");
+                Self::write_u64(runtime.is_live(&guard) as u64);
                 tx_hal::console_write_str::<P>("\n");
             }
 

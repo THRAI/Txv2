@@ -1,0 +1,11 @@
+# Prove Cargo can inspect the TEST-resident workspace without compiling or
+# creating a target directory.
+
+wait "/ # " within 90000
+sleep 500
+
+send "/bin/busybox mkdir -p /mnt/ext4-test /mnt/ext4-workload; /bin/busybox mount -t ext4 -o rw /dev/block/vda /mnt/ext4-test; /bin/busybox mount -t ext4 -o ro /dev/block/vdc /mnt/ext4-workload; TX_EXT4_MUSL_LOADER=/lib/ld-musl-riscv64.so.1 TX_EXT4_TOOLCHAIN_ROOT=/mnt/ext4-workload/toolchain PATH=/mnt/ext4-workload/toolchain/bin:/bin LD_PRELOAD=/lib/libgcompat.so.0:/mnt/ext4-workload/toolchain/lib/libtx-rustc-resolv-preload.so CARGO_HOME=/mnt/ext4-test/cargo-home /lib/ld-musl-riscv64.so.1 /mnt/ext4-workload/toolchain/bin/cargo metadata --no-deps --offline --format-version 1 --manifest-path /mnt/ext4-test/source/Cargo.toml >/dev/null; echo ext4-cargo-metadata-status:$?\n"
+expect "ext4-cargo-metadata-status:" within 60000
+expect "/ # " within 10000
+
+quit

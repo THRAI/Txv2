@@ -1,0 +1,21 @@
+# Tx remount/readback for the write_fsync/after-commit fault matrix entry.
+# The matrix runner attaches its sole replay image as /dev/block/vda.
+
+wait ":mount:bdevfs:ok" within 90000
+wait "/ # " within 90000
+sleep 500
+
+send "/bin/busybox mkdir -p /tmp/tx-fault-remount; /bin/busybox mount -t ext4 /dev/block/vda /tmp/tx-fault-remount; echo tx-remount-mount-status:$?\n"
+expect "tx-remount-mount-status:0" within 30000
+expect "/ # " within 30000
+
+sleep 500
+send "/bin/busybox ls /tmp/tx-fault-remount >/dev/null; echo tx-remount-readback-status:$?\n"
+expect "tx-remount-readback-status:0" within 30000
+expect "/ # " within 30000
+
+sleep 500
+send "/bin/busybox umount -l /tmp/tx-fault-remount; echo tx-remount-umount-status:$?\n"
+expect "tx-remount-umount-status:0" within 30000
+expect "/ # " within 30000
+quit

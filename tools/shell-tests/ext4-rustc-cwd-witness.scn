@@ -1,0 +1,10 @@
+# Isolate rustc -vV from the TEST source-tree working directory.
+
+wait "/ # " within 90000
+sleep 500
+
+send "/bin/busybox mkdir -p /mnt/ext4-test /mnt/ext4-workload; /bin/busybox mount -t ext4 -o rw /dev/block/vda /mnt/ext4-test; /bin/busybox mount -t ext4 -o ro /dev/block/vdc /mnt/ext4-workload; cd /mnt/ext4-test/source; PATH=/mnt/ext4-workload/toolchain/bin:/bin LD_PRELOAD=/lib/libgcompat.so.0:/mnt/ext4-workload/toolchain/lib/libtx-rustc-resolv-preload.so /lib/ld-musl-riscv64.so.1 /mnt/ext4-workload/toolchain/bin/rustc -vV; echo ext4-rustc-cwd-status:$?\n"
+expect "ext4-rustc-cwd-status:" within 30000
+expect "/ # " within 10000
+
+quit

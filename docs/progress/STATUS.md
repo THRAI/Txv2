@@ -18272,6 +18272,48 @@
 
 ## Latest Research
 
+- 2026-07-14 (reactor refactor implementation plan ready).
+  `docs/superpowers/plans/2026-07-14-reactor-refactor.md` decomposes the
+  approved design into 13 TDD-oriented tasks: restore the broad test baseline,
+  pin poll/wake/cancel races, introduce authoritative task control and leases,
+  coalesce wake ingress, generation-check runqueues, split policy from hart
+  mechanism, unify the driver, reorganize modules, correct per-thread
+  userspace rendezvous, retire compatibility paths, and run host/target/QEMU
+  gates. Current evidence: lifecycle 8/8 and userspace 16/16 pass;
+  `reactor_smoke --no-run` is blocked by three obsolete sixth arguments to
+  `DelegateRegistry::install_request`. Next step is choosing subagent-driven or
+  inline execution and starting Task 1. Existing dirty Reactor/kernel/runtime
+  edits must be preserved with path-scoped commits.
+
+- 2026-07-14 (reactor refactor design approved).
+  The design in
+  `docs/superpowers/specs/2026-07-14-reactor-refactor-design.md` defines a
+  correctness-first convergence: one authoritative `TaskControl`,
+  generation/epoch-bearing run tokens, transition-sensitive wake ingress,
+  scheduler policy separated from hart-owned runqueues, one poll/commit
+  implementation, per-thread userspace rendezvous ownership, and staged
+  compatibility retirement. The initial implementation retains
+  `Vec<TaskSlot>` and a shared wake ingress; segmented storage and per-hart wake
+  sharding require measurements. Verification for this documentation slice is
+  docs lint, progress validation, and diff checking. Next step is user review,
+  then a phase-by-phase implementation plan. Blocker: the dirty checkout has
+  existing Reactor test/API drift that Phase 0 must repair before using focused
+  tests as correctness gates.
+
+- 2026-07-14 (tx-time module migration complete).
+  Retired the substrate TimerWheel and reactor legacy dual-fire path. `tx-time`
+  now provides the sole TimerEngine/deadline facade; ReactorTimerDomain owns
+  routing and hardware arm policy, while semantic consumers retain their state.
+  Verification passed: tx-time 27, reactor timer surfaces 3+2, tx-shims 592,
+  devfs 22, both time invariants at zero findings, RV64 full-build, and QEMU
+  smoke boot plus SMP owner-wake sentinels. Deferred network, board RTC,
+  CPU/TAI, and full VDSO work remain out of scope. See
+  `docs/progress/plans/2026-07-13-tx-time-module-migration.json`.
+
+- `docs/progress/research/2026-07-02-smp4-nonltp-complete-deductions.md`
+- `docs/progress/research/2026-06-27-alpine-gcc-readiness.md`
+- `docs/progress/research/2026-06-27-alpine-tty-readiness.md`
+- `docs/progress/research/2026-06-26-vfs-tutorial-plan.md`
 - `docs/progress/research/2026-05-07-interface-drift-audit.md`
 - `docs/progress/research/2026-05-04-vm-pagebacked-midway-checkpoint.md`
 - `docs/progress/research/2026-05-04-vm-pagebacked-gap-update.md`

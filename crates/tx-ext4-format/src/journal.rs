@@ -59,12 +59,12 @@ impl Jbd2TransactionImage {
     }
 
     /// Encode a legacy transaction with zero or more revoke pages between its
-    /// metadata payloads and commit record.
+    /// metadata copies and commit record.
     pub fn encode_legacy_with_revokes(
         sequence: u32,
         journal_uuid: [u8; 16],
         updates: Vec<Jbd2MetadataUpdate>,
-        revoked_blocks: Vec<u32>,
+        mut revoked_blocks: Vec<u32>,
     ) -> Result<Self> {
         if updates.is_empty() {
             return Err(Ext4FormatError::Corrupt);
@@ -97,6 +97,19 @@ impl Jbd2TransactionImage {
         }
         .encode_legacy(&mut descriptor)?;
 
+        revoked_blocks.sort_unstable();
+        revoked_blocks.dedup();
+        let mut revokes = Vec::new();
+        for blocks in revoked_blocks.chunks(Jbd2Revoke::MAX_BLOCKS_PER_PAGE) {
+            let mut page = [0; JBD2_BLOCK_SIZE];
+            Jbd2Revoke {
+                header: Jbd2Header::revoke(sequence),
+                blocks: blocks.to_vec(),
+            }
+            .encode(&mut page)?;
+            revokes.push(page);
+        }
+
         let mut commit = [0; JBD2_BLOCK_SIZE];
         Jbd2Commit {
             header: Jbd2Header::commit(sequence),
@@ -107,17 +120,6 @@ impl Jbd2TransactionImage {
             nanoseconds: 0,
         }
         .encode(&mut commit)?;
-
-        let mut revokes = Vec::new();
-        for blocks in revoked_blocks.chunks(Jbd2Revoke::MAX_BLOCKS_PER_PAGE) {
-            let mut revoke = [0; JBD2_BLOCK_SIZE];
-            Jbd2Revoke {
-                header: Jbd2Header::revoke(sequence),
-                blocks: blocks.to_vec(),
-            }
-            .encode(&mut revoke)?;
-            revokes.push(revoke);
-        }
 
         Ok(Self {
             descriptor,
@@ -199,6 +201,10 @@ impl Jbd2Superblock {
     const INCOMPAT_CSUM_V3: u32 = 0x0000_0010;
     const CHECKSUM_TYPE_OFFSET: usize = 0x50;
     const CHECKSUM_OFFSET: usize = 0xFC;
+    /// `journal_superblock_s` has a fixed 1024-byte checksum domain even
+    /// when the journal block size is 4096 bytes. The remaining bytes are
+    /// block padding and are not covered by `s_checksum`.
+    const CHECKSUM_COVERED_LEN: usize = 1024;
     const CRC32C_CHECKSUM_TYPE: u8 = 4;
 
     pub fn parse(bytes: &[u8]) -> Result<Self> {
@@ -222,6 +228,7 @@ impl Jbd2Superblock {
         if start != 0 && (start < first || start >= max_len) {
             return Err(Ext4FormatError::Corrupt);
         }
+        Self::validate_checksum(bytes)?;
         Ok(Self {
             block_type: header.block_type,
             block_size,
@@ -231,6 +238,30 @@ impl Jbd2Superblock {
             start,
             uuid: bytes[48..64].try_into().unwrap(),
         })
+    }
+
+    fn validate_checksum(bytes: &[u8]) -> Result<()> {
+        let incompat = read_u32(bytes, 40)?;
+        if incompat & (Self::INCOMPAT_CSUM_V2 | Self::INCOMPAT_CSUM_V3) == 0 {
+            return Ok(());
+        }
+        require_len(bytes, Self::CHECKSUM_COVERED_LEN)?;
+        if bytes[Self::CHECKSUM_TYPE_OFFSET] != Self::CRC32C_CHECKSUM_TYPE {
+            return Err(Ext4FormatError::Unsupported);
+        }
+        let expected = read_u32(bytes, Self::CHECKSUM_OFFSET)?;
+        let zero = [0u8; 4];
+        let checksum = crc32c_append(
+            crc32c_append(
+                crc32c_append(0xFFFF_FFFF, &bytes[..Self::CHECKSUM_OFFSET]),
+                &zero,
+            ),
+            &bytes[Self::CHECKSUM_OFFSET + 4..Self::CHECKSUM_COVERED_LEN],
+        );
+        if checksum != expected {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        Ok(())
     }
 
     /// Update only the dynamic recovery state of a journal superblock page.
@@ -267,7 +298,7 @@ impl Jbd2Superblock {
                 return Err(Ext4FormatError::Unsupported);
             }
             page[Self::CHECKSUM_OFFSET..Self::CHECKSUM_OFFSET + 4].fill(0);
-            let checksum = crc32c_append(0xFFFF_FFFF, page);
+            let checksum = crc32c_append(0xFFFF_FFFF, &page[..Self::CHECKSUM_COVERED_LEN]);
             write_u32(page, Self::CHECKSUM_OFFSET, checksum)?;
         }
         Ok(())
@@ -501,6 +532,9 @@ impl Jbd2Revoke {
     pub fn encode(&self, bytes: &mut [u8]) -> Result<()> {
         if self.header.block_type != JBD2_BLOCK_REVOKE {
             return Err(Ext4FormatError::Corrupt);
+        }
+        if self.blocks.len() > Self::MAX_BLOCKS_PER_PAGE {
+            return Err(Ext4FormatError::OutOfBounds);
         }
         let count = Self::HEADER_LEN
             .checked_add(

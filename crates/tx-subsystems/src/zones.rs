@@ -161,10 +161,6 @@ pub fn dump_summary<P: TxPlatform>() {
     write_usize::<P>(summary.zone_count);
     console_write_str::<P>(":captured=");
     write_usize::<P>(summary.captured_zones);
-    console_write_str::<P>(":retired=");
-    write_usize::<P>(summary.epoch.retired_count);
-    console_write_str::<P>(":collect_requested=");
-    write_usize::<P>(summary.epoch.collection_requested as usize);
     console_write_str::<P>("\n");
     if let Ok(diag) = page_allocator::backend_diagnostics() {
         console_write_str::<P>("txkernel:pagealloc:free=");

@@ -132,9 +132,6 @@ pub enum VmPmapError {
     AlreadyMappedDrift,
     /// A different mapping reached this page outside the required
     /// AddressSpace page-level Materializer transaction.
-    ///
-    /// The existing mapping is preserved for diagnostics. Canonical fault,
-    /// prefault, and eager user-access paths should make this unreachable.
     ConcurrentPublication,
     MappingMismatch,
 }
@@ -270,11 +267,6 @@ impl VmPmap {
         if let Some(existing) = state.mappings.get(&page) {
             if existing.ppn == ppn && existing.prot == prot {
                 if !replace_existing {
-                    // Idempotent republish from non-fault callers: nothing to
-                    // do. Fault callers deliberately continue below: the
-                    // hardware fault proves that the real PTE (or cached
-                    // translation) disagrees with this software bookkeeping,
-                    // so a full unmap/recommit/fence is required.
                     return Ok(PmapPublishOutcome {
                         page,
                         replaced: false,
@@ -282,12 +274,6 @@ impl VmPmap {
                 }
             }
             if !replace_existing {
-                // Canonical publishers hold an exclusive page-level
-                // Materializer across validation and this pmap critical
-                // section. A different resident mapping therefore identifies
-                // an entrypoint that bypassed that transaction. Preserve the
-                // existing mapping and surface a distinct diagnostic;
-                // MappingMismatch remains reserved for shadow/PTE drift.
                 return Err(VmPmapError::ConcurrentPublication);
             }
             let existing = state.mappings.remove(&page).expect("existing mapping");
@@ -327,15 +313,10 @@ impl VmPmap {
             .mappings
             .insert(page, PmapMapping::new(ppn, prot, map_pin));
         state.commits += 1;
-        // Publishing an invalid -> valid leaf is not complete until the
-        // publishing hart crosses the architecture's translation barrier.
-        // Another hart that raced the commit may already be waiting on this
-        // exact page transaction; it performs the same local synchronization
-        // when it observes and converges on the winner.
-        //
-        // Do not hold the software-residency lock while the architecture
-        // synchronization executes. Canonical callers still own the page
-        // Materializer.
+        // An invalid-to-valid leaf publication is not complete on RV64/LA64
+        // until the publishing hart crosses the architecture translation
+        // barrier. Drop the software-state lock first; the caller still owns
+        // the page-level Materializer transaction.
         drop(state);
         (self.ops.synchronize_new_mappings)(
             self.asid(),
@@ -420,11 +401,8 @@ impl VmPmap {
         published
     }
 
-    /// Re-establish architecture visibility for an already-published page.
-    ///
-    /// Used when a faulting hart waited behind another publisher. The winner's
-    /// PTE is authoritative; the waiter only needs to discard the
-    /// failed/stale translation associated with the access that trapped.
+    /// Re-establish translation visibility on a hart that faulted before a
+    /// sibling published the same page and then waited for its transaction.
     pub(in crate::vm) fn refresh_page_translation(
         &self,
         page: UserPage,
@@ -458,10 +436,10 @@ impl VmPmap {
             None
         };
         let drain_start = pmap_map_path_clock_now();
-        // `state` is the per-AddressSpace pmap transaction lock, not merely a
-        // container lock. Keep it across the HAL leaf updates so shadow
-        // residency and hardware PTEs cannot be observed or modified as two
-        // independent states by another hart.
+        // Keep the pmap transaction lock across shadow removal, HAL leaf
+        // updates and shootdown. Harts spinning for the same lock service
+        // pending shootdown IPIs, so this does not deadlock the synchronous
+        // cross-CPU protocol.
         let mut state = self
             .state
             .lock_with_progress(self.ops.service_pending_tlb_shootdown);
@@ -540,9 +518,6 @@ impl VmPmap {
     pub fn protect_range(&self, range: UserRange, prot: Prot) -> Result<usize, VmPmapError> {
         let permissions = permissions_for_prot(prot);
         let mut protected = 0;
-        // Serialize the complete shadow-state/PTE/shootdown transaction with
-        // publish, teardown, and gift removal. Different page materialization
-        // remains concurrent outside this short pmap commit section.
         let mut state = self
             .state
             .lock_with_progress(self.ops.service_pending_tlb_shootdown);

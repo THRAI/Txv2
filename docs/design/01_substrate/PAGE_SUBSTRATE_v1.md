@@ -28,6 +28,7 @@
 - [`../00_meta-framework/MODULE_MAP_v1.md`](../00_meta-framework/MODULE_MAP_v1.md) §3 — foundation/HAL layout and boundary rules.
 - [`../00_meta-framework/object_model_v2.md`](../00_meta-framework/object_model_v2.md) §3, §7 — Frame as compound-payload entity; MapPin / CachePin / DmaToken as typed evidence.
 - [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — STEP, MAP, and HAL/substrate boundary discipline.
+- [`../03_memory-vm/MEMORY_IO_ARCHITECTURE_v1.md`](../03_memory-vm/MEMORY_IO_ARCHITECTURE_v1.md) — canonical allocation-gateway, memory-pressure, reclaim-provider, and file-I/O ownership contract above this substrate.
 - [`../03_memory-vm/PAGE_BACKED_v1.md`](../03_memory-vm/PAGE_BACKED_v1.md) — consumes frame and page-cache substrate primitives.
 
 ### Zone-derived type policy
@@ -228,12 +229,12 @@ pub struct FrameMeta {
     ///   bits 28..32  — pin_count   (DmaToken and other pinning holders)
     state: AtomicU32,
 
-    /// Non-counter flags and scratch. Separate word so updates don't
-    /// contend with `state`'s CAS traffic.
+    /// Physical-lifecycle flags. Separate word so updates don't contend with
+    /// `state`'s CAS traffic. File-page dirty/writeback state is not stored
+    /// here; PageSlot owns that semantic state.
     ///
     /// Bit layout:
-    ///   bit 0    — dirty         (PTE dirty bit set; needs writeback if File-backed)
-    ///   bit 1    — io_locked     (writeback or direct-IO in flight)
+    ///   bits 0-1  — reserved for physical-lifecycle extensions
     ///   bit 2    — direct_mapped (in kernel direct map; never reclaimed)
     ///   bit 3    — reserved      (kernel image, PT_NODE_POOL, FrameMeta array)
     ///   bits 4..16 — reserved for future use
@@ -904,10 +905,16 @@ Anonymous pages are never written to backing storage. This affects two aspects o
 `reserve_frame()` returns `AllocError::Exhausted` when the allocator has no free frame. The caller (typically high in the stack) decides whether to:
 
 - **Fail the operation.** For user-initiated allocations (mmap, fork's address-space clone, file-cache fill), return `ENOMEM` to userspace.
-- **Retry after reclaim.** For non-urgent kernel allocations, trigger a reclaim pass, then retry. Reclaim pass is implemented in the VM subsystem (PageContainer-level LRU eviction for file-backed; anonymous pages are typically not reclaimable).
+- **Use the managed slow path.** A waitable allocation enters the
+  `AllocationGateway` above the allocator. The gateway asks the global memory
+  pressure coordinator for bounded owner-driven reclaim/writeback progress,
+  waits when its allocation class permits, and retries.
 - **Panic.** For boot-time or kernel-critical allocations (can't make forward progress), panic with a clear message.
 
-The substrate itself does not implement reclaim. It delivers the failure signal; the VM subsystem handles memory pressure.
+The substrate itself does not implement reclaim and does not call upper layers
+while holding allocator state. It exposes allocation results and pressure
+snapshots. The global coordinator orchestrates policy, but only registered
+resource owners can claim and evict their objects.
 
 ### 8.2 Anonymous-page pinning
 <!-- txdoc:PAGE-SUBSTRATE-NO-SWAP-DISCIPLINE-ANONYMOUS-PAGE-PINNING-1 -->
@@ -1047,7 +1054,9 @@ The page substrate is small in surface area but touches every memory-using compo
 - **Pmap stages:** bootstrap (asm) → direct-map extension (1 GiB leaves, no intermediates) → boot MMIO mapping (2 MiB / 4 KiB leaves, PT_NODE_POOL intermediates) → frame-allocator-backed intermediates with PT_NODE_POOL fallback.
 - **Kernel heap:** slab with power-of-two small classes from 8 B to 2 KiB; page-sized and larger allocations use frame-allocator page runs.
 - **Shootdown:** HAL-provided batching primitive; substrate uses one batch per step-commit.
-- **No swap:** anonymous pages are pinned; memory pressure = synchronous failure.
+- **No swap:** anonymous pages are hard commitments until explicit teardown;
+  managed allocation may reclaim registered caches but cannot evict anonymous
+  content.
 - **No KPTI:** kernel mappings are always present in all page tables.
 
 The substrate's `init()` runs during CoreInit and establishes all of the above before any SMP bring-up, any reactor, or any subsystem. After init, typed page allocation, `FrameMeta` manipulation, the pmap typed-intermediate source, and the slab/global heap are available throughout the kernel.
@@ -1064,3 +1073,4 @@ Everything on top of this — `PageContainer`, `RNodeBacking`, user AddressSpace
 - [`object_model_v2.md`](../00_meta-framework/object_model_v2.md) §3.3 (compound payload predicates), §5 (reference hierarchy), §6 (reclamation), §7.5 (operational contributions).
 - [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — STEP-4, OBL-*, ARCH-*.
 - [`SUBSYSTEM_ANATOMY_v2_1.md`](../00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md) §4 (substrate primitives: zone, index, credit, mutation; this document adds the frame allocator as a sibling).
+- [`MEMORY_IO_ARCHITECTURE_v1.md`](../03_memory-vm/MEMORY_IO_ARCHITECTURE_v1.md) — dual-plane ownership, allocation gateway, global pressure coordination, and `FrameMeta` authority boundary.

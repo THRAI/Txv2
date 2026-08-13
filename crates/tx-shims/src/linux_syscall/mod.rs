@@ -79,7 +79,7 @@ use tx_subsystems::thread_runtime::execution::{
     step_sigprocmask, step_sigprocmask_with_payload, SigmaskHow, SigprocmaskChange, SigprocmaskOp,
 };
 use tx_subsystems::thread_runtime::{
-    step_thread_exit, ThreadExitOp, ThreadIdentity, ThreadKillOp, ThreadPayload,
+    ThreadExitOp, ThreadExitPosts, ThreadIdentity, ThreadKillOp, ThreadPayload,
 };
 use tx_subsystems::tty::execution::{
     step_ioctl_tcgets, step_ioctl_tcsets, step_ioctl_tiocgpgrp, step_ioctl_tiocgwinsz,
@@ -96,7 +96,8 @@ use tx_subsystems::vfs::structure::{
 };
 use tx_subsystems::vfs::{
     step_open, step_walk, DEntry, FileFsyncOp, FlockOp, OpenFile, OpenFileGetFlOp, OpenFileSetFlOp,
-    OpenOp,
+    OpenInMountNamespaceOp, OpenOp, ResolveOpenTargetInMountNamespaceOp, ResolveOpenTargetOp,
+    TruncateFsObjectOp,
 };
 use tx_subsystems::vm::{
     AddressSpace, MadviseAdvice, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking,
@@ -634,7 +635,7 @@ pub fn dispatch_pthread_hot_oneshot(
     ctx: &SyscallCtx<'_>,
 ) -> Option<SyscallResult> {
     match req.nr {
-        NR_FUTEX | NR_RT_SIGPROCMASK | NR_EXIT | NR_SET_TID_ADDRESS => {}
+        NR_FUTEX | NR_RT_SIGPROCMASK | NR_SET_TID_ADDRESS => {}
         _ => return None,
     }
 
@@ -643,7 +644,6 @@ pub fn dispatch_pthread_hot_oneshot(
     let result = match req.nr {
         NR_FUTEX => sys_futex_oneshot(req.args, ctx)?,
         NR_RT_SIGPROCMASK => sys_rt_sigprocmask(req.args, ctx),
-        NR_EXIT => sys_exit(req.args, ctx),
         NR_SET_TID_ADDRESS => sys_set_tid_address(req.args, ctx),
         _ => unreachable!("pthread hot dispatch prefilter covers all arms"),
     };
@@ -687,32 +687,55 @@ pub fn dispatch_clone_oneshot<P: PmapIf>(
     Some(result)
 }
 
-/// One-shot lane for `exit(2)` from an already-resolved thread identity.
+/// Drive exit cleanup without allowing a terminating thread to be interrupted
+/// by its own fatal-signal mailbox state.
 ///
-/// `exit` never returns to userspace and does not need a Linux syscall context:
-/// `step_thread_exit` resolves the owning process and `clear_child_tid` state
-/// through the thread identity. Keeping this before `SyscallCtx` construction
-/// trims the pthread child teardown path without changing the no-return
-/// contract.
-pub fn dispatch_thread_exit_oneshot(
-    req: &SyscallRequest,
-    thread: &Cap<ThreadIdentity>,
-) -> Option<SyscallResult> {
-    if req.nr != NR_EXIT {
-        return None;
-    }
-    let l0_span = emit_syscall_enter(req);
-    let result = match step_thread_exit(thread.clone(), req.args[0] as i32) {
-        tx_subsystems::thread_runtime::ThreadExitOutcome::Completed => SyscallResult::NoReturn,
-        // The process lifecycle lane can temporarily belong to exec.  Do not
-        // report NoReturn until this thread has actually detached; the async
-        // kernel boundary consumes this private retry result and yields.
-        tx_subsystems::thread_runtime::ThreadExitOutcome::Retry => {
-            SyscallResult::Error(EAGAIN_VALUE)
+/// `clear_child_tid` can suspend on page materialisation. The normal syscall
+/// driver treats process termination as an interrupt, so this terminal path
+/// instead retains the exit operation and creates a scheduler boundary before
+/// rechecking it. This keeps device and page-service tasks runnable while the
+/// lifecycle permit and old address space remain pinned by `ThreadExitOp`.
+async fn drive_thread_exit_op(mut op: ThreadExitOp) -> Result<(), tx_subsystems::execution::Errno> {
+    loop {
+        match op.step_exit() {
+            crate::adapter::step_engine::StepOutcome::Done(()) => return Ok(()),
+            crate::adapter::step_engine::StepOutcome::Err(errno) => return Err(errno),
+            crate::adapter::step_engine::StepOutcome::Continue { .. }
+            | crate::adapter::step_engine::StepOutcome::Yield { .. } => {
+                tx_reactor::yield_now().await;
+            }
         }
-    };
-    emit_syscall_exit(l0_span, &result);
-    Some(result)
+    }
+}
+
+pub async fn drive_thread_exit_with_posts(
+    thread: Cap<ThreadIdentity>,
+    status: i32,
+    posts: ThreadExitPosts,
+) -> Result<(), tx_subsystems::execution::Errno> {
+    drive_thread_exit_op(ThreadExitOp::new(thread, status).with_posts(posts)).await
+}
+
+pub async fn drive_thread_exit(
+    thread: Cap<ThreadIdentity>,
+    status: i32,
+) -> Result<(), tx_subsystems::execution::Errno> {
+    drive_thread_exit_op(ThreadExitOp::new(thread, status)).await
+}
+
+pub async fn drive_thread_exit_with_status(
+    thread: Cap<ThreadIdentity>,
+    status: ExitStatus,
+) -> Result<(), tx_subsystems::execution::Errno> {
+    drive_thread_exit_op(ThreadExitOp::with_status(thread, status)).await
+}
+
+pub async fn drive_thread_exit_with_status_and_posts(
+    thread: Cap<ThreadIdentity>,
+    status: ExitStatus,
+    posts: ThreadExitPosts,
+) -> Result<(), tx_subsystems::execution::Errno> {
+    drive_thread_exit_op(ThreadExitOp::with_status(thread, status).with_posts(posts)).await
 }
 
 /// Fast dispatch for immediate syscalls that can be answered from the
@@ -1059,7 +1082,7 @@ where
         nr if nr == NR_MINCORE => return sys_mincore(req.args, ctx),
         nr if nr == NR_REMAP_FILE_PAGES => return sys_remap_file_pages(req.args),
         nr if nr == NR_MLOCK2 => return sys_mlock2(req.args, ctx).await,
-        nr if nr == NR_UTIMENSAT => return sys_utimensat::<P>(req.args, ctx),
+        nr if nr == NR_UTIMENSAT => return sys_utimensat::<P>(req.args, ctx).await,
         nr if nr == NR_SHMGET => return sys_shmget(req.args, ctx),
         nr if nr == NR_SHMDT => return sys_shmdt(req.args, ctx).await,
         nr if nr == NR_MSGGET => return sys_msgget(req.args, ctx),
@@ -1068,8 +1091,8 @@ where
         nr if nr == NR_IOPRIO_GET => return sys_ioprio_get(req.args, ctx),
         nr if nr == NR_IOPRIO_SET => return sys_ioprio_set(req.args, ctx),
         nr if nr == NR_SEMGET => return sys_semget(req.args, ctx),
-        nr if nr == NR_MQ_OPEN => return sys_mq_open(req.args, ctx),
-        nr if nr == NR_MQ_UNLINK => return sys_mq_unlink(req.args, ctx),
+        nr if nr == NR_MQ_OPEN => return sys_mq_open(req.args, ctx).await,
+        nr if nr == NR_MQ_UNLINK => return sys_mq_unlink(req.args, ctx).await,
         nr if nr == NR_MQ_GETSETATTR => return sys_mq_getsetattr(req.args, ctx),
         nr if nr == NR_MQ_NOTIFY => return sys_mq_notify(req.args, ctx),
         nr if nr == NR_MEMBARRIER => return sys_membarrier::<P>(&req.args),
@@ -1125,7 +1148,7 @@ where
         nr if nr == NR_PPOLL => sys_ppoll::<P>(req.args, ctx).await,
         nr if nr == NR_PSELECT6 => sys_pselect6::<P>(req.args, ctx).await,
         nr if nr == NR_PSELECT6_TIME64 => sys_pselect6::<P>(req.args, ctx).await,
-        nr if nr == NR_EXIT => sys_exit(req.args, ctx),
+        nr if nr == NR_EXIT => sys_exit(req.args, ctx).await,
         nr if nr == NR_EXIT_GROUP => sys_exit_group(req.args, ctx),
         nr if nr == NR_BRK => sys_brk(req.args, ctx).await,
         nr if nr == NR_RT_SIGPROCMASK => sys_rt_sigprocmask(req.args, ctx),
@@ -1173,44 +1196,56 @@ where
         // (`step_chmod` / `step_chown`) plus a walker-side `access(2)`
         // predicate over the inode meta.
         nr if nr == NR_FCHMOD => sys_fchmod(req.args[0] as u32, req.args[1] as u32, ctx),
-        nr if nr == NR_FCHMODAT => sys_fchmodat::<P>(
-            req.args[0] as i32,
-            req.args[1],
-            req.args[2] as u32,
-            req.args[3] as i32,
-            ctx,
-        ),
-        nr if nr == NR_FCHMODAT2 => sys_fchmodat::<P>(
-            req.args[0] as i32,
-            req.args[1],
-            req.args[2] as u32,
-            req.args[3] as i32,
-            ctx,
-        ),
+        nr if nr == NR_FCHMODAT => {
+            sys_fchmodat::<P>(
+                req.args[0] as i32,
+                req.args[1],
+                req.args[2] as u32,
+                req.args[3] as i32,
+                ctx,
+            )
+            .await
+        }
+        nr if nr == NR_FCHMODAT2 => {
+            sys_fchmodat::<P>(
+                req.args[0] as i32,
+                req.args[1],
+                req.args[2] as u32,
+                req.args[3] as i32,
+                ctx,
+            )
+            .await
+        }
         nr if nr == NR_FCHOWN => sys_fchown(
             req.args[0] as u32,
             req.args[1] as u32,
             req.args[2] as u32,
             ctx,
         ),
-        nr if nr == NR_FCHOWNAT => sys_fchownat::<P>(
-            req.args[0] as i32,
-            req.args[1],
-            req.args[2] as u32,
-            req.args[3] as u32,
-            req.args[4] as i32,
-            ctx,
-        ),
-        nr if nr == NR_FACCESSAT => {
-            sys_faccessat::<P>(req.args[0] as i32, req.args[1], req.args[2] as i32, ctx)
+        nr if nr == NR_FCHOWNAT => {
+            sys_fchownat::<P>(
+                req.args[0] as i32,
+                req.args[1],
+                req.args[2] as u32,
+                req.args[3] as u32,
+                req.args[4] as i32,
+                ctx,
+            )
+            .await
         }
-        nr if nr == NR_FACCESSAT2 => sys_faccessat2::<P>(
-            req.args[0] as i32,
-            req.args[1],
-            req.args[2] as i32,
-            req.args[3] as i32,
-            ctx,
-        ),
+        nr if nr == NR_FACCESSAT => {
+            sys_faccessat::<P>(req.args[0] as i32, req.args[1], req.args[2] as i32, ctx).await
+        }
+        nr if nr == NR_FACCESSAT2 => {
+            sys_faccessat2::<P>(
+                req.args[0] as i32,
+                req.args[1],
+                req.args[2] as i32,
+                req.args[3] as i32,
+                ctx,
+            )
+            .await
+        }
         // Wave 2 of the fd-ops slice — fd-management arms
         // (`openat` / `close` / `dup` / `dup3`). `sys_openat` needs
         // `<P>` because the walker's `resolve_path_at` is generic over
@@ -1226,7 +1261,7 @@ where
             )
             .await
         }
-        nr if nr == NR_CLOSE => sys_close(req.args[0] as u32, ctx),
+        nr if nr == NR_CLOSE => sys_close(req.args[0] as u32, ctx).await,
         nr if nr == NR_CLOSE_RANGE => sys_close_range(req.args, ctx),
         nr if nr == NR_DUP => sys_dup(req.args[0] as u32, ctx),
         nr if nr == NR_DUP3 => sys_dup3(
@@ -1490,14 +1525,17 @@ where
         nr if nr == NR_INOTIFY_RM_WATCH => sys_inotify_rm_watch(req.args, ctx),
         nr if nr == NR_FANOTIFY_INIT => sys_fanotify_init(req.args, ctx),
         nr if nr == NR_FANOTIFY_MARK => sys_fanotify_mark(req.args, ctx),
-        nr if nr == NR_NAME_TO_HANDLE_AT => sys_name_to_handle_at::<P>(
-            req.args[0] as i32,
-            req.args[1],
-            req.args[2],
-            req.args[3],
-            req.args[4] as u32,
-            ctx,
-        ),
+        nr if nr == NR_NAME_TO_HANDLE_AT => {
+            sys_name_to_handle_at::<P>(
+                req.args[0] as i32,
+                req.args[1],
+                req.args[2],
+                req.args[3],
+                req.args[4] as u32,
+                ctx,
+            )
+            .await
+        }
         nr if nr == NR_OPEN_BY_HANDLE_AT => {
             sys_open_by_handle_at(req.args[0] as i32, req.args[1], req.args[2] as u32, ctx)
         }

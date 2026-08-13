@@ -39,13 +39,7 @@ unsafe impl Send for AddressSpace {}
 unsafe impl Sync for AddressSpace {}
 
 pub struct AddressSpace {
-    /// Stable identity of this address space for object namespaces whose
-    /// keys contain user virtual addresses (notably private futexes).
-    ///
-    /// A raw `&AddressSpace` address is not a suitable identity because zone
-    /// slots may move/reuse storage, and an architecture ASID may be recycled.
-    /// This monotonically allocated id is stable for the full lifetime of the
-    /// address space and is not reused during a boot.
+    /// 用于区分不同地址空间中的私有 futex 键；启动期间不复用。
     id: u64,
     pub(in crate::vm) recipes: RecipeIndex,
     pub(in crate::vm) pmap: VmPmap,
@@ -102,7 +96,6 @@ impl AddressSpace {
         &self.pmap
     }
 
-    /// Return the stable, boot-unique identity used to scope private futexes.
     pub const fn futex_identity(&self) -> u64 {
         self.id
     }
@@ -140,7 +133,11 @@ impl AddressSpace {
 
     pub fn recipes_snapshot(&self) -> Vec<VmEntry> {
         let guard = Self::recipe_guard();
-        self.recipes.snapshot(&guard)
+        self.recipes_snapshot_with_guard(&guard)
+    }
+
+    pub fn recipes_snapshot_with_guard(&self, guard: &step_engine::Guard<'_>) -> Vec<VmEntry> {
+        self.recipes.snapshot(guard)
     }
 
     /// Stamp a [`UfdRegistration`] tag on every VMA whose range is

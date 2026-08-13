@@ -1,0 +1,34 @@
+# alpine-gcc-compile-smoke.txt - compile and run a C program inside Alpine guest.
+#
+# Build the initramfs with a toolchain-bearing Alpine rootfs first, for example:
+#   TX_ALPINE_ROOTFS=target/rootfs/alpine-rv64-gcc-qemu \
+#     cargo xtask image cpio --profile alpine --target rv64-qemu
+
+wait ":bootstrap-exec:ok" within 90000
+wait "/ # " within 90000
+sleep 500
+
+send "echo gcc-guest-start\n"
+expect "gcc-guest-start" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "/usr/bin/gcc --version\n"
+expect "gcc" within 20000
+expect "/ # " within 20000
+
+sleep 500
+send "cat > /tmp/hello.c <<'EOF'\n#include <stdio.h>\nint main(void) { puts(\"guest-gcc-ok\"); return 0; }\nEOF\n"
+expect "/ # " within 20000
+
+sleep 500
+send "/usr/bin/gcc /tmp/hello.c -o /tmp/hello\n"
+expect "/ # " within 90000
+
+sleep 500
+send "/tmp/hello\n"
+expect "guest-gcc-ok" within 20000
+expect "/ # " within 20000
+
+sleep 500
+quit

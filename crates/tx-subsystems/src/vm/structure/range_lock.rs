@@ -65,6 +65,18 @@ impl<'a> WouldBlock<'a> {
             self.observed_release,
         )
     }
+
+    /// Convert a one-shot failed acquisition into its wait token without
+    /// publishing a release for the transient pending-writer row. Publishing
+    /// here would wake this same caller and turn an async retry loop into a
+    /// busy spin while the real owner still holds the range.
+    pub(in crate::vm) fn into_wait_token(mut self) -> WaitToken {
+        let token = self.wait_token();
+        if let Some(pending) = self.pending_writer.take() {
+            pending.cancel_without_notify();
+        }
+        token
+    }
 }
 
 pub struct RangeGuard<'a> {
@@ -162,8 +174,18 @@ impl RangeLock {
     pub fn diagnostic_snapshot(&self) -> RangeLockDiagnosticSnapshot {
         let state = self.state.lock();
         RangeLockDiagnosticSnapshot {
-            active: state.active.len(),
-            pending_writers: state.pending_writers.len(),
+            active: state
+                .active
+                .nodes
+                .iter()
+                .filter(|node| node.reservation.is_some())
+                .count(),
+            pending_writers: state
+                .pending_writers
+                .nodes
+                .iter()
+                .filter(|node| node.reservation.is_some())
+                .count(),
             wait_source_id: self.wait_source_id,
         }
     }
@@ -173,13 +195,9 @@ impl RangeLock {
         &self.wait_source
     }
 
-    /// Wait for a release newer than the generation observed while the
-    /// acquisition attempt was blocked.
-    ///
-    /// The endpoint future installs its subscription on the first poll; the
-    /// generation is checked again in that same poll, closing the
-    /// check-before-subscribe lost-wakeup window without reintroducing the
-    /// retired channel registry.
+    /// Subscribe and recheck the release generation in the same poll, so a
+    /// release racing between failed acquisition and waiter registration is
+    /// not lost.
     pub async fn wait_for_release_since(&self, observed: u64) {
         let mut wait =
             crate::wait_source::wait_on_endpoint(self.release_endpoint(), RANGE_LOCK_RELEASE_MASK);
@@ -386,10 +404,10 @@ impl RangeLockState {
     }
 
     fn materializer_blocked(&self, range: UserRange) -> bool {
-        // A page's resolve/materialize/private-page/PTE publication sequence
-        // has one linearization owner. Different pages remain independent,
-        // but overlapping Materializers must not both prepare and publish from
-        // different snapshots of the same page.
+        // Resolve, page-cache/private-page materialization and final PTE
+        // publication form one page transaction. Overlapping materializers
+        // must therefore serialize just like writers; different pages remain
+        // independent.
         self.active.any_overlap_where(range, |_| true)
             || self.pending_writers.any_overlap_where(range, |_| true)
     }
@@ -540,13 +558,6 @@ impl<const N: usize> ReservationIntervalTree<N> {
             root: None,
             nodes: [const { ReservationNode::empty() }; N],
         }
-    }
-
-    fn len(&self) -> usize {
-        self.nodes
-            .iter()
-            .filter(|node| node.reservation.is_some())
-            .count()
     }
 
     fn insert(&mut self, reservation: Reservation) -> bool {

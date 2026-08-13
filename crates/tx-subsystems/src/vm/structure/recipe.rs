@@ -1,16 +1,16 @@
 //! Authoritative recipe range index, published lock-free under EBR.
 
-use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use tx_substrate::Published;
 
-use crate::vm::adapter::step_engine::epoch_mod as epoch;
+use crate::vm::adapter::step_engine::{borrow_current_guard, guard as epoch_guard};
 use crate::vm::lock_metrics::{vm_spin_mutex, VmSpinMutex};
 
 use crate::execution::Guard;
 
 use super::recipe_tree::{RecipeTree, VmEntryView};
+use super::types::RecipeGeneration;
 use super::{
     AddressSpaceStats, AddressSpaceStatsDelta, MapPlacement, Prot, UfdRegistration, UserRange,
     UserVirtAddr, VmBacking, VmEntry, VmEntryError, VmEntryFlags, VmEntryProtectRewrite,
@@ -25,73 +25,7 @@ static RECIPE_OP_NODE_ALLOC_TOTAL: AtomicUsize = AtomicUsize::new(0);
 static RECIPE_OP_NODE_ALLOC_MAX: AtomicUsize = AtomicUsize::new(0);
 static RECIPE_NODE_ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
 static RECIPE_CHUNK_ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
-static RECIPE_RECLAIM_COUNT: AtomicUsize = AtomicUsize::new(0);
-static RECIPE_RECLAIM_TOTAL_NS: AtomicUsize = AtomicUsize::new(0);
-static RECIPE_RECLAIM_MAX_NS: AtomicUsize = AtomicUsize::new(0);
-static RECIPE_RECLAIM_NODE_TOTAL: AtomicUsize = AtomicUsize::new(0);
-static RECIPE_RECLAIM_NODE_MAX: AtomicUsize = AtomicUsize::new(0);
-static RECIPE_DEFERRED_RECLAIM_ENQUEUED: AtomicUsize = AtomicUsize::new(0);
-static RECIPE_DEFERRED_RECLAIM_DRAINED: AtomicUsize = AtomicUsize::new(0);
-static RECIPE_DEFERRED_RECLAIM_INLINE_FALLBACK: AtomicUsize = AtomicUsize::new(0);
-
-const RECIPE_DEFERRED_RECLAIM_CAP: usize = 512;
-
-struct DeferredRecipeTree(*mut RecipeTree);
-
-// SAFETY: the raw pointer came from `Box::into_raw(Box::new(RecipeTree))`.
-// EBR has already declared it unreachable from all prior readers before it is
-// placed in this queue, and queue ownership is exclusive until the later drop.
-unsafe impl Send for DeferredRecipeTree {}
-
-struct DeferredRecipeReclaimQueue {
-    slots: [MaybeUninit<DeferredRecipeTree>; RECIPE_DEFERRED_RECLAIM_CAP],
-    head: usize,
-    len: usize,
-}
-
-impl DeferredRecipeReclaimQueue {
-    const fn new() -> Self {
-        Self {
-            slots: [const { MaybeUninit::uninit() }; RECIPE_DEFERRED_RECLAIM_CAP],
-            head: 0,
-            len: 0,
-        }
-    }
-
-    fn push(&mut self, tree: DeferredRecipeTree) -> Result<(), DeferredRecipeTree> {
-        if self.len == RECIPE_DEFERRED_RECLAIM_CAP {
-            return Err(tree);
-        }
-        let tail = (self.head + self.len) % RECIPE_DEFERRED_RECLAIM_CAP;
-        self.slots[tail].write(tree);
-        self.len += 1;
-        Ok(())
-    }
-
-    fn pop(&mut self) -> Option<DeferredRecipeTree> {
-        if self.len == 0 {
-            return None;
-        }
-        let idx = self.head;
-        self.head = (self.head + 1) % RECIPE_DEFERRED_RECLAIM_CAP;
-        self.len -= 1;
-        // SAFETY: slots in the occupied ring range are initialized by `push`.
-        Some(unsafe { self.slots[idx].assume_init_read() })
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.len
-    }
-}
-
-static DEFERRED_RECIPE_RECLAIMS: VmSpinMutex<DeferredRecipeReclaimQueue> = vm_spin_mutex(
-    DeferredRecipeReclaimQueue::new(),
-    b"debug.lock.vm.recipe_reclaim.deferred",
-);
-
 const VM_RECIPE_PUBLISH_SHAPE_METRICS: bool = cfg!(tx_vm_recipe_publish_shape_metrics);
-const VM_RECIPE_RECLAIM_SHAPE_METRICS: bool = cfg!(tx_vm_recipe_reclaim_shape_metrics);
 const VM_RECIPE_NODE_ALLOC_METRICS: bool = cfg!(tx_vm_recipe_node_alloc_metrics);
 const VM_RECIPE_PHASE_METRICS: bool = cfg!(tx_vm_recipe_phase_metrics);
 
@@ -105,14 +39,6 @@ pub(in crate::vm) struct RecipeDebugTotals {
     pub op_node_alloc_max: u64,
     pub node_alloc_count: u64,
     pub chunk_alloc_count: u64,
-    pub reclaim_count: u64,
-    pub reclaim_total_ns: u64,
-    pub reclaim_max_ns: u64,
-    pub reclaim_node_total: u64,
-    pub reclaim_node_max: u64,
-    pub deferred_reclaim_enqueued: u64,
-    pub deferred_reclaim_drained: u64,
-    pub deferred_reclaim_inline_fallback: u64,
 }
 
 static LAST_PUBLISH_LEAF_SPLITS: AtomicUsize = AtomicUsize::new(0);
@@ -144,7 +70,6 @@ struct RecipePublishDebug {
 struct RecipeRewriteResult {
     commit: VmMapCommit,
     touched_entries: usize,
-    old_tree: Option<*mut RecipeTree>,
     publish_debug: Option<RecipePublishDebug>,
     rewrite_ns: Option<u64>,
     publish_ns: Option<u64>,
@@ -152,31 +77,19 @@ struct RecipeRewriteResult {
 
 /// Authoritative recipe range index.
 ///
-/// The published tree is owned by an `AtomicPtr<RecipeTree>` and reachable via
-/// EBR (`adapter::step_engine::epoch_mod`): readers under a `Guard<'_>` perform a single
-/// `Acquire` load and observe the immutable tree without holding a lock. A
-/// separate writer `mutation` mutex serializes mutators so they can build a
-/// replacement tree, atomically swap it in, and retire the old one through
-/// `epoch::retire_raw`. Old trees are freed by EBR once every reader past has
-/// drained, satisfying VM_v1_2 §1.2 publication rule with guard-scoped reader
-/// lifetimes.
+/// `Published<RecipeTree>` owns the immutable root and defers old-root
+/// destruction through substrate RCU. Readers observe one acquire-published
+/// root under a `Guard<'_>` without taking the semantic mutation lock. Writers
+/// retain that lock across derive, prepare, and commit so no stale derived root
+/// can replace a newer one.
 pub(in crate::vm) struct RecipeIndex {
-    current: AtomicPtr<RecipeTree>,
+    current: Published<RecipeTree>,
+    publication_sequence: AtomicU64,
     mutation: VmSpinMutex<()>,
     #[cfg(test)]
     last_publish_touched_entries: AtomicUsize,
     #[cfg(test)]
     last_publish_leaf_splits: AtomicUsize,
-}
-
-impl Drop for RecipeIndex {
-    fn drop(&mut self) {
-        let raw = self.current.swap(core::ptr::null_mut(), Ordering::AcqRel);
-        if !raw.is_null() {
-            // SAFETY: `current` was last published from `Box::into_raw`.
-            unsafe { drop(Box::from_raw(raw)) };
-        }
-    }
 }
 
 #[cfg(test)]
@@ -198,15 +111,20 @@ impl RecipeSnapshot {
 
 impl RecipeIndex {
     pub(in crate::vm) fn new() -> Self {
-        let initial = Box::into_raw(Box::new(RecipeTree::new()));
         Self {
-            current: AtomicPtr::new(initial),
+            current: Published::try_new(RecipeTree::new())
+                .expect("initial RecipeIndex publication allocation"),
+            publication_sequence: AtomicU64::new(0),
             mutation: vm_spin_mutex((), b"debug.lock.vm.recipe_index.mutation"),
             #[cfg(test)]
             last_publish_touched_entries: AtomicUsize::new(0),
             #[cfg(test)]
             last_publish_leaf_splits: AtomicUsize::new(0),
         }
+    }
+
+    fn writer_guard() -> Guard<'static> {
+        borrow_current_guard().unwrap_or_else(epoch_guard)
     }
 
     fn rewrite_with_debug<F>(
@@ -227,7 +145,7 @@ impl RecipeIndex {
             let rewrite_ns = recipe_phase_elapsed(rewrite_start);
             let leaf_splits = LAST_PUBLISH_LEAF_SPLITS.load(Ordering::Acquire);
             let publish_start = recipe_phase_clock_now();
-            let old_tree = self.publish(rewritten, touched_entries, leaf_splits);
+            self.publish(rewritten, touched_entries, leaf_splits)?;
             let publish_ns = recipe_phase_elapsed(publish_start);
             return Ok(RecipeRewriteResult {
                 commit: VmMapCommit {
@@ -235,7 +153,6 @@ impl RecipeIndex {
                     stats_delta,
                 },
                 touched_entries,
-                old_tree,
                 publish_debug: None,
                 rewrite_ns,
                 publish_ns,
@@ -256,7 +173,7 @@ impl RecipeIndex {
                 .saturating_sub(before_chunks);
         let after_len = rewritten.len();
         let publish_start = recipe_phase_clock_now();
-        let old_tree = self.publish(rewritten, touched_entries, node_allocs);
+        self.publish(rewritten, touched_entries, node_allocs)?;
         let publish_ns = recipe_phase_elapsed(publish_start);
         Ok(RecipeRewriteResult {
             commit: VmMapCommit {
@@ -264,7 +181,6 @@ impl RecipeIndex {
                 stats_delta,
             },
             touched_entries,
-            old_tree,
             publish_debug: Some(RecipePublishDebug {
                 op,
                 before_len,
@@ -280,9 +196,10 @@ impl RecipeIndex {
     }
 
     pub(in crate::vm) fn clone_shared(&self, guard: &Guard<'_>) -> Self {
-        let initial = Box::into_raw(Box::new(self.pinned(guard).clone()));
         Self {
-            current: AtomicPtr::new(initial),
+            current: Published::try_new(self.pinned(guard).clone())
+                .expect("cloned RecipeIndex publication allocation"),
+            publication_sequence: AtomicU64::new(0),
             mutation: vm_spin_mutex((), b"debug.lock.vm.recipe_index.mutation"),
             #[cfg(test)]
             last_publish_touched_entries: AtomicUsize::new(0),
@@ -293,14 +210,8 @@ impl RecipeIndex {
 
     /// Borrow the published tree under the caller-supplied epoch guard. The
     /// returned reference is valid for the guard's lifetime.
-    fn pinned<'g>(&self, guard: &'g Guard<'_>) -> &'g RecipeTree {
-        let _ = guard;
-        let raw = self.current.load(Ordering::Acquire);
-        // SAFETY: the guard pins this CPU at the publication epoch, so the
-        // tree behind `raw` is not yet reclaimed. Writers retire the old
-        // pointer only after swap, and EBR guarantees no pinned reader can be
-        // observing a stale pointer issued before its guard.
-        unsafe { &*raw }
+    fn pinned<'g>(&'g self, guard: &'g Guard<'_>) -> &'g RecipeTree {
+        self.current.read(guard)
     }
 
     #[cfg(test)]
@@ -308,10 +219,6 @@ impl RecipeIndex {
         RecipeSnapshot {
             entries: self.pinned(guard).clone(),
         }
-    }
-
-    pub(in crate::vm) fn lookup(&self, addr: UserVirtAddr, guard: &Guard<'_>) -> Option<VmEntry> {
-        self.pinned(guard).lookup(addr)
     }
 
     #[cfg(test)]
@@ -323,9 +230,34 @@ impl RecipeIndex {
         self.pinned(guard).lookup_ref(addr)
     }
 
+    pub(in crate::vm) fn lookup(&self, addr: UserVirtAddr, guard: &Guard<'_>) -> Option<VmEntry> {
+        self.pinned(guard).lookup(addr)
+    }
+
+    /// Perform one bounded owned lookup and capture a stable even publication
+    /// sequence when no writer overlapped the observation.
+    pub(in crate::vm) fn lookup_stamped(
+        &self,
+        addr: UserVirtAddr,
+        guard: &Guard<'_>,
+    ) -> Option<(VmEntry, Option<RecipeGeneration>)> {
+        let before = self.publication_sequence.load(Ordering::Acquire);
+        let entry = self.pinned(guard).lookup(addr);
+        let after = self.publication_sequence.load(Ordering::Acquire);
+        let generation =
+            (before == after && after.is_multiple_of(2)).then(|| RecipeGeneration::new(after));
+        entry.map(|entry| (entry, generation))
+    }
+
+    pub(in crate::vm) fn stable_generation(&self, _guard: &Guard<'_>) -> Option<RecipeGeneration> {
+        let before = self.publication_sequence.load(Ordering::Acquire);
+        let after = self.publication_sequence.load(Ordering::Acquire);
+        (before == after && after.is_multiple_of(2)).then(|| RecipeGeneration::new(after))
+    }
+
     #[allow(dead_code)]
     pub(in crate::vm) fn lookup_view<'g>(
-        &self,
+        &'g self,
         addr: UserVirtAddr,
         guard: &'g Guard<'_>,
     ) -> Option<VmEntryView<'g>> {
@@ -366,14 +298,28 @@ impl RecipeIndex {
         }
     }
 
-    /// Replace the published tree with `next` and retire the old one through
-    /// EBR. Requires the writer mutation lock to already be held.
+    /// Prepare and commit one replacement while the semantic writer lock is
+    /// held. Allocation failure leaves the current root authoritative.
     fn publish(
         &self,
         next: RecipeTree,
         touched_entries: usize,
         node_allocs: usize,
-    ) -> Option<*mut RecipeTree> {
+    ) -> Result<(), VmMapError> {
+        let replacement = self.current.prepare_replace(next).map_err(|_| {
+            emit_recipe_phase_count(b"debug.vm.recipe.phase.publish_alloc_error", 1);
+            VmMapError::NoFreeRange
+        })?;
+        let current_sequence = self.publication_sequence.load(Ordering::Relaxed);
+        let publishing_sequence = current_sequence
+            .checked_add(1)
+            .expect("RecipeIndex publication sequence exhausted");
+        let committed_sequence = publishing_sequence
+            .checked_add(1)
+            .expect("RecipeIndex publication sequence exhausted");
+        debug_assert!(current_sequence.is_multiple_of(2));
+        self.publication_sequence
+            .store(publishing_sequence, Ordering::Release);
         #[cfg(test)]
         self.last_publish_touched_entries
             .store(touched_entries, Ordering::Release);
@@ -384,12 +330,10 @@ impl RecipeIndex {
         let _ = touched_entries;
         #[cfg(not(test))]
         let _ = node_allocs;
-        let new_ptr = Box::into_raw(Box::new(next));
-        let old_ptr = self.current.swap(new_ptr, Ordering::AcqRel);
-        if !old_ptr.is_null() {
-            return Some(old_ptr);
-        }
-        None
+        replacement.commit();
+        self.publication_sequence
+            .store(committed_sequence, Ordering::Release);
+        Ok(())
     }
 
     fn finish_rewrite(result: RecipeRewriteResult) -> VmMapCommit {
@@ -397,41 +341,10 @@ impl RecipeIndex {
         emit_recipe_phase_duration(b"debug.vm.recipe.phase.publish_swap_ns", result.publish_ns);
         let debug_start = recipe_phase_clock_now();
         if let Some(debug) = result.publish_debug {
-            emit_recipe_publish_debug(&debug, result.old_tree.is_some());
+            emit_recipe_publish_debug(&debug, true);
         }
         emit_recipe_phase_duration_start(b"debug.vm.recipe.phase.debug_emit_ns", debug_start);
-        let retire_start = recipe_phase_clock_now();
-        Self::retire_published_tree(result.old_tree);
-        emit_recipe_phase_duration_start(b"debug.vm.recipe.phase.retire_enqueue_ns", retire_start);
         result.commit
-    }
-
-    fn retire_published_tree(old_tree: Option<*mut RecipeTree>) {
-        if let Some(old_ptr) = old_tree {
-            // SAFETY: every reader holds an epoch guard issued before its
-            // load; EBR delays reclamation until those guards drop. Once
-            // drained, `reclaim_recipe_tree` runs and frees the box.
-            let result = unsafe { epoch::retire_raw(old_ptr as *mut u8, reclaim_recipe_tree) };
-            if result.is_ok() {
-                emit_recipe_phase_count(b"debug.vm.recipe.phase.retire_queued", 1);
-            } else {
-                emit_recipe_phase_count(b"debug.vm.recipe.phase.retire_error", 1);
-            }
-        }
-    }
-
-    /// Borrow the published tree behind the writer mutation lock. The
-    /// returned reference is valid until the lock is released.
-    ///
-    /// # Safety
-    ///
-    /// Must only be called while `self.mutation` is held by the caller; the
-    /// caller is responsible for not retaining the borrow past the swap.
-    unsafe fn under_writer_lock(&self) -> &RecipeTree {
-        let raw = self.current.load(Ordering::Acquire);
-        // SAFETY: the writer mutation lock prevents concurrent writers from
-        // swapping or retiring; readers are EBR-protected separately.
-        unsafe { &*raw }
     }
 
     #[cfg(test)]
@@ -460,8 +373,8 @@ impl RecipeIndex {
             let lock_start = recipe_phase_clock_now();
             let _writer = self.mutation.lock();
             emit_recipe_phase_duration_start(b"debug.vm.recipe.phase.lock_wait_ns", lock_start);
-            // SAFETY: writer lock held, so under_writer_lock's borrow is sound.
-            let current = unsafe { self.under_writer_lock() };
+            let guard = Self::writer_guard();
+            let current = self.pinned(&guard);
             match placement {
                 MapPlacement::RequireFree => {
                     validate_insert_free(current, &entry)?;
@@ -487,7 +400,8 @@ impl RecipeIndex {
             let lock_start = recipe_phase_clock_now();
             let _writer = self.mutation.lock();
             emit_recipe_phase_duration_start(b"debug.vm.recipe.phase.lock_wait_ns", lock_start);
-            let current = unsafe { self.under_writer_lock() };
+            let guard = Self::writer_guard();
+            let current = self.pinned(&guard);
             self.rewrite_with_debug(RecipePublishOp::Unmap, current, |current| {
                 rewrite_unmap(current, range)
             })
@@ -506,7 +420,8 @@ impl RecipeIndex {
             let _writer = self.mutation.lock();
             emit_recipe_phase_duration_start(b"debug.vm.recipe.phase.lock_wait_ns", lock_start);
             emit_vm_recipe_trace(b"debug.vm.recipe.protect.phase", 1);
-            let current = unsafe { self.under_writer_lock() };
+            let guard = Self::writer_guard();
+            let current = self.pinned(&guard);
             self.rewrite_with_debug(RecipePublishOp::Protect, current, |current| {
                 rewrite_protect(current, range, prot)
             })
@@ -536,7 +451,8 @@ impl RecipeIndex {
             let lock_start = recipe_phase_clock_now();
             let _writer = self.mutation.lock();
             emit_recipe_phase_duration_start(b"debug.vm.recipe.phase.lock_wait_ns", lock_start);
-            let current = unsafe { self.under_writer_lock() };
+            let guard = Self::writer_guard();
+            let current = self.pinned(&guard);
             self.rewrite_with_debug(RecipePublishOp::Locked, current, |current| {
                 rewrite_locked(current, range, locked)
             })
@@ -555,7 +471,8 @@ impl RecipeIndex {
             let lock_start = recipe_phase_clock_now();
             let _writer = self.mutation.lock();
             emit_recipe_phase_duration_start(b"debug.vm.recipe.phase.lock_wait_ns", lock_start);
-            let current = unsafe { self.under_writer_lock() };
+            let guard = Self::writer_guard();
+            let current = self.pinned(&guard);
             let op = match placement {
                 VmRemapPlacement::Move => RecipePublishOp::RemapMove,
                 VmRemapPlacement::InPlace => RecipePublishOp::RemapInPlace,
@@ -575,7 +492,8 @@ impl RecipeIndex {
             let lock_start = recipe_phase_clock_now();
             let _writer = self.mutation.lock();
             emit_recipe_phase_duration_start(b"debug.vm.recipe.phase.lock_wait_ns", lock_start);
-            let current = unsafe { self.under_writer_lock() };
+            let guard = Self::writer_guard();
+            let current = self.pinned(&guard);
             self.rewrite_with_debug(RecipePublishOp::ReplaceEntry, current, |current| {
                 let (rewritten, touched_entries) = current.replace_exact(entry)?;
                 let stats_delta = stats_delta_between(current, &rewritten);
@@ -610,103 +528,13 @@ impl RecipeIndex {
             let lock_start = recipe_phase_clock_now();
             let _writer = self.mutation.lock();
             emit_recipe_phase_duration_start(b"debug.vm.recipe.phase.lock_wait_ns", lock_start);
-            let current = unsafe { self.under_writer_lock() };
+            let guard = Self::writer_guard();
+            let current = self.pinned(&guard);
             self.rewrite_with_debug(RecipePublishOp::UfdTag, current, |current| {
                 rewrite_tag_ufd_registration(current, range, tag)
             })
         };
         Ok(Self::finish_rewrite(result?))
-    }
-}
-
-unsafe fn reclaim_recipe_tree(ptr: *mut u8) {
-    enqueue_deferred_recipe_reclaim(ptr as *mut RecipeTree);
-}
-
-fn enqueue_deferred_recipe_reclaim(ptr: *mut RecipeTree) {
-    let tree = DeferredRecipeTree(ptr);
-    let enqueue_start = recipe_phase_clock_now();
-    let fallback = {
-        let mut queue = DEFERRED_RECIPE_RECLAIMS.lock();
-        match queue.push(tree) {
-            Ok(()) => {
-                RECIPE_DEFERRED_RECLAIM_ENQUEUED.fetch_add(1, Ordering::Relaxed);
-                emit_recipe_phase_duration_start(
-                    b"debug.vm.recipe.phase.deferred_enqueue_ns",
-                    enqueue_start,
-                );
-                emit_recipe_phase_count(b"debug.vm.recipe.phase.deferred_enqueued", 1);
-                return;
-            }
-            Err(tree) => tree,
-        }
-    };
-    emit_recipe_phase_duration_start(b"debug.vm.recipe.phase.deferred_enqueue_ns", enqueue_start);
-
-    RECIPE_DEFERRED_RECLAIM_INLINE_FALLBACK.fetch_add(1, Ordering::Relaxed);
-    emit_recipe_phase_count(b"debug.vm.recipe.phase.inline_fallback", 1);
-    // SAFETY: the queue was full, so ownership remains with this fallback path.
-    unsafe { perform_recipe_tree_reclaim(fallback.0) };
-}
-
-pub(in crate::vm) fn drain_deferred_recipe_reclaims(limit: usize) -> usize {
-    let drain_start = recipe_phase_clock_now();
-    let mut drained = 0usize;
-    while drained < limit {
-        let next = {
-            let mut queue = DEFERRED_RECIPE_RECLAIMS.lock();
-            queue.pop()
-        };
-        let Some(tree) = next else {
-            break;
-        };
-        // SAFETY: `tree` was queued after EBR deemed it reclaimable; this
-        // drain owns the pending drop.
-        unsafe { perform_recipe_tree_reclaim(tree.0) };
-        drained += 1;
-    }
-    emit_recipe_phase_duration_start(b"debug.vm.recipe.phase.deferred_drain_ns", drain_start);
-    if drained != 0 {
-        RECIPE_DEFERRED_RECLAIM_DRAINED.fetch_add(drained, Ordering::Relaxed);
-        emit_recipe_phase_count(b"debug.vm.recipe.phase.deferred_drained", drained as u64);
-        if VM_RECIPE_RECLAIM_SHAPE_METRICS {
-            emit_vm_recipe_trace(b"debug.vm.recipe.reclaim_deferred.drained", drained as i64);
-        }
-    }
-    drained
-}
-
-#[cfg(test)]
-pub(in crate::vm) fn deferred_recipe_reclaim_len_for_test() -> usize {
-    DEFERRED_RECIPE_RECLAIMS.lock().len()
-}
-
-unsafe fn perform_recipe_tree_reclaim(ptr: *mut RecipeTree) {
-    if tx_observe::current().is_none() {
-        // SAFETY: `ptr` was last published from `Box::into_raw(Box::new(_))`.
-        let _ = unsafe { Box::from_raw(ptr as *mut RecipeTree) };
-        return;
-    }
-
-    let start_ns = tx_observe::clock_now_ns();
-    let tree = unsafe { &*ptr };
-    let mut node_count = 0usize;
-    if VM_RECIPE_RECLAIM_SHAPE_METRICS {
-        let reclaim_stats = tree.reclaim_stats();
-        node_count = reclaim_stats.node_chunks;
-        emit_recipe_reclaim_shape_debug(&reclaim_stats);
-    }
-    // SAFETY: `ptr` was last published from `Box::into_raw(Box::new(_))`.
-    let _ = unsafe { Box::from_raw(ptr as *mut RecipeTree) };
-    let duration_ns = tx_observe::clock_now_ns().saturating_sub(start_ns);
-    emit_recipe_phase_count(b"debug.vm.recipe.phase.reclaim_drop_ns", duration_ns);
-    record_recipe_reclaim_debug(duration_ns, node_count);
-    emit_vm_recipe_trace(
-        b"debug.vm.recipe.reclaim_tree.duration_ns",
-        duration_ns as i64,
-    );
-    if VM_RECIPE_RECLAIM_SHAPE_METRICS {
-        emit_vm_recipe_trace(b"debug.vm.recipe.reclaim_tree.end", 1);
     }
 }
 
@@ -760,14 +588,6 @@ pub(in crate::vm) fn reset_recipe_debug_totals() {
         &RECIPE_OP_NODE_ALLOC_MAX,
         &RECIPE_NODE_ALLOC_COUNT,
         &RECIPE_CHUNK_ALLOC_COUNT,
-        &RECIPE_RECLAIM_COUNT,
-        &RECIPE_RECLAIM_TOTAL_NS,
-        &RECIPE_RECLAIM_MAX_NS,
-        &RECIPE_RECLAIM_NODE_TOTAL,
-        &RECIPE_RECLAIM_NODE_MAX,
-        &RECIPE_DEFERRED_RECLAIM_ENQUEUED,
-        &RECIPE_DEFERRED_RECLAIM_DRAINED,
-        &RECIPE_DEFERRED_RECLAIM_INLINE_FALLBACK,
     ] {
         cell.store(0, Ordering::Relaxed);
     }
@@ -783,15 +603,6 @@ pub(in crate::vm) fn recipe_debug_totals() -> RecipeDebugTotals {
         op_node_alloc_max: RECIPE_OP_NODE_ALLOC_MAX.load(Ordering::Relaxed) as u64,
         node_alloc_count: RECIPE_NODE_ALLOC_COUNT.load(Ordering::Relaxed) as u64,
         chunk_alloc_count: RECIPE_CHUNK_ALLOC_COUNT.load(Ordering::Relaxed) as u64,
-        reclaim_count: RECIPE_RECLAIM_COUNT.load(Ordering::Relaxed) as u64,
-        reclaim_total_ns: RECIPE_RECLAIM_TOTAL_NS.load(Ordering::Relaxed) as u64,
-        reclaim_max_ns: RECIPE_RECLAIM_MAX_NS.load(Ordering::Relaxed) as u64,
-        reclaim_node_total: RECIPE_RECLAIM_NODE_TOTAL.load(Ordering::Relaxed) as u64,
-        reclaim_node_max: RECIPE_RECLAIM_NODE_MAX.load(Ordering::Relaxed) as u64,
-        deferred_reclaim_enqueued: RECIPE_DEFERRED_RECLAIM_ENQUEUED.load(Ordering::Relaxed) as u64,
-        deferred_reclaim_drained: RECIPE_DEFERRED_RECLAIM_DRAINED.load(Ordering::Relaxed) as u64,
-        deferred_reclaim_inline_fallback: RECIPE_DEFERRED_RECLAIM_INLINE_FALLBACK
-            .load(Ordering::Relaxed) as u64,
     }
 }
 
@@ -852,97 +663,6 @@ fn emit_recipe_publish_shape_debug(debug: &RecipePublishDebug, retired_old: bool
     if retired_old {
         emit_vm_recipe_trace(b"debug.vm.recipe.publish.retire_old", 1);
     }
-}
-
-fn emit_recipe_reclaim_shape_debug(reclaim_stats: &super::recipe_tree::RecipeReclaimStats) {
-    emit_vm_recipe_trace(b"debug.vm.recipe.reclaim_tree.begin", 1);
-    emit_vm_recipe_trace(
-        b"debug.vm.recipe.reclaim_tree.entries",
-        reclaim_stats.entries as i64,
-    );
-    emit_vm_recipe_trace(
-        b"debug.vm.recipe.reclaim_tree.nodes",
-        reclaim_stats.node_chunks as i64,
-    );
-    emit_vm_recipe_trace(
-        b"debug.vm.recipe.reclaim_tree.child_refs",
-        reclaim_stats.copied_child_refs as i64,
-    );
-    emit_vm_recipe_trace(
-        b"debug.vm.recipe.reclaim_tree.depth",
-        reclaim_stats.tree_depth as i64,
-    );
-    emit_vm_recipe_trace(
-        b"debug.vm.recipe.reclaim_tree.leaf_count",
-        reclaim_stats.leaf_count as i64,
-    );
-    emit_vm_recipe_trace(
-        b"debug.vm.recipe.reclaim_tree.internal_count",
-        reclaim_stats.internal_count as i64,
-    );
-    emit_vm_recipe_trace(
-        b"debug.vm.recipe.reclaim_tree.internal_fanout_min",
-        reclaim_stats.internal_fanout_min as i64,
-    );
-    emit_vm_recipe_trace(
-        b"debug.vm.recipe.reclaim_tree.internal_fanout_max",
-        reclaim_stats.internal_fanout_max as i64,
-    );
-    let avg_fanout = if reclaim_stats.internal_count == 0 {
-        0
-    } else {
-        reclaim_stats.internal_fanout_total / reclaim_stats.internal_count
-    };
-    emit_vm_recipe_trace(
-        b"debug.vm.recipe.reclaim_tree.internal_fanout_avg",
-        avg_fanout as i64,
-    );
-    emit_vm_recipe_trace(
-        b"debug.vm.recipe.reclaim_tree.nonroot_internal_count",
-        reclaim_stats.nonroot_internal_count as i64,
-    );
-    emit_vm_recipe_trace(
-        b"debug.vm.recipe.reclaim_tree.nonroot_internal_fanout_min",
-        reclaim_stats.nonroot_internal_fanout_min as i64,
-    );
-    emit_vm_recipe_trace(
-        b"debug.vm.recipe.reclaim_tree.nonroot_internal_fanout_max",
-        reclaim_stats.nonroot_internal_fanout_max as i64,
-    );
-    let avg_nonroot_fanout = if reclaim_stats.nonroot_internal_count == 0 {
-        0
-    } else {
-        reclaim_stats.nonroot_internal_fanout_total / reclaim_stats.nonroot_internal_count
-    };
-    emit_vm_recipe_trace(
-        b"debug.vm.recipe.reclaim_tree.nonroot_internal_fanout_avg",
-        avg_nonroot_fanout as i64,
-    );
-    emit_vm_recipe_trace(
-        b"debug.vm.recipe.reclaim_tree.leaf_fill_min",
-        reclaim_stats.leaf_fill_min as i64,
-    );
-    emit_vm_recipe_trace(
-        b"debug.vm.recipe.reclaim_tree.leaf_fill_max",
-        reclaim_stats.leaf_fill_max as i64,
-    );
-    let avg_fill = if reclaim_stats.leaf_count == 0 {
-        0
-    } else {
-        reclaim_stats.leaf_fill_total / reclaim_stats.leaf_count
-    };
-    emit_vm_recipe_trace(
-        b"debug.vm.recipe.reclaim_tree.leaf_fill_avg",
-        avg_fill as i64,
-    );
-}
-
-fn record_recipe_reclaim_debug(duration_ns: u64, node_count: usize) {
-    RECIPE_RECLAIM_COUNT.fetch_add(1, Ordering::Relaxed);
-    saturating_fetch_add_usize(&RECIPE_RECLAIM_TOTAL_NS, duration_ns as usize);
-    saturating_fetch_add_usize(&RECIPE_RECLAIM_NODE_TOTAL, node_count);
-    atomic_max_usize(&RECIPE_RECLAIM_MAX_NS, duration_ns as usize);
-    atomic_max_usize(&RECIPE_RECLAIM_NODE_MAX, node_count);
 }
 
 fn saturating_fetch_add_usize(cell: &AtomicUsize, delta: usize) {
@@ -1045,7 +765,7 @@ fn try_merge_adjacent_entries(
     if left.range.end() != right.range.start()
         || left.prot != right.prot
         || left.flags != right.flags
-        || !left.has_contiguous_backing_with(right)
+        || !left.same_backing(right)
         || left.ufd_registration != right.ufd_registration
     {
         return Ok(None);
@@ -1580,15 +1300,20 @@ fn rewrite_tag_ufd_registration(
 fn range_is_fully_mapped(entries: &RecipeTree, range: UserRange) -> bool {
     let mut cursor = range.start().as_usize();
     let end = range.end().as_usize();
+    let mut contiguous = true;
 
-    while cursor < end {
-        let Some(entry) = entries.lookup_view(UserVirtAddr(cursor)) else {
-            return false;
-        };
-        cursor = entry.range.end().as_usize().min(end);
-    }
+    entries.for_each_overlapping(range, &mut |entry| {
+        if !contiguous || cursor >= end {
+            return;
+        }
+        if entry.range.start().as_usize() > cursor {
+            contiguous = false;
+            return;
+        }
+        cursor = cursor.max(entry.range.end().as_usize().min(end));
+    });
 
-    true
+    contiguous && cursor >= end
 }
 
 fn stats_for(entries: &RecipeTree) -> AddressSpaceStats {
@@ -1626,10 +1351,7 @@ fn stats_delta_between(before: &RecipeTree, after: &RecipeTree) -> AddressSpaceS
 
 fn emit_vm_recipe_trace(name: &[u8], value: i64) {
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            value,
-        );
+        observer.debug_counter(name, value);
     }
 }
 
@@ -1667,10 +1389,7 @@ fn emit_recipe_phase_count(name: &[u8], value: u64) {
         return;
     }
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            value as i64,
-        );
+        observer.debug_counter(name, value as i64);
     }
 }
 
@@ -1678,7 +1397,7 @@ fn emit_vm_recipe_allocation(name: &[u8], value: u64) {
     if let Some(observer) = tx_observe::current() {
         observer.allocation(
             tx_observe::AllocationTrack::VmRecipeNode,
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            tx_observe::EventNameId::from_name(name),
             value,
         );
     }

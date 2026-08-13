@@ -396,6 +396,40 @@ fn drive_boot_wiring() {
 
 // --- tests --------------------------------------------------------
 
+#[test]
+fn reactor_epoch_boundary_replenishes_publication_retire_credit_under_load() {
+    let _isolation = setup();
+    tx_test_support::drain_to_quiescence();
+    let published = tx_substrate::Published::try_new(0u64).expect("initial publication");
+
+    for value in 1..=tx_substrate::epoch::LOCAL_RETIRE_RESERVATION_CAPACITY as u64 {
+        let next = published
+            .prepare_detached(value)
+            .expect("detached publication");
+        let retire = tx_substrate::epoch::try_reserve_local_retire()
+            .expect("publication retire reservation");
+        published
+            .commit_reserved(next, retire)
+            .expect("reserved publication commit");
+    }
+    assert_eq!(
+        tx_substrate::epoch::try_reserve_local_retire().expect_err("pool must be full"),
+        tx_substrate::epoch::EpochError::LocalRetireExhausted
+    );
+
+    // The reactor polls at most one task per outer iteration. Two successive
+    // quiescent boundaries therefore cover the E -> E+2 grace period even
+    // while runnable tasks keep the idle-maintenance path unreachable.
+    super::service_reactor_epoch_boundary();
+    super::service_reactor_epoch_boundary();
+
+    let replenished = tx_substrate::epoch::try_reserve_local_retire()
+        .expect("reactor boundaries must replenish publication retire credit");
+    drop(replenished);
+    drop(published);
+    tx_test_support::drain_to_quiescence();
+}
+
 struct FileIoRuntimeTestBlockDevice;
 
 impl tx_subsystems::device::BlockDeviceOps for FileIoRuntimeTestBlockDevice {
@@ -458,7 +492,7 @@ fn boot_init_submits_registered_file_io_service_runtimes() {
     )
     .expect("file io runtime test page container");
     tx_subsystems::device::register_page_container_file_io_service(
-        pc,
+        pc.clone(),
         tx_subsystems::device::BlockDeviceHandle::whole(&FILE_IO_RUNTIME_TEST_BLOCK_REG),
     );
 
@@ -478,10 +512,13 @@ fn file_io_runtime_task_submission_owns_one_runtime() {
         1,
     )
     .expect("file io runtime test page container");
-    let runtime = tx_subsystems::device::register_page_container_file_io_service(
-        pc,
+    tx_subsystems::device::register_page_container_file_io_service(
+        pc.clone(),
         tx_subsystems::device::BlockDeviceHandle::whole(&FILE_IO_RUNTIME_TEST_BLOCK_REG),
     );
+    let mut runtimes = tx_subsystems::device::claim_pending_file_io_service_runtimes_for_test();
+    let runtime = runtimes.pop().expect("one file I/O runtime claim");
+    assert!(runtimes.is_empty());
     let mut submitted = 0;
 
     assert!(CoreInit::<TestPlatform>::submit_file_io_runtime_task_with(
@@ -551,6 +588,29 @@ fn root_device_policy_defaults_final_qemu_to_vda_and_preserves_compatibility_roo
         CoreInit::<TestPlatform>::root_device_name_from_boot("tx.root=vda", true),
         Some("vda")
     );
+}
+
+#[test]
+fn automatic_media_layout_only_applies_without_an_explicit_boot_selector() {
+    assert!(CoreInit::<TestPlatform>::should_autodetect_boot_media_layout("", false));
+    assert!(
+        CoreInit::<TestPlatform>::should_autodetect_boot_media_layout(
+            "console=ttyS0 tx.oscomp.groups=basic-musl",
+            false
+        )
+    );
+    for cmdline in [
+        "tx.root=vda",
+        "tx.profile=onsite",
+        "tx.runsh=/root/test.sh",
+        "init=/sbin/init",
+    ] {
+        assert!(
+            !CoreInit::<TestPlatform>::should_autodetect_boot_media_layout(cmdline, false),
+            "explicit selector must disable image-layout probing: {cmdline}"
+        );
+    }
+    assert!(!CoreInit::<TestPlatform>::should_autodetect_boot_media_layout("", true));
 }
 
 #[test]

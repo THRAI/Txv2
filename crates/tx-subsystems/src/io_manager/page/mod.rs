@@ -1,12 +1,93 @@
 //! L4 page-submission values.
 
 use alloc::collections::VecDeque;
+use alloc::vec::Vec;
 
 use crate::execution::Errno;
+use crate::fs_iface::BioPlanList;
+use crate::io_manager::block::{QueueError, SubmitOutcome};
 
 pub mod admission;
 pub mod completion;
+pub mod manager;
 pub mod service;
+
+pub(crate) use manager::PageIoSubmissionHandle;
+
+/// Opaque correlation token for one immutable L4-to-L6 submission action.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct PageL6ActionId(u64);
+
+impl PageL6ActionId {
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+/// Immutable L6 work emitted by the page submission manager.
+///
+/// Request, graph, resume, and retained-lease ownership stays in L4. L6 sees
+/// only neutral BIO plans plus an opaque token echoed in its receipt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PageL6Action {
+    PageBios {
+        id: PageL6ActionId,
+        bios: BioPlanList,
+    },
+    MetadataFirst {
+        id: PageL6ActionId,
+        bios: BioPlanList,
+    },
+    GraphReady {
+        id: PageL6ActionId,
+        bios: BioPlanList,
+    },
+}
+
+impl PageL6Action {
+    pub const fn id(&self) -> PageL6ActionId {
+        match self {
+            Self::PageBios { id, .. }
+            | Self::MetadataFirst { id, .. }
+            | Self::GraphReady { id, .. } => *id,
+        }
+    }
+
+    pub const fn bios(&self) -> &BioPlanList {
+        match self {
+            Self::PageBios { bios, .. }
+            | Self::MetadataFirst { bios, .. }
+            | Self::GraphReady { bios, .. } => bios,
+        }
+    }
+
+    pub fn into_bios(self) -> BioPlanList {
+        match self {
+            Self::PageBios { bios, .. }
+            | Self::MetadataFirst { bios, .. }
+            | Self::GraphReady { bios, .. } => bios,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PageL6SubmitFailure {
+    pub failed_index: usize,
+    pub error: QueueError,
+}
+
+/// L6 admission facts. A failed batch keeps every preceding successful
+/// outcome so L4 can retain completion routes for already-accepted BIOs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PageL6Receipt {
+    pub id: PageL6ActionId,
+    pub submitted: Vec<SubmitOutcome>,
+    pub failure: Option<PageL6SubmitFailure>,
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct PageContainerKey(u64);
@@ -266,9 +347,30 @@ impl PageRequestQueue {
         self.pending.remove(index)
     }
 
+    /// Put a previously popped request back without changing its identity.
+    /// Backend `Yield` uses this so the retained PageBacked owner and waiters
+    /// continue to refer to the same request id on retry.
+    pub fn requeue(&mut self, request: PageIoRequest) -> Result<(), PageQueueError> {
+        if request.range.is_empty() {
+            return Err(PageQueueError::EmptyRange);
+        }
+        if self.pending.len() >= self.max_pending {
+            return Err(PageQueueError::Full);
+        }
+        if self.pending.iter().any(|pending| pending.id == request.id) {
+            return Ok(());
+        }
+        self.pending.push_back(request);
+        Ok(())
+    }
+
     pub fn remove(&mut self, id: PageIoRequestId) -> Option<PageIoRequest> {
         let index = self.pending.iter().position(|request| request.id == id)?;
         self.pending.remove(index)
+    }
+
+    pub fn contains(&self, id: PageIoRequestId) -> bool {
+        self.pending.iter().any(|request| request.id == id)
     }
 
     pub fn find(

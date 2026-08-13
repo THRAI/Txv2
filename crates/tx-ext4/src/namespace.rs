@@ -1,15 +1,19 @@
 use crate::adapter::step_engine::{self as step_engine, Cap, NoProgress, StepOutcome};
 use step_engine::Guard;
-use tx_ext4_format::pager::{BlockImage, DirEntryLite, InodeMetaLite};
+use tx_ext4_format::mutation::{FsyncStamp, SetAttr};
+use tx_ext4_format::ondisk::Inode;
+use tx_ext4_format::pager::{BlockImage, DirEntryLite};
 use tx_subsystems::execution::Errno;
-use tx_subsystems::mount::MountPayload;
+use tx_subsystems::mount::{MountPayload, MountTransactionFrontier};
+use tx_subsystems::page_backed::FileFsyncFrontier;
 use tx_subsystems::vfs::structure::{
     Credential, DirCursor, DirEntry, FsObjectId, InlineName, InodeKind, InodeMeta, RNode,
-    RNodeBacking,
+    RNodeBacking, Timespec,
 };
 
 use crate::read_backend::{
-    cursor_from_offset, cursor_offset, map_inode_meta, Ext4FsInstance, READDIR_WINDOW_ENTRIES,
+    cursor_from_offset, cursor_offset, fs_object_id as inode_fs_object_id, inode_no,
+    map_inode_meta, Ext4FsInstance, READDIR_WINDOW_ENTRIES,
 };
 
 // ext4 dir-entry file_type codes (POSIX-shaped). Maps the on-disk byte
@@ -23,6 +27,84 @@ fn ext4_file_type_to_kind(file_type: u8) -> InodeKind {
         6 => InodeKind::Socket,
         7 => InodeKind::Symlink,
         _ => InodeKind::Regular,
+    }
+}
+
+impl<I: BlockImage> Ext4FsInstance<I> {
+    fn plan_serialized_meta_update(
+        &self,
+        inode: tx_ext4_format::pager::InodeNo,
+        meta: &InodeMeta,
+    ) -> Result<Option<SetAttr>, Errno> {
+        let current = self.inode_meta_cached(inode)?;
+        if meta.size != current.size
+            || meta.nlinks != current.nlinks
+            || meta.blocks != current.blocks_512
+            || meta.flags != current.flags
+        {
+            return Err(Errno::EOPNOTSUPP);
+        }
+
+        let mode_changed = meta.mode != current.mode;
+        let owner_changed = meta.uid != current.uid || meta.gid != current.gid;
+        let times_changed = timespec_changed(meta.atime, current.atime)
+            || timespec_changed(meta.mtime, current.mtime)
+            || timespec_changed(meta.ctime, current.ctime);
+        match (
+            mode_changed.then_some(SetAttr::Mode(meta.mode)),
+            owner_changed.then_some(SetAttr::Owner {
+                uid: (meta.uid != current.uid).then_some(meta.uid),
+                gid: (meta.gid != current.gid).then_some(meta.gid),
+            }),
+            if times_changed {
+                Some(SetAttr::Times {
+                    atime_ns: timespec_changed(meta.atime, current.atime)
+                        .then(|| timespec_to_ns(meta.atime))
+                        .transpose()?,
+                    mtime_ns: timespec_changed(meta.mtime, current.mtime)
+                        .then(|| timespec_to_ns(meta.mtime))
+                        .transpose()?,
+                    ctime_ns: timespec_to_ns(meta.ctime)?,
+                })
+            } else {
+                None
+            },
+        ) {
+            (None, None, None) => Ok(None),
+            (Some(update), None, None)
+            | (None, Some(update), None)
+            | (None, None, Some(update)) => Ok(Some(update)),
+            _ => Err(Errno::EOPNOTSUPP),
+        }
+    }
+}
+
+fn timespec_changed(desired: Timespec, current_sec: u32) -> bool {
+    desired.sec != current_sec as i64 || desired.nsec != 0
+}
+
+fn timespec_to_ns(ts: Timespec) -> Result<u64, Errno> {
+    if ts.sec < 0 || !(0..1_000_000_000).contains(&ts.nsec) {
+        return Err(Errno::EINVAL);
+    }
+    (ts.sec as u64)
+        .checked_mul(1_000_000_000)
+        .and_then(|sec| sec.checked_add(ts.nsec as u64))
+        .ok_or(Errno::EINVAL)
+}
+
+fn fsync_stamp_from_meta(meta: &InodeMeta) -> Result<FsyncStamp, Errno> {
+    timespec_to_ns(meta.ctime).map(FsyncStamp::new)
+}
+
+pub(crate) fn journal_mutation_runtime_errno(
+    error: crate::journal::JournalMutationRuntimeError,
+) -> Errno {
+    match error {
+        crate::journal::JournalMutationRuntimeError::Busy(_) => Errno::EBUSY,
+        crate::journal::JournalMutationRuntimeError::Image(_)
+        | crate::journal::JournalMutationRuntimeError::Stage(_) => Errno::EIO,
+        crate::journal::JournalMutationRuntimeError::Settlement(errno) => errno,
     }
 }
 
@@ -40,16 +122,12 @@ fn ext4_file_type_to_kind(file_type: u8) -> InodeKind {
 
 use tx_subsystems::vfs::FsOps;
 
-fn current_ext4_time_sec() -> u32 {
-    tx_subsystems::wall_clock::current_realtime_sec().min(u32::MAX as u64) as u32
-}
-
-/// Initial sparse-cache window for ext4 regular-file PageContainers.
+/// Static writable capacity for ext4 regular-file PageContainers.
 ///
-/// This is not a file-size limit: file-backed PageContainers are sparse and
-/// may grow beyond this window. Keeping a moderate initial value preserves
-/// the existing cache geometry without rejecting large linker outputs.
-const EXT4_FILE_INITIAL_PAGE_WINDOW: u64 = 65536;
+/// PageContainer currently has a fixed `page_count` capacity. Match tmpfs'
+/// day-1 growth window so newly-created ext4 files can grow through ordinary
+/// PageBacked writes instead of failing after one page.
+const EXT4_FILE_PAGE_CAP: u64 = 2048;
 
 /// Factory for `MountOutput::fs_ops`.
 ///
@@ -75,19 +153,16 @@ where
     ) -> StepOutcome<FsObjectId, NoProgress> {
         // Diagnostic: record that ext4 lookup was called (vs some other backend).
         tx_subsystems::vfs::resolution::diagnostic::record_diag(20);
-        let parent_inode = match self.resolve_object(parent) {
-            Ok((parent, _)) => parent,
+        let parent = match inode_no(parent) {
+            Ok(parent) => parent,
             Err(err) => {
                 tx_subsystems::vfs::resolution::diagnostic::record_diag(21);
                 return StepOutcome::err(err.into());
             }
         };
 
-        match self.lookup_cached(parent, parent_inode, name) {
-            Ok(Some(inode)) => match self.object_id_for_inode(inode) {
-                Ok(id) => StepOutcome::done(id),
-                Err(err) => StepOutcome::err(err.into()),
-            },
+        match self.lookup_cached(parent, name) {
+            Ok(Some(inode)) => StepOutcome::done(inode_fs_object_id(inode)),
             Ok(None) => {
                 tx_subsystems::vfs::resolution::diagnostic::record_diag(22); // ENOENT
                 StepOutcome::err(Errno::ENOENT.into())
@@ -104,33 +179,52 @@ where
         fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<InodeMeta, NoProgress> {
-        let (_, meta) = match self.resolve_object(fs_object_id) {
-            Ok(resolved) => resolved,
+        let inode = match inode_no(fs_object_id) {
+            Ok(inode) => inode,
             Err(err) => return StepOutcome::err(err.into()),
         };
-        StepOutcome::done(map_inode_meta(meta))
+
+        match self.inode_meta_cached(inode) {
+            Ok(meta) => StepOutcome::done(map_inode_meta(meta)),
+            Err(err) => StepOutcome::err(err.into()),
+        }
     }
 
     fn serialize_inode_meta(
         &self,
         fs_object_id: FsObjectId,
         meta: &InodeMeta,
-        _guard: &Guard<'_>,
+        guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
         if self.is_read_only() {
             return StepOutcome::err(Errno::EROFS.into());
         }
-        let inode = match self.resolve_object(fs_object_id) {
-            Ok((inode, _)) => inode,
+        let Some(_admission) = self.try_lock_metadata_mutation_admission() else {
+            return self.wait_for_metadata_mutation_admission();
+        };
+        let Some(runtime) = self.metadata_mutation_runtime() else {
+            return StepOutcome::err(Errno::EOPNOTSUPP.into());
+        };
+        let inode = match inode_no(fs_object_id) {
+            Ok(inode) => inode,
             Err(err) => return StepOutcome::err(err.into()),
         };
-        match self.with_pager(|pager| {
-            pager
-                .write_inode_meta_journaled_checkpointed(inode, inode_meta_lite(meta))
-                .map(|_| ())
-        }) {
+        let update = match self.plan_serialized_meta_update(inode, meta) {
+            Ok(Some(update)) => update,
+            Ok(None) => return StepOutcome::done(()),
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        let stamp = match fsync_stamp_from_meta(meta) {
+            Ok(stamp) => stamp,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        let mutation = match self.with_pager(|pager| pager.plan_setattr(inode, update, stamp)) {
+            Ok(mutation) => mutation,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        match self.begin_metadata_mutation(&runtime, &mutation, guard) {
             Ok(()) => StepOutcome::done(()),
-            Err(err) => StepOutcome::err(err.into()),
+            Err(err) => StepOutcome::err(journal_mutation_runtime_errno(err).into()),
         }
     }
 
@@ -138,36 +232,80 @@ where
         &self,
         fs_object_id: FsObjectId,
         new_mode: u16,
-        cred: &Credential,
-        _guard: &Guard<'_>,
+        _cred: &Credential,
+        guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        // ext4 previously inherited the trait's ENOSYS default; with
-        // the onsite alpine image mounted as an ext4 root, git init's
-        // core.filemode probe (chmod on .git/config.lock) hit it and
-        // aborted. Semantics mirror the tmpfs implementation: keep
-        // IFMT, replace the low 12 permission bits, persist through
-        // the journaled inode-meta write.
         if self.is_read_only() {
             return StepOutcome::err(Errno::EROFS.into());
         }
-        let (inode, disk_meta) = match self.resolve_object(fs_object_id) {
-            Ok(resolved) => resolved,
+        let Some(_admission) = self.try_lock_metadata_mutation_admission() else {
+            return self.wait_for_metadata_mutation_admission();
+        };
+        let Some(runtime) = self.metadata_mutation_runtime() else {
+            return StepOutcome::err(Errno::EOPNOTSUPP.into());
+        };
+        let inode = match inode_no(fs_object_id) {
+            Ok(inode) => inode,
             Err(err) => return StepOutcome::err(err.into()),
         };
-        let meta = map_inode_meta(disk_meta);
-        if let Err(e) = tx_subsystems::vfs::predicates::check_chmod_perm(&meta, cred) {
-            return StepOutcome::err(e.into());
-        }
-        let mut updated = meta;
-        updated.mode = (updated.mode & tx_subsystems::vfs::structure::S_IFMT) | (new_mode & 0o7777);
-        let write = self.with_pager(|pager| {
-            pager
-                .write_inode_meta_journaled_checkpointed(inode, inode_meta_lite(&updated))
-                .map(|_| ())
-        });
-        match write {
+        let current = match self.inode_meta_cached(inode) {
+            Ok(meta) => meta,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        let stamp = FsyncStamp::new(current.ctime as u64);
+        let mutation =
+            match self.with_pager(|pager| pager.plan_setattr_mode(inode, new_mode, stamp)) {
+                Ok(mutation) => mutation,
+                Err(err) => return StepOutcome::err(err.into()),
+            };
+        match self.begin_metadata_mutation(&runtime, &mutation, guard) {
             Ok(()) => StepOutcome::done(()),
-            Err(err) => StepOutcome::err(err.into()),
+            Err(err) => StepOutcome::err(journal_mutation_runtime_errno(err).into()),
+        }
+    }
+
+    fn chown_inode(
+        &self,
+        fs_object_id: FsObjectId,
+        new_uid: Option<u32>,
+        new_gid: Option<u32>,
+        _cred: &Credential,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        if self.is_read_only() {
+            return StepOutcome::err(Errno::EROFS.into());
+        }
+        let Some(_admission) = self.try_lock_metadata_mutation_admission() else {
+            return self.wait_for_metadata_mutation_admission();
+        };
+        let Some(runtime) = self.metadata_mutation_runtime() else {
+            return StepOutcome::err(Errno::EOPNOTSUPP.into());
+        };
+        let inode = match inode_no(fs_object_id) {
+            Ok(inode) => inode,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        let current = match self.inode_meta_cached(inode) {
+            Ok(meta) => meta,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        let stamp = FsyncStamp::new(current.ctime as u64);
+        let mutation = match self.with_pager(|pager| {
+            pager.plan_setattr(
+                inode,
+                SetAttr::Owner {
+                    uid: new_uid,
+                    gid: new_gid,
+                },
+                stamp,
+            )
+        }) {
+            Ok(mutation) => mutation,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        match self.begin_metadata_mutation(&runtime, &mutation, guard) {
+            Ok(()) => StepOutcome::done(()),
+            Err(err) => StepOutcome::err(journal_mutation_runtime_errno(err).into()),
         }
     }
 
@@ -177,34 +315,60 @@ where
         name: &[u8],
         mode: u16,
         cred: &Credential,
-        _guard: &Guard<'_>,
+        guard: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
         if self.is_read_only() {
             return StepOutcome::err(Errno::EROFS.into());
         }
-        let parent_ino = match self.resolve_object(parent) {
-            Ok((v, _)) => v,
+        let Some(_admission) = self.try_lock_metadata_mutation_admission() else {
+            return self.wait_for_metadata_mutation_admission();
+        };
+        let Some(runtime) = self.metadata_mutation_runtime() else {
+            return StepOutcome::err(Errno::EOPNOTSUPP.into());
+        };
+        let parent_ino = match inode_no(parent) {
+            Ok(v) => v,
             Err(e) => return StepOutcome::err(e.into()),
         };
-        let now_sec = current_ext4_time_sec();
-        match self.with_pager_namespace_mutation(&[parent], |pager| {
-            pager.create_regular_file(parent_ino, name, mode, cred.uid, cred.gid, now_sec)
+        let (new_ino, mutation) = match self.with_pager(|pager| {
+            pager.plan_create_regular_file(
+                parent_ino,
+                name,
+                mode,
+                cred.uid,
+                cred.gid,
+                FsyncStamp::new(0),
+            )
         }) {
-            Ok(new_ino) => {
-                self.invalidate_lookup_cache_for(parent);
-                let meta = match self.with_pager(|pager| pager.inode_meta(new_ino)) {
-                    Ok(m) => m,
-                    Err(e) => return StepOutcome::err(e.into()),
-                };
+            Ok(result) => result,
+            Err(e) => return StepOutcome::err(e.into()),
+        };
+        match self.begin_metadata_mutation(&runtime, &mutation, guard) {
+            Ok(()) => {
+                // Allocation establishes a new inode identity even when ext4
+                // reused the same numeric inode as a recently unlinked file.
+                // A close-time writeback owner may still keep that old file's
+                // page container alive, so remove the weak index entry before
+                // the new inode can be materialised.
+                self.invalidate_file_page_container(inode_fs_object_id(new_ino));
+                self.invalidate_lookup_cache_for(parent_ino);
                 StepOutcome::done((
-                    tx_subsystems::vfs::structure::FsObjectId::from_inode_generation(
-                        new_ino.get(),
-                        meta.generation,
-                    ),
-                    map_inode_meta(meta),
+                    inode_fs_object_id(new_ino),
+                    InodeMeta {
+                        mode: Inode::S_IFREG | (mode & 0o7777),
+                        uid: cred.uid,
+                        gid: cred.gid,
+                        size: 0,
+                        atime: Timespec::default(),
+                        mtime: Timespec::default(),
+                        ctime: Timespec::default(),
+                        nlinks: 1,
+                        blocks: 0,
+                        flags: Inode::EXTENTS_FL,
+                    },
                 ))
             }
-            Err(e) => StepOutcome::err(e.into()),
+            Err(err) => StepOutcome::err(journal_mutation_runtime_errno(err).into()),
         }
     }
 
@@ -213,30 +377,46 @@ where
         parent: FsObjectId,
         name: &[u8],
         target: FsObjectId,
-        _guard: &Guard<'_>,
+        guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
         if self.is_read_only() {
             return StepOutcome::err(Errno::EROFS.into());
         }
-        let parent_ino = match self.resolve_object(parent) {
-            Ok((v, _)) => v,
+        let Some(_admission) = self.try_lock_metadata_mutation_admission() else {
+            return self.wait_for_metadata_mutation_admission();
+        };
+        let Some(runtime) = self.metadata_mutation_runtime() else {
+            return StepOutcome::err(Errno::EOPNOTSUPP.into());
+        };
+        let parent_ino = match inode_no(parent) {
+            Ok(v) => v,
             Err(e) => return StepOutcome::err(e.into()),
         };
-        let target_ino = match self.resolve_object(target) {
-            Ok((v, _)) => v,
+        let target_ino = match inode_no(target) {
+            Ok(v) => v,
             Err(e) => return StepOutcome::err(e.into()),
         };
-        match self.with_pager_namespace_mutation(&[parent], |pager| {
-            pager.unlink_inode(parent_ino, name, target_ino)
+        let current = match self.inode_meta_cached(target_ino) {
+            Ok(meta) => meta,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        let mutation = match self.with_pager(|pager| {
+            pager.plan_unlink_dir_entry(
+                parent_ino,
+                name,
+                target_ino,
+                FsyncStamp::new(current.ctime as u64),
+            )
         }) {
-            Ok(remaining_links) => {
-                self.invalidate_lookup_cache_for(parent);
-                if remaining_links == 0 {
-                    self.mark_inode_orphaned(target);
-                }
+            Ok(mutation) => mutation,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        match self.begin_metadata_mutation(&runtime, &mutation, guard) {
+            Ok(()) => {
+                self.invalidate_lookup_cache_for(parent_ino);
                 StepOutcome::done(())
             }
-            Err(e) => StepOutcome::err(e.into()),
+            Err(err) => StepOutcome::err(journal_mutation_runtime_errno(err).into()),
         }
     }
 
@@ -246,38 +426,101 @@ where
         old_name: &[u8],
         new_parent: FsObjectId,
         new_name: &[u8],
-        _guard: &Guard<'_>,
+        guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
         if self.is_read_only() {
             return StepOutcome::err(Errno::EROFS.into());
         }
-        let old_parent_ino = match self.resolve_object(old_parent) {
-            Ok((v, _)) => v,
+        let Some(_admission) = self.try_lock_metadata_mutation_admission() else {
+            return self.wait_for_metadata_mutation_admission();
+        };
+        let Some(runtime) = self.metadata_mutation_runtime() else {
+            return StepOutcome::err(Errno::EOPNOTSUPP.into());
+        };
+        if old_parent == new_parent && old_name == new_name {
+            return StepOutcome::done(());
+        }
+        let old_parent_ino = match inode_no(old_parent) {
+            Ok(v) => v,
             Err(e) => return StepOutcome::err(e.into()),
         };
-        let new_parent_ino = match self.resolve_object(new_parent) {
-            Ok((v, _)) => v,
+        let new_parent_ino = match inode_no(new_parent) {
+            Ok(v) => v,
             Err(e) => return StepOutcome::err(e.into()),
         };
 
-        match self.with_pager_namespace_mutation(&[old_parent, new_parent], |pager| {
-            pager.rename_inode(old_parent_ino, old_name, new_parent_ino, new_name)
+        let old_ino = match self.lookup_cached(old_parent_ino, old_name) {
+            Ok(Some(ino)) => ino,
+            Ok(None) => return StepOutcome::err(Errno::ENOENT.into()),
+            Err(e) => return StepOutcome::err(e.into()),
+        };
+        let overwritten_ino = match self.lookup_cached(new_parent_ino, new_name) {
+            Ok(Some(ino)) => Some(ino),
+            Ok(None) => None,
+            Err(e) => return StepOutcome::err(e.into()),
+        };
+        let current = match self.inode_meta_cached(old_ino) {
+            Ok(meta) => meta,
+            Err(e) => return StepOutcome::err(e.into()),
+        };
+        let current_kind = current.mode & 0xF000;
+        let same_parent_directory_rename = current_kind == Inode::S_IFDIR
+            && old_parent_ino == new_parent_ino
+            && overwritten_ino.is_none();
+        if current_kind != Inode::S_IFREG && !same_parent_directory_rename {
+            return StepOutcome::err(Errno::EOPNOTSUPP.into());
+        }
+        let overwritten_meta = match overwritten_ino {
+            Some(ino) => match self.inode_meta_cached(ino) {
+                Ok(meta) => Some(meta),
+                Err(e) => return StepOutcome::err(e.into()),
+            },
+            None => None,
+        };
+        if overwritten_meta
+            .as_ref()
+            .is_some_and(|meta| meta.mode & 0xF000 != 0x8000)
+        {
+            return StepOutcome::err(Errno::EOPNOTSUPP.into());
+        }
+        let mutation = match self.with_pager(|pager| {
+            match (old_parent_ino == new_parent_ino, overwritten_ino) {
+                (true, Some(ino)) => pager.plan_rename_overwrite_dir_entry(
+                    old_parent_ino,
+                    old_name,
+                    new_name,
+                    old_ino,
+                    ino,
+                    FsyncStamp::new(current.ctime as u64),
+                ),
+                (true, None) => pager.plan_rename_dir_entry(
+                    old_parent_ino,
+                    old_name,
+                    new_name,
+                    old_ino,
+                    FsyncStamp::new(current.ctime as u64),
+                ),
+                (false, Some(_)) => Err(tx_ext4_format::Ext4FormatError::Unsupported),
+                (false, None) => pager.plan_cross_dir_rename_dir_entry(
+                    old_parent_ino,
+                    old_name,
+                    new_parent_ino,
+                    new_name,
+                    old_ino,
+                    FsyncStamp::new(current.ctime as u64),
+                ),
+            }
         }) {
-            Ok(outcome) => {
-                self.invalidate_lookup_cache_for(old_parent);
-                self.invalidate_lookup_cache_for(new_parent);
-                if let Some((displaced, remaining_links)) = outcome.displaced {
-                    if remaining_links == 0 {
-                        let displaced_id = match self.object_id_for_inode(displaced) {
-                            Ok(id) => id,
-                            Err(err) => return StepOutcome::err(err.into()),
-                        };
-                        self.mark_inode_orphaned(displaced_id);
-                    }
-                }
+            Ok(mutation) => mutation,
+            Err(e) => return StepOutcome::err(e.into()),
+        };
+        match self.begin_metadata_mutation(&runtime, &mutation, guard) {
+            Ok(()) => {
+                self.invalidate_lookup_cache_for(old_parent_ino);
+                self.invalidate_lookup_cache_for(new_parent_ino);
                 StepOutcome::done(())
             }
-            Err(e) => StepOutcome::err(e.into()),
+            Err(err) => StepOutcome::err(journal_mutation_runtime_errno(err).into()),
         }
     }
 
@@ -286,35 +529,54 @@ where
         parent: FsObjectId,
         name: &[u8],
         target: FsObjectId,
-        _guard: &Guard<'_>,
+        guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
         if self.is_read_only() {
             return StepOutcome::err(Errno::EROFS.into());
         }
-        let parent_ino = match self.resolve_object(parent) {
-            Ok((v, _)) => v,
+        let Some(_admission) = self.try_lock_metadata_mutation_admission() else {
+            return self.wait_for_metadata_mutation_admission();
+        };
+        let Some(runtime) = self.metadata_mutation_runtime() else {
+            return StepOutcome::err(Errno::EOPNOTSUPP.into());
+        };
+        let parent_ino = match inode_no(parent) {
+            Ok(v) => v,
             Err(e) => return StepOutcome::err(e.into()),
         };
-        let (target_ino, meta) = match self.resolve_object(target) {
-            Ok(resolved) => resolved,
+        let target_ino = match inode_no(target) {
+            Ok(v) => v,
             Err(e) => return StepOutcome::err(e.into()),
         };
-        match self.lookup_cached(parent, parent_ino, name) {
+        match self.lookup_cached(parent_ino, name) {
             Ok(Some(_)) => return StepOutcome::err(Errno::EEXIST.into()),
             Ok(None) => {}
             Err(e) => return StepOutcome::err(e.into()),
         }
-        if meta.mode & 0xF000 == 0x4000 {
-            return StepOutcome::err(Errno::EPERM.into());
+        let current = match self.inode_meta_cached(target_ino) {
+            Ok(meta) => meta,
+            Err(e) => return StepOutcome::err(e.into()),
+        };
+        if current.mode & 0xF000 != 0x8000 {
+            return StepOutcome::err(Errno::EOPNOTSUPP.into());
         }
-        match self.with_pager_namespace_mutation(&[parent], |pager| {
-            pager.link_inode(parent_ino, name, target_ino)
+        let mutation = match self.with_pager(|pager| {
+            pager.plan_link_dir_entry(
+                parent_ino,
+                name,
+                target_ino,
+                FsyncStamp::new(current.ctime as u64),
+            )
         }) {
+            Ok(mutation) => mutation,
+            Err(e) => return StepOutcome::err(e.into()),
+        };
+        match self.begin_metadata_mutation(&runtime, &mutation, guard) {
             Ok(()) => {
-                self.invalidate_lookup_cache_for(parent);
+                self.invalidate_lookup_cache_for(parent_ino);
                 StepOutcome::done(())
             }
-            Err(e) => StepOutcome::err(e.into()),
+            Err(err) => StepOutcome::err(journal_mutation_runtime_errno(err).into()),
         }
     }
 
@@ -324,39 +586,59 @@ where
         name: &[u8],
         mode: u16,
         cred: &Credential,
-        _guard: &Guard<'_>,
+        guard: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
         if self.is_read_only() {
             return StepOutcome::err(Errno::EROFS.into());
         }
-        let parent_ino = match self.resolve_object(parent) {
-            Ok((v, _)) => v,
+        let Some(_admission) = self.try_lock_metadata_mutation_admission() else {
+            return self.wait_for_metadata_mutation_admission();
+        };
+        let Some(runtime) = self.metadata_mutation_runtime() else {
+            return StepOutcome::err(Errno::EOPNOTSUPP.into());
+        };
+        let parent_ino = match inode_no(parent) {
+            Ok(v) => v,
             Err(e) => return StepOutcome::err(e.into()),
         };
-        match self.with_pager(|pager| pager.lookup(parent_ino, name)) {
+        match self.lookup_cached(parent_ino, name) {
             Ok(Some(_)) => return StepOutcome::err(Errno::EEXIST.into()),
             Ok(None) => {}
             Err(e) => return StepOutcome::err(e.into()),
         }
-        let now_sec = current_ext4_time_sec();
-        match self.with_pager_namespace_mutation(&[parent], |pager| {
-            pager.create_directory(parent_ino, name, mode, cred.uid, cred.gid, now_sec)
+        let (new_ino, _data_block, mutation) = match self.with_pager(|pager| {
+            pager.plan_create_directory(
+                parent_ino,
+                name,
+                mode,
+                cred.uid,
+                cred.gid,
+                FsyncStamp::new(0),
+            )
         }) {
-            Ok(new_ino) => {
-                self.invalidate_lookup_cache_for(parent);
-                let meta = match self.with_pager(|pager| pager.inode_meta(new_ino)) {
-                    Ok(m) => m,
-                    Err(e) => return StepOutcome::err(e.into()),
-                };
+            Ok(result) => result,
+            Err(e) => return StepOutcome::err(e.into()),
+        };
+        match self.begin_metadata_mutation(&runtime, &mutation, guard) {
+            Ok(()) => {
+                self.invalidate_lookup_cache_for(parent_ino);
                 StepOutcome::done((
-                    tx_subsystems::vfs::structure::FsObjectId::from_inode_generation(
-                        new_ino.get(),
-                        meta.generation,
-                    ),
-                    map_inode_meta(meta),
+                    inode_fs_object_id(new_ino),
+                    InodeMeta {
+                        mode: Inode::S_IFDIR | (mode & 0o7777),
+                        uid: cred.uid,
+                        gid: cred.gid,
+                        size: tx_ext4_format::pager::BLOCK_SIZE as u64,
+                        atime: Timespec::default(),
+                        mtime: Timespec::default(),
+                        ctime: Timespec::default(),
+                        nlinks: 2,
+                        blocks: 8,
+                        flags: Inode::EXTENTS_FL,
+                    },
                 ))
             }
-            Err(e) => StepOutcome::err(e.into()),
+            Err(err) => StepOutcome::err(journal_mutation_runtime_errno(err).into()),
         }
     }
 
@@ -365,40 +647,109 @@ where
         parent: FsObjectId,
         name: &[u8],
         target: FsObjectId,
-        _guard: &Guard<'_>,
+        guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
         if self.is_read_only() {
             return StepOutcome::err(Errno::EROFS.into());
         }
-        let parent_ino = match self.resolve_object(parent) {
-            Ok((v, _)) => v,
+        let Some(_admission) = self.try_lock_metadata_mutation_admission() else {
+            return self.wait_for_metadata_mutation_admission();
+        };
+        let Some(runtime) = self.metadata_mutation_runtime() else {
+            return StepOutcome::err(Errno::EOPNOTSUPP.into());
+        };
+        let parent_ino = match inode_no(parent) {
+            Ok(v) => v,
             Err(e) => return StepOutcome::err(e.into()),
         };
-        let target_ino = match self.resolve_object(target) {
-            Ok((v, _)) => v,
+        let target_ino = match inode_no(target) {
+            Ok(v) => v,
             Err(e) => return StepOutcome::err(e.into()),
         };
-        match self.with_pager_namespace_mutation(&[parent], |pager| {
-            pager.unlink_directory(parent_ino, name, target_ino)
+        let current = match self.inode_meta_cached(target_ino) {
+            Ok(meta) => meta,
+            Err(e) => return StepOutcome::err(e.into()),
+        };
+        let mutation = match self.with_pager(|pager| {
+            pager.plan_rmdir_dir_entry(
+                parent_ino,
+                name,
+                target_ino,
+                FsyncStamp::new(current.ctime as u64),
+            )
         }) {
+            Ok(mutation) => mutation,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        match self.begin_metadata_mutation(&runtime, &mutation, guard) {
             Ok(()) => {
-                self.invalidate_lookup_cache_for(parent);
-                self.mark_inode_orphaned(target);
+                self.invalidate_lookup_cache_for(parent_ino);
                 StepOutcome::done(())
             }
-            Err(e) => StepOutcome::err(e.into()),
+            Err(err) => StepOutcome::err(journal_mutation_runtime_errno(err).into()),
         }
     }
 
     fn symlink(
         &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _link_target: &[u8],
-        _cred: &Credential,
-        _guard: &Guard<'_>,
+        parent: FsObjectId,
+        name: &[u8],
+        link_target: &[u8],
+        cred: &Credential,
+        guard: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
-        StepOutcome::err(Errno::ENOSYS.into())
+        if self.is_read_only() {
+            return StepOutcome::err(Errno::EROFS.into());
+        }
+        let Some(_admission) = self.try_lock_metadata_mutation_admission() else {
+            return self.wait_for_metadata_mutation_admission();
+        };
+        let Some(runtime) = self.metadata_mutation_runtime() else {
+            return StepOutcome::err(Errno::EOPNOTSUPP.into());
+        };
+        let parent_ino = match inode_no(parent) {
+            Ok(v) => v,
+            Err(e) => return StepOutcome::err(e.into()),
+        };
+        match self.lookup_cached(parent_ino, name) {
+            Ok(Some(_)) => return StepOutcome::err(Errno::EEXIST.into()),
+            Ok(None) => {}
+            Err(e) => return StepOutcome::err(e.into()),
+        }
+        let (new_ino, mutation) = match self.with_pager(|pager| {
+            pager.plan_create_fast_symlink(
+                parent_ino,
+                name,
+                link_target,
+                cred.uid,
+                cred.gid,
+                FsyncStamp::new(0),
+            )
+        }) {
+            Ok(result) => result,
+            Err(e) => return StepOutcome::err(e.into()),
+        };
+        match self.begin_metadata_mutation(&runtime, &mutation, guard) {
+            Ok(()) => {
+                self.invalidate_lookup_cache_for(parent_ino);
+                StepOutcome::done((
+                    inode_fs_object_id(new_ino),
+                    InodeMeta {
+                        mode: Inode::S_IFLNK | 0o777,
+                        uid: cred.uid,
+                        gid: cred.gid,
+                        size: link_target.len() as u64,
+                        atime: Timespec::default(),
+                        mtime: Timespec::default(),
+                        ctime: Timespec::default(),
+                        nlinks: 1,
+                        blocks: 0,
+                        flags: 0,
+                    },
+                ))
+            }
+            Err(err) => StepOutcome::err(journal_mutation_runtime_errno(err).into()),
+        }
     }
 
     fn readdir(
@@ -407,8 +758,8 @@ where
         cursor: DirCursor,
         _guard: &Guard<'_>,
     ) -> StepOutcome<Option<(DirEntry, DirCursor)>, NoProgress> {
-        let inode = match self.resolve_object(fs_object_id) {
-            Ok((inode, _)) => inode,
+        let inode = match inode_no(fs_object_id) {
+            Ok(inode) => inode,
             Err(err) => return StepOutcome::err(err.into()),
         };
         let offset = match cursor_offset(cursor) {
@@ -417,16 +768,11 @@ where
         };
         let mut entries = [DirEntryLite::empty(); READDIR_WINDOW_ENTRIES];
         let mut next_offsets = [0u64; READDIR_WINDOW_ENTRIES];
-        let count = match self.read_dir_entries_cached(
-            fs_object_id,
-            inode,
-            offset,
-            &mut entries,
-            &mut next_offsets,
-        ) {
-            Ok(count) => count,
-            Err(err) => return StepOutcome::err(err.into()),
-        };
+        let count =
+            match self.read_dir_entries_cached(inode, offset, &mut entries, &mut next_offsets) {
+                Ok(count) => count,
+                Err(err) => return StepOutcome::err(err.into()),
+            };
         if count == 0 {
             return StepOutcome::done(None);
         }
@@ -436,14 +782,10 @@ where
             Ok(name) => name,
             Err(err) => return StepOutcome::err(err.into()),
         };
-        let entry_id = match self.object_id_for_inode(entry.inode) {
-            Ok(id) => id,
-            Err(err) => return StepOutcome::err(err.into()),
-        };
         StepOutcome::done(Some((
             DirEntry {
                 name,
-                fs_object_id: entry_id,
+                fs_object_id: inode_fs_object_id(entry.inode),
                 kind: ext4_file_type_to_kind(entry.file_type),
             },
             cursor_from_offset(next_offsets[0]),
@@ -458,7 +800,64 @@ where
         if self.is_read_only() {
             return StepOutcome::err(Errno::EROFS.into());
         }
-        match self.destroy_orphaned_inode(fs_object_id, guard) {
+        let Some(_admission) = self.try_lock_metadata_mutation_admission() else {
+            return self.wait_for_metadata_mutation_admission();
+        };
+        let Some(runtime) = self.metadata_mutation_runtime() else {
+            return StepOutcome::err(Errno::EOPNOTSUPP.into());
+        };
+        let inode = match inode_no(fs_object_id) {
+            Ok(inode) => inode,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        let current = match self.inode_meta_cached(inode) {
+            Ok(meta) => meta,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        let mutation = match self.with_pager(|pager| {
+            pager.plan_destroy_inode(inode, FsyncStamp::new(current.ctime.into()))
+        }) {
+            Ok(mutation) => mutation,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        match self.begin_metadata_mutation(&runtime, &mutation, guard) {
+            Ok(()) => {
+                // `FsObjectLifetime::drop` probes this hook for linked files
+                // too.  Only a zero-link inode is actually reclaimable; a
+                // successful no-op probe for a linked inode must retain its
+                // cache identity so an immediate reopen observes dirty data
+                // which close-time writeback has not persisted yet.
+                if current.nlinks == 0 {
+                    self.invalidate_file_page_container(fs_object_id);
+                }
+                self.settle_metadata_caches();
+                StepOutcome::done(())
+            }
+            Err(err) => StepOutcome::err(journal_mutation_runtime_errno(err).into()),
+        }
+    }
+
+    fn settle_file(
+        &self,
+        _fs_object_id: FsObjectId,
+        _generation_frontier: &FileFsyncFrontier,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        self.settle_metadata_caches();
+        StepOutcome::done(())
+    }
+
+    fn settle_mount(
+        &self,
+        _transaction_frontier: MountTransactionFrontier,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        self.settle_metadata_caches();
+        StepOutcome::done(())
+    }
+
+    fn shutdown(&self, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
+        match self.shutdown_mount() {
             Ok(()) => StepOutcome::done(()),
             Err(err) => StepOutcome::err(err.into()),
         }
@@ -467,42 +866,35 @@ where
     fn materialise_rnode(
         &self,
         fs_object_id: FsObjectId,
-        _meta: InodeMeta,
+        meta: InodeMeta,
         mount: &Cap<MountPayload>,
-        guard: &Guard<'_>,
+        _guard: &Guard<'_>,
     ) -> StepOutcome<Cap<RNode>, NoProgress> {
-        if let Err(err) = self.resolve_object(fs_object_id) {
-            return StepOutcome::err(err.into());
-        }
         let pin = match self.mount_pin.lock().clone() {
             Some(p) => p,
             None => return StepOutcome::err(Errno::ENOSYS.into()),
         };
 
+        const PAGE_SIZE: u64 = 4096;
         // Always allocate a writable growth window for regular files.
         // `PageContainer::new()` initialises `size_bytes` to `page_count *
         // PAGE_SIZE` (the physical capacity), not to the inode's logical size,
         // so we must call `set_size_bytes` afterwards.  Without this correction
         // O_APPEND writes compute `offset = size_bytes = PAGE_SIZE`, which
         // immediately exceeds `capacity = PAGE_SIZE`, yielding EINVAL.
-        let (pc, disk_meta) = match self.get_or_create_page_container(
+        let page_count = meta.size.div_ceil(PAGE_SIZE).max(EXT4_FILE_PAGE_CAP);
+        let pc = match self.file_page_container_for_materialized_inode(
             fs_object_id,
+            page_count,
+            meta.size,
             pin,
-            EXT4_FILE_INITIAL_PAGE_WINDOW,
-            guard,
+            _guard,
         ) {
-            Ok(result) => result,
+            Ok(pc) => pc,
             Err(err) => return StepOutcome::err(err.into()),
         };
-        let mut materialized_meta = map_inode_meta(disk_meta);
-        materialized_meta.size = pc.size_bytes();
 
-        match RNode::new_cap_in_mount(
-            fs_object_id,
-            materialized_meta,
-            RNodeBacking::PageBacked { pc },
-            mount,
-        ) {
+        match RNode::new_cap_in_mount(fs_object_id, meta, RNodeBacking::PageBacked { pc }, mount) {
             Ok(rnode) => StepOutcome::done(rnode),
             Err(_) => StepOutcome::err(Errno::ENOMEM.into()),
         }
@@ -513,8 +905,8 @@ where
         fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<alloc::boxed::Box<[u8]>, NoProgress> {
-        let inode = match self.resolve_object(fs_object_id) {
-            Ok((inode, _)) => inode,
+        let inode = match inode_no(fs_object_id) {
+            Ok(inode) => inode,
             Err(err) => return StepOutcome::err(err.into()),
         };
         match self.with_pager(|pager| pager.read_symlink(inode)) {
@@ -523,31 +915,5 @@ where
         }
     }
 
-    // `step_chown` would commit the same way if a workload needs it.
-}
-
-fn inode_meta_lite(meta: &InodeMeta) -> InodeMetaLite {
-    fn sec_to_u32(sec: i64) -> u32 {
-        if sec <= 0 {
-            0
-        } else {
-            sec.min(u32::MAX as i64) as u32
-        }
-    }
-
-    InodeMetaLite {
-        // `write_inode_meta_journaled` preserves the on-disk generation; this
-        // value is intentionally not applied by the format layer.
-        generation: 0,
-        mode: meta.mode,
-        uid: meta.uid,
-        gid: meta.gid,
-        size: meta.size,
-        nlinks: meta.nlinks,
-        blocks_512: meta.blocks,
-        flags: meta.flags,
-        atime: sec_to_u32(meta.atime.sec),
-        ctime: sec_to_u32(meta.ctime.sec),
-        mtime: sec_to_u32(meta.mtime.sec),
-    }
+    // `chmod_inode`, `chown_inode` commit through `serialize_inode_meta`.
 }

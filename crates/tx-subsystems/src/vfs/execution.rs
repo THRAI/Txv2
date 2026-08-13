@@ -9,7 +9,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::execution::Guard;
-use crate::page_backed::FsPageBacking;
+use crate::page_backed::{FileFsyncFrontier, FsPageBacking};
 use crate::tty;
 use crate::vfs::adapter::step_engine::{
     self, ByteProgress, Cap, Errno, NoProgress, OneShotStepOp, ScriptCtx, StepOp, StepOutcome,
@@ -23,7 +23,7 @@ use super::structure::{
     Credential, DirCursor, DirEntry, FsObjectId, InodeKind, InodeMeta, OpenFile, OpenFileBacking,
     OpenFileIoctl, OpenFileIoctlCaller, OpenFileIoctlResult, RNodeBacking, StructPayload,
 };
-use crate::mount::{MountIdentity, MountNamespace, MountPayload};
+use crate::mount::{MountIdentity, MountNamespace, MountPayload, MountTransactionFrontier};
 
 // === FsOps — emits step_v3 outcomes ==================================
 //
@@ -176,6 +176,35 @@ pub trait FsOps: Send + Sync + 'static {
         fs_object_id: FsObjectId,
         guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress>;
+
+    /// 在页缓存数据到达代际边界后收敛文件系统自己的持久化状态。
+    fn settle_file(
+        &self,
+        fs_object_id: FsObjectId,
+        generation_frontier: &FileFsyncFrontier,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        let _ = (fs_object_id, generation_frontier, guard);
+        StepOutcome::done(())
+    }
+
+    fn snapshot_mount_transaction_frontier(&self) -> MountTransactionFrontier {
+        MountTransactionFrontier::default()
+    }
+
+    fn settle_mount(
+        &self,
+        transaction_frontier: MountTransactionFrontier,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        let _ = (transaction_frontier, guard);
+        StepOutcome::done(())
+    }
+
+    fn shutdown(&self, guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
+        let _ = guard;
+        StepOutcome::done(())
+    }
 
     /// Read a symlink's target bytes. Default returns `ENOSYS` (parity
     /// with [`FsOps::read_link`]).
@@ -1955,6 +1984,7 @@ pub struct FileFsyncOp {
     pub page_backing: alloc::sync::Arc<dyn crate::page_backed::FsPageBacking>,
     pub fs_object_id: super::structure::FsObjectId,
     pub page_container: Option<crate::adapter::step_engine::Cap<crate::page_backed::PageContainer>>,
+    pub raw_block_device: bool,
     pub state: crate::page_backed::FileFsyncState,
 }
 
@@ -1963,23 +1993,75 @@ impl<I: SubjectIdentity> StepOp<I> for FileFsyncOp {
     type Progress = NoProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
         use StepOutcome as V3;
-        if let Some(container) = &self.page_container {
-            let has_backend_planner = match container.kind() {
-                crate::page_backed::PageContainerKind::File { mount, .. } => {
-                    mount.payload().backend_planner().is_some()
-                }
-                _ => false,
-            };
-            if has_backend_planner && container.has_file_io_service_runtime() {
-                return match self.state.advance(container) {
-                    Err(errno) => V3::Err(errno.into()),
-                    Ok(None) => self.state.pending_outcome(NoProgress),
-                    Ok(Some(Ok(()))) => V3::Done(()),
-                    Ok(Some(Err(errno))) => V3::Err(errno.into()),
+        if let Some((container, mount)) =
+            self.page_container
+                .as_ref()
+                .and_then(|container| match container.kind() {
+                    crate::page_backed::PageContainerKind::File { mount, .. } => {
+                        Some((container, mount))
+                    }
+                    crate::page_backed::PageContainerKind::Anon { .. }
+                    | crate::page_backed::PageContainerKind::Device { .. } => None,
+                })
+        {
+            if self.raw_block_device && mount.payload().backend_planner().is_none() {
+                let guard = step_engine::guard();
+                return match crate::page_backed::step_raw_block_fsync(container, &guard) {
+                    V3::Done(()) => V3::Done(()),
+                    V3::Err(e) => V3::Err(e),
+                    V3::Continue { .. } => V3::Continue {
+                        progress: NoProgress,
+                    },
+                    V3::Yield { shape, .. } => V3::Yield {
+                        progress: NoProgress,
+                        shape,
+                    },
                 };
             }
+            match self.state.advance(container) {
+                Err(errno) => V3::Err(errno.into()),
+                Ok(
+                    crate::page_backed::FileFsyncFrontierAdvance::Submitted { .. }
+                    | crate::page_backed::FileFsyncFrontierAdvance::Waiting,
+                ) => V3::Continue {
+                    progress: NoProgress,
+                },
+                Ok(crate::page_backed::FileFsyncFrontierAdvance::Error(errno)) => {
+                    V3::Err(errno.into())
+                }
+                Ok(crate::page_backed::FileFsyncFrontierAdvance::Complete) => {
+                    if self.state.backend_finished() {
+                        return V3::Done(());
+                    }
+                    let guard = step_engine::guard();
+                    match self.page_backing.fsync_file(self.fs_object_id, &guard) {
+                        V3::Done(()) => V3::Done(()),
+                        V3::Err(e)
+                            if e == step_engine::Errno::ENOSYS
+                                && mount.payload().backend_planner().is_some() =>
+                        {
+                            drop(guard);
+                            match self.state.submit_backend_fsync(container) {
+                                Ok(()) => V3::Continue {
+                                    progress: NoProgress,
+                                },
+                                Err(errno) => V3::Err(errno.into()),
+                            }
+                        }
+                        V3::Err(e) => V3::Err(e),
+                        V3::Continue { .. } => V3::Continue {
+                            progress: NoProgress,
+                        },
+                        V3::Yield { shape, .. } => V3::Yield {
+                            progress: NoProgress,
+                            shape,
+                        },
+                    }
+                }
+            }
+        } else {
             let guard = step_engine::guard();
-            return match crate::page_backed::step_fsync(container, &guard) {
+            match self.page_backing.fsync_file(self.fs_object_id, &guard) {
                 V3::Done(()) => V3::Done(()),
                 V3::Err(e) => V3::Err(e),
                 V3::Continue { .. } => V3::Continue {
@@ -1989,19 +2071,7 @@ impl<I: SubjectIdentity> StepOp<I> for FileFsyncOp {
                     progress: NoProgress,
                     shape,
                 },
-            };
-        }
-        let guard = step_engine::guard();
-        match self.page_backing.fsync_file(self.fs_object_id, &guard) {
-            V3::Done(()) => V3::Done(()),
-            V3::Err(e) => V3::Err(e),
-            V3::Continue { .. } => V3::Continue {
-                progress: NoProgress,
-            },
-            V3::Yield { shape, .. } => V3::Yield {
-                progress: NoProgress,
-                shape,
-            },
+            }
         }
     }
 }

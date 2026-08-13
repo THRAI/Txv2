@@ -1101,7 +1101,12 @@ where
     // observe a completed zombie rather than a half-published episode.
     #[cfg(any(test, feature = "test-support"))]
     for thread in threads {
-        let _ = crate::thread_runtime::execution::step_thread_exit_with_status(thread, status);
+        let _ = crate::thread_runtime::execution::step_thread_exit_with_status_and_posts(
+            thread,
+            status,
+            &mut signal_post,
+            &mut wake_post,
+        );
     }
     #[cfg(not(any(test, feature = "test-support")))]
     let _ = threads;
@@ -1160,7 +1165,7 @@ fn step_process_exit_inner<F, G>(
             exit_aspace = Some(payload.aspace_cap());
             closed_fds = measure_process_lock_service(
                 b"debug.lock_service.process.payload.process_exit.drain_fds.duration_ns",
-                || payload.drain_fds(),
+                || payload.drain_fds_with_post(&mut wake_post),
             );
         }
     }
@@ -1202,7 +1207,7 @@ fn step_process_exit_inner<F, G>(
 /// fork/clone/wait4 slice (2026-05-06) added the `exit_source` fire
 /// alongside the SIGCHLD post for parent-side wake.
 pub(crate) fn step_process_exit(process: &Cap<ProcessIdentity>, status: ExitStatus) {
-    step_process_exit_inner(
+    step_process_exit_with_posts(
         process,
         status,
         |weak, event| {
@@ -1213,6 +1218,18 @@ pub(crate) fn step_process_exit(process: &Cap<ProcessIdentity>, status: ExitStat
         },
         |mailbox, event| mailbox.post(event),
     );
+}
+
+pub(crate) fn step_process_exit_with_posts<F, G>(
+    process: &Cap<ProcessIdentity>,
+    status: ExitStatus,
+    signal_post: F,
+    wake_post: G,
+) where
+    F: FnMut(ArcWeak<TaskMailbox>, MailboxEvent),
+    G: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
+    step_process_exit_inner(process, status, signal_post, wake_post);
 }
 
 /// Complete the close protocol after a process fd table has been detached.
@@ -1250,6 +1267,64 @@ pub fn finalize_detached_open_files<'a>(
         }
     }
     first_error.map_or(Ok(()), Err)
+}
+
+/// Wait-capable completion for one fd that has already been removed from its
+/// process table.
+///
+/// Descriptor removal is intentionally not retried: Linux considers the fd
+/// closed even when final writeback later reports an error. The retained
+/// `OpenFile` capability only keeps close-time EOF publication alive while a
+/// mount-local metadata owner is busy.
+pub struct FinalizeDetachedOpenFileOp {
+    file: Cap<OpenFile>,
+    last_close_completed: bool,
+}
+
+impl FinalizeDetachedOpenFileOp {
+    pub fn new(file: Cap<OpenFile>) -> Self {
+        Self {
+            file,
+            last_close_completed: false,
+        }
+    }
+
+    fn complete_last_close(&mut self, guard: &step_engine::Guard<'_>) {
+        if self.last_close_completed {
+            return;
+        }
+        if !self
+            .file
+            .socket_identity()
+            .is_some_and(|socket| socket.fd_ref_count() != 0)
+        {
+            if let Some(ops) = self.file.file_ops() {
+                ops.on_last_close(guard);
+            }
+        }
+        self.last_close_completed = true;
+    }
+}
+
+impl<I: SubjectIdentity> StepOp<I> for FinalizeDetachedOpenFileOp {
+    type Output = ();
+    type Progress = NoProgress;
+
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
+        let guard = step_engine::guard();
+        match step_flush_page_backed_open_file_without_retry(&self.file, &guard) {
+            StepOutcome::Done(()) => {
+                self.complete_last_close(&guard);
+                StepOutcome::done(())
+            }
+            StepOutcome::Continue { progress } => StepOutcome::Continue { progress },
+            StepOutcome::Yield { progress, shape } => StepOutcome::Yield { progress, shape },
+            StepOutcome::Err(errno) => {
+                self.complete_last_close(&guard);
+                StepOutcome::Err(errno)
+            }
+        }
+    }
 }
 
 /// Allocation-free half of [`finalize_detached_open_files`].
@@ -1295,33 +1370,58 @@ fn flush_page_backed_open_file_without_retry(
     file: &Cap<OpenFile>,
     guard: &step_engine::Guard<'_>,
 ) -> Result<(), step_engine::Errno> {
+    match step_flush_page_backed_open_file_without_retry(file, guard) {
+        StepOutcome::Done(()) => Ok(()),
+        StepOutcome::Err(errno) => Err(errno),
+        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => Err(step_engine::Errno::EIO),
+    }
+}
+
+fn step_flush_page_backed_open_file_without_retry(
+    file: &Cap<OpenFile>,
+    guard: &step_engine::Guard<'_>,
+) -> StepOutcome<(), NoProgress> {
     use crate::vfs::structure::{OpenFileBacking, RNodeBacking};
     if !matches!(file.backing(), OpenFileBacking::Rnode { .. }) {
-        return Ok(());
+        return StepOutcome::done(());
     }
     let RNodeBacking::PageBacked { pc } = file.rnode().backing() else {
-        return Ok(());
+        return StepOutcome::done(());
     };
 
-    // Main's IO-manager/JBD2 mount deliberately disables the legacy
-    // synchronous FsPageBacking hooks.  Close only admits background
-    // writeback there; explicit fsync owns and waits for the durability
-    // frontier through FsyncOp. Treating the expected ENOSYS from the retired
-    // hook as a failure would retain every closed file forever.
-    let _ = pc.queue_dirty_file_writeback();
+    // Main's IO-manager/JBD2 mount keeps data on the asynchronous L4/L6 path,
+    // but buffered-write allocation may have published a page-aligned
+    // provisional inode size.  Commit the PageContainer's byte-precise EOF
+    // before the dirty slots move to Writeback, then admit their data without
+    // turning close into an fsync durability barrier.
     if pc
         .file_backend_context()
         .is_some_and(|context| context.payload().backend_planner().is_some())
     {
-        return Ok(());
+        let size_result = pc.publish_exact_size_for_close_visibility(guard);
+        let _ = pc.queue_dirty_file_writeback_retained(pc.clone());
+        return match size_result {
+            StepOutcome::Done(()) => StepOutcome::done(()),
+            StepOutcome::Continue { .. } => StepOutcome::continue_with(NoProgress),
+            StepOutcome::Yield { shape, .. } => StepOutcome::Yield {
+                progress: NoProgress,
+                shape,
+            },
+            StepOutcome::Err(errno) => StepOutcome::Err(errno),
+        };
     }
 
     // Legacy mounts have no owned background backend. Preserve final-smp's
     // close-to-reopen visibility and retry failed synchronous writeback.
+    let _ = pc.queue_dirty_file_writeback();
     match crate::page_backed::step_fsync(pc, guard) {
-        StepOutcome::Done(()) => Ok(()),
-        StepOutcome::Err(errno) => Err(errno),
-        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => Err(step_engine::Errno::EIO),
+        StepOutcome::Done(()) => StepOutcome::done(()),
+        StepOutcome::Continue { .. } => StepOutcome::continue_with(NoProgress),
+        StepOutcome::Yield { shape, .. } => StepOutcome::Yield {
+            progress: NoProgress,
+            shape,
+        },
+        StepOutcome::Err(errno) => StepOutcome::Err(errno),
     }
 }
 
@@ -1341,13 +1441,14 @@ fn retry_deferred_page_writebacks(guard: &step_engine::Guard<'_>, budget: usize)
     };
 
     for pc in batch {
-        let _ = pc.queue_dirty_file_writeback();
         if pc
             .file_backend_context()
             .is_some_and(|context| context.payload().backend_planner().is_some())
         {
+            let _ = pc.queue_dirty_file_writeback_retained(pc.clone());
             continue;
         }
+        let _ = pc.queue_dirty_file_writeback();
         match crate::page_backed::step_fsync(&pc, guard) {
             StepOutcome::Done(()) => {}
             StepOutcome::Err(_) | StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {

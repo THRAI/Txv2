@@ -1094,6 +1094,21 @@ pub(crate) enum ExecCollapseHandoff {
 pub(crate) struct ThreadExitPermit {
     generation: u64,
     owner: GroupExitOwner,
+    status: ExitStatus,
+    tid: u32,
+}
+
+impl ThreadExitPermit {
+    pub(crate) const fn status(&self) -> ExitStatus {
+        self.status
+    }
+
+    pub(crate) fn thread_status(&self, requested_status: i32) -> i32 {
+        match self.owner {
+            GroupExitOwner::ThreadExit => requested_status,
+            _ => self.status.wait_status_word(),
+        }
+    }
 }
 
 /// Per-process resource frame — the set of resources governed by
@@ -1747,10 +1762,13 @@ impl ProcessPayload {
     /// driven from fd-table accounting, so exit paths need a concrete
     /// drain rather than waiting for the whole payload to disappear
     /// later through EBR.
-    pub(crate) fn drain_fds(&self) -> BTreeMap<u32, Cap<OpenFile>> {
+    pub(crate) fn drain_fds_with_post<F>(&self, post: &mut F) -> BTreeMap<u32, Cap<OpenFile>>
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+    {
         let drained = core::mem::take(&mut *self.fds.lock());
         for file in drained.values() {
-            decr_pipe_fd_ref(file);
+            decr_pipe_fd_ref_with_post(file, &mut *post);
         }
         drained
     }
@@ -1947,7 +1965,11 @@ impl ProcessPayload {
         true
     }
 
-    pub(crate) fn prepare_thread_exit(&self, tid: u32) -> Option<ThreadExitPermit> {
+    pub(crate) fn prepare_thread_exit(
+        &self,
+        tid: u32,
+        requested_status: ExitStatus,
+    ) -> Option<ThreadExitPermit> {
         let mut episode = self.group_exit.lock();
         match episode.as_mut() {
             Some(current) if current.owner == GroupExitOwner::ExecReserved => None,
@@ -1958,6 +1980,8 @@ impl ProcessPayload {
                     Some(ThreadExitPermit {
                         generation: current.generation,
                         owner: GroupExitOwner::ExecCollapsing,
+                        status: current.status,
+                        tid,
                     })
                 }
             }
@@ -1968,6 +1992,8 @@ impl ProcessPayload {
                     Some(ThreadExitPermit {
                         generation: current.generation,
                         owner: GroupExitOwner::Exit,
+                        status: current.status,
+                        tid,
                     })
                 }
             }
@@ -1988,17 +2014,14 @@ impl ProcessPayload {
                 Some(ThreadExitPermit {
                     generation,
                     owner: GroupExitOwner::ThreadExit,
+                    status: requested_status,
+                    tid,
                 })
             }
         }
     }
 
-    pub(crate) fn finish_thread_exit(
-        &self,
-        permit: ThreadExitPermit,
-        was_last: bool,
-        status: ExitStatus,
-    ) -> bool {
+    pub(crate) fn finish_thread_exit(&self, permit: ThreadExitPermit, was_last: bool) -> bool {
         let mut episode = self.group_exit.lock();
         let clear_episode = {
             let Some(current) = episode.as_mut() else {
@@ -2013,12 +2036,15 @@ impl ProcessPayload {
             match permit.owner {
                 GroupExitOwner::ThreadExit if was_last => {
                     current.owner = GroupExitOwner::Exit;
-                    current.status = status;
+                    current.status = permit.status;
                     current.remaining_threads.store(0, Ordering::Release);
                     false
                 }
                 GroupExitOwner::ThreadExit => true,
                 GroupExitOwner::ExecCollapsing => {
+                    if !current.claimed_thread_exits.remove(&permit.tid) {
+                        return false;
+                    }
                     if current
                         .remaining_threads
                         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
@@ -2032,6 +2058,9 @@ impl ProcessPayload {
                         && current.remaining_threads.load(Ordering::Acquire) == 0
                 }
                 GroupExitOwner::Exit => {
+                    if !current.claimed_thread_exits.remove(&permit.tid) {
+                        return false;
+                    }
                     if current
                         .remaining_threads
                         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
@@ -2042,6 +2071,61 @@ impl ProcessPayload {
                         return false;
                     }
                     false
+                }
+                GroupExitOwner::ExecReserved | GroupExitOwner::ExecAborting => return false,
+            }
+        };
+        if clear_episode {
+            *episode = None;
+        }
+        true
+    }
+
+    pub(crate) fn abort_thread_exit(&self, tid: u32, permit: ThreadExitPermit) -> bool {
+        let mut episode = self.group_exit.lock();
+        if permit.tid != tid {
+            return false;
+        }
+        let clear_episode = {
+            let Some(current) = episode.as_mut() else {
+                return false;
+            };
+            let owner_matches = current.owner == permit.owner
+                || (permit.owner == GroupExitOwner::ExecCollapsing
+                    && current.owner == GroupExitOwner::ExecAborting);
+            if current.generation != permit.generation || !owner_matches {
+                return false;
+            }
+            match permit.owner {
+                GroupExitOwner::ThreadExit => {
+                    if current.initiator_tid != tid {
+                        return false;
+                    }
+                    true
+                }
+                GroupExitOwner::Exit => {
+                    if !current.claimed_thread_exits.remove(&tid) {
+                        return false;
+                    }
+                    false
+                }
+                GroupExitOwner::ExecCollapsing => {
+                    // Keep the tid as a tombstone until this collapse attempt
+                    // is handed off. The thread is still live, so removing it
+                    // here would allow a second permit to settle the same
+                    // participant before the owner observes the retry.
+                    if !current.claimed_thread_exits.contains(&tid) {
+                        return false;
+                    }
+                    let remaining = match current.remaining_threads.fetch_update(
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                        |remaining| remaining.checked_sub(1),
+                    ) {
+                        Ok(previous) => previous - 1,
+                        Err(_) => return false,
+                    };
+                    current.owner == GroupExitOwner::ExecAborting && remaining == 0
                 }
                 GroupExitOwner::ExecReserved | GroupExitOwner::ExecAborting => return false,
             }
@@ -2369,6 +2453,13 @@ pub(crate) fn incr_pipe_fd_ref(file: &Cap<OpenFile>) {
 
 pub(crate) fn decr_pipe_fd_ref(file: &Cap<OpenFile>) {
     adjust_pipe_fd_ref(file, false);
+}
+
+pub(crate) fn decr_pipe_fd_ref_with_post<F>(file: &Cap<OpenFile>, post: &mut F)
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
+    file.adjust_process_fd_reference_with_post(false, post);
 }
 
 fn adjust_pipe_fd_ref(file: &Cap<OpenFile>, increment: bool) {

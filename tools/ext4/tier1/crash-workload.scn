@@ -1,0 +1,69 @@
+# ext4 Tier 1 crash workload.
+#
+# This script is the deterministic crash campaign workload input. The crash
+# executor will run this workload against SCRATCH and kill QEMU at phase markers
+# from the expanded crash-campaign manifest.
+
+wait ":mount:sdcard:ext4:ok" within 90000
+wait "/ # " within 90000
+
+send "/bin/busybox sync; /bin/busybox umount -l /musl; /bin/busybox mkdir -p /musl; /bin/busybox mount -t ext4 /dev/block/vdb /musl; echo crash-workload-mount:$?\n"
+expect "crash-workload-mount:0" within 30000
+expect "/ # " within 30000
+
+group ordered-data
+send "echo tx.ext4.crash.phase.D0\n"
+expect "tx.ext4.crash.phase.D0" within 10000
+expect "/ # " within 10000
+send "/bin/busybox mkdir -p /musl/crash-data; printf crash-data > /musl/crash-data/file; echo tx.ext4.crash.phase.D1\n"
+expect "tx.ext4.crash.phase.D1" within 30000
+expect "/ # " within 30000
+send "/bin/busybox sync; echo tx.ext4.crash.phase.D2\n"
+expect "tx.ext4.crash.phase.D2" within 30000
+expect "/ # " within 30000
+
+group namespace
+send "echo tx.ext4.crash.phase.D3\n"
+expect "tx.ext4.crash.phase.D3" within 10000
+expect "/ # " within 10000
+send "/bin/busybox mkdir -p /musl/crash-ns; echo crash-ns-mkdir:$?\n"
+expect "crash-ns-mkdir:0" within 30000
+expect "/ # " within 30000
+send "printf ns > /musl/crash-ns/a; echo crash-ns-write:$?\n"
+expect "crash-ns-write:0" within 30000
+expect "/ # " within 30000
+send "/bin/busybox mv /musl/crash-ns/a /musl/crash-ns/b; echo crash-ns-mv:$?; echo tx.ext4.crash.phase.D4\n"
+expect "crash-ns-mv:0" within 30000
+expect "tx.ext4.crash.phase.D4" within 30000
+expect "/ # " within 30000
+send "/bin/busybox rm /musl/crash-ns/b; echo tx.ext4.crash.phase.D5\n"
+expect "tx.ext4.crash.phase.D5" within 30000
+expect "/ # " within 30000
+send "/bin/busybox rmdir /musl/crash-ns; /bin/busybox sync; echo tx.ext4.crash.phase.D6\n"
+expect "tx.ext4.crash.phase.D6" within 30000
+expect "/ # " within 30000
+
+group orphan
+send "echo tx.ext4.crash.phase.D7\n"
+expect "tx.ext4.crash.phase.D7" within 10000
+expect "/ # " within 10000
+send "/bin/busybox mkdir -p /musl/crash-orphan; printf orphan > /musl/crash-orphan/live; exec 3</musl/crash-orphan/live; echo tx.ext4.crash.phase.D8\n"
+expect "tx.ext4.crash.phase.D8" within 10000
+expect "/ # " within 10000
+send "/bin/busybox rm /musl/crash-orphan/live; unlink_status=$?; echo crash-orphan-unlink:$unlink_status; echo tx.ext4.crash.phase.D9\n"
+expect "crash-orphan-unlink:0" within 10000
+expect "tx.ext4.crash.phase.D9" within 10000
+expect "/ # " within 10000
+send "/bin/busybox cat <&3; status=$?; echo tx.ext4.crash.phase.D10\n"
+expect "orphan" within 10000
+expect "tx.ext4.crash.phase.D10" within 10000
+expect "/ # " within 10000
+send "exec 3<&-; echo tx.ext4.crash.phase.D11\n"
+expect "tx.ext4.crash.phase.D11" within 10000
+expect "/ # " within 10000
+send "/bin/busybox sync; echo tx.ext4.crash.phase.D12; echo crash-workload-orphan:$status\n"
+expect "tx.ext4.crash.phase.D12" within 30000
+expect "crash-workload-orphan:0" within 30000
+expect "/ # " within 30000
+
+quit

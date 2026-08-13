@@ -1,6 +1,6 @@
 //! Device and block-handle shells shared by devfs, bdev-fs, and backends.
 
-use alloc::collections::VecDeque;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
@@ -9,7 +9,7 @@ use tx_substrate::wake::{MailboxEvent, TaskMailbox};
 
 use crate::adapter::step_engine::{
     self as step_engine, ByteProgress, Cap, NoProgress, ScriptCtx, SpinMutex, StepOp, StepOutcome,
-    SubjectIdentity,
+    SubjectIdentity, Weak,
 };
 use crate::adapter::wait_routing::WaitOutcome;
 
@@ -17,7 +17,8 @@ use crate::execution::{Errno, Guard};
 use crate::io_manager::backend::{BlockPageCompletion, BlockPageRequestTracker, PageFrameRef};
 use crate::io_manager::block::{
     BioVec, BlockCompletionSource, BlockDeviceCompletion, BlockDispatch, BlockDispatchExecutor,
-    BlockOp, BlockQueue, BlockServiceDriver, BlockServiceNext, BlockTagTable, DeviceKey,
+    BlockFlags, BlockOp, BlockQueue, BlockServiceDriver, BlockServiceNext, BlockTag, BlockTagTable,
+    DeviceKey,
 };
 use crate::io_manager::page::service::{
     PageService, PageServiceBackendDriven, PageServiceTaggedBlockCompletionError,
@@ -26,11 +27,39 @@ use crate::io_manager::page::PageIoOp;
 use crate::io_manager::runtime::{
     IoServiceKind, QueueDepth, ServiceBudget, ServiceKick, ServiceWakeSource,
 };
-use crate::page_backed::{FileBlockServiceTurn, Frame, PageContainer};
+use crate::page_backed::{
+    BlockSubmissionHandle, FileBlockServiceTurn, Frame, PageContainer, PageIoSubmissionHandle,
+};
 use tx_services::time::DeadlineRegistrar;
 
 const MAX_STATIC_BLOCK_DEVICES: usize = 16;
 const FILE_IO_SERVICE_SOURCE_ID_BASE: u64 = 0x7200;
+
+/// 文件对象的通用读写接口。网络套接字通过该接口接入 VFS，避免 VFS
+/// 直接依赖具体的套接字类型。
+pub trait FileOps: Send + Sync {
+    fn read(
+        &self,
+        out: &mut [u8],
+        nonblocking: bool,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<usize, ByteProgress>;
+
+    fn write(
+        &self,
+        bytes: &[u8],
+        nonblocking: bool,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<usize, ByteProgress>;
+
+    fn on_set_fl_nonblock(&self, post: &mut dyn FnMut(&TaskMailbox, MailboxEvent) -> bool) {
+        let _ = post;
+    }
+
+    fn on_last_close(&self, guard: &Guard<'_>) {
+        let _ = guard;
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct DevT(u64);
@@ -241,39 +270,6 @@ pub trait RtcDeviceOps: Send + Sync + 'static {
     }
 }
 
-/// P3-S2 (D13): file-object operations for `StructPayload` kinds richer
-/// than plain byte devices — the socket arm implements this so callers can
-/// delegate instead of naming kinds. Same dispatch shape as
-/// [`CharDeviceOps`]; carries `nonblocking` because these objects have
-/// O_NONBLOCK semantics. See `docs/design/07_net/REFACTOR_P3_v1.md` §3.
-pub trait FileOps: Send + Sync {
-    fn read(
-        &self,
-        out: &mut [u8],
-        nonblocking: bool,
-        guard: &Guard<'_>,
-    ) -> StepOutcome<usize, ByteProgress>;
-    fn write(
-        &self,
-        bytes: &[u8],
-        nonblocking: bool,
-        guard: &Guard<'_>,
-    ) -> StepOutcome<usize, ByteProgress>;
-    /// F_SETFL O_NONBLOCK side-effect hook (P3-S5). Sockets re-kick send
-    /// readiness so writers parked behind a formerly-blocking fd re-poll.
-    fn on_set_fl_nonblock(&self, post: &mut dyn FnMut(&TaskMailbox, MailboxEvent) -> bool) {
-        let _ = post;
-    }
-
-    /// Last-close teardown (P3-S5): the kind's close protocol, run by the
-    /// close/exit lanes once no other retainer holds the open-file
-    /// description. Sockets run `step_socket_close` (fd removal alone
-    /// does not drive the network close handshake).
-    fn on_last_close(&self, guard: &Guard<'_>) {
-        let _ = guard;
-    }
-}
-
 pub trait CharDeviceOps: Send + Sync + 'static {
     fn read(&self, out: &mut [u8], guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress>;
     fn write(&self, bytes: &[u8], guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress>;
@@ -366,6 +362,62 @@ pub trait BlockDeviceOps: Send + Sync + 'static {
 
     fn barrier(&self, guard: &Guard<'_>) -> StepOutcome<(), NoProgress>;
 
+    fn durability_capabilities(&self) -> BlockDurabilityCapabilities {
+        BlockDurabilityCapabilities::NONE
+    }
+
+    fn write_blocks_with_options(
+        &self,
+        block_id: PhysicalBlockNumber,
+        source: &[Frame],
+        options: BlockWriteOptions,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        if options.fua {
+            return StepOutcome::err(Errno::EOPNOTSUPP.into());
+        }
+        self.write_blocks(block_id, source, guard)
+    }
+
+    /// Whether requests may remain in the device after the submission call
+    /// returns. Synchronous board drivers keep the default implementation.
+    fn supports_async_blocks(&self) -> bool {
+        false
+    }
+
+    fn submit_read_blocks_async(
+        &self,
+        cookie: u64,
+        block_id: PhysicalBlockNumber,
+        target: &mut [Frame],
+        guard: &Guard<'_>,
+    ) -> BlockAsyncSubmit {
+        let _ = cookie;
+        BlockAsyncSubmit::Complete(step_result_to_result(
+            self.read_blocks(block_id, target, guard),
+        ))
+    }
+
+    fn submit_write_blocks_async(
+        &self,
+        cookie: u64,
+        block_id: PhysicalBlockNumber,
+        source: &[Frame],
+        options: BlockWriteOptions,
+        guard: &Guard<'_>,
+    ) -> BlockAsyncSubmit {
+        let _ = cookie;
+        BlockAsyncSubmit::Complete(step_result_to_result(
+            self.write_blocks_with_options(block_id, source, options, guard),
+        ))
+    }
+
+    /// Drain at most `budget` terminal completions. Every completion must
+    /// return the submission cookie unchanged.
+    fn poll_async_blocks(&self, _budget: usize, _guard: &Guard<'_>) -> Vec<BlockAsyncCompletion> {
+        Vec::new()
+    }
+
     fn read_blocks_bootstrap(
         &self,
         block_id: PhysicalBlockNumber,
@@ -387,6 +439,42 @@ pub trait BlockDeviceOps: Send + Sync + 'static {
     fn barrier_bootstrap(&self) -> StepOutcome<(), NoProgress> {
         let guard = crate::adapter::step_engine::guard();
         self.barrier(&guard)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockDurabilityCapabilities {
+    pub fua: bool,
+    pub flush: bool,
+}
+
+impl BlockDurabilityCapabilities {
+    pub const NONE: Self = Self {
+        fua: false,
+        flush: false,
+    };
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockWriteOptions {
+    pub fua: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlockAsyncSubmit {
+    Complete(Result<(), Errno>),
+    Submitted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockAsyncCompletion {
+    pub cookie: u64,
+    pub result: Result<(), Errno>,
+}
+
+impl BlockAsyncCompletion {
+    pub const fn new(cookie: u64, result: Result<(), Errno>) -> Self {
+        Self { cookie, result }
     }
 }
 
@@ -477,8 +565,71 @@ impl BlockDeviceHandle {
         self.reg.ops.write_blocks(block_id, source, guard)
     }
 
+    pub fn write_blocks_with_options(
+        self,
+        lba_offset: u64,
+        source: &[Frame],
+        options: BlockWriteOptions,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        let Some(block_id) = self.block_id_for(lba_offset, source.len() as u64) else {
+            return StepOutcome::err(Errno::EINVAL.into());
+        };
+        if options.fua && !self.reg.ops.durability_capabilities().fua {
+            return StepOutcome::err(Errno::EOPNOTSUPP.into());
+        }
+        self.reg
+            .ops
+            .write_blocks_with_options(block_id, source, options, guard)
+    }
+
     pub fn barrier(self, guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
+        if !self.reg.ops.durability_capabilities().flush {
+            return StepOutcome::err(Errno::EOPNOTSUPP.into());
+        }
         self.reg.ops.barrier(guard)
+    }
+
+    pub fn supports_async_blocks(self) -> bool {
+        self.reg.ops.supports_async_blocks()
+    }
+
+    pub fn submit_read_blocks_async(
+        self,
+        cookie: u64,
+        lba_offset: u64,
+        target: &mut [Frame],
+        guard: &Guard<'_>,
+    ) -> BlockAsyncSubmit {
+        let Some(block_id) = self.block_id_for(lba_offset, target.len() as u64) else {
+            return BlockAsyncSubmit::Complete(Err(Errno::EINVAL));
+        };
+        self.reg
+            .ops
+            .submit_read_blocks_async(cookie, block_id, target, guard)
+    }
+
+    pub fn submit_write_blocks_async(
+        self,
+        cookie: u64,
+        lba_offset: u64,
+        source: &[Frame],
+        options: BlockWriteOptions,
+        guard: &Guard<'_>,
+    ) -> BlockAsyncSubmit {
+        let Some(block_id) = self.block_id_for(lba_offset, source.len() as u64) else {
+            return BlockAsyncSubmit::Complete(Err(Errno::EINVAL));
+        };
+        if options.fua && !self.reg.ops.durability_capabilities().fua {
+            return BlockAsyncSubmit::Complete(Err(Errno::EOPNOTSUPP));
+        }
+        self.reg
+            .ops
+            .submit_write_blocks_async(cookie, block_id, source, options, guard)
+    }
+
+    pub fn poll_async_blocks(self, budget: usize, guard: &Guard<'_>) -> Vec<BlockAsyncCompletion> {
+        self.reg.ops.poll_async_blocks(budget, guard)
     }
 
     fn block_id_for(self, lba_offset: u64, count: u64) -> Option<PhysicalBlockNumber> {
@@ -502,10 +653,25 @@ impl fmt::Debug for BlockDeviceHandle {
     }
 }
 
+const ASYNC_BLOCK_POLL_BUDGET: usize = 32;
+static NEXT_ASYNC_BLOCK_COOKIE: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy)]
+struct AsyncBlockRoute {
+    namespace: u64,
+    tag: BlockTag,
+}
+
+static ASYNC_BLOCK_ROUTES: SpinMutex<BTreeMap<u64, AsyncBlockRoute>> =
+    SpinMutex::new(BTreeMap::new());
+static ROUTED_ASYNC_BLOCK_COMPLETIONS: SpinMutex<BTreeMap<u64, VecDeque<BlockDeviceCompletion>>> =
+    SpinMutex::new(BTreeMap::new());
+
 pub struct BlockDeviceDispatchAdapter<'a, 'g> {
     handle: BlockDeviceHandle,
     guard: &'a Guard<'g>,
     completions: VecDeque<BlockDeviceCompletion>,
+    async_namespace: Option<u64>,
 }
 
 impl<'a, 'g> BlockDeviceDispatchAdapter<'a, 'g> {
@@ -514,6 +680,19 @@ impl<'a, 'g> BlockDeviceDispatchAdapter<'a, 'g> {
             handle,
             guard,
             completions: VecDeque::new(),
+            async_namespace: None,
+        }
+    }
+
+    /// Build the production L6 adapter. The namespace belongs to the
+    /// persistent block-submission manager, so completions remain routable
+    /// even though this bounded adapter is reconstructed on every turn.
+    pub fn new_async(handle: BlockDeviceHandle, guard: &'a Guard<'g>, namespace: u64) -> Self {
+        Self {
+            handle,
+            guard,
+            completions: VecDeque::new(),
+            async_namespace: Some(namespace),
         }
     }
 
@@ -533,9 +712,12 @@ impl<'a, 'g> BlockDeviceDispatchAdapter<'a, 'g> {
             }
             BlockOp::Write => {
                 let frames = frames_from_bio_vecs(&dispatch.bio.plan.vecs)?;
-                step_result_to_result(self.handle.write_blocks(
+                step_result_to_result(self.handle.write_blocks_with_options(
                     dispatch.bio.plan.lba.start_lba(),
                     &frames,
+                    BlockWriteOptions {
+                        fua: dispatch.bio.plan.flags.contains(BlockFlags::FUA),
+                    },
                     self.guard,
                 ))
             }
@@ -544,19 +726,112 @@ impl<'a, 'g> BlockDeviceDispatchAdapter<'a, 'g> {
             }
         }
     }
+
+    fn submit_async_dispatch(&mut self, dispatch: &BlockDispatch, namespace: u64) {
+        if dispatch.bio.plan.device != DeviceKey::new(self.handle.registration().devt.raw()) {
+            self.completions
+                .push_back(BlockDeviceCompletion::new(dispatch.tag, Err(Errno::ENODEV)));
+            return;
+        }
+
+        let cookie = NEXT_ASYNC_BLOCK_COOKIE
+            .fetch_add(1, Ordering::AcqRel)
+            .max(1);
+        ASYNC_BLOCK_ROUTES.lock().insert(
+            cookie,
+            AsyncBlockRoute {
+                namespace,
+                tag: dispatch.tag,
+            },
+        );
+        let submitted = match dispatch.bio.plan.op {
+            BlockOp::Read => match frames_from_bio_vecs(&dispatch.bio.plan.vecs) {
+                Ok(mut frames) => self.handle.submit_read_blocks_async(
+                    cookie,
+                    dispatch.bio.plan.lba.start_lba(),
+                    &mut frames,
+                    self.guard,
+                ),
+                Err(error) => BlockAsyncSubmit::Complete(Err(error)),
+            },
+            BlockOp::Write => match frames_from_bio_vecs(&dispatch.bio.plan.vecs) {
+                Ok(frames) => self.handle.submit_write_blocks_async(
+                    cookie,
+                    dispatch.bio.plan.lba.start_lba(),
+                    &frames,
+                    BlockWriteOptions {
+                        fua: dispatch.bio.plan.flags.contains(BlockFlags::FUA),
+                    },
+                    self.guard,
+                ),
+                Err(error) => BlockAsyncSubmit::Complete(Err(error)),
+            },
+            BlockOp::Flush | BlockOp::Barrier => {
+                BlockAsyncSubmit::Complete(step_result_to_result(self.handle.barrier(self.guard)))
+            }
+        };
+
+        if let BlockAsyncSubmit::Complete(result) = submitted {
+            ASYNC_BLOCK_ROUTES.lock().remove(&cookie);
+            self.completions
+                .push_back(BlockDeviceCompletion::new(dispatch.tag, result));
+        }
+    }
+
+    fn take_routed_completion(&mut self, namespace: u64) -> Option<BlockDeviceCompletion> {
+        let mut routed = ROUTED_ASYNC_BLOCK_COMPLETIONS.lock();
+        let completion = routed.get_mut(&namespace)?.pop_front();
+        if routed.get(&namespace).is_some_and(VecDeque::is_empty) {
+            routed.remove(&namespace);
+        }
+        completion
+    }
+
+    fn poll_async_completion(&mut self, namespace: u64) -> Option<BlockDeviceCompletion> {
+        if let Some(completion) = self.take_routed_completion(namespace) {
+            return Some(completion);
+        }
+
+        for completion in self
+            .handle
+            .poll_async_blocks(ASYNC_BLOCK_POLL_BUDGET, self.guard)
+        {
+            let Some(route) = ASYNC_BLOCK_ROUTES.lock().remove(&completion.cookie) else {
+                continue;
+            };
+            let routed = BlockDeviceCompletion::new(route.tag, completion.result);
+            if route.namespace == namespace {
+                self.completions.push_back(routed);
+            } else {
+                ROUTED_ASYNC_BLOCK_COMPLETIONS
+                    .lock()
+                    .entry(route.namespace)
+                    .or_default()
+                    .push_back(routed);
+            }
+        }
+        self.completions.pop_front()
+    }
 }
 
 impl BlockDispatchExecutor for BlockDeviceDispatchAdapter<'_, '_> {
     fn submit(&mut self, dispatch: &BlockDispatch) {
-        let result = self.execute_dispatch(dispatch);
-        self.completions
-            .push_back(BlockDeviceCompletion::new(dispatch.tag, result));
+        if let Some(namespace) = self.async_namespace {
+            self.submit_async_dispatch(dispatch, namespace);
+        } else {
+            let result = self.execute_dispatch(dispatch);
+            self.completions
+                .push_back(BlockDeviceCompletion::new(dispatch.tag, result));
+        }
     }
 }
 
 impl BlockCompletionSource for BlockDeviceDispatchAdapter<'_, '_> {
     fn poll_completion(&mut self) -> Option<BlockDeviceCompletion> {
-        self.completions.pop_front()
+        self.completions.pop_front().or_else(|| {
+            self.async_namespace
+                .and_then(|namespace| self.poll_async_completion(namespace))
+        })
     }
 }
 
@@ -632,7 +907,8 @@ pub fn drive_page_container_file_block_device_service_once<F>(
 where
     F: FnMut(ServiceKick) -> bool,
 {
-    let mut adapter = BlockDeviceDispatchAdapter::new(handle, guard);
+    let mut adapter =
+        BlockDeviceDispatchAdapter::new_async(handle, guard, container.file_io_block_namespace());
     container.drive_file_block_io_service_once(
         budget,
         &mut adapter,
@@ -697,28 +973,33 @@ pub struct PageContainerFileIoServiceTaskReport {
     pub last_turn: Option<PageContainerFileIoServiceTurn>,
 }
 
-#[derive(Clone)]
-pub struct PageContainerFileIoServiceRuntime {
-    container: Cap<PageContainer>,
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct FileIoManagerRuntimeRegistrationId(u64);
+
+impl FileIoManagerRuntimeRegistrationId {
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+/// Move-only reactor custody for one file-I/O manager pair.
+///
+/// The weak endpoint is used only to check whether the PageBacked semantic
+/// owner is still live for a bounded service turn. It is never upgraded across
+/// an await. The typed L4/L6 handles keep request and block-manager state out
+/// of the PageContainer lifetime.
+pub struct FileIoManagerRuntimeClaim {
+    registration: FileIoManagerRuntimeRegistrationId,
+    container: Weak<PageContainer>,
+    page_submission: PageIoSubmissionHandle,
+    block_submission: BlockSubmissionHandle,
     handle: BlockDeviceHandle,
     wake_source: Arc<ServiceWakeSource>,
 }
 
-impl PageContainerFileIoServiceRuntime {
-    pub fn new(
-        container: Cap<PageContainer>,
-        handle: BlockDeviceHandle,
-        wake_source: Arc<ServiceWakeSource>,
-    ) -> Self {
-        Self {
-            container,
-            handle,
-            wake_source,
-        }
-    }
-
-    pub fn container(&self) -> &Cap<PageContainer> {
-        &self.container
+impl FileIoManagerRuntimeClaim {
+    pub const fn registration_id(&self) -> FileIoManagerRuntimeRegistrationId {
+        self.registration
     }
 
     pub const fn handle(&self) -> BlockDeviceHandle {
@@ -733,19 +1014,75 @@ impl PageContainerFileIoServiceRuntime {
         post_file_io_service_kick(&self.wake_source, ServiceKick::new(service)) as usize
     }
 
-    pub fn diagnostic(&self) -> (u64, usize, u64, crate::page_backed::FileIoServiceDiagnostic) {
-        (
-            self.wake_source.source_id(),
-            self.wake_source.wake_endpoint().subscriber_count(),
-            self.wake_source.wake_endpoint().pending_mask_snapshot(),
-            self.container.file_io_service_diagnostic(),
-        )
+    fn retain_manager_custody(&self) {
+        // These handles are intentionally owned by the claim, rather than by
+        // a long-lived PageContainer capability held in a reactor future.
+        let _ = (&self.page_submission, &self.block_submission);
+    }
+
+    /// End this claim's reactor ownership and release its typed manager
+    /// handles. The registration removal is idempotent against test cleanup.
+    pub fn retire(self) -> bool {
+        retire_file_io_manager_runtime(self.registration)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn detached_for_test(
+        container: Cap<PageContainer>,
+        handle: BlockDeviceHandle,
+        wake_source: Arc<ServiceWakeSource>,
+    ) -> Self {
+        let (page_submission, block_submission) = container.file_io_runtime_handles();
+        Self {
+            registration: FileIoManagerRuntimeRegistrationId(0),
+            container: container.downgrade(),
+            page_submission,
+            block_submission,
+            handle,
+            wake_source,
+        }
     }
 }
 
+struct FileIoManagerRuntimePayload {
+    page_submission: PageIoSubmissionHandle,
+    block_submission: BlockSubmissionHandle,
+    handle: BlockDeviceHandle,
+    wake_source: Arc<ServiceWakeSource>,
+}
+
+enum FileIoManagerRuntimeState {
+    Pending(FileIoManagerRuntimePayload),
+    Claimed,
+}
+
 struct RegisteredFileIoServiceRuntime {
-    runtime: PageContainerFileIoServiceRuntime,
-    submitted: bool,
+    id: FileIoManagerRuntimeRegistrationId,
+    container: Weak<PageContainer>,
+    handle: BlockDeviceHandle,
+    source_id: u64,
+    state: FileIoManagerRuntimeState,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PageContainerFileIoServiceRuntimeSnapshot {
+    container: Weak<PageContainer>,
+    handle: BlockDeviceHandle,
+    source_id: u64,
+}
+
+impl PageContainerFileIoServiceRuntimeSnapshot {
+    pub const fn handle(&self) -> BlockDeviceHandle {
+        self.handle
+    }
+
+    pub const fn source_id(&self) -> u64 {
+        self.source_id
+    }
+
+    pub fn is_live(&self, guard: &Guard<'_>) -> bool {
+        self.container.upgrade(guard).is_some()
+    }
 }
 
 /// Kernel-owned task submission for a registered file-I/O service runtime.
@@ -754,7 +1091,7 @@ struct RegisteredFileIoServiceRuntime {
 /// state. The reactor owner installs this narrow callback after it is ready to
 /// accept long-lived service futures.
 pub trait FileIoServiceRuntimeSpawner: Send + Sync {
-    fn spawn_file_io_service(&self, runtime: PageContainerFileIoServiceRuntime);
+    fn spawn_file_io_service(&self, claim: FileIoManagerRuntimeClaim);
 }
 
 static FILE_IO_SERVICE_RUNTIMES: SpinMutex<Vec<RegisteredFileIoServiceRuntime>> =
@@ -762,23 +1099,35 @@ static FILE_IO_SERVICE_RUNTIMES: SpinMutex<Vec<RegisteredFileIoServiceRuntime>> 
 static FILE_IO_SERVICE_RUNTIME_SPAWNER: SpinMutex<Option<Arc<dyn FileIoServiceRuntimeSpawner>>> =
     SpinMutex::new(None);
 static NEXT_FILE_IO_SERVICE_SOURCE_ID: AtomicU64 = AtomicU64::new(FILE_IO_SERVICE_SOURCE_ID_BASE);
+static NEXT_FILE_IO_SERVICE_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
 
 pub fn register_page_container_file_io_service(
     container: Cap<PageContainer>,
     handle: BlockDeviceHandle,
-) -> PageContainerFileIoServiceRuntime {
+) -> FileIoManagerRuntimeRegistrationId {
     let source_id = NEXT_FILE_IO_SERVICE_SOURCE_ID.fetch_add(1, Ordering::AcqRel);
     let wake_source = Arc::new(ServiceWakeSource::new(source_id));
     let _ = container.attach_file_io_wake_source(Arc::clone(&wake_source));
-    let runtime = PageContainerFileIoServiceRuntime::new(container, handle, wake_source);
+    let (page_submission, block_submission) = container.file_io_runtime_handles();
+    let id = FileIoManagerRuntimeRegistrationId(
+        NEXT_FILE_IO_SERVICE_RUNTIME_ID.fetch_add(1, Ordering::AcqRel),
+    );
     FILE_IO_SERVICE_RUNTIMES
         .lock()
         .push(RegisteredFileIoServiceRuntime {
-            runtime: runtime.clone(),
-            submitted: false,
+            id,
+            container: container.downgrade(),
+            handle,
+            source_id,
+            state: FileIoManagerRuntimeState::Pending(FileIoManagerRuntimePayload {
+                page_submission,
+                block_submission,
+                handle,
+                wake_source,
+            }),
         });
     let _ = submit_pending_file_io_service_runtimes();
-    runtime
+    id
 }
 
 /// Install the single kernel-owned spawner and drain every runtime registered
@@ -804,17 +1153,7 @@ pub fn submit_pending_file_io_service_runtimes() -> usize {
     let Some(spawner) = FILE_IO_SERVICE_RUNTIME_SPAWNER.lock().clone() else {
         return 0;
     };
-    let pending = {
-        let mut runtimes = FILE_IO_SERVICE_RUNTIMES.lock();
-        let mut pending = Vec::new();
-        for entry in runtimes.iter_mut() {
-            if !entry.submitted {
-                entry.submitted = true;
-                pending.push(entry.runtime.clone());
-            }
-        }
-        pending
-    };
+    let pending = claim_pending_file_io_service_runtimes();
     let submitted = pending.len();
     for runtime in pending {
         spawner.spawn_file_io_service(runtime);
@@ -822,12 +1161,54 @@ pub fn submit_pending_file_io_service_runtimes() -> usize {
     submitted
 }
 
-pub fn page_container_file_io_service_runtimes_snapshot() -> Vec<PageContainerFileIoServiceRuntime>
-{
+fn claim_pending_file_io_service_runtimes() -> Vec<FileIoManagerRuntimeClaim> {
+    // Registration can run from a VFS/exec path that already pins the current
+    // CPU's epoch. Reuse that guard rather than nesting another EBR guard;
+    // callers without an active guard still acquire a fresh one.
+    let guard = tx_substrate::epoch::borrow_current_guard().unwrap_or_else(step_engine::guard);
+    {
+        let mut runtimes = FILE_IO_SERVICE_RUNTIMES.lock();
+        let mut pending = Vec::new();
+        runtimes.retain_mut(|entry| {
+            if entry.container.upgrade(&guard).is_none() {
+                return false;
+            }
+            if matches!(entry.state, FileIoManagerRuntimeState::Pending(_)) {
+                let FileIoManagerRuntimeState::Pending(payload) =
+                    core::mem::replace(&mut entry.state, FileIoManagerRuntimeState::Claimed)
+                else {
+                    unreachable!("pending claim state was checked above");
+                };
+                pending.push(FileIoManagerRuntimeClaim {
+                    registration: entry.id,
+                    container: entry.container,
+                    page_submission: payload.page_submission,
+                    block_submission: payload.block_submission,
+                    handle: payload.handle,
+                    wake_source: payload.wake_source,
+                });
+            }
+            true
+        });
+        pending
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn claim_pending_file_io_service_runtimes_for_test() -> Vec<FileIoManagerRuntimeClaim> {
+    claim_pending_file_io_service_runtimes()
+}
+
+pub fn page_container_file_io_service_runtimes_snapshot(
+) -> Vec<PageContainerFileIoServiceRuntimeSnapshot> {
     FILE_IO_SERVICE_RUNTIMES
         .lock()
         .iter()
-        .map(|entry| entry.runtime.clone())
+        .map(|entry| PageContainerFileIoServiceRuntimeSnapshot {
+            container: entry.container,
+            handle: entry.handle,
+            source_id: entry.source_id,
+        })
         .collect()
 }
 
@@ -835,17 +1216,85 @@ pub fn page_container_file_io_service_runtime_count() -> usize {
     FILE_IO_SERVICE_RUNTIMES.lock().len()
 }
 
+fn retire_file_io_manager_runtime(id: FileIoManagerRuntimeRegistrationId) -> bool {
+    if id.raw() == 0 {
+        return false;
+    }
+    let mut runtimes = FILE_IO_SERVICE_RUNTIMES.lock();
+    let initial_len = runtimes.len();
+    runtimes.retain(|entry| entry.id != id);
+    runtimes.len() != initial_len
+}
+
 pub async fn page_container_file_io_service_task_loop_owned(
-    runtime: PageContainerFileIoServiceRuntime,
+    claim: FileIoManagerRuntimeClaim,
     config: PageContainerFileIoServiceTaskConfig,
 ) -> PageContainerFileIoServiceTaskReport {
-    page_container_file_io_service_task_loop(
-        &runtime.container,
-        runtime.handle,
-        &runtime.wake_source,
-        config,
-    )
-    .await
+    let report = page_container_file_io_service_task_loop_claim(&claim, config).await;
+    let _ = claim.retire();
+    report
+}
+
+async fn page_container_file_io_service_task_loop_claim(
+    claim: &FileIoManagerRuntimeClaim,
+    config: PageContainerFileIoServiceTaskConfig,
+) -> PageContainerFileIoServiceTaskReport {
+    let mut report = PageContainerFileIoServiceTaskReport::default();
+    while config
+        .max_ready_turns
+        .is_none_or(|max_ready_turns| report.ready_turns < max_ready_turns)
+    {
+        let wait = crate::wait_source::wait_on_registered_endpoint(
+            claim.wake_source.wake_endpoint(),
+            file_io_service_interest_mask(),
+        );
+        if wait.await != WaitOutcome::Ready {
+            report.waits_failed += 1;
+            break;
+        }
+
+        report.waits_ready += 1;
+        report.ready_turns += 1;
+        let guard = step_engine::guard();
+        let Some(container) = claim.container.upgrade(&guard) else {
+            report.waits_failed += 1;
+            break;
+        };
+        // The Cap now retains the container. Do not pin one epoch across a
+        // complete page/block/page service turn: page completions publish a
+        // new immutable resident root and can consume more retire credits than
+        // one guarded epoch can replenish.
+        drop(guard);
+        claim.retain_manager_custody();
+        let turn = match drive_page_container_file_io_service_once_compact(
+            &container,
+            config.page_budget,
+            config.block_budget,
+            claim.handle,
+            |kick| post_file_io_service_kick(&claim.wake_source, kick),
+        ) {
+            Ok(turn) => turn,
+            Err(_) => {
+                report.waits_failed += 1;
+                break;
+            }
+        };
+        drop(container);
+
+        report.dispatched += turn.block.dispatched;
+        report.device_completions += turn.block.device_completions;
+        report.page_completions += turn.block.page_completions;
+        report.self_kicks += turn.block.kicks
+            + turn
+                .page_before
+                .as_ref()
+                .map(|turn| turn.kicks)
+                .unwrap_or(0)
+            + turn.page_after.as_ref().map(|turn| turn.kicks).unwrap_or(0);
+        report.last_turn = Some(turn);
+    }
+
+    report
 }
 
 pub async fn page_container_file_io_service_task_loop(
@@ -870,13 +1319,11 @@ pub async fn page_container_file_io_service_task_loop(
 
         report.waits_ready += 1;
         report.ready_turns += 1;
-        let guard = step_engine::guard();
-        let turn = match drive_page_container_file_io_service_once(
+        let turn = match drive_page_container_file_io_service_once_compact(
             container,
             config.page_budget,
             config.block_budget,
             handle,
-            &guard,
             |kick| post_file_io_service_kick(wake_source, kick),
         ) {
             Ok(turn) => turn,
@@ -917,24 +1364,76 @@ pub fn drive_page_container_file_io_service_once<F>(
     page_budget: ServiceBudget,
     block_budget: ServiceBudget,
     handle: BlockDeviceHandle,
-    guard: &Guard<'_>,
+    kick: F,
+) -> Result<PageContainerFileIoServiceTurn, PageServiceTaggedBlockCompletionError>
+where
+    F: FnMut(ServiceKick) -> bool,
+{
+    drive_page_container_file_io_service_once_inner(
+        container,
+        page_budget,
+        block_budget,
+        handle,
+        true,
+        kick,
+    )
+}
+
+fn drive_page_container_file_io_service_once_compact<F>(
+    container: &PageContainer,
+    page_budget: ServiceBudget,
+    block_budget: ServiceBudget,
+    handle: BlockDeviceHandle,
+    kick: F,
+) -> Result<PageContainerFileIoServiceTurn, PageServiceTaggedBlockCompletionError>
+where
+    F: FnMut(ServiceKick) -> bool,
+{
+    drive_page_container_file_io_service_once_inner(
+        container,
+        page_budget,
+        block_budget,
+        handle,
+        false,
+        kick,
+    )
+}
+
+fn drive_page_container_file_io_service_once_inner<F>(
+    container: &PageContainer,
+    page_budget: ServiceBudget,
+    block_budget: ServiceBudget,
+    handle: BlockDeviceHandle,
+    capture_work: bool,
     mut kick: F,
 ) -> Result<PageContainerFileIoServiceTurn, PageServiceTaggedBlockCompletionError>
 where
     F: FnMut(ServiceKick) -> bool,
 {
-    let page_before = container.drive_file_io_service_once_owned(page_budget, &mut kick);
-    let block = drive_page_container_file_block_device_service_once(
-        container,
-        block_budget,
-        handle,
-        guard,
-        &mut kick,
-    )?;
+    let page_before = if capture_work {
+        container.drive_file_io_service_once_owned(page_budget, &mut kick)
+    } else {
+        container.drive_file_io_service_once_owned_compact(page_budget, &mut kick)
+    };
+    // Device dispatch still needs an epoch guard for the registered block
+    // handle, but page completion must run after that guard is gone so RCU
+    // resident-root publication can replenish local retire credits.
+    let block = {
+        let guard = step_engine::guard();
+        drive_page_container_file_block_device_service_once(
+            container,
+            block_budget,
+            handle,
+            &guard,
+            &mut kick,
+        )?
+    };
     let page_after = if block.page_completions == 0 {
         None
-    } else {
+    } else if capture_work {
         container.drive_file_io_service_once_owned(page_budget, &mut kick)
+    } else {
+        container.drive_file_io_service_once_owned_compact(page_budget, &mut kick)
     };
     let next = page_container_file_io_next(&page_before, &block, &page_after);
 
@@ -983,13 +1482,11 @@ where
     type Progress = NoProgress;
 
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        let guard = step_engine::guard();
         match drive_page_container_file_io_service_once(
             self.container,
             self.page_budget,
             self.block_budget,
             self.handle,
-            &guard,
             &mut self.kick,
         ) {
             Ok(turn) => StepOutcome::Done(turn),
@@ -1130,6 +1627,10 @@ pub fn reset_page_container_file_io_service_registry_for_test() {
     FILE_IO_SERVICE_RUNTIMES.lock().clear();
     *FILE_IO_SERVICE_RUNTIME_SPAWNER.lock() = None;
     NEXT_FILE_IO_SERVICE_SOURCE_ID.store(FILE_IO_SERVICE_SOURCE_ID_BASE, Ordering::Release);
+    NEXT_FILE_IO_SERVICE_RUNTIME_ID.store(1, Ordering::Release);
+    ASYNC_BLOCK_ROUTES.lock().clear();
+    ROUTED_ASYNC_BLOCK_COMPLETIONS.lock().clear();
+    NEXT_ASYNC_BLOCK_COOKIE.store(1, Ordering::Release);
 }
 
 #[cfg(test)]
@@ -1147,13 +1648,86 @@ mod tests {
     };
     use crate::io_manager::runtime::{QueueDepth, ServiceBudget};
     use crate::page_backed::{AnonSwapPolicy, PageContainerKind};
-    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use tx_hal::Ppn;
     use tx_services::time::DEFAULT_REALTIME_EPOCH_BASE_NS;
 
     struct RecordingBlockDevice;
     static LAST_READ_BLOCK: AtomicU64 = AtomicU64::new(u64::MAX);
     static BARRIER_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static LAST_WRITE_FUA: AtomicBool = AtomicBool::new(false);
+
+    struct DelayedAsyncBlockDevice;
+    static DELAYED_ASYNC_COMPLETIONS: SpinMutex<VecDeque<BlockAsyncCompletion>> =
+        SpinMutex::new(VecDeque::new());
+
+    impl BlockDeviceOps for DelayedAsyncBlockDevice {
+        fn read_blocks(
+            &self,
+            _block_id: PhysicalBlockNumber,
+            _target: &mut [Frame],
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<(), NoProgress> {
+            StepOutcome::done(())
+        }
+
+        fn write_blocks(
+            &self,
+            _block_id: PhysicalBlockNumber,
+            _source: &[Frame],
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<(), NoProgress> {
+            StepOutcome::done(())
+        }
+
+        fn barrier(&self, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
+            StepOutcome::done(())
+        }
+
+        fn supports_async_blocks(&self) -> bool {
+            true
+        }
+
+        fn submit_read_blocks_async(
+            &self,
+            cookie: u64,
+            _block_id: PhysicalBlockNumber,
+            _target: &mut [Frame],
+            _guard: &Guard<'_>,
+        ) -> BlockAsyncSubmit {
+            DELAYED_ASYNC_COMPLETIONS
+                .lock()
+                .push_back(BlockAsyncCompletion::new(cookie, Ok(())));
+            BlockAsyncSubmit::Submitted
+        }
+
+        fn poll_async_blocks(
+            &self,
+            budget: usize,
+            _guard: &Guard<'_>,
+        ) -> Vec<BlockAsyncCompletion> {
+            let mut pending = DELAYED_ASYNC_COMPLETIONS.lock();
+            let count = budget.min(pending.len());
+            pending.drain(..count).collect()
+        }
+    }
+
+    impl BlockDevice for DelayedAsyncBlockDevice {
+        fn total_blocks(&self) -> u64 {
+            128
+        }
+
+        fn block_size(&self) -> u32 {
+            4096
+        }
+    }
+
+    static DELAYED_ASYNC_OPS: DelayedAsyncBlockDevice = DelayedAsyncBlockDevice;
+    static DELAYED_ASYNC_REG: BlockDeviceRegistration = BlockDeviceRegistration {
+        devt: DevT::new(8, 11),
+        name: "async-vda",
+        ops: &DELAYED_ASYNC_OPS,
+    };
 
     impl BlockDeviceOps for RecordingBlockDevice {
         fn read_blocks(
@@ -1178,6 +1752,24 @@ mod tests {
 
         fn barrier(&self, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
             BARRIER_COUNT.fetch_add(1, Ordering::SeqCst);
+            StepOutcome::done(())
+        }
+
+        fn durability_capabilities(&self) -> BlockDurabilityCapabilities {
+            BlockDurabilityCapabilities {
+                fua: true,
+                flush: true,
+            }
+        }
+
+        fn write_blocks_with_options(
+            &self,
+            _block_id: PhysicalBlockNumber,
+            _source: &[Frame],
+            options: BlockWriteOptions,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<(), NoProgress> {
+            LAST_WRITE_FUA.store(options.fua, Ordering::SeqCst);
             StepOutcome::done(())
         }
     }
@@ -1265,7 +1857,7 @@ mod tests {
     }
 
     #[test]
-    fn file_io_service_registry_snapshots_owned_runtime_for_reactor_submission() {
+    fn file_io_service_registry_keeps_only_weak_liveness_and_manager_metadata() {
         tx_test_support::init_host();
         let _lock = crate::test_support::EPOCH_TEST_LOCK
             .lock()
@@ -1280,7 +1872,7 @@ mod tests {
         )
         .expect("page container cap");
 
-        let runtime = register_page_container_file_io_service(
+        let registration = register_page_container_file_io_service(
             pc.clone(),
             BlockDeviceHandle::whole(&BLOCK_REG),
         );
@@ -1288,27 +1880,59 @@ mod tests {
 
         assert_eq!(page_container_file_io_service_runtime_count(), 1);
         assert_eq!(snapshot.len(), 1);
-        assert_eq!(runtime.container().page_count(), 1);
-        assert_eq!(snapshot[0].container().page_count(), 1);
+        assert_eq!(registration.raw(), 1);
+        let guard = step_engine::guard();
+        assert!(snapshot[0].is_live(&guard));
+        drop(guard);
         assert_eq!(snapshot[0].handle().registration().devt, BLOCK_REG.devt);
         assert_eq!(snapshot[0].handle().start_lba(), 0);
         assert_eq!(snapshot[0].handle().len_lba(), BLOCK_REG.ops.total_blocks());
-        assert_eq!(
-            snapshot[0].wake_source().source_id(),
-            FILE_IO_SERVICE_SOURCE_ID_BASE
-        );
+        assert_eq!(snapshot[0].source_id(), FILE_IO_SERVICE_SOURCE_ID_BASE);
 
         reset_page_container_file_io_service_registry_for_test();
         assert!(page_container_file_io_service_runtimes_snapshot().is_empty());
     }
 
     #[test]
-    fn file_io_runtime_spawner_drains_boot_backlog_and_submits_late_registration_once() {
-        struct CountingSpawner(AtomicUsize);
+    fn file_io_runtime_registry_does_not_retain_page_container() {
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        crate::zones::register_all().expect("kernel zones");
+        reset_page_container_file_io_service_registry_for_test();
+        let pc = PageContainer::new_cap(
+            PageContainerKind::Anon {
+                swap_policy: AnonSwapPolicy::Reclaimable,
+            },
+            1,
+        )
+        .expect("page container cap");
+        register_page_container_file_io_service(pc.clone(), BlockDeviceHandle::whole(&BLOCK_REG));
+        let snapshot = page_container_file_io_service_runtimes_snapshot();
+        drop(pc);
+
+        let guard = step_engine::guard();
+        assert!(
+            !snapshot[0].is_live(&guard),
+            "registry metadata must not keep a PageContainer capability alive"
+        );
+        drop(guard);
+        reset_page_container_file_io_service_registry_for_test();
+    }
+
+    #[test]
+    fn file_io_runtime_spawner_drains_boot_backlog_and_retires_claims_once() {
+        struct CountingSpawner {
+            spawned: AtomicUsize,
+            retired: AtomicUsize,
+        }
 
         impl FileIoServiceRuntimeSpawner for CountingSpawner {
-            fn spawn_file_io_service(&self, _runtime: PageContainerFileIoServiceRuntime) {
-                self.0.fetch_add(1, Ordering::AcqRel);
+            fn spawn_file_io_service(&self, claim: FileIoManagerRuntimeClaim) {
+                self.spawned.fetch_add(1, Ordering::AcqRel);
+                self.retired
+                    .fetch_add(usize::from(claim.retire()), Ordering::AcqRel);
             }
         }
 
@@ -1326,15 +1950,23 @@ mod tests {
             1,
         )
         .expect("first page container");
-        register_page_container_file_io_service(first, BlockDeviceHandle::whole(&BLOCK_REG));
+        register_page_container_file_io_service(
+            first.clone(),
+            BlockDeviceHandle::whole(&BLOCK_REG),
+        );
 
-        let spawner = Arc::new(CountingSpawner(AtomicUsize::new(0)));
+        let spawner = Arc::new(CountingSpawner {
+            spawned: AtomicUsize::new(0),
+            retired: AtomicUsize::new(0),
+        });
         assert_eq!(
             install_file_io_service_runtime_spawner(spawner.clone()),
             Some(1)
         );
-        assert_eq!(spawner.0.load(Ordering::Acquire), 1);
+        assert_eq!(spawner.spawned.load(Ordering::Acquire), 1);
+        assert_eq!(spawner.retired.load(Ordering::Acquire), 1);
         assert_eq!(submit_pending_file_io_service_runtimes(), 0);
+        assert_eq!(page_container_file_io_service_runtime_count(), 0);
 
         let second = PageContainer::new_cap(
             PageContainerKind::Anon {
@@ -1343,14 +1975,20 @@ mod tests {
             1,
         )
         .expect("second page container");
-        register_page_container_file_io_service(second, BlockDeviceHandle::whole(&BLOCK_REG));
+        register_page_container_file_io_service(
+            second.clone(),
+            BlockDeviceHandle::whole(&BLOCK_REG),
+        );
 
-        assert_eq!(spawner.0.load(Ordering::Acquire), 2);
+        assert_eq!(spawner.spawned.load(Ordering::Acquire), 2);
+        assert_eq!(spawner.retired.load(Ordering::Acquire), 2);
         assert_eq!(submit_pending_file_io_service_runtimes(), 0);
+        assert_eq!(page_container_file_io_service_runtime_count(), 0);
         assert_eq!(
-            install_file_io_service_runtime_spawner(Arc::new(CountingSpawner(
-                AtomicUsize::new(0,)
-            ))),
+            install_file_io_service_runtime_spawner(Arc::new(CountingSpawner {
+                spawned: AtomicUsize::new(0),
+                retired: AtomicUsize::new(0),
+            })),
             None
         );
 
@@ -1392,6 +2030,51 @@ mod tests {
     }
 
     #[test]
+    fn async_dispatch_completion_is_routed_to_its_manager_namespace() {
+        use crate::adapter::step_engine::guard;
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        reset_page_container_file_io_service_registry_for_test();
+        DELAYED_ASYNC_COMPLETIONS.lock().clear();
+        let guard = guard();
+        let handle = BlockDeviceHandle::whole(&DELAYED_ASYNC_REG);
+        let mut first = BlockDeviceDispatchAdapter::new_async(handle, &guard, 41);
+        let mut second = BlockDeviceDispatchAdapter::new_async(handle, &guard, 42);
+        let dispatch = |tag| BlockDispatch {
+            tag: BlockTag::new(tag),
+            bio: Bio {
+                id: BlockRequestId::new(tag),
+                plan: BioPlan::new(
+                    DeviceKey::new(DELAYED_ASYNC_REG.devt.raw()),
+                    BlockOp::Read,
+                    LbaRange::new(tag * 8, 8),
+                    alloc::vec![BioVec::new(tag, 0, 4096)],
+                    BlockFlags::EMPTY,
+                ),
+            },
+        };
+
+        first.submit(&dispatch(7));
+        second.submit(&dispatch(9));
+
+        // The second poll drains both device completions. The first one must
+        // be retained for namespace 41 instead of being consumed by 42.
+        assert_eq!(
+            second.poll_completion(),
+            Some(BlockDeviceCompletion::new(BlockTag::new(9), Ok(())))
+        );
+        assert_eq!(
+            first.poll_completion(),
+            Some(BlockDeviceCompletion::new(BlockTag::new(7), Ok(())))
+        );
+        assert_eq!(first.poll_completion(), None);
+        assert_eq!(second.poll_completion(), None);
+        reset_page_container_file_io_service_registry_for_test();
+    }
+
+    #[test]
     fn block_device_dispatch_adapter_executes_barrier_dispatch() {
         use crate::adapter::step_engine::guard;
         tx_test_support::init_host();
@@ -1422,6 +2105,113 @@ mod tests {
         assert_eq!(completion.tag, BlockTag::new(8));
         assert_eq!(completion.result, Ok(()));
         assert_eq!(BARRIER_COUNT.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn dispatch_adapter_passes_fua_to_capable_device() {
+        use crate::adapter::step_engine::guard;
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        LAST_WRITE_FUA.store(false, Ordering::SeqCst);
+        let guard = guard();
+        let mut adapter =
+            BlockDeviceDispatchAdapter::new(BlockDeviceHandle::whole(&BLOCK_REG), &guard);
+        let dispatch = BlockDispatch {
+            tag: BlockTag::new(9),
+            bio: Bio {
+                id: BlockRequestId::new(5),
+                plan: BioPlan::new(
+                    DeviceKey::new(BLOCK_REG.devt.raw()),
+                    BlockOp::Write,
+                    LbaRange::new(2, 8),
+                    alloc::vec![BioVec::new(0, 0, 4096)],
+                    BlockFlags::FUA,
+                ),
+            },
+        };
+
+        adapter.submit(&dispatch);
+
+        assert_eq!(
+            adapter.poll_completion().expect("completion").result,
+            Ok(())
+        );
+        assert!(LAST_WRITE_FUA.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn default_device_rejects_fua_instead_of_ignoring_it() {
+        struct FlushOnlyDevice;
+
+        impl BlockDeviceOps for FlushOnlyDevice {
+            fn read_blocks(
+                &self,
+                _block_id: PhysicalBlockNumber,
+                _target: &mut [Frame],
+                _guard: &Guard<'_>,
+            ) -> StepOutcome<(), NoProgress> {
+                StepOutcome::done(())
+            }
+
+            fn write_blocks(
+                &self,
+                _block_id: PhysicalBlockNumber,
+                _source: &[Frame],
+                _guard: &Guard<'_>,
+            ) -> StepOutcome<(), NoProgress> {
+                StepOutcome::done(())
+            }
+
+            fn barrier(&self, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
+                StepOutcome::done(())
+            }
+        }
+
+        impl BlockDevice for FlushOnlyDevice {
+            fn total_blocks(&self) -> u64 {
+                8
+            }
+
+            fn block_size(&self) -> u32 {
+                4096
+            }
+        }
+
+        static OPS: FlushOnlyDevice = FlushOnlyDevice;
+        static REG: BlockDeviceRegistration = BlockDeviceRegistration {
+            devt: DevT::new(8, 9),
+            name: "fua-none",
+            ops: &OPS,
+        };
+        use crate::adapter::step_engine::guard;
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        let guard = guard();
+        let mut adapter = BlockDeviceDispatchAdapter::new(BlockDeviceHandle::whole(&REG), &guard);
+        let dispatch = BlockDispatch {
+            tag: BlockTag::new(10),
+            bio: Bio {
+                id: BlockRequestId::new(6),
+                plan: BioPlan::new(
+                    DeviceKey::new(REG.devt.raw()),
+                    BlockOp::Write,
+                    LbaRange::new(0, 8),
+                    alloc::vec![BioVec::new(0, 0, 4096)],
+                    BlockFlags::FUA,
+                ),
+            },
+        };
+
+        adapter.submit(&dispatch);
+
+        assert_eq!(
+            adapter.poll_completion().expect("completion").result,
+            Err(Errno::EOPNOTSUPP)
+        );
     }
 
     #[test]

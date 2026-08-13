@@ -96,6 +96,16 @@ impl DmaAllocation {
     }
 }
 
+#[cold]
+fn dma_allocation_failure(pages: usize, len: usize, operation: &str) -> ! {
+    let diagnostics = page_allocator::backend_diagnostics().ok();
+    let free = diagnostics.as_ref().map_or(0, |diag| diag.free_count);
+    let max_run = diagnostics
+        .as_ref()
+        .map_or(0, |diag| diag.max_contiguous_free_run);
+    panic!("virtio DMA {operation} failed: len={len} pages={pages} free={free} max_run={max_run}")
+}
+
 impl Drop for DmaAllocation {
     fn drop(&mut self) {
         let _ = self.owned.base();
@@ -112,7 +122,10 @@ unsafe impl<P: TxPlatform> virtio_drivers::Hal for TxVirtioHal<P> {
                 DMA_ALLOCATIONS.lock().push(allocation);
                 (paddr, vaddr)
             }
-            Err(()) => (0, NonNull::dangling()),
+            // The HAL has no error return. Publishing address zero makes the
+            // device ignore an invalid descriptor while the caller spins for
+            // a completion forever, so fail with allocator diagnostics.
+            Err(()) => dma_allocation_failure(pages, pages.saturating_mul(PAGE_SIZE), "alloc"),
         }
     }
 
@@ -151,10 +164,8 @@ unsafe impl<P: TxPlatform> virtio_drivers::Hal for TxVirtioHal<P> {
             return 0;
         }
         let pages = len.div_ceil(PAGE_SIZE);
-        let allocation = match alloc_dma_pages::<P>(pages, direction) {
-            Ok(allocation) => allocation,
-            Err(()) => return 0,
-        };
+        let allocation = alloc_dma_pages::<P>(pages, direction)
+            .unwrap_or_else(|()| dma_allocation_failure(pages, len, "share"));
 
         match direction {
             BufferDirection::DriverToDevice | BufferDirection::Both => {

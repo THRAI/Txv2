@@ -11,6 +11,26 @@ use tx_substrate::{epoch, zone};
 static AP_INIT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static CURRENT_CPU: AtomicUsize = AtomicUsize::new(0);
 static ONLINE_CPUS: AtomicUsize = AtomicUsize::new(0b1);
+static ZONE_DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+unsafe fn noop_reclaim(_ptr: *mut u8) {}
+
+#[derive(Debug)]
+struct OfflineZoneObject;
+
+impl Drop for OfflineZoneObject {
+    fn drop(&mut self) {
+        ZONE_DROP_COUNT.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+static OFFLINE_TEST_ZONE: zone::Zone<OfflineZoneObject> = zone::Zone::const_new();
+
+unsafe impl zone::ZoneAllocated for OfflineZoneObject {
+    fn zone() -> &'static zone::Zone<Self> {
+        &OFFLINE_TEST_ZONE
+    }
+}
 
 static BOOT_MEMORY: [MemoryRegion; 0] = [];
 static BOOT_INFO: BootInfo = BootInfo {
@@ -69,7 +89,8 @@ impl ConsoleIf for TestPlatform {
 impl PmapIf for TestPlatform {}
 impl TrapIf for TestPlatform {}
 impl SignalFrameIf for TestPlatform {}
-unsafe fn restore_test_local_execution(_: usize) {}
+unsafe fn restore_test_local_execution(_saved_state: usize) {}
+
 impl IrqIf for TestPlatform {
     fn exclude_local_execution() -> tx_hal::LocalExecutionGuard {
         unsafe { tx_hal::LocalExecutionGuard::new(0, restore_test_local_execution) }
@@ -124,14 +145,21 @@ impl PowerIf for TestPlatform {
 }
 
 fn reset_runtime() {
+    tx_substrate::testing::init_host_for_test_once();
     unsafe {
         epoch::testing::reset_for_test();
         zone::testing::reset_for_test();
     }
     CURRENT_CPU.store(0, Ordering::Release);
     ONLINE_CPUS.store(0b1, Ordering::Release);
+    ZONE_DROP_COUNT.store(0, Ordering::Release);
     epoch::init_on_bsp::<TestPlatform>().expect("epoch bsp init");
-    zone::init_on_bsp::<TestPlatform>().expect("zone bsp init");
+    zone::testing::init_for_test_with_possible_cpus(
+        4096,
+        tx_substrate::page_allocator::testing::direct_map_base_for_test(),
+        2,
+    )
+    .expect("zone test init");
 }
 
 #[test]
@@ -159,4 +187,75 @@ fn substrate_ap_init_rejects_cpu_outside_possible_mask() {
         err,
         tx_substrate::ApInitError::Epoch(epoch::EpochError::InvalidCpu)
     );
+}
+
+#[test]
+fn duplicate_ap_admission_does_not_reset_epoch_retirement_state() {
+    let _guard = AP_INIT_TEST_LOCK.lock().expect("ap init test lock");
+    reset_runtime();
+
+    CURRENT_CPU.store(1, Ordering::Release);
+    ONLINE_CPUS.store(0b11, Ordering::Release);
+    tx_substrate::init_on_ap(CpuId(1)).expect("first AP substrate init");
+    let mut node = Box::new(epoch::testing::IntrusiveTestNode::new(
+        core::ptr::NonNull::<u8>::dangling().as_ptr(),
+        noop_reclaim,
+    ));
+    unsafe {
+        epoch::testing::retire_intrusive_for_test(&mut node).expect("AP intrusive retire");
+    }
+
+    let error = tx_substrate::init_on_ap(CpuId(1))
+        .expect_err("duplicate AP admission must not reset live epoch state");
+
+    assert_eq!(
+        error,
+        tx_substrate::ApInitError::Epoch(epoch::EpochError::CpuAlreadyOnline)
+    );
+    assert_eq!(
+        epoch::cpu_summary(CpuId(1))
+            .expect("CPU 1 summary")
+            .bag_retired,
+        1
+    );
+}
+
+#[test]
+fn cpu_offline_transfers_three_zone_bag_heads() {
+    let _guard = AP_INIT_TEST_LOCK.lock().expect("ap init test lock");
+    reset_runtime();
+    zone::register_zone_for::<OfflineZoneObject>().expect("offline test zone registration");
+    CURRENT_CPU.store(1, Ordering::Release);
+    ONLINE_CPUS.store(0b11, Ordering::Release);
+    tx_substrate::init_on_ap(CpuId(1)).expect("AP substrate init");
+
+    for index in 0..3 {
+        CURRENT_CPU.store(0, Ordering::Release);
+        let cap = zone::sign(OfflineZoneObject).expect("zone object allocation");
+        CURRENT_CPU.store(1, Ordering::Release);
+        drop(cap);
+        if index != 2 {
+            CURRENT_CPU.store(0, Ordering::Release);
+            assert_eq!(epoch::try_drain(0).advanced_epochs, 1);
+        }
+    }
+    assert_eq!(
+        epoch::cpu_summary(CpuId(1))
+            .expect("CPU 1 zone retirement summary")
+            .bag_retired,
+        3
+    );
+
+    CURRENT_CPU.store(0, Ordering::Release);
+    epoch::offline_cpu(CpuId(1)).expect("offline CPU 1");
+    assert_eq!(
+        epoch::cpu_summary(CpuId(0))
+            .expect("coordinator zone retirement summary")
+            .bag_retired,
+        3
+    );
+    for _ in 0..4 {
+        let _ = epoch::try_drain(usize::MAX);
+    }
+    assert_eq!(ZONE_DROP_COUNT.load(Ordering::Acquire), 3);
 }

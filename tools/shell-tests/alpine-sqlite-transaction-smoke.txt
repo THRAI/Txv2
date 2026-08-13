@@ -1,0 +1,21 @@
+# alpine-sqlite-transaction-smoke.txt - sqlite3 transaction/index/integrity smoke.
+wait "/ # " within 60000
+sleep 500
+send "rm -f /tmp/sqlite-tx-demo.db /tmp/sqlite-tx-demo.db-journal /tmp/sqlite-tx-demo.db-wal /tmp/sqlite-tx-demo.db-shm\n"
+expect "/ # " within 10000
+sleep 500
+send "/usr/bin/sqlite3 -batch -noheader /tmp/sqlite-tx-demo.db \"PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA temp_store=MEMORY; PRAGMA mmap_size=0; CREATE TABLE account(id INTEGER PRIMARY KEY, name TEXT UNIQUE, balance INTEGER CHECK(balance >= 0)); CREATE INDEX account_balance_idx ON account(balance); BEGIN IMMEDIATE; INSERT INTO account(name,balance) VALUES('alice',10),('bob',20),('carol',30); SAVEPOINT sp; UPDATE account SET balance=balance+5 WHERE name='alice'; ROLLBACK TO sp; RELEASE sp; COMMIT; SELECT 'sum-after-rollback:' || sum(balance) FROM account; BEGIN; UPDATE account SET balance=balance+7 WHERE name='bob'; INSERT INTO account(name,balance) VALUES('dana',40); COMMIT; SELECT 'ordered:' || group_concat(name || ':' || balance, ',') FROM (SELECT name,balance FROM account ORDER BY balance DESC,name); CREATE TABLE audit(action TEXT, n INTEGER); INSERT INTO audit SELECT 'accounts', count(*) FROM account; SELECT 'audit:' || n FROM audit; PRAGMA integrity_check;\"; echo sqlite-tx-status-$?\n"
+expect "delete" within 20000
+expect "sum-after-rollback:60" within 20000
+expect "ordered:dana:40,carol:30,bob:27,alice:10" within 20000
+expect "audit:4" within 20000
+expect "ok" within 20000
+expect "sqlite-tx-status-0" within 20000
+sleep 500
+send "/usr/bin/sqlite3 -batch -noheader /tmp/sqlite-tx-demo.db \"SELECT 'reopen-count:' || count(*) FROM account; SELECT 'reopen-bob:' || balance FROM account WHERE name='bob'; PRAGMA integrity_check;\"; echo sqlite-tx-reopen-status-$?\n"
+expect "reopen-count:4" within 20000
+expect "reopen-bob:27" within 20000
+expect "ok" within 20000
+expect "sqlite-tx-reopen-status-0" within 20000
+sleep 500
+quit

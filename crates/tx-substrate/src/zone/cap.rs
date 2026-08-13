@@ -7,16 +7,15 @@
 use core::hash::{Hash, Hasher};
 use core::marker::PhantomData;
 use core::ops::Deref;
-use core::panic::Location;
 use core::ptr::NonNull;
 use core::sync::atomic::Ordering;
 
 use crate::epoch::{self, Guard};
 
-use super::meta::{SlotState, RETAIN_SENTINEL_DEAD};
+use super::meta::SlotState;
 use super::policy::IsPayloadPolicy;
 use super::registry::{self, SlotKey};
-use super::slot::{reclaim_slot, Slot};
+use super::slot::Slot;
 use super::{Dead, ZoneAllocated};
 
 #[cfg(any(test, tx_cap_upgrade_metrics))]
@@ -40,10 +39,7 @@ const SLOW_CAP_UPGRADE_NS: u64 = 100_000;
 fn emit_cap_upgrade_trace(name: &'static [u8], value: i64) {
     debug_assert!(CAP_UPGRADE_TRACE_NAMES.contains(&name));
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            value,
-        );
+        observer.debug_counter(name, value);
     }
 }
 
@@ -115,49 +111,69 @@ pub struct Cap<T: 'static> {
 ///
 /// The wrapper keeps the public surface ready for split identity/payload
 /// entities even though this slice uses the same underlying slot state.
+///
+/// A non-payload Zone policy cannot derive a binding token through this
+/// wrapper:
+///
+/// ```compile_fail
+/// use tx_substrate::zone::{PayloadCap, ZoneAllocated};
+///
+/// fn token_for_any_zone<T: ZoneAllocated>(cap: &PayloadCap<T>) {
+///     let _ = cap.binding_token();
+/// }
+/// ```
 pub struct PayloadCap<T: 'static> {
     inner: Cap<T>,
 }
 
-#[cold]
-#[inline(never)]
-fn panic_stale_cap_clone<T: 'static>(
-    cap_addr: usize,
-    raw: u32,
-    caller: &'static Location<'static>,
-) -> ! {
-    let key = SlotKey::from_raw(raw);
-    match registry::lookup(key.zone_id()) {
-        Some(info) => panic!(
-            "zone stale Cap clone: expected_type={} cap_addr=0x{:016x} raw=0x{:08x} zone={} slab={} slot={} \
-             registry_type={} allocated={} slabs={} empty_slabs={} caller={}:{}:{}",
-            core::any::type_name::<T>(),
-            cap_addr,
-            raw,
-            key.zone_id().0,
-            key.slab_id(),
-            key.slot_index(),
-            info.type_name,
-            info.allocated_slots,
-            info.slab_count,
-            info.empty_slab_count,
-            caller.file(),
-            caller.line(),
-            caller.column(),
-        ),
-        None => panic!(
-            "zone stale Cap clone: expected_type={} cap_addr=0x{:016x} raw=0x{:08x} zone={} slab={} slot={} \
-             registry=missing caller={}:{}:{}",
-            core::any::type_name::<T>(),
-            cap_addr,
-            raw,
-            key.zone_id().0,
-            key.slab_id(),
-            key.slot_index(),
-            caller.file(),
-            caller.line(),
-            caller.column(),
-        ),
+/// Non-retaining identity for generation-exact binding comparison.
+///
+/// A token cannot observe or retain its target. It is derived from live Zone
+/// evidence and may later be used only to reject stale conditional teardown.
+///
+/// ```compile_fail
+/// use tx_substrate::zone::BindingToken;
+/// let _forged = BindingToken::<()>::from_raw_parts(0, 0);
+/// ```
+#[repr(C)]
+pub struct BindingToken<T: 'static> {
+    key: SlotKey,
+    generation: u16,
+    _marker: PhantomData<fn() -> T>,
+}
+
+impl<T: 'static> Clone for BindingToken<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T: 'static> Copy for BindingToken<T> {}
+
+impl<T: 'static> PartialEq for BindingToken<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key && self.generation == other.generation
+    }
+}
+
+impl<T: 'static> Eq for BindingToken<T> {}
+
+impl<T: 'static> BindingToken<T> {
+    pub const fn key(self) -> SlotKey {
+        self.key
+    }
+
+    pub const fn generation(self) -> u16 {
+        self.generation
+    }
+}
+
+impl<T: 'static> core::fmt::Debug for BindingToken<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("BindingToken")
+            .field("key", &self.key)
+            .field("generation", &self.generation)
+            .finish()
     }
 }
 
@@ -190,12 +206,7 @@ impl<T: 'static> Cap<T> {
         }
     }
 
-    /// Upgrade a raw cap key observed while `guard` was pinned.
-    ///
-    /// The guard prevents a retired zone slot from being reclaimed and reused
-    /// between copying the raw key from a publication table and incrementing
-    /// its retain count here.  A concurrent final release changes the slot out
-    /// of `Live`, in which case the upgrade cleanly returns `None`.
+    /// Upgrade a raw cap key observed while an epoch guard is pinned.
     pub fn try_clone_raw_live(raw: u32, guard: &Guard<'_>) -> Option<Self> {
         let _ = guard;
         let key = SlotKey::from_raw(raw);
@@ -219,42 +230,6 @@ impl<T: 'static> Cap<T> {
         }
     }
 
-    pub(crate) fn try_retire_slot(slot: NonNull<Slot<T>>) {
-        let meta = unsafe { slot.as_ref().meta() };
-        loop {
-            let cur = meta.load(Ordering::Acquire);
-            if cur.retain() != RETAIN_SENTINEL_DEAD {
-                return;
-            }
-            if cur.state() != SlotState::Dead {
-                return;
-            }
-
-            // The sentinel blocks new upgrades. Moving to Retiring hands the
-            // slot to EBR; only the EBR callback may run T's destructor and
-            // return the slot to the Keg.
-            let new = cur.with_retain(0).with_state(SlotState::Retiring);
-            match meta.compare_exchange(cur, new, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => {
-                    let retire_result =
-                        unsafe { epoch::retire_raw(slot.as_ptr() as *mut u8, reclaim_slot::<T>) };
-                    if retire_result.is_ok() {
-                        return;
-                    }
-
-                    let _ = epoch::drain_with_budget(64);
-                    unsafe { epoch::retire_raw(slot.as_ptr() as *mut u8, reclaim_slot::<T>) }
-                        .expect(
-                            "zone slot retire enqueue failed after bounded drain; \
-                             retired-bag page allocation failed",
-                        );
-                    return;
-                }
-                Err(_) => continue,
-            }
-        }
-    }
-
     pub(crate) unsafe fn from_slot(slot: NonNull<Slot<T>>) -> Self {
         let key = unsafe { slot.as_ref().key() };
         Self {
@@ -267,10 +242,26 @@ impl<T: 'static> Cap<T> {
         registry::slot_for::<T>(self.key())
     }
 
+    fn expect_slot(&self, op: &'static str) -> NonNull<Slot<T>> {
+        self.slot().unwrap_or_else(|| {
+            let debug = registry::slot_lookup_debug::<T>(self.key());
+            panic!(
+                "zone Cap key no longer resolves to a live slot: \
+                 op={op} reason={} requested_type={} registered_type={:?} \
+                 key={:?} allocated_slots={:?} slab_count={:?} empty_slab_count={:?}",
+                debug.reason,
+                debug.requested_type,
+                debug.registered_type,
+                debug.key,
+                debug.allocated_slots,
+                debug.slab_count,
+                debug.empty_slab_count,
+            )
+        })
+    }
+
     pub fn downgrade(&self) -> Weak<T> {
-        let slot = self
-            .slot()
-            .expect("zone Cap key no longer resolves to a live slot");
+        let slot = self.expect_slot("downgrade");
         let meta = unsafe { slot.as_ref().meta() };
         let cur = meta.load(Ordering::Acquire);
         debug_assert_eq!(cur.state(), SlotState::Live);
@@ -281,11 +272,24 @@ impl<T: 'static> Cap<T> {
         }
     }
 
+    pub fn binding_token(&self) -> BindingToken<T> {
+        let slot = self.expect_slot("binding_token");
+        let word = unsafe { slot.as_ref().meta().load(Ordering::Acquire) };
+        assert_eq!(
+            word.state(),
+            SlotState::Live,
+            "BindingToken requires live retained evidence"
+        );
+        BindingToken {
+            key: self.key(),
+            generation: word.generation(),
+            _marker: PhantomData,
+        }
+    }
+
     pub fn ident_ref<'g>(&self, guard: &'g Guard<'_>) -> IdentRef<'g, T> {
         let _ = guard;
-        let slot = self
-            .slot()
-            .expect("zone Cap key no longer resolves to a live slot");
+        let slot = self.expect_slot("ident_ref");
         let meta = unsafe { slot.as_ref().meta() };
         let cur = meta.load(Ordering::Acquire);
         debug_assert_eq!(cur.state(), SlotState::Live);
@@ -339,18 +343,11 @@ impl<T: 'static> Cap<T> {
         };
         unsafe { slot.as_ref().meta().load(Ordering::Acquire).retain() }
     }
-
-    fn try_retire(slot: NonNull<Slot<T>>) {
-        Self::try_retire_slot(slot);
-    }
 }
 
 impl<T: 'static> Clone for Cap<T> {
-    #[track_caller]
     fn clone(&self) -> Self {
-        let Some(slot) = self.slot() else {
-            panic_stale_cap_clone::<T>(self as *const Self as usize, self.raw, Location::caller());
-        };
+        let slot = self.expect_slot("clone");
         let meta = unsafe { slot.as_ref().meta() };
         loop {
             let cur = meta.load(Ordering::Acquire);
@@ -386,30 +383,94 @@ impl<T: 'static> Drop for Cap<T> {
             return;
         };
         let meta = unsafe { slot.as_ref().meta() };
-        let old = loop {
+        loop {
             let cur = meta.load(Ordering::Acquire);
             debug_assert_eq!(cur.state(), SlotState::Live);
             debug_assert!(cur.retain() > 0);
-            let new = if cur.retain() == 1 {
-                // Last retention installs the no-upgrade barrier. The slot is
-                // not reusable yet; EBR must first let old IdentRefs quiesce.
-                cur.with_retain(RETAIN_SENTINEL_DEAD)
-                    .with_state(SlotState::Dead)
-            } else {
-                cur.dec_retain()
-                    .expect("zone Cap retain count underflowed during drop")
-            };
-            match meta.compare_exchange(cur, new, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(previous) => break previous,
-                Err(_) => continue,
+            if cur.retain() == 1 {
+                break;
             }
-        };
-
-        if old.retain() > 1 {
-            return;
+            let new = cur
+                .dec_retain()
+                .expect("zone Cap retain count underflowed during drop");
+            if meta
+                .compare_exchange(cur, new, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
         }
 
-        Self::try_retire(slot);
+        let mut retired_key = None;
+        let mut retried_after_drain = false;
+        loop {
+            let retired = epoch::with_local_retire_guard(|local_guard| {
+                let key = if let Some(key) = retired_key {
+                    key
+                } else {
+                    loop {
+                        let cur = meta.load(Ordering::Acquire);
+                        debug_assert_eq!(cur.state(), SlotState::Live);
+                        debug_assert!(cur.retain() > 0);
+                        if cur.retain() > 1 {
+                            let new = cur
+                                .dec_retain()
+                                .expect("zone Cap retain count underflowed during drop");
+                            if meta
+                                .compare_exchange(cur, new, Ordering::AcqRel, Ordering::Acquire)
+                                .is_ok()
+                            {
+                                return Ok(None);
+                            }
+                            continue;
+                        }
+                        let retiring = cur.with_state(SlotState::Retiring).with_retiring_next(None);
+                        if meta
+                            .compare_exchange(cur, retiring, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok()
+                        {
+                            break unsafe { slot.as_ref().key() };
+                        }
+                    }
+                };
+
+                let retire_epoch = local_guard.sample_epoch_after_barrier();
+                unsafe {
+                    local_guard.try_enqueue_slot_after_barrier(key, retire_epoch, |previous| {
+                        loop {
+                            let current = meta.load(Ordering::Acquire);
+                            debug_assert_eq!(current.state(), SlotState::Retiring);
+                            let linked = current.with_retiring_next(previous.map(SlotKey::raw));
+                            if meta
+                                .compare_exchange(
+                                    current,
+                                    linked,
+                                    Ordering::Release,
+                                    Ordering::Relaxed,
+                                )
+                                .is_ok()
+                            {
+                                break;
+                            }
+                        }
+                    })?;
+                }
+                Ok(Some(key))
+            })
+            .expect("final Cap drop requires initialized local epoch retirement");
+
+            match retired {
+                Ok(None) | Ok(Some(_)) => return,
+                Err(epoch::EpochError::RetireBagOccupied) if !retried_after_drain => {
+                    retired_key = Some(unsafe { slot.as_ref().key() });
+                    retried_after_drain = true;
+                    let _ = epoch::drain_with_budget(usize::MAX);
+                }
+                Err(error) => {
+                    panic!("final Cap drop failed to enqueue Retiring slot: {error:?}");
+                }
+            }
+        }
     }
 }
 
@@ -417,9 +478,7 @@ impl<T: 'static> Deref for Cap<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        let slot = self
-            .slot()
-            .expect("zone Cap key no longer resolves to a live slot");
+        let slot = self.expect_slot("deref");
         unsafe { slot.as_ref().data_ref() }
     }
 }
@@ -468,8 +527,17 @@ impl<T: 'static> PayloadCap<T> {
     }
 }
 
+impl<T> PayloadCap<T>
+where
+    T: ZoneAllocated,
+    T::Policy: IsPayloadPolicy,
+{
+    pub fn binding_token(&self) -> BindingToken<T> {
+        self.inner.binding_token()
+    }
+}
+
 impl<T: 'static> Clone for PayloadCap<T> {
-    #[track_caller]
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -512,6 +580,7 @@ impl<T: 'static> Copy for Weak<T> {}
 const _: () = {
     assert!(core::mem::size_of::<Cap<()>>() == 4);
     assert!(core::mem::size_of::<Weak<()>>() == 8);
+    assert!(core::mem::size_of::<BindingToken<()>>() == 8);
 };
 
 unsafe impl<T: Send + Sync> Send for Weak<T> {}
@@ -610,6 +679,29 @@ pub struct IdentRef<'g, T: 'static> {
 }
 
 impl<'g, T: 'static> IdentRef<'g, T> {
+    /// Build a guarded reference from a Zone slot that was observed Live after
+    /// entering `guard`.
+    ///
+    /// # Safety
+    ///
+    /// `slot` must name a `Slot<T>` whose metadata was loaded as `Live` with
+    /// Acquire ordering after `guard` became active, and `generation` must come
+    /// from that same metadata observation.
+    pub(crate) unsafe fn from_published_slot(
+        slot: NonNull<Slot<T>>,
+        generation: u16,
+        guard: &'g Guard<'_>,
+    ) -> Self {
+        let _ = guard;
+        let key = unsafe { slot.as_ref().key() };
+        Self {
+            slot,
+            raw: key.raw(),
+            generation,
+            _guard: PhantomData,
+        }
+    }
+
     pub fn to_cap(&self) -> Result<Cap<T>, Dead> {
         let meta = unsafe { self.slot.as_ref().meta() };
         #[cfg(tx_cap_upgrade_metrics)]
@@ -623,10 +715,6 @@ impl<'g, T: 'static> IdentRef<'g, T> {
             if cur.generation() != self.generation || cur.state() != SlotState::Live {
                 return Err(Dead);
             }
-            if cur.retain() == RETAIN_SENTINEL_DEAD {
-                return Err(Dead);
-            }
-
             // Upgrade is a CAS that both revalidates generation/state and adds
             // one retained reference. If another thread kills the slot first,
             // the generation/state/sentinel checks fail on retry.
@@ -646,6 +734,14 @@ impl<'g, T: 'static> IdentRef<'g, T> {
 
     pub fn generation(&self) -> u16 {
         self.generation
+    }
+
+    pub fn binding_token(&self) -> BindingToken<T> {
+        BindingToken {
+            key: self.key(),
+            generation: self.generation,
+            _marker: PhantomData,
+        }
     }
 
     pub fn key(&self) -> SlotKey {

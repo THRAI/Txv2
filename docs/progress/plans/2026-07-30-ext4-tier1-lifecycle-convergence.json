@@ -1,0 +1,571 @@
+{
+  "schema": "tx.progress.plan.v1",
+  "id": "2026-07-30-ext4-tier1-lifecycle-convergence",
+  "title": "Converge ext4 Tier 1 lifecycle ownership",
+  "status": "complete",
+  "created": "2026-07-30",
+  "updated": "2026-08-05",
+  "owner": "ext4-lifecycle-coordinator",
+  "summary": "Implement the bounded ext4 Tier 1 surface through OwnedFileIoRequest, MutationHandle, and MountSettlementOp, then prove one production RW durability path with G0-G7 evidence.",
+  "scope": {
+    "in": [
+      "crates/tx-subsystems/src/page_backed",
+      "crates/tx-subsystems/src/mount",
+      "crates/tx-subsystems/src/vfs",
+      "crates/tx-ext4/src",
+      "crates/tx-ext4-format/src",
+      "crates/tx-fs/src/tx_ext4_bridge.rs",
+      "crates/tx-drivers/src/virtio",
+      "crates/tx-kernel/src/init.rs",
+      "crates/tx-shims/src/linux_syscall",
+      "xtask/src/ext4",
+      "xtask/src/lib.rs",
+      "xtask/src/lint.rs",
+      "tools/ext4/tier1",
+      "tools/shell-tests/ext4-tier1.scn",
+      "docs/superpowers/plans/2026-07-30-ext4-tier1-lifecycle-convergence.md",
+      "docs/progress"
+    ],
+    "out": [
+      "tier2-ext4-features",
+      "orphan_file",
+      "arbitrary-depth-extent-htree-growth",
+      "xattr-acl-quota-fallocate-direct-io-dax-fast-commit",
+      "multiple-concurrent-transactions",
+      "background-checkpoint-overlap",
+      "memory-pressure-tuning",
+      "native-rv64-rustc-performance-promotion"
+    ],
+    "write_sets": [
+      {
+        "owner": "ext4-lifecycle-coordinator",
+        "paths": [
+          "docs/superpowers/plans/2026-07-30-ext4-tier1-lifecycle-convergence.md",
+          "docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json"
+        ],
+        "notes": "The coordinator owns the plan and JSON ledger. STATUS.md is an additive catch-up only; implementation workers must use isolated worktrees and the per-task paths in the Markdown plan."
+      }
+    ]
+  },
+  "context": {
+    "design_docs": [
+      "docs/design/05_filesystem/EXT4_LIFECYCLE_v1.md",
+      "docs/design/05_filesystem/TX_EXT4_PLAN_v1_2.md",
+      "docs/design/05_filesystem/IO_MANAGER_v1.md",
+      "docs/design/03_memory-vm/MEMORY_IO_ARCHITECTURE_v1.md",
+      "docs/design/05_filesystem/MOUNT_v1.md"
+    ],
+    "progress_refs": [
+      "docs/progress/plans/2026-07-13-ext4-io-manager-write-path.json",
+      "docs/progress/plans/2026-07-23-rsext4-full-migration.json",
+      "docs/progress/plans/2026-07-25-memory-io-ext4-repair.json"
+    ],
+    "external_refs": [
+      "Linux ext4 and JBD2 behavior",
+      "e2fsprogs mke2fs debugfs dumpe2fs e2fsck",
+      "selected pinned xfstests Tier 1 manifest",
+      "QEMU RV64 virtio-blk durability behavior"
+    ]
+  },
+  "steps": [
+    {
+      "id": "task-01-reconcile",
+      "title": "Reconcile HEAD and historical journal slices",
+      "status": "complete",
+      "depends_on": [],
+      "paths": [
+        "docs/progress/research/2026-07-30-ext4-lifecycle-slice-reconciliation.md",
+        "docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json"
+      ],
+      "verification": [
+        "cargo test -p tx-ext4-format",
+        "cargo test -p tx-ext4 --lib --no-default-features",
+        "cargo test -p tx-subsystems --lib page_backed -- --test-threads=1",
+        "git show --stat 1cee426a 9f39f58f 555e4a40"
+      ],
+      "notes": "Completed at 101b98daec2fc1746d883d15715d2093e3ca850f. The reconciliation note maps 1cee426a checksum, 9f39f58f checkpoint-publication, and 555e4a40 recovery/cache/PageBacked witnesses by lifecycle owner; no historical patch was cherry-picked. Named baseline tests passed."
+    },
+    {
+      "id": "task-02-admission",
+      "title": "Install the Tier 1 capability gate and fail closed",
+      "status": "complete",
+      "depends_on": [
+        "task-01-reconcile"
+      ],
+      "paths": [
+        "crates/tx-ext4-format/src/capability.rs",
+        "crates/tx-ext4-format/src/lib.rs",
+        "crates/tx-ext4/src/read_backend.rs",
+        "crates/tx-ext4/src/namespace.rs",
+        "crates/tx-ext4/src/mount.rs",
+        "tools/ext4/tier1/capability-ledger.json"
+      ],
+      "verification": [
+        "cargo test -p tx-ext4-format --test host_tools tier1_ -- --test-threads=1",
+        "cargo test -p tx-ext4 --lib production_namespace_without_mutation_owner -- --test-threads=1",
+        "cargo -q xtask unit"
+      ],
+      "notes": "Completed: capability-ledger hash parity and unsupported request rejection are covered by host tests. RW mount admission validates the 4 KiB metadata_csum profile before backend construction, stores the accepted profile hash, and existing direct namespace, writeback-plan, flush, and truncate paths return EOPNOTSUPP before pager/cache mutation until MutationHandle exists. pager.rs was added as the minimal required path because it owns flush_page/truncate. Verified cargo test -p tx-ext4-format --test host_tools tier1_, cargo test -p tx-ext4 --lib --no-default-features, and cargo -q xtask unit."
+    },
+    {
+      "id": "task-03-owned-file-io",
+      "title": "Add PageDataLease and OwnedFileIoRequest",
+      "status": "complete",
+      "depends_on": [
+        "task-02-admission"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/page_backed/lifecycle.rs",
+        "crates/tx-subsystems/src/page_backed/mod.rs",
+        "crates/tx-subsystems/src/page_backed/lifecycle_tests.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-subsystems --lib owned_request_ -- --test-threads=1",
+        "cargo test -p tx-subsystems --lib page_data_lease -- --test-threads=1",
+        "cargo -q xtask unit"
+      ],
+      "notes": "Completed at 3b4732be. PageBacked now owns one request record for writeback/read/control state, terminal completion retires its matching L4 row, and pre-admission fetch retirement consumes its control owner. Missing-owner completions leave PageSlot state unchanged. Verified cargo test -p tx-subsystems --lib owned_request_, cargo test -p tx-subsystems --lib page_backed -- --test-threads=1 (148 passed), cargo -q xtask unit, legacy dual-map cleanup scan, and git diff --check."
+    },
+    {
+      "id": "task-04-page-backed-migration",
+      "title": "Migrate PageBacked submission, resume, completion, and fsync",
+      "status": "complete",
+      "depends_on": [
+        "task-03-owned-file-io"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/page_backed/mod.rs",
+        "crates/tx-subsystems/src/page_backed/lifecycle.rs",
+        "crates/tx-subsystems/src/page_backed/fsync_submission.rs",
+        "crates/tx-subsystems/src/vfs/execution.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-subsystems --lib page_backed -- --test-threads=1",
+        "rg -n 'abort_writeback|complete_writeback|release_file_io_read_target|abort_file_writeback_submission' crates/tx-subsystems/src/page_backed --glob '*.rs'",
+        "cargo -q xtask unit"
+      ],
+      "notes": "Completed at a16958f2. Writeback leases and read targets are retained at admission by OwnedFileIoRequest; every initial/resume planning and queue failure reaches its one terminalizer. A completion requires a matching read/writeback payload, so a control-only owner is poison and cannot settle PageSlot. Legacy fsync submission rows were removed; FileFsyncState retains only the frontier and calls FsPageBacking::fsync_file after it completes. Verified cargo test -p tx-subsystems --lib page_backed -- --test-threads=1 (154 passed), Tier 1 admission tests, cargo -q xtask unit, static legacy cleanup scans, cargo xtask progress validate, cargo xtask lint docs, and git diff --check."
+    },
+    {
+      "id": "task-05-mutation-handle",
+      "title": "Add MutationHandle and owned cross-yield tokens",
+      "status": "complete",
+      "depends_on": [
+        "task-04-page-backed-migration"
+      ],
+      "paths": [
+        "crates/tx-ext4/src/mutation_lifecycle.rs",
+        "crates/tx-ext4/src/journal.rs",
+        "crates/tx-ext4/src/mount.rs",
+        "crates/tx-ext4/tests/mutation_lifecycle.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-ext4 --test mutation_lifecycle -- --test-threads=1",
+        "cargo test -p tx-ext4 --test journal_prepared_transaction -- --test-threads=1",
+        "cargo xtask lint arch"
+      ],
+      "notes": "Completed: private MutationHandle now owns prepared journal records, optional JournalExtentToken, data/commit request IDs, phase-local error state, and checkpoint retry state. JournalFsyncSource is a compatibility re-export but its callback orchestration moved to mutation_lifecycle.rs; a data failure consumes the handle and releases its ring extent exactly once. This bounded slice retains the existing immutable after-images inside PreparedJournalTransaction but does not yet add explicit frozen-read/allocator-claim tokens, AbortDraining, CommitUnknown/RecoveryOnly, or real FUA/flush durability. Verified cargo test -p tx-ext4 --test mutation_lifecycle, cargo test -p tx-ext4 --test journal_prepared_transaction, cargo test -p tx-ext4 --lib --no-default-features, cargo -q xtask unit, scoped rustfmt/diff checks. cargo xtask lint arch ran: the touched ext4 journal length finding was eliminated, but the repository still has 90 unrelated pre-existing architecture lint findings."
+    },
+    {
+      "id": "task-06-failure-settlement",
+      "title": "Close abort drain, commit uncertainty, and checkpoint retry",
+      "status": "complete",
+      "depends_on": [
+        "task-05-mutation-handle"
+      ],
+      "paths": [
+        "crates/tx-ext4/src/mutation_lifecycle.rs",
+        "crates/tx-ext4/src/journal.rs",
+        "crates/tx-ext4/tests/mutation_lifecycle.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-ext4 --test mutation_lifecycle -- --test-threads=1",
+        "cargo test -p tx-ext4 --test journal_prepared_transaction -- --test-threads=1",
+        "cargo -q xtask unit"
+      ],
+      "notes": "Completed: MutationHandle now records AbortRequested -> AbortDraining -> RolledBack for known pre-commit data or commit failure, releasing its JournalExtentToken once the aggregate graph completion reports terminal failure. The explicit commit_unknown request-ID path retains the handle and ring extent, records the source error, and gates new writeback/fsync planning with RecoveryOnly/EIO. Checkpoint failure records a source error but retains CommittedNeedsSettlement and its extent for retry; a later successful checkpoint is still the sole release route. This source-local gate precedes Task 13 errseq/open-file cursor and mounted-instance publication; Task 7 still must prove real FUA/flush ordering. Verified lifecycle, prepared-transaction, ext4 library, workspace unit, scoped rustfmt, and diff checks."
+    },
+    {
+      "id": "task-07-durability",
+      "title": "Implement real FUA and flush durability",
+      "status": "complete",
+      "depends_on": [
+        "task-06-failure-settlement"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/device.rs",
+        "crates/tx-subsystems/src/io_manager/block/mod.rs",
+        "crates/tx-ext4/src/journal.rs",
+        "crates/tx-drivers/src/virtio/blk.rs",
+        "crates/tx-drivers/src/virtio/mmio.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-subsystems --lib dispatch_adapter_passes_fua -- --test-threads=1",
+        "cargo test -p tx-ext4 --test journal_transaction_plan -- --test-threads=1",
+        "cargo -q xtask unit"
+      ],
+      "notes": "Completed: BlockDeviceOps exposes immutable FUA/flush capabilities plus write options; BlockDeviceDispatchAdapter transfers BlockFlags::FUA to a capable device and rejects unsupported FUA rather than silently dropping it. RV64 virtio PCI/MMIO truthfully advertise flush=true and fua=false because the present virtio driver exposes flush but no FUA write API. JournalTransactionPlan therefore emits ordered explicit flush fences after the journal body and commit, plus after the clean checkpoint write, rather than attaching an unsupported FUA flag. Verified dispatch_adapter_passes_fua_to_capable_device, default_device_rejects_fua_instead_of_ignoring_it, journal_transaction_plan (3), mutation_lifecycle (4), cargo check -p tx-drivers, cargo -q xtask unit (639 tx-shims tests), scoped rustfmt, and git diff --check. This does not admit a production RW path, runtime device-capability selection, tail/cache settlement, replay, or QEMU durability evidence; Task 8 remains next."
+    },
+    {
+      "id": "task-08-recovery-cache",
+      "title": "Gate replay on recovery state and refresh caches",
+      "status": "complete",
+      "depends_on": [
+        "task-07-durability"
+      ],
+      "paths": [
+        "crates/tx-ext4-format/src/ondisk.rs",
+        "crates/tx-ext4-format/src/journal_replay.rs",
+        "crates/tx-ext4-format/src/pager.rs",
+        "crates/tx-ext4/src/mount.rs",
+        "crates/tx-ext4/src/read_backend.rs",
+        "crates/tx-fs/src/tx_ext4_bridge.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-ext4-format --test jbd2_recovery -- --test-threads=1",
+        "cargo test -p tx-ext4-format --test pager_mock -- --test-threads=1",
+        "cargo test -p tx-ext4 --lib recovery -- --test-threads=1",
+        "cargo test -p tx-fs tx_ext4_bridge -- --test-threads=1"
+      ],
+      "notes": "Completed: recovery admission exposes Superblock::needs_recovery and recover_if_required; a clean ext4 superblock skips stale JBD2 replay, while recovery-required runs replay plus durable journal clean. JBD2 superblock CRC32C has valid and invalid witnesses; unsupported descriptor/commit checksum layouts fail closed. BlockImage::barrier is mandatory and the production bridge forwards it to the registered block device. RW admission persists recovery-required before a journalled mutation. A weak mount settlement observer invalidates pager image, extent mapping, lookup, directory, inode metadata, and bridge block caches after durable checkpoint; JournalExtentToken remains retained until that settlement returns, then tail reclaim releases it. Verified jbd2_recovery (9), pager_mock (17), tx-ext4 library (35), mutation_lifecycle (5), tx-fs bridge (6), scoped rustfmt, and git diff --check. This is not product recovery acceptance: Task 9 revoke/deferred-free, complete mutation vertical slices, mount settlement, production cutover, QEMU crash, e2fsck, and xfstests evidence remain pending."
+    },
+    {
+      "id": "task-09-revoke-free",
+      "title": "Add revoke records and deferred-free ownership",
+      "status": "complete",
+      "depends_on": [
+        "task-08-recovery-cache"
+      ],
+      "paths": [
+        "crates/tx-ext4-format/src/mutation.rs",
+        "crates/tx-ext4-format/src/journal_replay.rs",
+        "crates/tx-ext4/src/mutation_lifecycle.rs",
+        "crates/tx-ext4/src/journal.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-ext4-format --test jbd2_transaction_image -- --test-threads=1",
+        "cargo test -p tx-ext4-format --test jbd2_recovery -- --test-threads=1",
+        "cargo test -p tx-ext4 --test journal_transaction_plan -- --test-threads=1",
+        "cargo test -p tx-ext4 --test mutation_lifecycle -- --test-threads=1",
+        "cargo -q xtask unit"
+      ],
+      "notes": "Completed: immutable Ext4MutationPlan values canonicalize paired RevokeRecord and DeferredFreeClaim entries; JBD2 reserves and stages an optional revoke page between metadata and commit, and its durable graph orders that page before commit. MutationHandle owns the deferred-free claims from admission through cache observer settlement and JournalExtentToken tail reclaim, so test-only reuse remains EBUSY until tail reclaim. Replay recognizes the optional revoke page, validates its sequence, includes it in cursor accounting, and suppresses matching same-transaction stale after-images. Verified jbd2_transaction_image (2), jbd2_recovery (10), journal_transaction_plan (4), mutation_lifecycle (6), cargo -q xtask unit (639 + 114 + 35 + 166), scoped rustfmt, and git diff --check. This is not a production free path: truncate/unlink/rename-overwrite/orphan cleanup remain fail-closed and require Task 11/12 vertical slices plus QEMU crash/replay, e2fsck, and xfstests evidence."
+    },
+    {
+      "id": "task-10-setattr",
+      "title": "Migrate setattr as the first complete vertical slice",
+      "status": "complete",
+      "depends_on": [
+        "task-09-revoke-free"
+      ],
+      "paths": [
+        "crates/tx-ext4-format/src/mutation.rs",
+        "crates/tx-ext4-format/src/pager.rs",
+        "crates/tx-ext4/src/namespace.rs",
+        "crates/tx-ext4/src/mutation_lifecycle.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-ext4-format --test pager_mock setattr_ -- --test-threads=1",
+        "cargo test -p tx-ext4 --lib setattr -- --test-threads=1",
+        "cargo test -p tx-ext4 --lib --no-default-features"
+      ],
+      "notes": "Completed: mutation-journal mounts now bind the mount-owned JournalMutationRuntime back to Ext4FsInstance for metadata-only admission. FsOps::serialize_inode_meta admits exactly one supported SetAttr class (mode, owner, or times) through Ext4Pager::plan_setattr plus JournalMutationRuntime::begin_mutation, while size/nlink/blocks/flags and mixed-class updates remain fail-closed for Task 11/12. Ext4 overrides public chmod_inode and chown_inode to admit SetAttr::Mode and SetAttr::Owner directly; tests prove these public paths create an active journal transaction frontier without any direct home write. Verified cargo test -p tx-ext4 --lib --no-default-features -- --test-threads=1 (39), cargo test -p tx-ext4 --test mutation_lifecycle -- --test-threads=1 (7), cargo -q xtask unit (646 + 114 + 39 + 166), and scoped rustfmt."
+    },
+    {
+      "id": "task-11-data-truncate",
+      "title": "Migrate buffered data, bounded extents, and truncate",
+      "status": "complete",
+      "depends_on": [
+        "task-10-setattr"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/page_backed/lifecycle.rs",
+        "crates/tx-subsystems/src/page_backed/mod.rs",
+        "crates/tx-ext4-format/src/mutation.rs",
+        "crates/tx-ext4-format/src/pager.rs",
+        "crates/tx-ext4/src/pager.rs",
+        "crates/tx-ext4/src/read_backend.rs",
+        "crates/tx-ext4/src/mutation_lifecycle.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-subsystems --lib file_settlement_batches -- --test-threads=1",
+        "cargo test -p tx-ext4-format --test pager_mock writeback -- --test-threads=1",
+        "cargo test -p tx-ext4 --lib writeback -- --test-threads=1",
+        "cargo test -p tx-ext4 --lib truncate -- --test-threads=1"
+      ],
+      "notes": "Completed: bounded Tier 1 data/truncate is converged. PageBacked can retain a multi-page PageDataLease, group a captured FileFsyncFrontier into contiguous same-generation batches, and submit one OwnedFileIoRequest for a multi-page writeback range. Ext4 validates Direct multi-page sources without copying payload bytes, plans already-mapped writeback through JournalMutationRuntime, and keeps allocation or unsupported extent growth fail-closed before dirty publication. Truncate admits metadata-only size changes plus the bounded inline extent-leaf tail-free shape with inode/bitmap/group/superblock after-images, revoke records, and deferred-free claims; broader extent-depth growth remains Tier 2/out-of-scope under the capability ledger. The remaining reservation cleanup gap is closed in this slice: successful truncate now clears buffered-write reservations for pages at or beyond the new EOF, with regression coverage for truncate-before-flush. Verified cargo test -p tx-ext4 --lib --no-default-features truncate_before_flush -- --test-threads=1, previous Task 11 host suites, the fresh 1000-cut Task 16 receipt, and receipt-only verification."
+    },
+    {
+      "id": "task-12-namespace-orphan",
+      "title": "Migrate namespace and classic orphan operations",
+      "status": "complete",
+      "depends_on": [
+        "task-11-data-truncate"
+      ],
+      "paths": [
+        "crates/tx-ext4-format/src/mutation.rs",
+        "crates/tx-ext4-format/src/pager.rs",
+        "crates/tx-ext4/src/namespace.rs",
+        "crates/tx-ext4/src/read_backend.rs",
+        "crates/tx-ext4/src/mutation_lifecycle.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-ext4-format --test pager_mock namespace_plan_ -- --test-threads=1",
+        "cargo test -p tx-ext4 --lib namespace -- --test-threads=1",
+        "cargo test -p tx-ext4 --lib --no-default-features ext4_create_public_path_admits_regular_file_without_home_write -- --test-threads=1",
+        "cargo test -p tx-ext4 --lib --no-default-features ext4_mkdir_public_path_admits_directory_without_home_write -- --test-threads=1",
+        "cargo test -p tx-ext4 --lib --no-default-features ext4_symlink_public_path_admits_fast_symlink_without_home_write -- --test-threads=1",
+        "cargo test -p tx-ext4 --lib --no-default-features ext4_link_public_path_admits_namespace_mutation_without_home_write -- --test-threads=1",
+        "cargo test -p tx-ext4 --lib --no-default-features ext4_rename_public_path_admits_same_dir_overwrite_without_home_write -- --test-threads=1",
+        "cargo test -p tx-ext4 --lib --no-default-features ext4_rename_public_path_admits_cross_dir_regular_file_without_home_write -- --test-threads=1",
+        "cargo test -p tx-ext4 --lib --no-default-features ext4_rmdir_public_path_admits_namespace_mutation_without_home_write -- --test-threads=1",
+        "cargo -q xtask unit",
+        "cargo test -p tx-ext4 --lib orphan -- --test-threads=1",
+        "cargo test -p tx-ext4 --test mutation_lifecycle free_reuse -- --test-threads=1"
+      ],
+      "notes": "Completed: bounded create, unlink, link, rename, rmdir, symlink, destroy/free, and classic orphan paths now admit immutable Ext4MutationPlan values through JournalMutationRuntime without production direct home writes. Open-unlink deferral and closed zero-link destroy are covered by runtime tests and the Tier 1 role scenario; singleton classic-orphan cleanup was fixed before the final live run. The former crash-time orphan/recovery, crash-truncate replay, pinned xfstests, and immutable receipt blockers are closed by fresh run task16-live-retry-20260804: G0-G7 passed, D0-D12 crash cuts completed 1000/1000, TEST/SCRATCH/WORKLOAD e2fsck were clean, Docker-backed pinned xfstests passed 8/8, and historical D5 crash-cut-0213 plus D10 crash-cut-0725 did not recur. Directory split/rebalance, orphan_file, and arbitrary deeper shapes remain Tier 2/out-of-scope, not Task 12 blockers."
+    },
+    {
+      "id": "task-13-mount-settlement",
+      "title": "Add MountSettlementOp, errseq, and syscall routing",
+      "status": "complete",
+      "depends_on": [
+        "task-12-namespace-orphan"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/page_backed/error_seq.rs",
+        "crates/tx-subsystems/src/mount/mod.rs",
+        "crates/tx-subsystems/src/mount/settlement.rs",
+        "crates/tx-subsystems/src/page_backed/fs_page_backing.rs",
+        "crates/tx-subsystems/src/vfs/execution.rs",
+        "crates/tx-subsystems/src/vfs/structure.rs",
+        "crates/tx-subsystems/src/vfs/walker.rs",
+        "crates/tx-ext4/src/namespace.rs",
+        "crates/tx-ext4/src/settlement.rs",
+        "crates/tx-ext4/src/tests_v3.rs",
+        "crates/tx-shims/src/linux_syscall/fs_basic/dir_sync.rs",
+        "crates/tx-shims/src/linux_syscall/fs_handle.rs",
+        "crates/tx-shims/src/linux_syscall/fs_mut.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-subsystems --lib mount_settlement -- --test-threads=1",
+        "cargo test -p tx-shims --lib fsync -- --test-threads=1",
+        "cargo test -p tx-shims --lib syncfs -- --test-threads=1",
+        "cargo test -p tx-shims --lib umount -- --test-threads=1"
+      ],
+      "notes": "Completed: MountSettlementOp, MountRuntimeCell state, errseq cursors, file/mount/detach settlement scopes, fsync/fdatasync/syncfs/sync routing, namespace-backed normal/lazy umount behavior, and JournalMutationRuntime::snapshot_transaction_frontier() are implemented and tested. The remaining product dependencies listed earlier are now closed by Task 11/12 completion, Task 14 G0/production convergence, Task 15 runner availability, and Task 16 fresh receipt verification. Verified prior settlement_lifecycle, fd_ops_wave2, mutation_lifecycle, unit gates, and the final receipt-only verifier over target/ext4/tier1/task16-live-retry-20260804/acceptance-receipt.json."
+    },
+    {
+      "id": "task-14-production-cutover",
+      "title": "Cut production to one RW path and add G0 lints",
+      "status": "complete",
+      "depends_on": [
+        "task-13-mount-settlement"
+      ],
+      "paths": [
+        "crates/tx-ext4/src/mount.rs",
+        "crates/tx-ext4/src/namespace.rs",
+        "crates/tx-ext4-format/src/pager.rs",
+        "crates/tx-fs/src/tx_ext4_bridge.rs",
+        "crates/tx-kernel/src/init.rs",
+        "xtask/src/lint.rs",
+        "xtask/src/lint_invariants_ext4.rs"
+      ],
+      "verification": [
+        "cargo xtask lint invariants ext4-lifecycle-ownership",
+        "cargo xtask lint invariants ext4-no-direct-home-write",
+        "cargo xtask lint invariants ext4-durability-flags",
+        "cargo xtask lint arch",
+        "cargo -q xtask unit"
+      ],
+      "notes": "Completed: production RW ext4 mounts use the discovered-journal mutation runtime path; namespace and pager mutation entries are under the ext4-no-direct-home-write ratchet; G0 lifecycle ownership, no-direct-home-write, and durability-flag lints run in the live Tier 1 sequence before build/QEMU. The FUA/recovery, deterministic crash/replay, e2fsck, xfstests, and immutable G0-G7 blockers that were left open in the earlier note are now covered by the verified task16-live-retry-20260804 receipt. Verified prior G0 lint runs, cargo -q xtask unit, fresh 1000-cut acceptance evidence, and receipt-only verification."
+    },
+    {
+      "id": "task-15-tier1-runner",
+      "title": "Add one cargo xtask ext4 tier1 runner",
+      "status": "complete",
+      "depends_on": [
+        "task-14-production-cutover"
+      ],
+      "paths": [
+        "xtask/src/ext4/mod.rs",
+        "xtask/src/ext4/run_workspace.rs",
+        "xtask/src/ext4/receipt.rs",
+        "xtask/src/ext4/tests.rs",
+        "xtask/src/qemu.rs",
+        "xtask/src/shell_test.rs",
+        "xtask/src/lib.rs",
+        "boards/tx-hal-riscv64-qemu-virt/src/boot_static.rs",
+        "crates/tx-kernel/src/devices.rs",
+        "tools/ext4/tier1/xfstests-selection.json",
+        "tools/ext4/tier1/crash-cuts.json",
+        "tools/shell-tests/ext4-tier1.scn"
+      ],
+      "verification": [
+        "cargo test -p xtask ext4 -- --test-threads=1",
+        "cargo xtask ext4 tier1 --dry-run",
+        "cargo fmt --check --package xtask",
+        "cargo -q xtask unit"
+      ],
+      "notes": "Completed: cargo xtask ext4 tier1 is the single public Tier 1 runner. RunWorkspace owns temporary/final directories, child cleanup, authority artifacts, crash campaign plans, per-cut job/result/log/image artifacts, xfstests execution evidence, e2fsck binding, failed receipts, final receipt locks, and receipt verification. The placeholder-authority and no-real-campaign blockers are closed: authority ledgers are acceptance-ready, the runner completed fresh run task16-live-retry-20260804 with 1000 deterministic cuts, Docker-backed pinned xfstests 8/8, and immutable e2fsck evidence, and target/release/xtask ext4 tier1 --verify-receipt accepted the receipt. Future diagnostics should use --verify-receipt for immutable evidence and --resume --start-cut crash-cut-NNNN for live failures instead of replaying completed prefixes."
+    },
+    {
+      "id": "task-16-acceptance",
+      "title": "Close G0-G7 with fresh product evidence",
+      "status": "complete",
+      "depends_on": [
+        "task-15-tier1-runner"
+      ],
+      "paths": [
+        "tools/ext4/tier1",
+        ".gitignore",
+        "tools/ext4/fault_linux_rw_replay.py",
+        "tools/ext4/fault_qemu_executor.py",
+        "tools/tests/test_ext4_fault_matrix_runners.py",
+        "tools/tests/test_ext4_fault_qemu_executor.py",
+        ".agents/skills/tx-xtask/SKILL.md",
+        "xtask/src/lib.rs",
+        "xtask/src/ext4/mod.rs",
+        "xtask/src/ext4/crash_campaign.rs",
+        "xtask/src/ext4/receipt_verify.rs",
+        "xtask/src/ext4/receipt_verify_tests.rs",
+        "xtask/src/ext4/tests.rs",
+        "xtask/src/ext4/live_preflight.rs",
+        "docs/progress/research/2026-07-30-ext4-tier1-acceptance.md",
+        "docs/progress/plans/2026-07-30-ext4-tier1-lifecycle-convergence.json",
+        "docs/progress/STATUS.md"
+      ],
+      "verification": [
+        "cargo xtask ext4 tier1 --run-id 2026-07-30-tier1-candidate",
+        "cargo xtask ext4 tier1 --verify-receipt target/ext4/tier1/2026-07-30-tier1-candidate/acceptance-receipt.json",
+        "cargo xtask progress validate",
+        "cargo xtask lint docs",
+        "CARGO_INCREMENTAL=0 cargo test -p xtask receipt_verify -- --test-threads=1",
+        "CARGO_INCREMENTAL=0 cargo test -p xtask ext4 -- --test-threads=1",
+        "cargo test -p xtask tier1_parse_accepts_live_start_cut -- --test-threads=1",
+        "cargo test -p xtask tier1_parse_rejects_start_cut -- --test-threads=1",
+        "cargo test -p xtask tier1_crash_cut_start_uses_later_of_resume_prefix_and_requested_cut -- --test-threads=1",
+        "cargo test -p xtask ext4 -- --test-threads=1",
+        "CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --dry-run",
+        "CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --run-id task16-shell-scenario-bind-preflight-20260802",
+        "git diff --check",
+        "CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --run-id task16-run-owned-artifact-bind-preflight-20260802",
+        "CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --run-id task16-job-request-matrix-bind-preflight-20260802",
+        "CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --run-id task16-executor-plan-bind-preflight-20260802",
+        "rustfmt --edition 2024 --check xtask/src/ext4/receipt_verify.rs xtask/src/ext4/receipt_verify_tests.rs",
+        "CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --run-id task16-executor-plan-contract-preflight-20260802",
+        "python3 tools/tests/test_ext4_fault_qemu_executor.py",
+        "CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --run-id task16-preflight-contract-preflight-20260802",
+        "rustfmt --edition 2024 --check xtask/src/ext4/crash_campaign.rs xtask/src/ext4/receipt_verify.rs xtask/src/ext4/receipt_verify_tests.rs",
+        "CARGO_INCREMENTAL=0 cargo test -p xtask tier1_fault_job_request -- --test-threads=1",
+        "CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --run-id task16-fault-executor-log-preflight-20260802",
+        "rustfmt --edition 2024 --check xtask/src/lib.rs xtask/src/ext4/mod.rs xtask/src/ext4/tests.rs",
+        "CARGO_INCREMENTAL=0 cargo test -p xtask tier1_parse -- --test-threads=1",
+        "CARGO_INCREMENTAL=0 cargo test -p xtask tier1_live_preflight -- --test-threads=1",
+        "CARGO_INCREMENTAL=0 cargo xtask --help | rg \"ext4 tier1\"",
+        "CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --preflight-live --run-id task16-preflight-report-20260802 --preflight-report target/ext4/tier1/preflight/task16-preflight-report-20260802.json",
+        "jq '{schema, run_id, ready: .result.ready, blocker_count: .result.blocker_count, receipt: .result.acceptance_receipt_generated, xfstests_status: .authorities.xfstests_selection.status, crash_status: .authorities.crash_cut_catalog.status}' target/ext4/tier1/preflight/task16-preflight-report-20260802.json",
+        "CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --preflight-live --materialize-xfstests --run-id task16-xfstests-materialize-20260802 --preflight-report target/ext4/tier1/preflight/task16-xfstests-materialize-20260802.json",
+        "jq '{schema, run_id, ready: .result.ready, blocker_count: .result.blocker_count, materialize_requested: .preflight.materialize_xfstests_requested, xfstests_prepared: .preflight.xfstests_source_prepared, blockers: .result.blockers}' target/ext4/tier1/preflight/task16-xfstests-materialize-20260802.json",
+        "git -C external/xfstests rev-parse HEAD",
+        "shasum -a 256 external/xfstests/check",
+        "git check-ignore -v external/xfstests external/xfstests/check",
+        "for case in generic/013 generic/035 generic/091 generic/095 generic/226 generic/109 generic/388 generic/023; do test -f external/xfstests/tests/$case && printf 'ok %s\\n' \"$case\" || printf 'missing %s\\n' \"$case\"; done",
+        "CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --preflight-live --run-id task16-xfstests-cases-20260802 --preflight-report target/ext4/tier1/preflight/task16-xfstests-cases-20260802.json",
+        "jq '{ready: .result.ready, blocker_count: .result.blocker_count, selected_cases_verified: .preflight.xfstests_selected_cases_verified, blockers: .result.blockers}' target/ext4/tier1/preflight/task16-xfstests-cases-20260802.json",
+        "CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --preflight-live",
+        "CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --run-id task16-live-preflight-default-gate-20260802",
+        "python3 -m unittest tools.tests.test_ext4_fault_matrix_runners tools.tests.test_ext4_fault_qemu_executor",
+        "python3 tools/ext4/fault_linux_rw_replay.py --preflight",
+        "CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --preflight-live --run-id task16-docker-linux-replay-20260802 --preflight-report target/ext4/tier1/preflight/task16-docker-linux-replay-20260802.json",
+        "jq '.preflight, .result' target/ext4/tier1/preflight/task16-docker-linux-replay-20260802.json",
+        "rustfmt --edition 2024 --check xtask/src/ext4/mod.rs xtask/src/ext4/receipt_verify.rs xtask/src/ext4/receipt_verify_tests.rs xtask/src/ext4/tests.rs",
+        "CARGO_INCREMENTAL=0 cargo test -p xtask tier1_live_rejects_acceptance_ready_ -- --test-threads=1",
+        "CARGO_INCREMENTAL=0 cargo test -p xtask tier1_verify_receipt_rejects_crash_readiness_mismatched_campaign_plan -- --test-threads=1",
+        "CARGO_INCREMENTAL=0 cargo test -p xtask receipt_verify -- --test-threads=1",
+        "CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --dry-run",
+        "CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --preflight-live --run-id task16-authority-readiness-evidence-20260802 --preflight-report target/ext4/tier1/preflight/task16-authority-readiness-evidence-20260802.json",
+        "jq '.result.blocker_count, .result.blockers' target/ext4/tier1/preflight/task16-authority-readiness-evidence-20260802.json",
+        "git diff --check",
+        "CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --preflight-live --run-id task16-authorities-ready-20260802 --preflight-report target/ext4/tier1/preflight/task16-authorities-ready-20260802.json",
+        "CARGO_INCREMENTAL=0 cargo test -p xtask tier1_live_storage_preflight_blocks_when_capacity_is_below_campaign_floor -- --test-threads=1",
+        "CARGO_INCREMENTAL=0 cargo xtask ext4 tier1 --preflight-live --run-id task16-storage-capacity-20260802 --preflight-report target/ext4/tier1/preflight/task16-storage-capacity-20260802.json",
+        "jq '.preflight.storage_capacity, .result.blocker_count, .result.blockers' target/ext4/tier1/preflight/task16-storage-capacity-20260802.json",
+        "CARGO_INCREMENTAL=0 cargo test -p xtask ext4 -- --test-threads=1",
+        "python3 -m unittest tools.tests.test_ext4_fault_qemu_executor.Ext4FaultQemuExecutorTests.test_replay_image_recovery_restores_from_crash_after_failed_attempt_mutates_image tools.tests.test_ext4_fault_qemu_executor.Ext4FaultQemuExecutorTests.test_replay_image_recovery_fail_closes_when_mutated_replay_has_no_crash_restore",
+        "python3 -m unittest tools.tests.test_ext4_fault_qemu_executor",
+        "/usr/bin/time -p python3 tools/ext4/fault_tx_remount.py D10 crash-cut-0725 target/ext4/tier1/.task16-live-recovery-retry-20260804.tmp/crash-cuts/crash-cut-0725/postfix-replay-from-crash-20260804122223.img",
+        "cargo test -p xtask run_workspace_resume_ -- --test-threads=1",
+        "cargo test -p xtask tier1_crash_cut_resume_restores_completed_start_cut_slice -- --test-threads=1",
+        "cargo test -p xtask ext4 -- --test-threads=1",
+        "rustfmt --edition 2024 xtask/src/ext4/crash_campaign.rs xtask/src/ext4/run_workspace.rs xtask/src/ext4/tests.rs",
+        "cargo -q xtask unit",
+        "target/release/xtask ext4 tier1 --run-id task16-live-retry-20260804",
+        "/usr/bin/time -p target/release/xtask ext4 tier1 --verify-receipt target/ext4/tier1/task16-live-retry-20260804/acceptance-receipt.json",
+        "git diff --check -- tools/ext4/fault_qemu_executor.py tools/tests/test_ext4_fault_qemu_executor.py xtask/src/ext4/crash_campaign.rs xtask/src/ext4/receipt_verify.rs xtask/src/ext4/receipt_verify_tests.rs"
+      ],
+      "notes": "Completed: fresh run task16-live-retry-20260804 produced the immutable acceptance receipt at target/ext4/tier1/task16-live-retry-20260804/acceptance-receipt.json. The receipt verifies G0-G7 passed, crash_cuts.completed == required == 1000 across D0-D12, clean TEST/SCRATCH/WORKLOAD e2fsck, clean per-cut immutable replay-image e2fsck evidence, Docker-backed pinned xfstests 8/8, and no recurrence of the historical D5 crash-cut-0213 or D10 crash-cut-0725 blockers. Receipt-only verification passed with target/release/xtask ext4 tier1 --verify-receipt target/ext4/tier1/task16-live-retry-20260804/acceptance-receipt.json. The verifier now binds receipt-lock/artifacts.json, per-cut job request/result/executor-plan/serial/replay/e2fsck evidence, G0 lint logs, xfstests run evidence, final-vs-.tmp path equivalence, derived replay-image recovery SHA, and staged-role digest retention. Future diagnostics should reuse --verify-receipt for immutable evidence and --resume --start-cut crash-cut-NNNN for live failures instead of replaying completed 6h prefixes."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo xtask progress validate",
+      "status": "passed",
+      "notes": "Passed after closing Task 11-15 ledger state and the plan status."
+    },
+    {
+      "command": "cargo xtask lint docs",
+      "status": "passed",
+      "notes": "Passed after the progress catch-up; seven pre-existing stale-vocabulary warnings remain warnings only."
+    },
+    {
+      "command": "cargo -q xtask unit",
+      "status": "passed",
+      "notes": "Passed after the truncate-before-flush cleanup and ledger closure: 655 + 114 + 67 + 167."
+    },
+    {
+      "command": "cargo xtask ext4 tier1 --run-id 2026-07-30-tier1-candidate",
+      "status": "passed",
+      "notes": "Superseded by fresh run `target/release/xtask ext4 tier1 --run-id task16-live-retry-20260804`, which produced the verified receipt under target/ext4/tier1/task16-live-retry-20260804/."
+    },
+    {
+      "command": "e2fsck -fn on every immutable crash and replay image",
+      "status": "passed",
+      "notes": "Receipt `task16-live-retry-20260804` binds clean TEST/SCRATCH/WORKLOAD e2fsck and clean per-cut immutable replay image evidence for 1000 crash cuts."
+    }
+  ],
+  "risks": [
+    "A direct pager call can create a second durability domain unless G0 rejects every production callsite.",
+    "A committed transaction with checkpoint failure requires retained authority and retry; treating it as rollback corrupts the live view.",
+    "FUA metadata without device capability enforcement can make fsync appear durable while the medium is not ordered.",
+    "Lazy detach can withdraw topology while DMA or settlement remains live; the MountPayload pin must outlive topology removal.",
+    "Host contract tests and reused serial logs can be mistaken for product evidence without fresh QEMU, immutable image, e2fsck, and xfstests receipts."
+  ],
+  "blockers": [
+    "2026-08-02 close/dup3 visibility flush unblocked the previous `--group data,execute-from-scratch` QEMU failure, and a fresh wider QEMU run with `--group data,setattr,namespace,orphan,execute-from-scratch` passed 5 groups with 0 failures; do not promote Tier 1 until the remaining production cutover, FUA/recovery, live runner, crash-cut, e2fsck, xfstests, and immutable receipt gates close.",
+    "Task 14 G0 lints now pass in the current checkout and the former `namespace.rs`/`pager.rs` direct-home-write allowlist has been retired, but production cutover still lacks FUA/recovery product gates and the final live Tier 1 acceptance evidence.",
+    "Current block adapter ignores FUA flags and replay does not yet use the ext4 recovery-required gate on every production path.",
+    "The public `cargo xtask ext4 tier1` command exists, verifies the manifest-pinned xfstests source lock, parses xfstests output fail-closed, refuses to synthesize crash-cut completion or unconditional passed gates, and now routes per-cut fault jobs through the repository executor with bound request/result/log/image evidence. The xfstests and crash-cut authorities are now acceptance-ready input ledgers, but live execution correctly fails closed on local storage capacity before QEMU: the current ordinary-copy artifact plan requires about 564GB while this checkout has about 13.8GB free. No full 1000-cut run, pinned xfstests execution, or immutable G0-G7 receipt has been produced.",
+    "2026-08-02 preflight-report slice: `cargo xtask ext4 tier1 --preflight-live --preflight-report PATH` writes a durable `tx.ext4.tier1_live_preflight.v1` blocker report with authority hashes/statuses, host identity, blockers, and `acceptance_receipt_generated=false` without creating a run workspace or receipt. The current macOS report remains blocked on placeholder authorities, missing local `external/xfstests`, and Linux/root replay requirements.",
+    "2026-08-02 xfstests-materialize slice: `--materialize-xfstests` now clones/checks out the manifest-pinned source into ignored local `external/xfstests` state and verifies the pinned `check` sha256 before live preflight reports readiness. The current source is prepared at revision `acb6d4cb84205a8e3f19ca470cfcf7bf6d93a509`, so the live preflight blocker count dropped from four to three; authority statuses and Linux/root replay remain blocking, and no xfstests cases have been executed for acceptance.",
+    "2026-08-02 xfstests-selected-case slice: live preflight now verifies the selected xfstests case files exist under the pinned checkout after source-lock verification and records `xfstests_selected_cases_verified` in the JSON report. The current checkout proves all eight selected `generic/*` case files exist, but the selection authority status remains placeholder and the cases have not been executed as acceptance evidence.",
+    "2026-08-02 docker-linux-replay-preflight slice: `tools/ext4/fault_linux_rw_replay.py --preflight` now accepts either direct Linux/root loop-mount tooling or a privileged Docker-backed Linux loop-mount probe with `tx-ext4-e2fsprogs:local`. The fault QEMU executor still records `linux-rw-replay` as the repository-default runner command, and live preflight delegates Linux replay readiness to the same runner. The current macOS report `target/ext4/tier1/preflight/task16-docker-linux-replay-20260802.json` records `linux_rw_replay_ready=true`, `xfstests_selected_cases_verified=true`, and exactly two remaining blockers: xfstests selection and crash-cut catalog statuses are still not `acceptance-ready`. This is preflight readiness only, not a 1000-cut QEMU/e2fsck/xfstests acceptance receipt.",
+    "2026-08-02 authority-readiness-evidence slice: live preflight and receipt verification now reject status-only authority promotion. `acceptance-ready` xfstests selection ledgers must carry readiness_evidence binding source revision, check sha256, selected-case count, selected-case digest, and the Tier 1 selection policy. `acceptance-ready` crash-cut catalogs must carry readiness_evidence binding expanded cut count, family and phase-marker counts, phase-marker digest, workload/replay script sha256 values, kill policy, and e2fsck mode; receipt verification additionally cross-checks that crash readiness evidence against the run-owned `crash-campaign-plan` artifact schema, expanded cut count, family/phase-marker digest, workload/replay script sha256 values, kill policy, and e2fsck mode. The historical live report `target/ext4/tier1/preflight/task16-authority-readiness-evidence-20260802.json` still had exactly two blockers because the ledgers were declared, not acceptance-ready. This was an authority gate hardening slice only; Task 16 still lacked audited acceptance-ready authorities, real pinned xfstests execution, full fresh 1000-cut QEMU/e2fsck evidence, and a verified immutable G0-G7 receipt.",
+    "2026-08-02 authority-admission/storage-capacity slice: `tools/ext4/tier1/xfstests-selection.json` and `tools/ext4/tier1/crash-cuts.json` now carry acceptance-ready readiness_evidence derived from the pinned external/xfstests checkout, selected-case digest, crash phase-marker digest, and workload/replay script hashes. `cargo xtask ext4 tier1 --preflight-live --run-id task16-authorities-ready-20260802` passed with blocker_count=0 before the storage gate was added. The live preflight now estimates ordinary-copy storage for the current artifact plan as 4 base/role image copies plus 8 image copies per crash cut and records `preflight.storage_capacity`; on this checkout `task16-storage-capacity-20260802.json` fails with exactly one blocker because available space is 13775298560 bytes and required space is 563996314828 bytes. Task 16 remains pending: either provide a large-enough runner or implement clone/reflink/sparse image copying, then run the full fresh 1000-cut QEMU/e2fsck campaign, pinned xfstests execution, and verified immutable G0-G7 receipt.",
+    "2026-08-02 CoW-runner/orphan-blocker slice: live image staging now requires CoW clones for base/role/fault image copies and storage preflight accounts for a bounded divergent-write budget. The Python fault executor and replay/remount helpers also use CoW clones and require shell-test stop-needle confirmation before preserving crash evidence. Focused Python tests, `CARGO_INCREMENTAL=0 cargo test -p xtask ext4 -- --test-threads=1`, `cargo xtask progress validate`, and `git diff --check` passed. The fresh live campaign `task16-live-cow-replay-settle-20260802` reached `crash-cut-0010` but failed before receipt generation because `e2fsck -fn` on the preserved replay image reported deleted inode 21 with zero dtime and block/inode bitmap differences; a local Linux RW replay experiment left the same e2fsck failure, pointing at the remaining open-unlink/orphan lifecycle gap. Current CoW live preflight is also storage-blocked on this checkout (`available=9608380416`, `required=10808721408`). Task 16 remains pending: finish orphan crash-recovery semantics, restore enough live-run storage, then rerun the full fresh 1000-cut QEMU/e2fsck campaign, pinned xfstests execution, and verified immutable G0-G7 receipt.",
+    "2026-08-03 orphan-singleton cleanup slice: the live D10 blocker was narrowed to stale `s_last_orphan` after closed zero-link destroy freed a singleton orphan whose `dtime` next pointer was 0. Ext4 destroy planning now treats every zero-link inode as an orphan-pop candidate, including next=0, before freeing its inode bitmap bit; regression tests cover singleton pop and create/unlink/destroy/create/reunlink inode reuse. The Tier 1 crash workload now asserts namespace command statuses and `crash-orphan-unlink:0` before D10. Verified pager_mock (41), ext4 namespace (5), focused runtime orphan-reuse, Python fault executor (32), Python fault matrix (8), xtask ext4 (91), full-build rv64-qemu, and a fresh CoW D10 QEMU probe at `target/ext4/probe/task16-orphan-d10-20260803003514/serial.log` with fd readback `orphan`. Task 16 remains pending because this is one crash-cut probe only: this host currently lacks PATH-visible `e2fsck`/`debugfs`, has limited free storage, and still has no full fresh 1000-cut QEMU/replay/e2fsck run, pinned xfstests execution, or verified immutable G0-G7 receipt.",
+    "2026-08-03 preflight-report-current-state slice: the live preflight report now sets `xfstests_source_prepared=true` whenever the existing pinned `external/xfstests` checkout verifies, not only when `--materialize-xfstests` performed the checkout in the same invocation. Fresh G0 lints all passed with 0 findings, focused live-preflight/storage tests passed, and `target/ext4/tier1/preflight/task16-current-20260803005057.json` records xfstests source prepared, selected cases verified, and Linux replay ready. Current e2fsck/debugfs are not on PATH but are usable through the Homebrew fallback paths accepted by live preflight. The only current live-preflight blocker is storage capacity (`available=7825383424`, `required=10808721408`) for the CoW 1000-cut campaign. Task 16 remains pending: provide enough live-run storage or an equivalently proven artifact-storage change, then run the full fresh 1000-cut QEMU/replay/e2fsck campaign, pinned xfstests execution, and verified immutable G0-G7 receipt.",
+    "2026-08-03 staged-role-retention/preflight-clear slice: per-cut staged TEST/SCRATCH/WORKLOAD role images are now treated as executor temporaries. After shell-test observes the hard-kill cut and crash/replay images are preserved, `tools/ext4/fault_qemu_executor.py` records staged_role_image_digests and staged_role_images_retention=status removed-after-digest-recorded, then unlinks the staged role clones. Receipt verification still accepts retained staged files, but when staged role files are absent it requires the retention status and recorded digest to match the retained role-source image; a digest drift regression fails. Live storage preflight now counts 5 retained image copies per crash cut instead of 8 temporary+retained copies. Verified Python fault executor tests (32), focused receipt verifier removed-staged-role tests (2), focused live storage-preflight tests (2), and `cargo xtask ext4 tier1 --preflight-live --preflight-report target/ext4/tier1/preflight/task16-retention-preflight-20260803011058.json`, which reports blocker_count=0, available_bytes=7759519744, required_bytes=7662993408, xfstests source/cases verified, and Linux replay ready. Task 16 remains pending until the full fresh live Tier 1 run produces pinned xfstests execution, 1000-cut QEMU/replay/e2fsck evidence, and a verified immutable G0-G7 receipt.",
+    "2026-08-03 crash-executor-precut-retry slice: fresh live run `target/ext4/tier1/task16-live-retention-20260803011842` passed G0, full-build, base image creation, the 8-group TEST/SCRATCH/WORKLOAD matrix, and crash cuts 0000..0005 before failing at crash-cut-0006. The failure was pre-cut shell-test execution: the executor requested stop needle `tx.ext4.crash.phase.D6`, but shell-test exited before confirming the stop needle after timing out waiting for D1. A manual rerun against the same cut-0006 role images reached D6 successfully (`target/ext4/probe/task16-rerun-d6-20260803012810.log`), so this run did not establish a filesystem corruption blocker. The fault executor now records bounded attempts and retries only shell-test-command failures before the requested cut when original role_images are available, re-staging fresh CoW role clones before each retry; launch failures, missing cut confirmation without restage input, and post-cut e2fsck/replay/oracle failures still fail closed. Verified Python compile and `python3 -m unittest tools.tests.test_ext4_fault_qemu_executor` (33). Task 16 remains pending until a fresh full live Tier 1 run completes all 1000 cuts, pinned xfstests, and receipt verification.",
+    "2026-08-03 secondary-oracle-image-retention slice: the live runner now treats Linux replay, Tx remount, and semantic-oracle image copies as secondary oracle temporaries. The executor still creates them, and Rust parses the result while those files exist so log sha256 and image_sha256 values are checked; after parse, the runner deletes those secondary images and does not register them in artifacts.json. The final receipt verifier no longer requires linux-rw-replay-image, tx-remount-image, or semantic-oracle-image artifacts, but it still requires job-request paths to match the standard per-cut names, result/parser image_sha256 fields to be real, oracle logs to hash cleanly, and crash/replay images to remain retained artifacts for immutable replay/e2fsck binding. Live storage preflight now counts 2 retained image copies per crash cut. Verified focused storage-preflight tests (2), focused receipt verifier tests (38), Python fault executor tests (33), and `cargo xtask ext4 tier1 --preflight-live --preflight-report target/ext4/tier1/preflight/task16-secondary-retention-20260803014109.json`, which reports blocker_count=0, available_bytes=5609730048, required_bytes=4517265408. Task 16 remains pending until a fresh full live Tier 1 run completes all 1000 cuts, pinned xfstests, and receipt verification.",
+    "2026-08-04 resume/hash-cache frontier slice: diagnostic run `task16-d10-startcut-postfix-20260804` resumed with `--resume --start-cut crash-cut-0725`, skipped the known expensive prefix, and advanced the preserved suffix to 275 retained `result.json` files covering `crash-cut-0725..0999`. `crash-cut-outcomes.json` now records `completed=275`, `required=1000`, first cut `crash-cut-0725`, and last cut `crash-cut-0999`; all 275 `replay-serial.log` files contain `crash-replay-inspect:0`. The resumed guest matrix passed 8 groups, and offline `e2fsck -fn` passed for TEST, SCRATCH, and WORKLOAD role images. The previous `crash-cut-0884` replay timeout was transient and resolved by replay retry/resume. The active blocker is pinned xfstests on macOS: `./check generic/013 generic/035 generic/091 generic/095 generic/226 generic/301 generic/388 generic/475` fails with `fstests only supports Linux`. The runner now preserves failed replay attempt logs, rejects resumed cuts without replay success markers, fixes `crash-cut-outcomes.json` completed/required ordering, and caches artifact SHA256 values from failed-run `artifacts.json` plus executor-plan crash/replay image digests so future continuations can resume from the failure point without rehashing retained large images. Task 16 remains pending: this suffix is partial diagnostic evidence only, not the required fresh full G0-G7 receipt with 1000 crash cuts, Linux xfstests, immutable acceptance receipt, and receipt verification.",
+    "2026-08-04 xfstests Linux-backend guard slice: live Tier 1 now resolves the xfstests execution backend before G0/build/QEMU/crash work. Linux hosts run the pinned `./check` directly; non-Linux hosts must set `TX_EXT4_XFSTESTS_DOCKER_IMAGE` to an explicit prepared privileged Linux xfstests image, otherwise the live runner fails immediately instead of spending hours to rediscover `fstests only supports Linux`. Receipt verification now requires `xfstests-run-evidence.json` with schema `tx.ext4.xfstests_run_evidence.v1`, `backend=host-linux` or `docker-linux`, `linux_environment=true`, matching selected-case count/digest, `exit_code=0`, command evidence, and `log_sha256` matching the immutable `xfstests-log` artifact. Verified focused backend planner tests (3), focused xfstests receipt tests (6), accepted product fixture verification, live-preflight tests (5), full `cargo test -p xtask ext4 -- --test-threads=1` (116), and short live probes: `cargo xtask ext4 tier1 --run-id task16-xfstests-backend-guard-20260804` fails before G0 on macOS with the Linux-backend error, while `target/ext4/tier1/preflight/task16-xfstests-backend-20260804.json` records `xfstests_linux_execution_ready=false`. Current live blockers are missing Linux/Docker xfstests execution and storage (`available=3442511872`, `required=4517265408`). Task 16 remains pending until a Linux-capable backend plus enough storage produce the full fresh 1000-cut QEMU/e2fsck campaign, pinned xfstests execution, immutable receipt, and receipt verification.",
+    "2026-08-04 repo-owned xfstests Docker wrapper slice: non-Linux Tier 1 no longer needs a vague external prepared xfstests image. The runner defaults Docker-backed xfstests to `tx-ext4-xfstests-tier1:local` unless `TX_EXT4_XFSTESTS_DOCKER_IMAGE` overrides it, routes run evidence through `tools/ext4/tier1_xfstests_docker.py`, and calls the wrapper preflight before G0/build/QEMU. The wrapper checks the Docker image, privileged Linux loop-mount capability, selected helper executables in the pinned source, and in run mode creates run-local TEST/SCRATCH loop images plus `local.config` for real `./check` execution. Fresh short preflight `target/ext4/tier1/preflight/task16-xfstests-wrapper-preflight-20260804.json` now fails in 3.5s with `xfstests_linux_execution_ready=false` because the pinned source is not built (`ltp/fsstress`, `ltp/fsx`, `src/feature`, `src/godown`, `src/min_dio_alignment`, `src/t_rename_overwrite`) and local storage is still short (`available=3400409088`, `required=4517265408`). Task 16 remains pending: build the pinned xfstests helpers in a Linux-capable environment, free/provide enough storage, then run the full fresh 1000-cut QEMU/e2fsck campaign, pinned xfstests execution, immutable receipt, and receipt verification.",
+    "2026-08-04 xfstests runner/selection repair slice: continued from `task16-d10-startcut-postfix-20260804 --resume --start-cut crash-cut-0725` and stopped xfstests containers as soon as they produced deterministic not-run or environment-failure evidence, instead of waiting on known-failing workloads. The wrapper now self-prepares the pinned xfstests source in the Debian/glibc runner with `CFLAGS=-D_GNU_SOURCE`, selected helper targets, and run-local `mke2fs` for TEST/SCRATCH loop devices. `tools/ext4/Dockerfile.xfstests-tier1` includes `fio` for `generic/095` and `procps` for recoveryloop cleanup. `tools/ext4/tier1/xfstests-selection.json` replaces ext4-inapplicable reflink `generic/301` with rename-focused `generic/109`, and replaces Docker-inapplicable dm-error `generic/475` with renameat2 `generic/023`; the new selected-case digest is `6bb3684896482323e0fa6da1b2faed7176c5be6eda3081787fe1f112f8fd2279`. Focused Docker xfstests probes passed `generic/109`, `generic/095`, `generic/388`, and `generic/023`. The xtask workspace-root helper now resolves from launch cwd first so a shared `target/debug/xtask` compiled in another worktree cannot silently run Task 16 against the wrong checkout. Task 16 remains pending until the resumed live run completes pinned xfstests, writes the immutable G0-G7 receipt, and `cargo xtask ext4 tier1 --verify-receipt` passes.",
+    "2026-08-05 resume/verifier blocker slice: continued live run `task16-live-recovery-retry-20260804` from the failure point with `--resume --start-cut crash-cut-0725` instead of rerunning the 6h prefix. The resumed evidence reached a generated receipt with `crash_cuts.completed == required == 1000`, G0-G7 marked passed, clean TEST/SCRATCH/WORKLOAD `e2fsck -fn`, and Docker xfstests passing the revised pinned selection (`generic/013 generic/035 generic/091 generic/095 generic/226 generic/109 generic/169 generic/023`, selected-case digest `40e1bedaaf864db7b70dfe5090643cae861ca79b486bd7af6514c66cd1a16a91`). `generic/388` was replaced after repeat Docker probes produced Linux ext4 scratch inconsistency; `generic/169` passed as the replacement remount/size case. Runner/verifier fixes landed for full-prefix outcome restoration, resumed artifact-cache invalidation when staged files are overwritten, final stable role-image receipt paths, readonly e2fsck summary parsing, Docker-wrapper xfstests evidence, concatenated orphan serial output, restored job-request artifact registration, and final-vs-.tmp per-cut path equivalence. However, before `--verify-receipt` reached a clean final result, `target/ext4/tier1` disappeared from the checkout; broad local searches found no `task16-live-recovery-retry-20260804` receipt or crash-cut backup. Task 16 remains open and now needs a fresh evidence run. Future continuations must preserve the run directory and resume from the first failed cut (`cargo xtask ext4 tier1 --run-id <run-id> --resume --start-cut crash-cut-NNNN`) rather than rerunning completed prefixes while evidence remains available."
+  ],
+  "handoff": {
+    "needed": false,
+    "path": null
+  }
+}

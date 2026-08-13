@@ -632,7 +632,7 @@ pub fn prewarm_thread_payload_slots(count: usize) -> usize {
     let mut quiet = 0u8;
     while quiet < 2 {
         let stats = crate::thread_runtime::adapter::step_engine::drain_with_budget(usize::MAX);
-        if stats.reclaimed == 0 {
+        if stats.bag_reclaimed == 0 && stats.publication_dropped == 0 {
             quiet += 1;
         } else {
             quiet = 0;

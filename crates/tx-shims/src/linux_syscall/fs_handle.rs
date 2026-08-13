@@ -215,7 +215,7 @@ fn resolve_cwd_for_path(dirfd: i32, path: &[u8], ctx: &SyscallCtx<'_>) -> Result
     dirfd_anchor_errno(dirfd, path, ctx)
 }
 
-pub(super) fn sys_name_to_handle_at<P: PmapIf>(
+pub(super) async fn sys_name_to_handle_at<P: PmapIf>(
     dfd: i32,
     path_uaddr: u64,
     handle_uaddr: u64,
@@ -230,9 +230,10 @@ pub(super) fn sys_name_to_handle_at<P: PmapIf>(
     if path_uaddr == 0 {
         return SyscallResult::Error(EFAULT_VALUE);
     }
-    let path = match bootstrap_read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
+    let path = match read_user_cstr_wait(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX).await {
         Ok(path) => path,
-        Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+        Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::Fault(errno)) => return SyscallResult::Error(errno_to_i32(errno)),
     };
     let header = match read_handle_header(ctx, handle_uaddr) {
         Ok(header) => header,

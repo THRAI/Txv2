@@ -1157,7 +1157,6 @@ pub(super) fn vmmap_error_to_i32(error: VmMapError) -> i32 {
         VmMapError::WouldBlock => EAGAIN_VALUE,
         VmMapError::BackingOffsetOverflow => EINVAL_VALUE,
         VmMapError::Pmap(_) => errno_to_i32(Errno::EIO),
-        VmMapError::PageAlloc(_) => errno_to_i32(Errno::ENOMEM),
         VmMapError::Private(_) => errno_to_i32(Errno::ENOMEM),
     }
 }

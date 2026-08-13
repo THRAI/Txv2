@@ -2,7 +2,7 @@
 
 use super::{
     bootstrap_copy_from_user, bootstrap_copy_to_user, bootstrap_read_user, bootstrap_write_user,
-    errno_to_i32, read_user_cstr, MailboxRefPostFn, MailboxRefPostWithHintFn, ReadCStrError,
+    errno_to_i32, read_user_cstr_wait, MailboxRefPostFn, MailboxRefPostWithHintFn, ReadCStrError,
     SyscallCtx, SyscallResult, E2BIG_VALUE, EBADF_VALUE, EFAULT_VALUE, EINVAL_VALUE, EMFILE_VALUE,
     ENAMETOOLONG_VALUE, ENOENT_VALUE, ENOMEM_VALUE, ENOSYS_VALUE, O_ACCMODE, O_CLOEXEC, O_CREAT,
     O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY,
@@ -193,11 +193,11 @@ fn nsproxy_and_cred(
     Ok((nsproxy, cred))
 }
 
-fn read_mq_name(ctx: &SyscallCtx<'_>, name_ptr: u64) -> Result<Vec<u8>, SyscallResult> {
+async fn read_mq_name(ctx: &SyscallCtx<'_>, name_ptr: u64) -> Result<Vec<u8>, SyscallResult> {
     if name_ptr == 0 {
         return Err(SyscallResult::Error(EFAULT_VALUE));
     }
-    let name = match read_user_cstr(&ctx.aspace, name_ptr, MQ_NAME_MAX + 1) {
+    let name = match read_user_cstr_wait(&ctx.aspace, name_ptr, MQ_NAME_MAX + 1).await {
         Ok(name) => name,
         Err(ReadCStrError::TooLong) => return Err(SyscallResult::Error(ENAMETOOLONG_VALUE)),
         Err(ReadCStrError::Fault(errno)) => return Err(SyscallResult::error_from(errno)),
@@ -930,12 +930,12 @@ pub(super) fn sys_msgrcv(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult 
     }
 }
 
-pub(super) fn sys_mq_open(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+pub(super) async fn sys_mq_open(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let (ns, cred) = match nsproxy_and_cred(ctx) {
         Ok(v) => v,
         Err(e) => return SyscallResult::Error(errno_to_i32(e)),
     };
-    let name = match read_mq_name(ctx, args[0]) {
+    let name = match read_mq_name(ctx, args[0]).await {
         Ok(v) => v,
         Err(result) => return result,
     };
@@ -972,12 +972,12 @@ pub(super) fn sys_mq_open(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult
     SyscallResult::Return(fd as i64)
 }
 
-pub(super) fn sys_mq_unlink(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+pub(super) async fn sys_mq_unlink(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let (ns, _cred) = match nsproxy_and_cred(ctx) {
         Ok(v) => v,
         Err(e) => return SyscallResult::Error(errno_to_i32(e)),
     };
-    let name = match read_mq_name(ctx, args[0]) {
+    let name = match read_mq_name(ctx, args[0]).await {
         Ok(v) => v,
         Err(result) => return result,
     };

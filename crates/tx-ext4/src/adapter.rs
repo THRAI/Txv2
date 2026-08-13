@@ -26,3 +26,31 @@ pub mod step_engine {
         RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError, ZonePolicy,
     };
 }
+
+#[platform_adapter(
+    platform = "substrate",
+    domain = "wait_routing",
+    apis = ["wake", "step"],
+    reason = "route mount-local ext4 mutation-admission waits through the registered WaitSource substrate"
+)]
+pub mod wait_routing {
+    use alloc::sync::Arc;
+
+    pub use tx_substrate::step::{InterestMask, WaitSourceId};
+    pub use tx_substrate::wake::WaitSource;
+
+    pub fn new_wait_source() -> Arc<WaitSource> {
+        let source_id = tx_subsystems::allocate_notification_source_id();
+        let source = tx_substrate::wake::new_source(source_id);
+        tx_substrate::wake::register_source(Arc::clone(&source));
+        source
+    }
+
+    pub fn notify_all(source: &Arc<WaitSource>, interests: u64) {
+        source.notify_emit(InterestMask::new(interests));
+    }
+
+    pub fn unregister_source(source: &Arc<WaitSource>) {
+        tx_substrate::wake::unregister_source(WaitSourceId::new(source.id().raw()));
+    }
+}

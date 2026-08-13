@@ -1,0 +1,416 @@
+{
+  "schema": "tx.progress.plan.v1",
+  "id": "2026-07-25-identity-rcu-slot-migration",
+  "title": "Identity critical path RCU slot migration",
+  "status": "active",
+  "created": "2026-07-25",
+  "updated": "2026-07-25",
+  "owner": "codex",
+  "context": {
+    "design_docs": [
+      "docs/superpowers/specs/2026-07-25-identity-rcu-slot-design.md",
+      "docs/superpowers/plans/2026-07-25-identity-rcu-slot-migration.md",
+      "docs/design/00_meta-framework/OBJECT_API_LANES_v1.md",
+      "docs/design/00_meta-framework/object_model_v2.md",
+      "docs/design/01_substrate/EBR_ZONE_INTERFACE_v1.md"
+    ],
+    "progress_refs": [
+      "docs/progress/research/2026-07-25-zone-cap-backend-simplification-audit.md",
+      "docs/progress/research/2026-07-25-kernel-lock-rcu-candidate-audit.md",
+      "docs/progress/decisions/2026-07-14-object-api-lanes-rcu-publication.md",
+      "docs/progress/plans/2026-07-19-rcu-path-migration.json"
+    ],
+    "external_refs": []
+  },
+  "scope": {
+    "in": [
+      "crates/tx-substrate/src/zone/published_binding.rs",
+      "crates/tx-substrate/src/zone/cap.rs",
+      "crates/tx-substrate/src/zone/mod.rs",
+      "crates/tx-substrate/src/lib.rs",
+      "crates/tx-substrate/tests/published_binding.rs",
+      "crates/tx-substrate/tests/zone.rs",
+      "crates/tx-substrate/tests/epoch.rs",
+      "crates/tx-subsystems/src/thread_runtime",
+      "crates/tx-subsystems/src/process",
+      "crates/tx-kernel/src/trap.rs",
+      "crates/tx-kernel/src/trap_handoff.rs",
+      "crates/tx-kernel/src/thread_future.rs",
+      "crates/tx-shims/src/linux_syscall",
+      "crates/tx-scripts/src/process/exec",
+      "boards/tx-hal-riscv64-qemu-virt/src/trap.rs",
+      "boards/tx-hal-loongarch64-qemu-virt/src/la64_irq_trap.rs",
+      "xtask/src/lint_invariants_zone.rs",
+      "xtask/src/lint_invariants_api_language.rs",
+      "xtask/src/qemu.rs",
+      "xtask/src/test.rs",
+      "docs/design/00_meta-framework/OBJECT_API_LANES_v1.md",
+      "docs/design/01_substrate/EBR_ZONE_INTERFACE_v1.md",
+      "docs/design/02_execution/THREAD_RUNTIME_v1.md",
+      "docs/design/04_process-signals/PROCESS_v1.md",
+      "docs/superpowers/specs/2026-07-25-identity-rcu-slot-design.md",
+      "docs/superpowers/plans/2026-07-25-identity-rcu-slot-migration.md",
+      "docs/progress/plans/2026-07-25-identity-rcu-slot-migration.json",
+      "docs/progress/research/2026-07-25-kernel-lock-rcu-candidate-audit.md",
+      "docs/progress/STATUS.md"
+    ],
+    "out": [
+      "pointer-backed-Cap",
+      "public-RcuCap-or-RcuZone-types",
+      "strong-ThreadIdentity-owner_proc-edge",
+      "general-process-relation-migration",
+      "queue-or-state-machine-RCU-migration",
+      "normal-async-SyscallCtx-removal",
+      "immutable-root-Published-T-replacement",
+      "poll-scoped-current-task-RCU-migration",
+      "IRQ-context-epoch-Guard",
+      "timer-IRQ-payload-anchor-replacement"
+    ],
+    "write_sets": [
+      {
+        "owner": "identity-rcu-coordinator",
+        "paths": [
+          "docs/superpowers/specs/2026-07-25-identity-rcu-slot-design.md",
+          "docs/superpowers/plans/2026-07-25-identity-rcu-slot-migration.md",
+          "docs/progress/plans/2026-07-25-identity-rcu-slot-migration.json",
+          "docs/progress/research/2026-07-25-kernel-lock-rcu-candidate-audit.md"
+        ],
+        "notes": "Owns the design, sequencing, and progress record. STATUS.md is a shared index and must be merged without overwriting concurrent user changes."
+      }
+    ]
+  },
+  "summary": "Execute the approved identity RCU design through phases P0-P12: freeze exact baselines, land and prove PublishedBinding before adoption, migrate thread payload and per-hart owner in separate reviewable phases, migrate process payload and address space, build the one-Guard resolver and borrowed direct lane, close static/SMP gates, then use a three-variant A/B plus pinned guest rustc workload to decide follow-ups. Acceptance is reader-lock removal, not physical mutex deletion: owner 1->0, thread payload 8->0, process payload 47->0, and VM 21 expressions->0 while every writer/lifecycle owner remains explicit.",
+  "steps": [
+    {
+      "id": "baseline-artifacts",
+      "title": "Freeze exact source, layout, and measurement baselines",
+      "status": "pending",
+      "depends_on": [],
+      "paths": [
+        "docs/progress/research/2026-07-25-kernel-lock-rcu-candidate-audit.md",
+        "docs/superpowers/plans/2026-07-25-identity-rcu-slot-migration.md",
+        "docs/progress/plans/2026-07-25-identity-rcu-slot-migration.json"
+      ],
+      "verification": [
+        "fresh production callsite manifest has zero unknown rows",
+        "layout baseline records entity, Zone Slot, alignment, and slots per slab",
+        "direct-path baseline records owner/thread/process/VM lock and retain counters",
+        "guest rustc fixture readiness or an explicit macro-measurement blocker is recorded"
+      ],
+      "notes": "Phase P0. Before any storage edit, reproduce current-owner 1 reader, ThreadIdentity.payload 8 readers + 1 writer, ProcessIdentity.payload 47 readers + 41 writer/lifecycle/topology points = 88, external payload_slot() 9 sites, and VM 20 reader locations / 21 expressions + 1 construction + 2 swaps. Each manifest row records file:first_line, symbol, semantic class, owned-boundary reason, target facade, and writer owner. Count drift or an unknown row blocks implementation. Macro workload unavailability blocks only rustc performance claims, not substrate or identity correctness phases."
+    },
+    {
+      "id": "contract-ratchets",
+      "title": "Freeze single-binding and direct-resolver contracts",
+      "status": "pending",
+      "depends_on": [
+        "baseline-artifacts"
+      ],
+      "paths": [
+        "docs/design/00_meta-framework/OBJECT_API_LANES_v1.md",
+        "docs/design/01_substrate/EBR_ZONE_INTERFACE_v1.md",
+        "docs/design/02_execution/THREAD_RUNTIME_v1.md",
+        "docs/design/04_process-signals/PROCESS_v1.md",
+        "xtask/src/lint_invariants_zone.rs",
+        "xtask/src/lint_invariants_api_language.rs"
+      ],
+      "verification": [
+        "cargo test -p xtask lint_invariants_zone --lib",
+        "cargo test -p xtask lint_invariants_api_language --lib"
+      ],
+      "notes": "Phase P1. Add txdoc contracts for single bindings, one current userspace identity owner, payload-through-identity traversal, owned-boundary retention, and synchronous-exception versus IRQ separation. Add API leakage rejection and a bounded direct-resolver gate that counts Guards, locks, upgrades, clones, retains, and SyscallCtx construction. Detector tests must pass while the production scan reports the exact frozen non-zero baseline; an unexpected zero is a detector failure."
+    },
+    {
+      "id": "published-binding-primitive",
+      "title": "Implement PublishedBinding over Zone Slot",
+      "status": "pending",
+      "depends_on": [
+        "contract-ratchets"
+      ],
+      "paths": [
+        "crates/tx-substrate/src/zone/published_binding.rs",
+        "crates/tx-substrate/src/zone/cap.rs",
+        "crates/tx-substrate/src/zone/mod.rs",
+        "crates/tx-substrate/src/lib.rs",
+        "crates/tx-substrate/tests/published_binding.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-substrate --test published_binding",
+        "cargo test -p tx-substrate --test zone",
+        "cargo test -p tx-substrate --doc",
+        "cargo check -p tx-substrate --lib"
+      ],
+      "notes": "Phase P2. Land the primitive unused by production owners: root-first repr(C) layout, concrete Cap/PayloadCap method families, Acquire reader loop, AcqRel writer swaps, key-conditional clear, retained compatibility reads, and exclusive Drop without RcuHead or allocation. No subsystem storage migration belongs in this phase."
+    },
+    {
+      "id": "binding-race-closure",
+      "title": "Close layout, ordering, lifetime, and race proofs",
+      "status": "pending",
+      "depends_on": [
+        "published-binding-primitive"
+      ],
+      "paths": [
+        "crates/tx-substrate/tests/published_binding.rs",
+        "crates/tx-substrate/tests/zone.rs",
+        "crates/tx-substrate/tests/epoch.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-substrate --test published_binding -- --test-threads=1",
+        "cargo test -p tx-substrate --test zone",
+        "cargo test -p tx-substrate --test epoch",
+        "cargo xtask lint invariants api-language"
+      ],
+      "notes": "Phase P3. Before any production owner adopts the primitive, cover raw key zero, generation reuse, reader-before-final-drop, old target retained elsewhere, non-Live retry/invariant, concurrent writers, no allocation, and compile-fail Guard/IdentRef escape. P4 is blocked until this phase closes."
+    },
+    {
+      "id": "thread-payload-binding",
+      "title": "Migrate ThreadIdentity payload publication",
+      "status": "pending",
+      "depends_on": [
+        "binding-race-closure"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/thread_runtime/adapter.rs",
+        "crates/tx-subsystems/src/thread_runtime/structure.rs",
+        "crates/tx-subsystems/src/thread_runtime/execution.rs",
+        "crates/tx-subsystems/src/thread_runtime/tests.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-subsystems --lib thread_runtime::",
+        "cargo check -p tx-subsystems --lib"
+      ],
+      "notes": "Phase P4. Start from exactly 8 ThreadIdentity.payload reader points + 1 zombie-detach writer. Add guarded and terminal-retain facades, install before runnable publication, and make root-to-null withdrawal the zombie visibility point. Target payload reader locks 8->0 while retaining one private binding writer mutex and exact thread-exit ordering for exit status, mailbox wake, current-slot cleanup, and detach. Do not change any per-hart table or IRQ ownership protocol in this phase. Count drift, raw binding exposure, or unproven exit ordering blocks completion."
+    },
+    {
+      "id": "userspace-owner-root",
+      "title": "Migrate current userspace owner root and cleanup ticket",
+      "status": "pending",
+      "depends_on": [
+        "thread-payload-binding"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/thread_runtime/structure.rs",
+        "crates/tx-subsystems/src/thread_runtime/tests.rs",
+        "crates/tx-kernel/src/thread_future.rs",
+        "crates/tx-kernel/src/trap_handoff.rs",
+        "crates/tx-kernel/src/thread_future/tests.rs",
+        "crates/tx-kernel/src/init/tests.rs",
+        "boards/tx-hal-riscv64-qemu-virt/src/trap.rs",
+        "boards/tx-hal-loongarch64-qemu-virt/src/la64_irq_trap.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-subsystems --lib thread_runtime::",
+        "cargo test -p tx-kernel --lib thread_future",
+        "cargo test -p tx-kernel --lib trap_handoff",
+        "cargo test -p tx-hal-riscv64-qemu-virt --lib trap",
+        "cargo test -p tx-hal-loongarch64-qemu-virt --lib trap",
+        "cargo check -p tx-kernel --lib"
+      ],
+      "notes": "Phase P5. Replace only CURRENT_USERSPACE_THREAD_IDENTITY with CURRENT_USERSPACE_OWNER and migrate the one direct owner reader, targeting owner reader locks 1->0. Retain the strong CURRENT_USERSPACE_PAYLOAD IRQ anchor and both poll-scoped tables. Split active-owner state into atomic entry_hart plus a request writer cell. The cleanup ticket carries hart, request revision, thread key, and payload key; request comparison serializes same-thread revisions and key-conditional clears protect hart takeover. Every timer-preempt re-entry closes the old ticket before beginning the new request, including on the same hart. The four 64-cell tables retain 256 physical writer mutexes; exit sweep targets 129 ordinary locks plus one owner binding claim. Ticket revision/hart/key races, Release/Acquire order, IRQ separation, migration, and timer-preempt tests are hard gates."
+    },
+    {
+      "id": "process-payload-binding",
+      "title": "Migrate ProcessIdentity payload publication",
+      "status": "pending",
+      "depends_on": [
+        "binding-race-closure"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/process/adapter.rs",
+        "crates/tx-subsystems/src/process/structure.rs",
+        "crates/tx-subsystems/src/process/execution.rs",
+        "crates/tx-subsystems/src/process/exec_prep.rs",
+        "crates/tx-subsystems/src/process/tests.rs",
+        "crates/tx-subsystems/src/thread_runtime/execution.rs",
+        "crates/tx-subsystems/src/thread_runtime/tests.rs",
+        "crates/tx-scripts/src/process/exec/script.rs",
+        "crates/tx-shims/src/linux_syscall/proc.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-subsystems --lib process::",
+        "cargo test -p tx-subsystems --lib thread_runtime::",
+        "cargo test -p tx-scripts process::exec --lib",
+        "cargo test -p tx-shims --lib linux_syscall::proc",
+        "cargo check -p tx-subsystems -p tx-scripts -p tx-shims --lib"
+      ],
+      "notes": "Phase P6. Use the audited exact baseline 88 = 47 readers + 41 writer/lifecycle/topology points, with zero unknowns. Migrate all 47 readers to guarded payload_ref or explicit terminal payload_cap at a real owned boundary, targeting reader locks 47->0. The 41 writer points must each name their existing or added lifecycle/exec/topology reservation, lock, or revalidation owner; RCU publication is not revocation. The 9 external payload_slot() callsites (1 reader + 8 writer/lifecycle) must move behind domain facades and public lock exposure must reach zero. Fork snapshot, clone-thread attach, process exit detach, and exec exact-binding validation remain stronger coordination. The physical binding writer mutex remains 1->1 per identity. Any count mismatch, unknown site, unnamed writer owner, or surviving payload_slot() exposure blocks the phase."
+    },
+    {
+      "id": "address-space-binding",
+      "title": "Migrate ProcessPayload Frame vm publication",
+      "status": "pending",
+      "depends_on": [
+        "process-payload-binding"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/process/structure.rs",
+        "crates/tx-subsystems/src/process/execution.rs",
+        "crates/tx-subsystems/src/process/exec_prep.rs",
+        "crates/tx-subsystems/src/process/tests.rs",
+        "crates/tx-kernel/src/thread_future.rs",
+        "crates/tx-kernel/src/thread_future/tests.rs",
+        "crates/tx-scripts/src/process/exec/script.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-subsystems --lib process::",
+        "cargo test -p tx-subsystems --lib vm::",
+        "cargo test -p tx-kernel --lib thread_future",
+        "cargo test -p tx-scripts process::exec --lib"
+      ],
+      "notes": "Phase P7. Start from 20 unique VM reader locations / 21 reader expressions, one installed construction, and two production swaps. Migrate all reader expressions to aspace_ref or explicit terminal aspace_cap, targeting VM reader locks 21->0. ProcessIdentity::aspace_cap currently takes two reader locks; process payload migration reduces 2->1 and this phase must close 1->0. Keep both exec phase-6 root swaps as the irreversible visibility points with existing exec lifecycle, pmap activation, and shootdown coordination. The physical VM binding writer mutex remains 1->1. A count mismatch, fallible post-swap work, or an unproven old-aspace Guard lifetime blocks the phase. Record Frame, ProcessPayload, physical Slot, and slab-density changes."
+    },
+    {
+      "id": "guarded-direct-context",
+      "title": "Build one-Guard direct identity context",
+      "status": "pending",
+      "depends_on": [
+        "userspace-owner-root",
+        "process-payload-binding",
+        "address-space-binding"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/thread_runtime/structure.rs",
+        "crates/tx-subsystems/src/process/structure.rs",
+        "crates/tx-kernel/src/trap.rs",
+        "crates/tx-kernel/src/direct_trap_context.rs",
+        "crates/tx-kernel/src/trap_handoff.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel --lib direct_trap",
+        "cargo test -p tx-kernel --lib trap",
+        "cargo xtask lint invariants identity-rcu"
+      ],
+      "notes": "Phase P8. Resolve the current userspace ThreadIdentity owner, ThreadIdentity.payload, atomic active-hart commit marker, owner_proc Weak, process payload, and address space under one caller Guard. The marked direct resolver target is five reader mutex acquisitions to zero, exactly five IdentRefs, and zero intermediate retain CAS/clone operations. Keep owner_proc Weak to avoid the ProcessPayload-thread-process cycle; IRQ paths never enter this resolver. P4-P7, active-hart revalidation, Weak generation validation, and IRQ exclusion are hard dependencies."
+    },
+    {
+      "id": "borrowed-direct-dispatch",
+      "title": "Refactor direct syscall dispatch to borrowed domain types",
+      "status": "pending",
+      "depends_on": [
+        "guarded-direct-context"
+      ],
+      "paths": [
+        "crates/tx-shims/src/linux_syscall/ctx.rs",
+        "crates/tx-shims/src/linux_syscall/mod.rs",
+        "crates/tx-shims/src/linux_syscall",
+        "crates/tx-kernel/src/trap.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-shims --lib direct",
+        "cargo test -p tx-shims --lib rt_sigprocmask",
+        "cargo test -p tx-shims --lib futex",
+        "cargo test -p tx-kernel --lib direct_trap",
+        "cargo check -p tx-shims -p tx-kernel --lib"
+      ],
+      "notes": "Phase P9. Use a domain-reference DirectSyscallCtx with no Guard/IdentRef/publication imports. Convert only strictly synchronous arms and fall back before any context escape. Targets are getpid/gettid/clock reader locks 8->0, uid/gid 8->1 because cred remains lock-backed, and rt_sigprocmask identity locks 6->0. Futex, signal, user-memory, and other semantic locks are explicitly retained."
+    },
+    {
+      "id": "boundary-retain-ratchets",
+      "title": "Close async boundaries and retire old lock accessors",
+      "status": "pending",
+      "depends_on": [
+        "borrowed-direct-dispatch"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/thread_future.rs",
+        "crates/tx-shims/src/linux_syscall/ctx.rs",
+        "xtask/src/lint_invariants_zone.rs",
+        "xtask/src/lint_invariants_api_language.rs"
+      ],
+      "verification": [
+        "cargo -q xtask unit",
+        "cargo xtask lint invariants identity-rcu",
+        "cargo xtask lint invariants api-language",
+        "cargo xtask lint docs",
+        "cargo xtask progress validate"
+      ],
+      "notes": "Phase P10. Keep normal SyscallCtx owned, mark real retain boundaries, reject guarded types in async/storage/cross-CPU state, and ratchet production old-reader patterns and exposed lock APIs to zero. Count gates include current owner 1->0, thread payload readers 8->0, process payload readers 47->0, external payload_slot() exposure 9->0, VM reader expressions 21->0, composed process/VM reader locks 2->0, and unsupported direct prepass plus fallback hot 9->4 / poll miss 10->5. Allowlisted IRQ/poll locks and all named semantic writer coordination remain."
+    },
+    {
+      "id": "smp-performance-witness",
+      "title": "Close four-hart grace and same-configuration performance witnesses",
+      "status": "pending",
+      "depends_on": [
+        "boundary-retain-ratchets"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/init.rs",
+        "crates/tx-kernel/src/init/tests.rs",
+        "xtask/src/qemu.rs",
+        "xtask/src/test.rs",
+        "crates/tx-observe-types",
+        "crates/tx-observe",
+        "docs/progress/research"
+      ],
+      "verification": [
+        "cargo xtask full-build --target rv64-qemu --no-image",
+        "cargo xtask test smoke --target rv64-qemu --timeout-ms 30000",
+        "cargo xtask fault-decode --target rv64-qemu --serial <saved-log> --all --brief"
+      ],
+      "notes": "Phase P11. Compare lock baseline, binding plus owned retains, and binding plus borrowed direct context. Report physical binding-writer mutex counts separately from dynamic reader lock acquisitions; physical counts are expected not to fall merely because storage becomes PublishedBinding. The direct resolver correctness target is zero binding reader locks. Run direct microbenchmarks and a pinned offline guest rustc clean/incremental workload at -j1/-j4/-j8 when guest rustc is available. A repeatable rustc regression above 2 percent blocks completion pending attribution; fixture unavailability is an explicit macro-measurement blocker."
+    },
+    {
+      "id": "measurement-gated-followups",
+      "title": "Evaluate residual owner Weak, upgrade, resolver, and Cap costs",
+      "status": "pending",
+      "depends_on": [
+        "smp-performance-witness"
+      ],
+      "paths": [
+        "docs/progress/research",
+        "docs/superpowers/specs",
+        "docs/superpowers/plans"
+      ],
+      "verification": [
+        "same-configuration tx-observe attribution report",
+        "entity and dense-container layout comparison"
+      ],
+      "notes": "Phase P12. Optional IRQ-safe owner convergence, per-hart process publication, fused Weak upgrade, typed resolver fast path, pointer-backed Cap, and later fd/cwd/dentry/PageContainer work each require separate measured justification, design, layout accounting, and plan. None may expand the P0-P11 identity completion boundary."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo xtask lint docs",
+      "status": "passed",
+      "notes": "Revalidated after adding the P0-P12 staged landing contract. Passed with the seven existing stale-vocabulary warnings for active docs that discuss retired terms."
+    },
+    {
+      "command": "cargo xtask progress validate",
+      "status": "passed",
+      "notes": "Revalidated after splitting thread payload from the per-hart owner phase and adding P0 baseline artifacts. Passed with 37 progress records including this active plan."
+    },
+    {
+      "command": "jq empty docs/progress/plans/2026-07-25-identity-rcu-slot-migration.json",
+      "status": "passed",
+      "notes": "The staged plan parses as JSON; step ids are unique and every dependency resolves to a declared step."
+    },
+    {
+      "command": "scoped vocabulary, placeholder, and whitespace checks",
+      "status": "passed",
+      "notes": "No plan-placeholder patterns matched; Markdown fences are balanced; only intentional rejected-type and detector-pattern mentions remain; the scoped RCU plan/progress diff has no whitespace errors."
+    }
+  ],
+  "risks": [
+    "A PublishedBinding root installed before its strong evidence or withdrawn after evidence Drop can produce a guarded dangling pointer.",
+    "Treating EBR as revocation can allow an operation through an already-retained payload after semantic death unless the operation revalidates domain state.",
+    "Clearing userspace ownership by the future's resumed hart instead of the recorded entry hart can leave a stale root or clear a replacement; the owner ticket must make hart and revision explicit.",
+    "The timer IRQ payload anchor is intentionally retained because an IRQ handler cannot create an epoch Guard; routing it through PublishedBinding would violate the reader contract.",
+    "Changing ThreadIdentity.owner_proc to Cap would create a strong ProcessPayload to ThreadIdentity to ProcessIdentity cycle.",
+    "Replacing ProcessIdentity.payload affects exactly 88 audited production points: 47 readers and 41 writer/lifecycle/topology points. Every writer point must retain or gain named coordination rather than being treated as mere payload retention.",
+    "Adding one root pointer increases binding and containing-entity size and may reduce ThreadIdentity, ProcessIdentity, or ProcessPayload Zone slab density; the atomic active-hart marker also grows ThreadPayload.",
+    "Opening a nested or IRQ-context Guard would violate the existing epoch contract; synchronous syscall exceptions must remain distinct from timer/external/IPI IRQ scopes.",
+    "A trace-enabled benchmark can move the very cacheline and retain costs under study; final wall-time runs must disable probes identically.",
+    "Guest rustc readiness and a pinned offline large-project fixture may block macro measurement even after micro and SMP correctness close.",
+    "The shared checkout contains extensive unrelated staged, unstaged, and untracked work; implementation phases need narrow write sets and no unauthorized staging."
+  ],
+  "blockers": [
+    "Rust implementation has not started; this record currently captures the approved design and execution order only.",
+    "Implementation must reproduce the audited callsite counts before each phase; any delta from owner 1, thread 8+1, process 47+41=88, or VM 20 locations/21 expressions + 1 construction + 2 swaps must be classified before migration continues.",
+    "Guest rustc/rootfs and a pinned offline large-project workload must be confirmed before claiming macro performance results.",
+    "Staging and commits are deferred until explicitly authorized in the shared dirty checkout."
+  ],
+  "handoff": {
+    "needed": false,
+    "path": null
+  }
+}

@@ -152,15 +152,29 @@ impl<P: TxPlatform> CoreInit<P> {
         drop(tasks);
 
         if removed != 0 && step_engine::borrow_current_guard().is_none() {
-            let first = step_engine::drain_with_budget(TERMINAL_THREAD_EBR_DRAIN_BUDGET);
-            let second = step_engine::drain_with_budget(TERMINAL_THREAD_EBR_DRAIN_BUDGET);
+            // A completed thread can release a ProcessPayload whose deferred
+            // destructor drops the fd table; those OpenFile caps then enter a
+            // fresh EBR grace period before their pipe endpoint destructors
+            // can publish EOF/EPIPE. Two drains only reclaim the outer layer.
+            // Finish the bounded nested chain here, at the terminal-task seam,
+            // without turning every userspace reactor iteration into an EBR
+            // scan. Eight rounds cover four two-epoch layers and stop early as
+            // soon as this CPU's queues are empty.
+            const TERMINAL_THREAD_EBR_DRAIN_ROUNDS: usize = 8;
+            let mut reclaimed = 0usize;
+            let mut remaining = 0usize;
+            for _ in 0..TERMINAL_THREAD_EBR_DRAIN_ROUNDS {
+                let stats = step_engine::drain_with_budget(TERMINAL_THREAD_EBR_DRAIN_BUDGET);
+                reclaimed = reclaimed.saturating_add(stats.reclaimed);
+                remaining = stats.remaining;
+                if remaining == 0 {
+                    break;
+                }
+            }
             let vm_recipe_reclaims =
                 tx_subsystems::vm::drain_deferred_recipe_reclaims(TERMINAL_THREAD_EBR_DRAIN_BUDGET);
-            emit_child_submit_marker(
-                "debug.child_submit.ebr_reclaimed",
-                first.reclaimed.saturating_add(second.reclaimed) as i64,
-            );
-            emit_child_submit_marker("debug.child_submit.ebr_remaining", second.remaining as i64);
+            emit_child_submit_marker("debug.child_submit.ebr_reclaimed", reclaimed as i64);
+            emit_child_submit_marker("debug.child_submit.ebr_remaining", remaining as i64);
             emit_child_submit_marker(
                 "debug.child_submit.vm_recipe_reclaimed",
                 vm_recipe_reclaims as i64,

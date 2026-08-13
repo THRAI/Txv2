@@ -1,5 +1,7 @@
 //! VirtIO MMIO block transport for RISC-V QEMU virt and similar boards.
 
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::marker::PhantomData;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -8,12 +10,16 @@ use crate::adapter::step_engine::{self as step_engine, NoProgress, StepOutcome};
 use step_engine::page_allocator;
 use step_engine::SpinMutex;
 use tx_hal::{MmioRegion, PlatformInfoIf, TxPlatform};
-use tx_subsystems::device::{BlockDevice, BlockDeviceOps, PhysicalBlockNumber};
+use tx_subsystems::device::{
+    BlockAsyncCompletion, BlockAsyncSubmit, BlockDevice, BlockDeviceOps,
+    BlockDurabilityCapabilities, BlockWriteOptions, PhysicalBlockNumber,
+};
 use tx_subsystems::execution::{Errno, Guard};
 use tx_subsystems::page_backed::Frame;
-use virtio_drivers::device::blk::VirtIOBlk;
+use virtio_drivers::device::blk::{BlkReq, BlkResp, VirtIOBlk};
 use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
 
+use super::block_async::{AsyncBlockOp, AsyncBlockState, InFlightChunk, MAX_DMA_CHUNK_PAGES};
 use super::dma::TxVirtioHal;
 
 const PAGE_SIZE: usize = 4096;
@@ -59,6 +65,8 @@ pub(crate) fn peek_device_type(
 pub struct VirtioMmioBlock<P: TxPlatform> {
     region_source: RegionSource,
     inner: SpinMutex<Option<VirtIOBlk<TxVirtioHal<P>, MmioTransport<'static>>>>,
+    async_state: SpinMutex<AsyncBlockState>,
+    io_gate: SpinMutex<()>,
     initialized: AtomicBool,
     total_blocks: AtomicU64,
     block_size: AtomicU32,
@@ -86,6 +94,8 @@ impl<P: TxPlatform> VirtioMmioBlock<P> {
         Self {
             region_source,
             inner: SpinMutex::new(None),
+            async_state: SpinMutex::new(AsyncBlockState::new()),
+            io_gate: SpinMutex::new(()),
             initialized: AtomicBool::new(false),
             total_blocks: AtomicU64::new(0),
             block_size: AtomicU32::new(VIRTIO_BLK_SECTOR_SIZE),
@@ -146,6 +156,8 @@ impl<P: TxPlatform> BlockDeviceOps for VirtioMmioBlock<P> {
         target: &mut [Frame],
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
+        let _gate = self.io_gate.lock();
+        self.quiesce_async();
         let mut inner = self.inner.lock();
         let Some(blk) = inner.as_mut() else {
             return StepOutcome::Err(Errno::ENODEV.into());
@@ -155,30 +167,22 @@ impl<P: TxPlatform> BlockDeviceOps for VirtioMmioBlock<P> {
             return StepOutcome::Err(Errno::EINVAL.into());
         }
 
-        if let Some(buf) = contiguous_frame_slice_mut(target) {
-            let Ok(lba) = usize::try_from(block_id.as_u64()) else {
-                return StepOutcome::Err(Errno::EINVAL.into());
-            };
-            return if blk.read_blocks(lba, buf).is_ok() {
-                StepOutcome::Done(())
-            } else {
-                StepOutcome::Err(Errno::EIO.into())
-            };
-        }
-
-        for (idx, frame) in target.iter_mut().enumerate() {
+        let mut first = 0usize;
+        while first < target.len() {
+            let end = contiguous_chunk_end(target, first);
             let Some(lba) = block_id
                 .as_u64()
-                .checked_add(idx as u64 * sectors_per_page as u64)
+                .checked_add(first as u64 * sectors_per_page as u64)
             else {
                 return StepOutcome::Err(Errno::EINVAL.into());
             };
-            let Some(buf) = frame_slice_mut(*frame) else {
+            let Some(buf) = contiguous_frame_slice_mut(&mut target[first..end]) else {
                 return StepOutcome::Err(Errno::EIO.into());
             };
             if blk.read_blocks(lba as usize, buf).is_err() {
                 return StepOutcome::Err(Errno::EIO.into());
             }
+            first = end;
         }
         StepOutcome::Done(())
     }
@@ -189,6 +193,8 @@ impl<P: TxPlatform> BlockDeviceOps for VirtioMmioBlock<P> {
         source: &[Frame],
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
+        let _gate = self.io_gate.lock();
+        self.quiesce_async();
         let mut inner = self.inner.lock();
         let Some(blk) = inner.as_mut() else {
             return StepOutcome::Err(Errno::ENODEV.into());
@@ -198,35 +204,29 @@ impl<P: TxPlatform> BlockDeviceOps for VirtioMmioBlock<P> {
             return StepOutcome::Err(Errno::EINVAL.into());
         }
 
-        if let Some(buf) = contiguous_frame_slice(source) {
-            let Ok(lba) = usize::try_from(block_id.as_u64()) else {
-                return StepOutcome::Err(Errno::EINVAL.into());
-            };
-            return if blk.write_blocks(lba, buf).is_ok() {
-                StepOutcome::Done(())
-            } else {
-                StepOutcome::Err(Errno::EIO.into())
-            };
-        }
-
-        for (idx, frame) in source.iter().enumerate() {
+        let mut first = 0usize;
+        while first < source.len() {
+            let end = contiguous_chunk_end(source, first);
             let Some(lba) = block_id
                 .as_u64()
-                .checked_add(idx as u64 * sectors_per_page as u64)
+                .checked_add(first as u64 * sectors_per_page as u64)
             else {
                 return StepOutcome::Err(Errno::EINVAL.into());
             };
-            let Some(buf) = frame_slice(*frame) else {
+            let Some(buf) = contiguous_frame_slice(&source[first..end]) else {
                 return StepOutcome::Err(Errno::EIO.into());
             };
             if blk.write_blocks(lba as usize, buf).is_err() {
                 return StepOutcome::Err(Errno::EIO.into());
             }
+            first = end;
         }
         StepOutcome::Done(())
     }
 
     fn barrier(&self, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
+        let _gate = self.io_gate.lock();
+        self.quiesce_async();
         let mut inner = self.inner.lock();
         let Some(blk) = inner.as_mut() else {
             return StepOutcome::Err(Errno::ENODEV.into());
@@ -236,6 +236,187 @@ impl<P: TxPlatform> BlockDeviceOps for VirtioMmioBlock<P> {
         }
         StepOutcome::Done(())
     }
+
+    fn durability_capabilities(&self) -> BlockDurabilityCapabilities {
+        BlockDurabilityCapabilities {
+            fua: false,
+            flush: true,
+        }
+    }
+
+    fn supports_async_blocks(&self) -> bool {
+        true
+    }
+
+    fn submit_read_blocks_async(
+        &self,
+        cookie: u64,
+        block_id: PhysicalBlockNumber,
+        target: &mut [Frame],
+        _guard: &Guard<'_>,
+    ) -> BlockAsyncSubmit {
+        self.enqueue_async(cookie, AsyncBlockOp::Read, block_id, target)
+    }
+
+    fn submit_write_blocks_async(
+        &self,
+        cookie: u64,
+        block_id: PhysicalBlockNumber,
+        source: &[Frame],
+        options: BlockWriteOptions,
+        _guard: &Guard<'_>,
+    ) -> BlockAsyncSubmit {
+        if options.fua {
+            return BlockAsyncSubmit::Complete(Err(Errno::EOPNOTSUPP));
+        }
+        self.enqueue_async(cookie, AsyncBlockOp::Write, block_id, source)
+    }
+
+    fn poll_async_blocks(&self, budget: usize, _guard: &Guard<'_>) -> Vec<BlockAsyncCompletion> {
+        self.poll_async_completions(budget)
+    }
+}
+
+impl<P: TxPlatform> VirtioMmioBlock<P> {
+    fn enqueue_async(
+        &self,
+        cookie: u64,
+        op: AsyncBlockOp,
+        block_id: PhysicalBlockNumber,
+        frames: &[Frame],
+    ) -> BlockAsyncSubmit {
+        let _gate = self.io_gate.lock();
+        if !self.is_initialized() {
+            return BlockAsyncSubmit::Complete(Err(Errno::ENODEV));
+        }
+        let sectors = sectors_per_page(self.block_size());
+        match self
+            .async_state
+            .lock()
+            .enqueue(cookie, op, block_id.as_u64(), sectors, frames)
+        {
+            Ok(()) => BlockAsyncSubmit::Submitted,
+            Err(error) => BlockAsyncSubmit::Complete(Err(error)),
+        }
+    }
+
+    fn poll_async_completions(&self, budget: usize) -> Vec<BlockAsyncCompletion> {
+        let mut completions = self.async_state.lock().take_ready(budget);
+        if completions.len() < budget {
+            completions.extend(self.drive_async_device(budget - completions.len()));
+        }
+        completions
+    }
+
+    fn quiesce_async(&self) {
+        while self.async_state.lock().has_pending() {
+            let completions = self.drive_async_device(usize::MAX);
+            if completions.is_empty() {
+                core::hint::spin_loop();
+            } else {
+                self.async_state.lock().stash_ready(completions);
+            }
+        }
+    }
+
+    fn drive_async_device(&self, budget: usize) -> Vec<BlockAsyncCompletion> {
+        let mut completions = Vec::new();
+        if budget == 0 {
+            return completions;
+        }
+        let mut inner = self.inner.lock();
+        let Some(blk) = inner.as_mut() else {
+            return completions;
+        };
+        let mut state = self.async_state.lock();
+
+        for _ in 0..budget {
+            let Some(token) = blk.peek_used() else {
+                break;
+            };
+            let Some(mut part) = state.in_flight.remove(&token) else {
+                break;
+            };
+            let result = complete_mmio_part(blk, token, &mut part);
+            if let Some(completion) = state.finish_part(part.cookie, result) {
+                completions.push(completion);
+            }
+        }
+
+        loop {
+            let Some((cookie, op, chunk)) = state.next_chunk() else {
+                break;
+            };
+            let mut part = InFlightChunk {
+                cookie,
+                op,
+                chunk,
+                request: Box::new(BlkReq::default()),
+                response: Box::new(BlkResp::default()),
+            };
+            match submit_mmio_part(blk, &mut part) {
+                Ok(token) => {
+                    state
+                        .submitted(token, part)
+                        .expect("virtio-mmio returned an already in-flight queue token");
+                }
+                Err(virtio_drivers::Error::QueueFull) => {
+                    state.requeue_front(cookie, part.chunk);
+                    break;
+                }
+                Err(_) => {
+                    if let Some(completion) = state.fail_submission(cookie, Errno::EIO) {
+                        completions.push(completion);
+                    }
+                }
+            }
+        }
+        completions
+    }
+}
+
+fn submit_mmio_part<P: TxPlatform>(
+    blk: &mut VirtIOBlk<TxVirtioHal<P>, MmioTransport<'static>>,
+    part: &mut InFlightChunk,
+) -> virtio_drivers::Result<u16> {
+    match part.op {
+        AsyncBlockOp::Read => {
+            let buf = contiguous_frame_slice_mut(&mut part.chunk.frames)
+                .ok_or(virtio_drivers::Error::InvalidParam)?;
+            unsafe {
+                blk.read_blocks_nb(part.chunk.lba, &mut part.request, buf, &mut part.response)
+            }
+        }
+        AsyncBlockOp::Write => {
+            let buf = contiguous_frame_slice(&part.chunk.frames)
+                .ok_or(virtio_drivers::Error::InvalidParam)?;
+            unsafe {
+                blk.write_blocks_nb(part.chunk.lba, &mut part.request, buf, &mut part.response)
+            }
+        }
+    }
+}
+
+fn complete_mmio_part<P: TxPlatform>(
+    blk: &mut VirtIOBlk<TxVirtioHal<P>, MmioTransport<'static>>,
+    token: u16,
+    part: &mut InFlightChunk,
+) -> Result<(), Errno> {
+    let result = match part.op {
+        AsyncBlockOp::Read => {
+            let Some(buf) = contiguous_frame_slice_mut(&mut part.chunk.frames) else {
+                return Err(Errno::EIO);
+            };
+            unsafe { blk.complete_read_blocks(token, &part.request, buf, &mut part.response) }
+        }
+        AsyncBlockOp::Write => {
+            let Some(buf) = contiguous_frame_slice(&part.chunk.frames) else {
+                return Err(Errno::EIO);
+            };
+            unsafe { blk.complete_write_blocks(token, &part.request, buf, &mut part.response) }
+        }
+    };
+    result.map_err(|_| Errno::EIO)
 }
 
 impl<P: TxPlatform> BlockDevice for VirtioMmioBlock<P> {
@@ -255,14 +436,15 @@ fn sectors_per_page(block_size: u32) -> u32 {
     (PAGE_SIZE / block_size as usize) as u32
 }
 
-fn frame_slice_mut(frame: Frame) -> Option<&'static mut [u8]> {
-    let ptr = page_allocator::frame_kernel_addr(frame.ppn()).ok()?;
-    Some(unsafe { core::slice::from_raw_parts_mut(ptr, PAGE_SIZE) })
-}
-
-fn frame_slice(frame: Frame) -> Option<&'static [u8]> {
-    let ptr = page_allocator::frame_kernel_addr(frame.ppn()).ok()?;
-    Some(unsafe { core::slice::from_raw_parts(ptr, PAGE_SIZE) })
+fn contiguous_chunk_end(frames: &[Frame], first: usize) -> usize {
+    let mut end = first + 1;
+    while end < frames.len()
+        && end - first < MAX_DMA_CHUNK_PAGES
+        && frames[end].ppn().0 == frames[end - 1].ppn().0.saturating_add(1)
+    {
+        end += 1;
+    }
+    end
 }
 
 fn contiguous_frame_slice_mut(frames: &mut [Frame]) -> Option<&'static mut [u8]> {

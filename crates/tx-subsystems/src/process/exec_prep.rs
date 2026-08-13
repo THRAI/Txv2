@@ -148,10 +148,21 @@ impl ProcessExecPrep {
             return Err(ExecPrepError::StaleBinding);
         }
         after_lane_transition();
+        let mut retry = false;
         for sibling in siblings {
             match crate::thread_runtime::step_thread_exit(sibling, 0) {
                 ThreadExitOutcome::Completed => {}
-                ThreadExitOutcome::Retry => {}
+                ThreadExitOutcome::Retry => retry = true,
+            }
+        }
+        if retry {
+            match self.payload.handoff_exec_collapse_abort(self.generation) {
+                ExecCollapseHandoff::Completed => return Err(ExecPrepError::Again),
+                ExecCollapseHandoff::Aborting => {
+                    self.active = false;
+                    return Err(ExecPrepError::Again);
+                }
+                ExecCollapseHandoff::Stale => return Err(ExecPrepError::StaleBinding),
             }
         }
         if !self.payload.finish_exec_collapse(self.generation) {

@@ -117,24 +117,32 @@ fn source_function_body<'a>(src: &'a str, name: &str) -> &'a str {
 
 #[test]
 fn thread_exit_repairs_userspace_before_zombie_and_process_teardown() {
-    let body = source_function_body(include_str!("execution.rs"), "fn step_thread_exit_inner");
-    let cleanup = body
-        .find("notify_thread_exit_userspace_in_aspace")
-        .expect("userspace-visible thread cleanup present");
-    let zombify = body
-        .find("set_thread_zombie(&thread")
-        .expect("thread zombify present");
-    let process_exit = body
-        .find("step_process_exit(&parent")
-        .expect("last-thread process teardown present");
-
+    let source = include_str!("execution.rs");
+    let clear_child_tid = source_function_body(source, "fn step_clear_and_wake_child_tid(");
     assert!(
-        cleanup < zombify,
-        "clear_child_tid/robust repair precedes zombify"
+        !clear_child_tid.contains("spin_loop"),
+        "clear_child_tid must return wait progress to the reactor"
     );
+    let step_body = source_function_body(source, "fn step_exit_with_cleanup<F>");
+    let cleanup = step_body
+        .find("cleanup_step(aspace")
+        .expect("userspace-visible thread cleanup step present");
+    let commit = step_body
+        .find("finish_prepared_thread_exit_with_posts(")
+        .expect("thread exit commit present");
+    assert!(cleanup < commit, "userspace cleanup precedes exit commit");
+
+    let finish_body =
+        source_function_body(source, "fn finish_prepared_thread_exit_with_posts<Z, F, G>");
+    let zombify = finish_body
+        .find("set_thread_zombie(thread")
+        .expect("thread zombify present");
+    let process_exit = finish_body
+        .find("step_process_exit_with_posts(")
+        .expect("last-thread process teardown present");
     assert!(
-        cleanup < process_exit,
-        "userspace repair precedes address-space teardown"
+        zombify < process_exit,
+        "thread zombify precedes last-thread process teardown"
     );
 }
 
@@ -266,15 +274,15 @@ fn exec_collapse_rejects_thread_exit_completion_after_remaining_reaches_zero() {
 
     assert!(payload.begin_exec_collapse(generation, 1));
     let first = payload
-        .prepare_thread_exit(leader.tid.0.wrapping_add(1))
+        .prepare_thread_exit(leader.tid.0.wrapping_add(1), ExitStatus::Exited(0))
         .expect("first distinct tid claims exit");
     let excess = payload
-        .prepare_thread_exit(leader.tid.0.wrapping_add(2))
+        .prepare_thread_exit(leader.tid.0.wrapping_add(2), ExitStatus::Exited(0))
         .expect("second distinct tid claims exit");
 
-    assert!(payload.finish_thread_exit(first, false, ExitStatus::Exited(0)));
+    assert!(payload.finish_thread_exit(first, false));
     assert!(
-        !payload.finish_thread_exit(excess, false, ExitStatus::Exited(0)),
+        !payload.finish_thread_exit(excess, false),
         "a permit cannot complete after the exec-collapse counter reaches zero"
     );
     assert!(payload.finish_exec_collapse(generation));
@@ -282,6 +290,36 @@ fn exec_collapse_rejects_thread_exit_completion_after_remaining_reaches_zero() {
     assert!(payload.release_exec_lifecycle(generation));
     drop(payload_guard);
     assert_eq!(proc_cap.live_thread_count(), 1);
+}
+
+#[test]
+fn exec_collapse_abort_of_suspended_exit_settles_attempt() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let leader = first_thread(&proc_cap);
+    let payload_guard = proc_cap.payload.lock();
+    let payload = payload_guard.as_ref().expect("process alive");
+    let generation = payload
+        .reserve_exec_lifecycle(leader.tid.0)
+        .expect("reserve exec lifecycle");
+    let sibling_tid = leader.tid.0.wrapping_add(1);
+
+    assert!(payload.begin_exec_collapse(generation, 1));
+    let permit = payload
+        .prepare_thread_exit(sibling_tid, ExitStatus::Exited(0))
+        .expect("sibling claims collapse participant");
+    assert!(payload.abort_thread_exit(sibling_tid, permit));
+    assert!(
+        payload
+            .prepare_thread_exit(sibling_tid, ExitStatus::Exited(0))
+            .is_none(),
+        "aborted participant remains tombstoned until collapse handoff"
+    );
+    assert_eq!(
+        payload.handoff_exec_collapse_abort(generation),
+        crate::process::structure::ExecCollapseHandoff::Completed
+    );
+    assert!(payload.release_exec_lifecycle(generation));
 }
 
 #[test]

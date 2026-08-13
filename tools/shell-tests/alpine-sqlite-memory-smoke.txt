@@ -1,0 +1,11 @@
+# alpine-sqlite-memory-smoke.txt - minimal sqlite3 userland smoke.
+wait "/ # " within 60000
+sleep 500
+send "command -v sqlite3\n"
+expect "/usr/bin/sqlite3" within 10000
+sleep 500
+send "sqlite3 :memory: 'select 1+2;'; echo sqlite-memory-status-$?\n"
+expect "3" within 20000
+expect "sqlite-memory-status-0" within 20000
+sleep 500
+quit

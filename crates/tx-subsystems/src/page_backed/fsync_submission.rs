@@ -23,12 +23,15 @@ impl FsyncSubmission {
             state: FsyncSubmissionState::Queued,
         }
     }
+
     pub const fn id(self) -> PageIoRequestId {
         self.id
     }
+
     pub const fn state(self) -> FsyncSubmissionState {
         self.state
     }
+
     pub fn complete(&mut self, result: Result<(), Errno>) -> bool {
         if matches!(self.state, FsyncSubmissionState::Queued) {
             self.state = FsyncSubmissionState::Complete(result);
@@ -37,6 +40,7 @@ impl FsyncSubmission {
             false
         }
     }
+
     pub fn take(&mut self) -> Option<Result<(), Errno>> {
         let FsyncSubmissionState::Complete(result) = self.state else {
             return None;
@@ -49,6 +53,7 @@ impl FsyncSubmission {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn terminal_result_is_consumed_once() {
         let mut row = FsyncSubmission::new(PageIoRequestId::new(7));

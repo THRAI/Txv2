@@ -37,6 +37,128 @@ pub enum PmapRangeError {
     MissingReservation, // reserve_mapping 返回 None（预期有预约却没有）。
 }
 
+/// 固定容量的页表失效区间收集器。
+///
+/// 相邻区间会直接合并，容量耗尽时保留精确的重试游标，供 substrate
+/// 分批完成 shootdown，整个过程不需要堆分配。
+pub struct InvalidationRunGather<const N: usize> {
+    entries: [MaybeUninit<PmapInvalidation>; N],
+    len: usize,
+    next_cursor: VirtAddr,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidationRunGatherError {
+    kind: InvalidationRunGatherErrorKind,
+    next_cursor: VirtAddr,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InvalidationRunGatherErrorKind {
+    Capacity,
+    InvalidCursor,
+    AddressOverflow,
+}
+
+impl InvalidationRunGatherError {
+    pub const fn kind(self) -> InvalidationRunGatherErrorKind {
+        self.kind
+    }
+
+    pub const fn next_cursor(self) -> VirtAddr {
+        self.next_cursor
+    }
+}
+
+impl<const N: usize> InvalidationRunGather<N> {
+    pub const fn new(next_cursor: VirtAddr) -> Self {
+        Self {
+            entries: [const { MaybeUninit::uninit() }; N],
+            len: 0,
+            next_cursor,
+        }
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub const fn next_cursor(&self) -> VirtAddr {
+        self.next_cursor
+    }
+
+    pub fn push(
+        &mut self,
+        invalidation: PmapInvalidation,
+        next_cursor: VirtAddr,
+    ) -> Result<(), InvalidationRunGatherError> {
+        let Some(invalidation_end) = invalidation.virt().0.checked_add(invalidation.size()) else {
+            return Err(InvalidationRunGatherError {
+                kind: InvalidationRunGatherErrorKind::AddressOverflow,
+                next_cursor: self.next_cursor,
+            });
+        };
+        if next_cursor.0 <= self.next_cursor.0 || next_cursor.0 < invalidation_end {
+            return Err(InvalidationRunGatherError {
+                kind: InvalidationRunGatherErrorKind::InvalidCursor,
+                next_cursor: self.next_cursor,
+            });
+        }
+        if let Some(last) = self.last_mut() {
+            let Some(last_end) = last.virt().0.checked_add(last.size()) else {
+                return Err(InvalidationRunGatherError {
+                    kind: InvalidationRunGatherErrorKind::AddressOverflow,
+                    next_cursor: self.next_cursor,
+                });
+            };
+            if last_end == invalidation.virt().0 {
+                let Some(size) = last.size().checked_add(invalidation.size()) else {
+                    return Err(InvalidationRunGatherError {
+                        kind: InvalidationRunGatherErrorKind::AddressOverflow,
+                        next_cursor: self.next_cursor,
+                    });
+                };
+                *last = PmapInvalidation::new(last.virt(), size);
+                self.next_cursor = next_cursor;
+                return Ok(());
+            }
+        }
+        if self.len == N {
+            return Err(InvalidationRunGatherError {
+                kind: InvalidationRunGatherErrorKind::Capacity,
+                next_cursor: self.next_cursor,
+            });
+        }
+        self.entries[self.len].write(invalidation);
+        self.len += 1;
+        self.next_cursor = next_cursor;
+        Ok(())
+    }
+
+    pub fn as_slice(&self) -> &[PmapInvalidation] {
+        // SAFETY: `push` 保证 [0, len) 已初始化，MaybeUninit<T> 与 T 布局相同。
+        unsafe { core::slice::from_raw_parts(self.entries.as_ptr().cast(), self.len) }
+    }
+
+    pub fn clear(&mut self, next_cursor: VirtAddr) {
+        self.len = 0;
+        self.next_cursor = next_cursor;
+    }
+
+    fn last_mut(&mut self) -> Option<&mut PmapInvalidation> {
+        if self.len == 0 {
+            None
+        } else {
+            // SAFETY: `len` 以下的元素均由 `push` 初始化。
+            Some(unsafe { self.entries[self.len - 1].assume_init_mut() })
+        }
+    }
+}
+
 impl From<PmapError> for PmapRangeError {
     fn from(value: PmapError) -> Self {
         Self::Pmap(value)

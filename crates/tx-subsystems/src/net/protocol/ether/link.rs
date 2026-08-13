@@ -279,7 +279,10 @@ impl EtherIface {
         };
 
         match repr {
-            Icmpv6Repr::Ndisc(NdiscRepr::NeighborSolicit { target_addr, lladdr }) => {
+            Icmpv6Repr::Ndisc(NdiscRepr::NeighborSolicit {
+                target_addr,
+                lladdr,
+            }) => {
                 let src = packet.src;
                 let src_mac = lladdr.and_then(ether_from_lladdr);
                 // Learn the solicitor's mapping from its source link-layer option
@@ -299,7 +302,9 @@ impl EtherIface {
                 }
             }
             Icmpv6Repr::Ndisc(NdiscRepr::NeighborAdvert {
-                target_addr, lladdr, ..
+                target_addr,
+                lladdr,
+                ..
             }) => {
                 // Learn the advertised target's mapping from its target lladdr.
                 if let Some(mac) = lladdr.and_then(ether_from_lladdr) {

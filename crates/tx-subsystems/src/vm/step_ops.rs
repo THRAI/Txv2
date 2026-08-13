@@ -15,11 +15,11 @@
 //! reactors and shim layers that drive via `tx_scripts::drive`.
 
 use crate::vm::adapter::step_engine::{
-    self, Errno, NoProgress, OneShotStepOp, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
+    self, Errno, NoProgress, PageProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
 };
 use crate::vm::{
-    AddressSpace, Prot, UserAccessKind, UserRange, UserVirtAddr, VmMapCommit, VmMapError,
-    VmMapOutcome, VmMapRequest, VmRemapOutcome, VmRemapRequest,
+    AddressSpace, Prot, UserAccessKind, UserPageIter, UserRange, UserVirtAddr, VmFaultOutcome,
+    VmMapCommit, VmMapError, VmMapOutcome, VmMapRequest, VmRemapOutcome, VmRemapRequest,
 };
 
 /// Translate a [`VmMapError`] into a substrate [`Errno`] for
@@ -33,7 +33,6 @@ fn vmmap_error_to_errno(error: VmMapError) -> Errno {
         VmMapError::WouldBlock => Errno::EAGAIN,
         VmMapError::BackingOffsetOverflow => Errno::EINVAL,
         VmMapError::Pmap(_) => Errno::EIO,
-        VmMapError::PageAlloc(_) => Errno::ENOMEM,
         VmMapError::Private(_) => Errno::ENOMEM,
     }
 }
@@ -47,32 +46,68 @@ fn range_lock_blocked<O>(aspace: &AddressSpace) -> StepOutcome<O, NoProgress> {
 // ReserveUserRangeOp
 // ---------------------------------------------------------------------------
 
-/// One-shot wrapper for eager user-range materialization before direct I/O.
+/// Waitable eager user-range materialization before direct I/O.
 ///
-/// `reserve_user_range_for_access` resolves every page inline, so it is not a
-/// RangeLock wait operation. The [`OneShotStepOp`] marker makes an accidental
-/// `Continue` or `Yield` a driver-contract violation at the syscall boundary.
+/// The page cursor advances only after the page is already accessible or its
+/// PTE publication commits. An owned fault outcome is retained while the page
+/// waits on file I/O or a RangeLock source.
 pub struct ReserveUserRangeOp<'a> {
-    pub aspace: &'a AddressSpace,
-    pub range: UserRange,
-    pub kind: UserAccessKind,
+    aspace: &'a AddressSpace,
+    kind: UserAccessKind,
+    pages: UserPageIter,
+    current_page: Option<crate::vm::UserPage>,
+    pending: Option<VmFaultOutcome>,
+}
+
+impl<'a> ReserveUserRangeOp<'a> {
+    pub fn new(aspace: &'a AddressSpace, range: UserRange, kind: UserAccessKind) -> Self {
+        Self {
+            aspace,
+            kind,
+            pages: range.iter_pages(),
+            current_page: None,
+            pending: None,
+        }
+    }
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for ReserveUserRangeOp<'a> {
     type Output = ();
-    type Progress = NoProgress;
+    type Progress = PageProgress;
 
     fn step(&mut self, ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        // Direct-I/O prefaulting has no independent authority input, but keeps
-        // the enclosing syscall subject explicit at the StepOp boundary.
         let _ = ctx.subject();
-        self.aspace
-            .reserve_user_range_for_access(self.range, self.kind)
+        let page = match self.current_page {
+            Some(page) => page,
+            None => {
+                let Some(page) = self.pages.next() else {
+                    return StepOutcome::Done(());
+                };
+                self.current_page = Some(page);
+                page
+            }
+        };
+        match self
+            .aspace
+            .reserve_user_page_for_access_step(page, self.kind, &mut self.pending)
+        {
+            StepOutcome::Done(()) => {
+                self.current_page = None;
+                StepOutcome::Continue {
+                    progress: PageProgress::new(1),
+                }
+            }
+            StepOutcome::Continue { .. } => StepOutcome::Continue {
+                progress: PageProgress::EMPTY,
+            },
+            StepOutcome::Yield { shape, .. } => StepOutcome::Yield {
+                progress: PageProgress::EMPTY,
+                shape,
+            },
+            StepOutcome::Err(errno) => StepOutcome::Err(errno),
+        }
     }
 }
-
-impl OneShotStepOp for ReserveUserRangeOp<'_> {}
-impl OneShotStepOp<crate::process::ProcessIdentity> for ReserveUserRangeOp<'_> {}
 
 // ---------------------------------------------------------------------------
 // VmMapOp

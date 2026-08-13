@@ -44,7 +44,8 @@ use crate::page_backed::{MaterializeAccess, MaterializedPage, PageIndex};
 
 use super::structure::{
     AccessMode, AddressSpace, PrivateFrame, PrivateFrameState, PrivatePageError, UserRange,
-    UserVirtAddr, VmEntry, VmEntryBacking, VmFault, VmFaultOutcome, USER_PAGE_SIZE,
+    UserVirtAddr, VmEntry, VmEntryBacking, VmFault, VmFaultError, VmFaultMaterializationStep,
+    VmFaultOutcome, USER_PAGE_SIZE,
 };
 use crate::vm::adapter::step_engine::{self as step_engine, ByteProgress, NoProgress, StepOutcome};
 use crate::vm::checks::require_fault_recipe;
@@ -76,6 +77,18 @@ impl UserAccessKind {
 }
 
 impl AddressSpace {
+    /// Return whether every page already has a PTE with the requested access.
+    ///
+    /// This is deliberately non-materializing. Synchronous syscall fast lanes
+    /// use it to decline cold ranges and fall through to their waitable driver.
+    pub fn user_range_is_ready_for_access(&self, range: UserRange, kind: UserAccessKind) -> bool {
+        range.iter_pages().all(|page| {
+            self.pmap
+                .lookup(page)
+                .is_some_and(|snapshot| snapshot.prot.permits(kind.required_prot()))
+        })
+    }
+
     /// Copy `dst.len()` bytes from user-space `src` to kernel-side `dst`.
     /// Returns the number of bytes copied (= `dst.len()` on success).
     pub fn copy_from_user(
@@ -182,15 +195,15 @@ impl AddressSpace {
     /// published pages whose protection already permits the access
     /// are skipped, so calling this twice on the same range is cheap.
     ///
-    /// Errors and Blocked propagate to the caller:
+    /// Errors and waits propagate to the caller:
     ///
     /// - `Err(Errno::EFAULT)` for unmapped pages (no recipe), for
     ///   prot-mismatch (recipe rejects the access), and for
     ///   materialisation / publication failures from the underlying
     ///   subsystems (`VmFault` / pmap surface them as opaque internal
     ///   shapes; the user-VA contract collapses every one to EFAULT).
-    /// - `Blocked(token)` if a page-cache fetch needs to await; the
-    ///   caller awaits the wait source and retries.
+    /// - `Yield(OnWaitSource)` if a page-cache fetch or RangeLock needs to
+    ///   await; the caller awaits the exact wait source and retries.
     ///
     /// Per VM_v1_2 §"No rmap": private anon frames are tracked only
     /// via published PTEs, so the pmap is the canonical authoritative
@@ -207,99 +220,22 @@ impl AddressSpace {
         range: UserRange,
         kind: UserAccessKind,
     ) -> StepOutcome<(), NoProgress> {
-        use crate::page_backed::adapter::step_engine::StepOutcome as V3;
         for page in range.iter_pages() {
-            let page_addr = match page.checked_start_addr() {
-                Ok(addr) => addr,
-                Err(_) => return V3::err(Errno::EFAULT.into()),
-            };
-            let page_range = match UserRange::containing_page(page_addr) {
-                Ok(range) => range,
-                Err(_) => return V3::err(Errno::EFAULT.into()),
-            };
-            // Keep the same per-page publication discipline as the trap fault
-            // path. This covers the pmap fast-path check, recipe observation,
-            // private-page materialization and final PTE install.
-            let _page_guard = match self
-                .range_lock
-                .acquire_step(page_range, LockMode::Materializer)
-            {
-                V3::Done(guard) => guard,
-                V3::Yield { shape, .. } => {
-                    return V3::Yield {
-                        progress: NoProgress,
-                        shape,
-                    };
+            let mut pending = None;
+            loop {
+                match self.reserve_user_page_for_access_step(page, kind, &mut pending) {
+                    StepOutcome::Done(()) => break,
+                    StepOutcome::Continue { .. } => continue,
+                    wait @ StepOutcome::Yield { .. } => return wait,
+                    error @ StepOutcome::Err(_) => return error,
                 }
-                _ => return V3::err(Errno::EFAULT.into()),
-            };
-            // Skip pages already published with sufficient protection.
-            // We only avoid re-materialisation when the cached entry
-            // already permits the requested access.
-            if let Some(snapshot) = self.pmap.lookup(page) {
-                if snapshot.prot.permits(kind.required_prot()) {
-                    continue;
-                }
-                // Insufficient cached protection is not a hard fault:
-                // fork CoW deliberately leaves parent private pages
-                // mapped read-only. If the recipe permits the requested
-                // access, fall through and materialise/publish the
-                // writable private page below.
-            }
-            // Build a synthetic fault, observe the recipe, materialise,
-            // and publish synchronously.
-            let fault = VmFault::new(page_addr, kind.required_prot());
-            let outcome: VmFaultOutcome = match require_fault_recipe(self, fault) {
-                Ok(o) => o,
-                Err(e) => {
-                    // PROBE(git fork-exec EFAULT hunt): which VA, which error.
-                    crate::vm::probe::probe_emit(
-                        "resv-fault",
-                        &[page_addr.0 as u64, vm_fault_error_probe_code(&e)],
-                    );
-                    return V3::err(Errno::EFAULT.into());
-                }
-            };
-            let materialization = match outcome.materialize_pagebacked() {
-                Ok(m) => m,
-                Err(_) => {
-                    crate::vm::probe::probe_emit("resv-mat", &[page_addr.0 as u64]);
-                    return V3::err(Errno::EFAULT.into());
-                }
-            };
-            // Publish the materialisation. `replace_existing` honours
-            // the materialisation's own intent (private CoW path sets
-            // it; otherwise false). The page-key derives from the
-            // outcome's page_range, mirroring `fault_script`.
-            if self
-                .pmap
-                .publish_page_with_replacement(
-                    outcome.page_range.start().containing_page(),
-                    materialization.page.ppn,
-                    materialization.publish_prot,
-                    materialization.page.map_pin,
-                    materialization.replace_existing,
-                )
-                .is_err()
-            {
-                crate::vm::probe::probe_emit("resv-pub", &[page_addr.0 as u64]);
-                return V3::err(Errno::EFAULT.into());
             }
         }
-        V3::done(())
+        StepOutcome::Done(())
     }
 
-    /// Wait-capable counterpart of [`Self::reserve_user_range_for_access`].
-    ///
-    /// A concurrent first-touch, CoW publication, or binding mutation can
-    /// legitimately own the page-sized `RangeLock` transaction.  That is
-    /// kernel-internal scheduling state, not an I/O failure visible to the
-    /// syscall caller.  Drop all per-attempt state, await the lock's release
-    /// notification, and retry the complete range.  Rewalking pages already
-    /// published by a previous attempt is cheap because the pmap fast path
-    /// skips them.
-    ///
-    /// No epoch guard or `RangeGuard` is held across `.await`.
+    /// 可等待的用户区间预留入口。发生页缓存或区间锁竞争时等待对应事件后重试，
+    /// 且不跨越 `.await` 保存 epoch guard 或区间锁凭据。
     pub async fn reserve_user_range_for_access_wait(
         &self,
         range: UserRange,
@@ -311,12 +247,7 @@ impl AddressSpace {
             match self.reserve_user_range_for_access(range, kind) {
                 V3::Done(()) => return Ok(()),
                 V3::Err(error) => return Err(error.into()),
-                V3::Continue { .. } => {
-                    // The current synchronous implementation never emits
-                    // Continue, but retrying preserves the step contract if a
-                    // future backend starts using it.
-                    continue;
-                }
+                V3::Continue { .. } => continue,
                 V3::Yield { shape, .. } => {
                     let token =
                         crate::vm::notification::wait_token_from_shape(&shape).ok_or(Errno::EIO)?;
@@ -326,9 +257,98 @@ impl AddressSpace {
                     ) {
                         let _ = wait.await;
                     }
-                    // `None` means the release raced ahead of registration.
-                    // Retrying immediately is both safe and necessary.
                 }
+            }
+        }
+    }
+
+    /// Perform one bounded page-reservation attempt.
+    ///
+    /// `pending` contains only an owned recipe snapshot and its optional
+    /// publication sequence. It is retained across a wait so file completion
+    /// can continue directly into materialization/publication; guards,
+    /// reservations, and `MapPin`s are always released before Yield.
+    pub(crate) fn reserve_user_page_for_access_step(
+        &self,
+        page: crate::vm::UserPage,
+        kind: UserAccessKind,
+        pending: &mut Option<VmFaultOutcome>,
+    ) -> StepOutcome<(), NoProgress> {
+        let page_addr = match page.checked_start_addr() {
+            Ok(addr) => addr,
+            Err(_) => return StepOutcome::Err(Errno::EFAULT.into()),
+        };
+        let page_range = match UserRange::containing_page(page_addr) {
+            Ok(range) => range,
+            Err(_) => return StepOutcome::Err(Errno::EFAULT.into()),
+        };
+        let _page_guard = match self
+            .range_lock
+            .acquire_step_rich(page_range, LockMode::Materializer)
+        {
+            crate::vm::AcquireResult::Acquired(guard) => guard,
+            crate::vm::AcquireResult::WouldBlock(blocked) => {
+                let token = blocked.into_wait_token();
+                return crate::vm::notification::yield_wait_token(NoProgress, token);
+            }
+        };
+
+        let cached = self.pmap.lookup(page);
+        if cached.is_some_and(|snapshot| snapshot.prot.permits(kind.required_prot())) {
+            *pending = None;
+            return StepOutcome::Done(());
+        }
+
+        if pending.is_none() {
+            let fault = VmFault::new(page_addr, kind.required_prot());
+            *pending = match require_fault_recipe(self, fault) {
+                Ok(outcome) => Some(outcome),
+                Err(_) => return StepOutcome::Err(Errno::EFAULT.into()),
+            };
+        }
+
+        let outcome = pending.as_ref().expect("pending fault outcome");
+        if kind == UserAccessKind::Write {
+            if seed_inherited_private_frame(
+                &outcome.entry,
+                outcome.page_range.start().as_usize(),
+                cached,
+            )
+            .is_err()
+            {
+                *pending = None;
+                return StepOutcome::Err(Errno::EFAULT.into());
+            }
+        }
+        let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
+        let materialization = match outcome.materialize_pagebacked_step(&guard) {
+            VmFaultMaterializationStep::Done(materialization) => materialization,
+            VmFaultMaterializationStep::Blocked(token) => {
+                drop(guard);
+                return crate::vm::notification::yield_wait_token(NoProgress, token);
+            }
+            VmFaultMaterializationStep::Err(_) => {
+                drop(guard);
+                *pending = None;
+                return StepOutcome::Err(Errno::EFAULT.into());
+            }
+        };
+        drop(guard);
+
+        match self.publish_fault_materialization_locked_ref(outcome, materialization) {
+            Ok(_) => {
+                *pending = None;
+                StepOutcome::Done(())
+            }
+            Err(VmFaultError::StaleRecipe) => {
+                *pending = None;
+                StepOutcome::Continue {
+                    progress: NoProgress,
+                }
+            }
+            Err(_) => {
+                *pending = None;
+                StepOutcome::Err(Errno::EFAULT.into())
             }
         }
     }
@@ -630,30 +650,17 @@ fn resolve_user_page_addr(
         return ResolveOutcome::Err(Errno::EFAULT);
     }
 
-    // A fork can inherit an exact resident private frame through the pmap even
-    // when the per-entry private set has no row for it. Before a write fault
-    // falls back to the recipe backing, seed that resident frame as SharedCow.
-    // The normal private materializer will then copy from the inherited bytes
-    // instead of re-deriving a stale file-cache or zero page.
-    if kind == UserAccessKind::Write && !entry.flags.shared {
-        if let (Some(snapshot), Some(set), Some(page_off)) = (
-            cached,
-            entry.private(),
-            entry.page_offset_of(UserVirtAddr(page_addr)),
-        ) {
-            if set.lookup(page_off).is_none() {
-                let cache_pin = match page_allocator::acquire_cache_pin(snapshot.ppn) {
-                    Ok(pin) => pin,
-                    Err(_) => return ResolveOutcome::Err(Errno::EFAULT),
-                };
-                let frame =
-                    PrivateFrame::new(snapshot.ppn, PrivateFrameState::SharedCow, cache_pin);
-                match set.install_if_absent(page_off, frame) {
-                    Ok(_) | Err(PrivatePageError::Conflict { .. }) => {}
-                    Err(_) => return ResolveOutcome::Err(Errno::EFAULT),
-                }
-            }
-        }
+    // `fork_aspace` can preserve a resident private page by copying its pmap
+    // entry into the child even when the corresponding `PrivatePageSet` has no
+    // row.  A subsequent kernel-side write (for example, copying a syscall
+    // result to the child's stack) must CoW from that exact inherited frame.
+    // Seed it as SharedCow before entering the normal private materializer;
+    // otherwise the backing path can re-create a zero/file page and lose the
+    // bytes represented by the inherited PTE.
+    if kind == UserAccessKind::Write
+        && seed_inherited_private_frame(&entry, page_addr, cached).is_err()
+    {
+        return ResolveOutcome::Err(Errno::EFAULT);
     }
 
     // Pmap miss (or insufficient cached prot). Materialise via the
@@ -717,6 +724,40 @@ fn resolve_user_page_addr(
             emit_vm_user_trace(b"debug.vm.user.resolve.err", 6);
             ResolveOutcome::Err(Errno::EFAULT)
         }
+    }
+}
+
+/// Make a resident read-only private PTE visible to the per-entry CoW state
+/// before either the prefault or direct-copy lane materialises a write.
+///
+/// `fork_aspace` intentionally copies pmap-only resident pages into the child.
+/// When the corresponding `PrivatePageSet` has no row, the cached PTE is the
+/// sole authoritative source of the inherited bytes.  Both syscall prefault
+/// and direct `copy_to_user` must seed the same `SharedCow` source; otherwise
+/// whichever lane runs first can re-create a zero/file backing page.
+fn seed_inherited_private_frame(
+    entry: &VmEntry,
+    page_addr: usize,
+    cached: Option<super::pmap::PmapMappingSnapshot>,
+) -> Result<(), Errno> {
+    if entry.flags.shared {
+        return Ok(());
+    }
+    let (Some(snapshot), Some(set), Some(page_off)) = (
+        cached,
+        entry.private(),
+        entry.page_offset_of(UserVirtAddr(page_addr)),
+    ) else {
+        return Ok(());
+    };
+    if set.lookup(page_off).is_some() {
+        return Ok(());
+    }
+    let cache_pin = page_allocator::acquire_cache_pin(snapshot.ppn).map_err(|_| Errno::EFAULT)?;
+    let frame = PrivateFrame::new(snapshot.ppn, PrivateFrameState::SharedCow, cache_pin);
+    match set.install_if_absent(page_off, frame) {
+        Ok(_) | Err(PrivatePageError::Conflict { .. }) => Ok(()),
+        Err(_) => Err(Errno::EFAULT),
     }
 }
 
@@ -785,6 +826,7 @@ fn resolve_user_page(
                 page_range,
                 private_identity: entry.private_identity(),
                 entry: entry.clone(),
+                recipe_generation: None,
                 access: kind.required_prot(),
                 pmap_materialization_deferred: true,
             };
@@ -864,25 +906,5 @@ fn resolve_user_page(
                 }
             }
         }
-    }
-}
-
-
-/// PROBE(git fork-exec EFAULT hunt): stable small codes for
-/// `VmFaultError` variants so the vmwatch line can carry the cause.
-fn vm_fault_error_probe_code(e: &crate::vm::VmFaultError) -> u64 {
-    use crate::vm::VmFaultError as E;
-    match e {
-        E::Range(_) => 1,
-        E::NoRecipe => 2,
-        E::ProtectionViolation => 3,
-        E::WouldBlock => 4,
-        E::BackingMismatch => 5,
-        E::BackingOffsetOverflow => 6,
-        E::PageBeyondSize => 7,
-        E::PageCache(_) => 8,
-        E::SpecialUnavailable => 9,
-        E::StaleRecipe => 10,
-        E::Pmap(_) => 11,
     }
 }

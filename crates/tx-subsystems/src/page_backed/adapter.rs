@@ -41,8 +41,6 @@ pub mod step_engine {
 pub mod wait_routing {
     use alloc::sync::Arc;
 
-    pub use tx_substrate::bus::RawQueue;
-    use tx_substrate::step::WaitSourceId;
     pub use tx_substrate::wake::{MailboxEvent, TaskMailbox, WaitSource};
 
     pub fn new_wait_source(source_id: u64) -> Arc<WaitSource> {
@@ -62,22 +60,7 @@ pub mod wait_routing {
         );
     }
 
-    pub fn new_readiness_queue(source_id: u64) -> RawQueue {
-        let queue = RawQueue::with_source_id(WaitSourceId::new(source_id));
-        crate::wait_source::register_wait_queue_with_id(source_id, queue.clone());
-        queue
-    }
-
-    pub fn notify_readiness(queue: &RawQueue, mask_bits: u64) {
-        queue.fire(mask_bits);
-    }
-
-    pub fn clear_readiness(queue: &RawQueue, mask_bits: u64) {
-        queue.clear(mask_bits);
-    }
-
     pub fn unregister_source(source_id: u64) {
         tx_substrate::wake::unregister_source(tx_substrate::step::WaitSourceId::new(source_id));
-        crate::wait_source::release_wait_source(source_id);
     }
 }

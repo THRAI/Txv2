@@ -35,7 +35,6 @@ pub(in crate::vm) use private::{
     private_page_debug_samples, private_page_debug_totals, reset_private_page_debug_totals,
 };
 pub(in crate::vm) use recipe::{
-    drain_deferred_recipe_reclaims, recipe_debug_totals, reset_recipe_debug_totals,
-    AddressSpaceStatsCell, RecipeIndex,
+    recipe_debug_totals, reset_recipe_debug_totals, AddressSpaceStatsCell, RecipeIndex,
 };
 pub(in crate::vm) use types::AddressSpaceStatsDelta;

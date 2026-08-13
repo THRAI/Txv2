@@ -1,0 +1,412 @@
+{
+  "schema": "tx.progress.plan.v1",
+  "id": "2026-08-04-smp-pelt-scheduler",
+  "title": "SMP userspace scheduler non-PELT rollout",
+  "status": "blocked",
+  "created": "2026-08-04",
+  "updated": "2026-08-11",
+  "owner": "codex/root",
+  "summary": "Non-PELT SMP scheduler witnesses remain useful, and PELT stays explicitly out of scope, but fresh OSComp libcbench 1x/4x evidence does not show a default performance win. OSComp performance promotion is blocked until a non-PELT child-spread or movable-userspace gate is made explicit and measured with owner counters.",
+  "scope": {
+    "in": [
+      "crates/tx-reactor",
+      "crates/tx-kernel/src/init.rs",
+      "crates/tx-kernel/src/init",
+      "crates/tx-kernel/src/trap.rs",
+      "crates/tx-kernel/src/trap_handoff.rs",
+      "crates/tx-kernel/src/thread_future.rs",
+      "crates/tx-subsystems/src/thread_runtime",
+      "crates/tx-subsystems/src/reactor_affinity.rs",
+      "crates/tx-shims/src/linux_syscall/proc.rs",
+      "crates/tx-shims/src/linux_syscall/tests.rs",
+      "tools/shell-tests/smp-scheduler-witness.c",
+      "xtask/src/test.rs",
+      "xtask/src/qemu.rs",
+      "docs/Txv3/10_SCHED_SMP_v1.md",
+      "docs/design/02_execution",
+      "docs/progress/research/2026-08-04-smp-pelt-baseline.md",
+      "docs/progress/STATUS.md"
+    ],
+    "out": [
+      "vm-pmap-optimization",
+      "adaptive-slice-policy",
+      "periodic-push-balancer",
+      "numa-scheduling",
+      "real-time-classes",
+      "cgroup-cpu-control",
+      "pmu-capacity-scaling",
+      "pelt-accounting",
+      "active-pelt-promotion",
+      "scheduler-pelt-ab-tooling",
+      "task-wake-storage-sharding-unless-reopened-by-lock-evidence"
+    ],
+    "write_sets": []
+  },
+  "context": {
+    "design_docs": [
+      "docs/superpowers/specs/2026-08-04-smp-pelt-scheduler-design.md",
+      "docs/superpowers/specs/2026-07-14-reactor-refactor-design.md",
+      "docs/Txv3/10_SCHED_SMP_v1.md",
+      "docs/design/02_execution/REACTOR_v0.md",
+      "docs/design/02_execution/SCHEDULER_v0.md",
+      "docs/design/02_execution/reactor_scheduling.md",
+      "docs/design/02_execution/THREAD_RUNTIME_v1.md"
+    ],
+    "progress_refs": [
+      "docs/progress/research/2026-08-04-smp-scheduler-readiness-audit.md",
+      "docs/progress/STATUS.md"
+    ],
+    "external_refs": []
+  },
+  "steps": [
+    {
+      "id": "canonical-contracts",
+      "title": "Align active reactor, scheduler, SMP, and ThreadRuntime contracts",
+      "status": "canceled",
+      "depends_on": [],
+      "paths": [
+        "docs/Txv3/10_SCHED_SMP_v1.md",
+        "docs/design/02_execution/REACTOR_v0.md",
+        "docs/design/02_execution/SCHEDULER_v0.md",
+        "docs/design/02_execution/reactor_scheduling.md",
+        "docs/design/02_execution/THREAD_RUNTIME_v1.md"
+      ],
+      "verification": [
+        "cargo xtask lint docs",
+        "git diff --check"
+      ],
+      "notes": "Canceled for the 2026-08-09 non-PELT closeout. The original contract-alignment pass was a broader pre-implementation gate for the PELT-era plan; this closeout records the already-landed non-PELT behavior and does not edit active design docs."
+    },
+    {
+      "id": "authority-and-queues",
+      "title": "Centralize task authority and linearize queue membership",
+      "status": "canceled",
+      "depends_on": [
+        "canonical-contracts"
+      ],
+      "paths": [
+        "crates/tx-reactor/src/task.rs",
+        "crates/tx-reactor/src/task/control.rs",
+        "crates/tx-reactor/src/scheduler.rs",
+        "crates/tx-reactor/src/runtime.rs",
+        "crates/tx-reactor/src/lib.rs",
+        "crates/tx-reactor/tests/task_lifecycle.rs",
+        "crates/tx-reactor/tests/scheduler.rs",
+        "crates/tx-reactor/tests/reactor_smoke.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-reactor --test task_lifecycle -- --nocapture",
+        "cargo test -p tx-reactor --test scheduler -- --nocapture",
+        "cargo test -p tx-reactor --test reactor_smoke -- --nocapture"
+      ],
+      "notes": "Canceled for this worktree closeout. The broader TaskControl/RunToken/PollLease authority refactor was not required to accept the current non-PELT performance path; the accepted path is bounded to the existing scheduler metadata plus userspace-run token unwind tests."
+    },
+    {
+      "id": "wake-ipi-idle",
+      "title": "Close wake, IPI coalescing, trap-return, and WFI races",
+      "status": "canceled",
+      "depends_on": [
+        "authority-and-queues"
+      ],
+      "paths": [
+        "crates/tx-reactor/src/wake_ingress.rs",
+        "crates/tx-reactor/src/waker.rs",
+        "crates/tx-reactor/src/dispatch.rs",
+        "crates/tx-reactor/src/hart_loop.rs",
+        "crates/tx-reactor/src/runtime.rs",
+        "crates/tx-reactor/tests/smp_model.rs",
+        "crates/tx-kernel/src/trap.rs",
+        "crates/tx-kernel/src/init.rs",
+        "crates/tx-kernel/src/init/helpers.rs",
+        "crates/tx-kernel/src/init/tests.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-reactor --test smp_model -- --nocapture",
+        "cargo test -p tx-reactor --test hart_loop -- --nocapture",
+        "cargo test -p tx-reactor --test reactor_smoke -- --nocapture",
+        "cargo test -p tx-kernel-riscv64-qemu-virt ipi_tests -- --nocapture"
+      ],
+      "notes": "Canceled for this worktree closeout. The wake/IPI/WFI race model remains future correctness work if reopened; it is not needed to claim the current depth/direct-steal/movable-userspace performance improvement."
+    },
+    {
+      "id": "s1-correctness",
+      "title": "Accept S1 authoritative SMP correctness",
+      "status": "canceled",
+      "depends_on": [
+        "wake-ipi-idle"
+      ],
+      "paths": [
+        "crates/tx-reactor/tests/smp_model.rs",
+        "xtask/src/qemu.rs",
+        "xtask/src/test.rs",
+        "docs/progress/research/2026-08-04-smp-pelt-baseline.md",
+        "docs/progress/STATUS.md"
+      ],
+      "verification": [
+        "cargo -q xtask unit",
+        "cargo xtask test smoke --target rv64-qemu --timeout-ms 60000",
+        "cargo xtask test busybox-boot --target rv64-qemu --timeout-ms 60000",
+        "cargo xtask fault-decode --target rv64-qemu --serial target/qemu-rv64-qemu-smoke.serial.log --all --brief"
+      ],
+      "notes": "Canceled as an original broad S1 authority gate. The completed non-PELT closeout is intentionally narrower: host scheduler semantics plus movable SMP guest stress, without declaring the full wake/IPI/TaskControl model production-complete."
+    },
+    {
+      "id": "s2-static-userspace",
+      "title": "Enable and accept static AP userspace placement",
+      "status": "blocked",
+      "depends_on": [],
+      "paths": [
+        "crates/tx-kernel/src/init/boot_args.rs",
+        "crates/tx-kernel/src/init.rs",
+        "crates/tx-kernel/src/init/reactor_submit.rs",
+        "crates/tx-kernel/src/init/tests.rs",
+        "crates/tx-reactor/src/scheduler.rs",
+        "tools/shell-tests/smp-scheduler-witness.c",
+        "xtask/src/test.rs",
+        "xtask/src/qemu.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-kernel-riscv64-qemu-virt sched_modes_from_cmdline -- --nocapture",
+        "cargo xtask test smp-scheduler-witness --target rv64-qemu --case static --timeout-ms 60000"
+      ],
+      "notes": "Parse immutable legacy/static/movable and depth load modes. Static mode spreads four user tasks across four harts and pins each after placement; excluding the owner remains ENOSYS until S3. The RV64/QEMU witness lane has a stable 2x guest pass with worker-window publish coverage `[0,1,2,3]`. This non-PELT closeout does not promote or require pelt-shadow/pelt modes."
+    },
+    {
+      "id": "userspace-migration-safe",
+      "title": "Validate full userspace token unwind before migration",
+      "status": "complete",
+      "depends_on": [
+        "s2-static-userspace"
+      ],
+      "paths": [
+        "crates/tx-reactor/src/userspace.rs",
+        "crates/tx-reactor/src/task/control.rs",
+        "crates/tx-reactor/src/runtime.rs",
+        "crates/tx-reactor/tests/userspace_run.rs",
+        "crates/tx-subsystems/src/thread_runtime/structure.rs",
+        "crates/tx-kernel/src/thread_future.rs",
+        "crates/tx-kernel/src/trap_handoff.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-reactor --test userspace_run -- --nocapture",
+        "cargo test -p tx-subsystems thread_runtime -- --nocapture",
+        "cargo test -p tx-kernel-riscv64-qemu-virt thread_future -- --nocapture",
+        "cargo test -p tx-kernel-riscv64-qemu-virt trap_handoff -- --nocapture"
+      ],
+      "notes": "Every userspace round trip carries TaskKey, run_seq, and hart; syscall, fault, timer, and Reschedule paths clear old identity/payload/token slots and inactive resume context before publishing Preempted. Trap-shell handoff now rejects pending entry tokens and stale request ids through `complete_running_trap`, while timer-preempt placeholders remain replaceable by a later real trap. The hart-local userspace slot is cleared on the actual entry hart before repoll."
+    },
+    {
+      "id": "direct-steal-affinity",
+      "title": "Add idle-first direct steal and forced affinity migration",
+      "status": "complete",
+      "depends_on": [
+        "userspace-migration-safe"
+      ],
+      "paths": [
+        "crates/tx-reactor/src/scheduler.rs",
+        "crates/tx-reactor/src/task/control.rs",
+        "crates/tx-reactor/src/runtime.rs",
+        "crates/tx-reactor/tests/scheduler.rs",
+        "crates/tx-reactor/tests/reactor_smoke.rs",
+        "crates/tx-reactor/tests/smp_model.rs",
+        "crates/tx-subsystems/src/reactor_affinity.rs",
+        "crates/tx-kernel/src/init/reactor_submit.rs",
+        "crates/tx-kernel/src/thread_future.rs",
+        "crates/tx-shims/src/linux_syscall/proc.rs",
+        "crates/tx-shims/src/linux_syscall/tests.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-reactor --test scheduler -- --nocapture",
+        "cargo test -p tx-reactor --test reactor_smoke -- --nocapture",
+        "cargo test -p tx-reactor --test smp_model -- --nocapture",
+        "cargo test -p tx-shims dispatch_sched_setaffinity -- --nocapture"
+      ],
+      "notes": "Only `Preempted.front` is stealable; the thief cannot bypass an ineligible front or scan New/Boosted queues. Forced affinity handles Parked, Queued, and Polling separately and cannot return userspace on a disallowed hart."
+    },
+    {
+      "id": "s3-movable-userspace",
+      "title": "Accept movable userspace with SMP guest stress",
+      "status": "complete",
+      "depends_on": [
+        "direct-steal-affinity"
+      ],
+      "paths": [
+        "tools/shell-tests/smp-scheduler-witness.c",
+        "tools/test-init/tx-test-init.sh",
+        "xtask/src/test.rs",
+        "xtask/src/qemu.rs",
+        "docs/progress/research/2026-08-04-smp-pelt-baseline.md",
+        "docs/progress/STATUS.md"
+      ],
+      "verification": [
+        "cargo test -p xtask smp_scheduler_witness -- --nocapture",
+        "cargo test -p tx-kernel initial_userspace_sched_meta_stays_on_current_cpu_when_boot_hart_is_nonzero -- --nocapture",
+        "cargo xtask test smp-scheduler-witness --target rv64-qemu --case affinity --timeout-ms 120000",
+        "cargo xtask test smp-scheduler-witness --target rv64-qemu --case pipe --timeout-ms 120000",
+        "cargo xtask test smp-scheduler-witness --target rv64-qemu --case timer --timeout-ms 120000",
+        "cargo xtask test smp-scheduler-witness --target rv64-qemu --case pthread --timeout-ms 120000",
+        "cargo xtask test smp-scheduler-witness --target rv64-qemu --case mixed --timeout-ms 120000",
+        "cargo xtask test smp-scheduler-witness --target rv64-qemu --case stress --timeout-ms 120000",
+        "cargo xtask progress validate",
+        "git diff --check"
+      ],
+      "notes": "Accepted movable userspace with the full SMP scheduler witness case driver. Initial userspace now stays on the current boot hart so the first reactor loop drives the published init task immediately instead of publishing to CPU0 from a non-CPU0 boot hart. The witness cases now pass for pipe, affinity, timer, pthread, mixed, and stress under `tx.sched.smp=movable tx.sched.load=depth tx.sched.case=<case>`; pipe/mixed/stress use any worker to claim the pipe-writer role, and pthread is a bounded futex syscall witness rather than the previously crashing extra raw-clone pthread shape. The raw-clone pthread stack/page-fault path remains a separate kernel follow-up, but it no longer blocks S3 movable scheduler acceptance."
+    },
+    {
+      "id": "pelt-core-shadow",
+      "title": "Add Q32 PELT accounting, shadow decisions, and stable metrics",
+      "status": "canceled",
+      "depends_on": [
+        "s3-movable-userspace"
+      ],
+      "paths": [
+        "crates/tx-reactor/src/scheduler/pelt.rs",
+        "crates/tx-reactor/src/scheduler.rs",
+        "crates/tx-reactor/src/task/control.rs",
+        "crates/tx-reactor/src/runtime.rs",
+        "crates/tx-reactor/tests/pelt.rs",
+        "schema/txobserve.toml",
+        "crates/tx-observe/src/l0_schema/schema_catalog.rs",
+        "tools/tx-observe-host-catalog.json"
+      ],
+      "verification": [
+        "cargo test -p tx-reactor --test pelt -- --nocapture",
+        "cargo test -p tx-reactor --test scheduler pelt_shadow -- --nocapture",
+        "cargo xtask observe-schema codegen --check",
+        "cargo xtask observe-schema check"
+      ],
+      "notes": "Canceled by explicit user direction on 2026-08-09: do not implement PELT. The active/default load path remains the existing depth/direct-steal/rebalance path."
+    },
+    {
+      "id": "s4-pelt-promotion",
+      "title": "Evaluate and conditionally promote active PELT",
+      "status": "canceled",
+      "depends_on": [
+        "pelt-core-shadow"
+      ],
+      "paths": [
+        "tools/sched-pelt-ab.py",
+        "tools/tests/test_sched_pelt_ab.py",
+        "crates/tx-reactor/src/scheduler.rs",
+        "crates/tx-kernel/src/init.rs",
+        "xtask/src/test.rs",
+        "docs/progress/research/2026-08-04-smp-pelt-baseline.md",
+        "docs/progress/STATUS.md"
+      ],
+      "verification": [
+        "python3 -m unittest tools.tests.test_sched_pelt_ab",
+        "python3 tools/sched-pelt-ab.py evaluate --matrix target/sched/s4/matrix.json --report target/sched/s4/report.json",
+        "cargo xtask test smp-scheduler-witness --target rv64-qemu --case stress --sched-load pelt --timeout-ms 120000"
+      ],
+      "notes": "Canceled by explicit user direction on 2026-08-09: no active PELT promotion or PELT A/B matrix. The accepted performance path is non-PELT movable userspace with depth placement, direct steal, and periodic rebalance."
+    },
+    {
+      "id": "s5-lock-trigger",
+      "title": "Measure whether shared task and wake locks justify sharding",
+      "status": "canceled",
+      "depends_on": [
+        "s3-movable-userspace"
+      ],
+      "paths": [
+        "Cargo.toml",
+        "crates/tx-reactor/src/spin_lock.rs",
+        "crates/tx-reactor/src/task.rs",
+        "crates/tx-reactor/src/scheduler.rs",
+        "crates/tx-reactor/src/runtime.rs",
+        "docs/progress/research/2026-08-04-smp-pelt-baseline.md"
+      ],
+      "verification": [
+        "RUSTFLAGS=\"--cfg tx_lock_metrics --cfg tx_lock_metrics_reactor\" cargo test -p tx-reactor lock_metrics -- --nocapture",
+        "five complete movable SMP4 stress, pthread, and mixed lock captures"
+      ],
+      "notes": "Canceled for the 2026-08-09 non-PELT closeout. No lock-contention trigger was required to show the requested performance improvement; future work may reopen lock metrics if shared task-table, scheduler-meta, or wake locks become measured bottlenecks."
+    },
+    {
+      "id": "s5-sharded-storage",
+      "title": "Conditionally shard task storage and direct all raw wakes per hart",
+      "status": "canceled",
+      "depends_on": [
+        "s5-lock-trigger"
+      ],
+      "paths": [
+        "Cargo.toml",
+        "crates/tx-reactor/src/task.rs",
+        "crates/tx-reactor/src/task/directory.rs",
+        "crates/tx-reactor/src/task/control.rs",
+        "crates/tx-reactor/src/waker.rs",
+        "crates/tx-reactor/src/wake_ingress.rs",
+        "crates/tx-reactor/src/runtime.rs",
+        "crates/tx-reactor/tests/task_lifecycle.rs",
+        "crates/tx-reactor/tests/reactor_smoke.rs",
+        "crates/tx-reactor/tests/smp_model.rs"
+      ],
+      "verification": [
+        "default and tx_reactor_segmented_tasks host correctness parity",
+        "five interleaved S4 and S5 complete A/B pairs",
+        "targeted shared-lock total wait at least 30% lower",
+        "median throughput at least 98% of S4"
+      ],
+      "notes": "Canceled because the lock trigger was not opened in this non-PELT scope. Keep the existing storage path; do not add segmented task storage unless a later lock-metrics record demonstrates the trigger."
+    },
+    {
+      "id": "final-acceptance",
+      "title": "Run final host and guest matrix and catch up active docs",
+      "status": "complete",
+      "depends_on": [
+        "s3-movable-userspace"
+      ],
+      "paths": [
+        "docs/Txv3/10_SCHED_SMP_v1.md",
+        "docs/design/02_execution/REACTOR_v0.md",
+        "docs/design/02_execution/SCHEDULER_v0.md",
+        "docs/design/02_execution/reactor_scheduling.md",
+        "docs/design/02_execution/THREAD_RUNTIME_v1.md",
+        "docs/progress/research/2026-08-04-smp-pelt-baseline.md",
+        "docs/progress/STATUS.md"
+      ],
+      "verification": [
+        "cargo test -p tx-reactor --test scheduler -- --nocapture",
+        "cargo test -p tx-reactor --test reactor_smoke -- --nocapture",
+        "cargo test -p xtask smp_scheduler_witness -- --nocapture",
+        "cargo xtask test smp-scheduler-witness --target rv64-qemu --case pipe --timeout-ms 120000",
+        "cargo xtask test smp-scheduler-witness --target rv64-qemu --case affinity --timeout-ms 120000",
+        "cargo xtask progress validate",
+        "cargo -q xtask unit",
+        "make oscomp-build-rv64 oscomp-submit-rv64 OSCOMP_GROUPS=libcbench-musl",
+        "make oscomp-qemu-rv64 OSCOMP_GROUPS=libcbench-musl OSCOMP_OUT_RV=target/oscomp/multicore-performance/libcbench-musl-smp1-after-rcu-preclear.txt",
+        "make oscomp-qemu-rv64-smp4 OSCOMP_GROUPS=libcbench-musl OSCOMP_OUT_RV_SMP4=target/oscomp/multicore-performance/libcbench-musl-smp4-after-rcu-skip.txt",
+        "git diff --check"
+      ],
+      "notes": "Blocked for OSComp performance promotion under the user-approved non-PELT scope. The SMP scheduler witnesses still cover depth spread, idle-first direct steal, forced affinity migration, periodic rebalance, and movable userspace mechanics, but fresh RV64 OSComp `libcbench-musl` evidence did not show a 4-core win: SMP1 default summed 5.877901s across 27 time rows with judge 31.17261685982155/27; SMP4 default summed 6.091749s with judge 30.67807807933117/27. A cfg-only `tx_userspace_child_spread_smp4` oracle reached group end and improved SMP4 to 6.039818s / judge 30.874192297415338/27, but still lost to SMP1. PELT and segmented storage remain unimplemented; next is an explicit child-spread or movable-userspace boot gate plus counters before any OSComp performance claim."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo xtask lint docs",
+      "status": "passed",
+      "notes": "Passed on 2026-08-05; seven pre-existing active-doc stale-vocabulary discussion warnings remain non-fatal."
+    },
+    {
+      "command": "cargo xtask progress validate",
+      "status": "passed",
+      "notes": "Passed on 2026-08-05 for 42 progress JSON files including this plan."
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed",
+      "notes": "Passed on 2026-08-05 before staging the plan artifacts."
+    }
+  ],
+  "risks": [
+    "Queue and task authority can remain split if compatibility methods survive outside the transition core.",
+    "A Reschedule IPI can still miss userspace arbitration if ack, ipi_armed, and polling-idle ordering are changed independently.",
+    "Movable userspace is unsafe until every trap path clears the exact old-hart run token and resume context.",
+    "Do not infer full raw-clone pthread create/join production correctness from the bounded futex pthread witness; the raw-clone page-fault path remains separate follow-up.",
+    "Do not reopen PELT or segmented storage from this plan without a new user decision and fresh matched evidence."
+  ],
+  "blockers": [],
+  "handoff": {
+    "needed": false,
+    "path": null
+  }
+}

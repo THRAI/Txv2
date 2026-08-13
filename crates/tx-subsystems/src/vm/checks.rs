@@ -5,6 +5,9 @@
 //! and return the evidence execution needs, while reservation and mutation stay
 //! in `execution.rs`.
 
+#[cfg(test)]
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 use crate::vm::adapter::step_engine::{self as step_engine};
 use crate::vm::structure::recipe_tree::VmEntryView;
 use crate::vm::{
@@ -13,12 +16,29 @@ use crate::vm::{
     VmMapError, VmRemapPlacement,
 };
 
+#[cfg(test)]
+static FAULT_PUBLICATION_FULL_REVALIDATE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(in crate::vm) fn reset_fault_publication_full_revalidate_count() {
+    FAULT_PUBLICATION_FULL_REVALIDATE_COUNT.store(0, Ordering::Release);
+}
+
+#[cfg(test)]
+pub(in crate::vm) fn fault_publication_full_revalidate_count() -> usize {
+    FAULT_PUBLICATION_FULL_REVALIDATE_COUNT.load(Ordering::Acquire)
+}
+
 pub fn require_fault_recipe(
     aspace: &AddressSpace,
     fault: VmFault,
 ) -> Result<VmFaultOutcome, VmFaultError> {
     let page_range = UserRange::containing_page(fault.addr).map_err(VmFaultError::Range)?;
-    let entry = aspace.lookup(fault.addr).ok_or(VmFaultError::NoRecipe)?;
+    let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
+    let (entry, recipe_generation) = aspace
+        .recipes
+        .lookup_stamped(fault.addr, &guard)
+        .ok_or(VmFaultError::NoRecipe)?;
     if !permits_fault(&entry, fault.access) {
         return Err(VmFaultError::ProtectionViolation);
     }
@@ -27,6 +47,7 @@ pub fn require_fault_recipe(
         page_range,
         private_identity: entry.private_identity(),
         entry,
+        recipe_generation,
         access: fault.access,
         pmap_materialization_deferred: aspace.pmap().materialization_deferred(),
     })
@@ -37,7 +58,30 @@ pub fn require_fault_publication(
     outcome: &VmFaultOutcome,
     materialization: &VmFaultMaterialization,
 ) -> Result<(), VmFaultError> {
-    let guard = step_engine::guard();
+    require_fault_materialization(outcome, materialization)?;
+
+    // Async materialization may have dropped its earlier observation before
+    // the final page transaction. Revalidate the private-page winner as well
+    // as the recipe generation so a stale CoW frame cannot replace the page
+    // installed by a concurrent writer.
+    if let Some(private) = outcome.entry.private() {
+        let page_off = outcome.private_page_off()?;
+        if let Some(current) = private.lookup(page_off) {
+            if current.ppn != materialization.page.ppn {
+                return Err(VmFaultError::StaleRecipe);
+            }
+        }
+    }
+
+    let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
+    if outcome.recipe_generation.is_some()
+        && aspace.recipes.stable_generation(&guard) == outcome.recipe_generation
+    {
+        return Ok(());
+    }
+
+    #[cfg(test)]
+    FAULT_PUBLICATION_FULL_REVALIDATE_COUNT.fetch_add(1, Ordering::AcqRel);
     let entry = aspace
         .recipes
         .lookup_view(outcome.page_range.start(), &guard)
@@ -48,27 +92,21 @@ pub fn require_fault_publication(
     if entry.private.map(|private| private.raw()) != outcome.private_identity {
         return Err(VmFaultError::StaleRecipe);
     }
-    // Resolve and final materialization are separated by optional async work.
-    // Once the final page-level Materializer is acquired, revalidate the
-    // private-page winner before publishing; an earlier observation may have
-    // gone stale while no reservation was held.
-    if let Some(private) = outcome.entry.private() {
-        let page_off = outcome.private_page_off()?;
-        if let Some(current) = private.lookup(page_off) {
-            if current.ppn != materialization.page.ppn {
+
+    Ok(())
+}
+
+fn require_fault_materialization(
+    outcome: &VmFaultOutcome,
+    materialization: &VmFaultMaterialization,
+) -> Result<(), VmFaultError> {
+    match (outcome.entry.backing_kind(), materialization.backing) {
+        (VmEntryBacking::None, VmFaultMaterializationBacking::Special(special)) => {
+            if outcome.entry.special_backing() != Some(special)
+                || materialization.page_index.as_u64() != 0
+            {
                 return Err(VmFaultError::StaleRecipe);
             }
-        }
-    }
-
-    match (entry.backing, materialization.backing) {
-        (VmEntryBacking::None, VmFaultMaterializationBacking::Special(special)) => {
-            if view_matches_entry(entry, &outcome.entry)
-                && outcome.entry.special_backing() == Some(special)
-            {
-                return Ok(());
-            }
-            return Err(VmFaultError::StaleRecipe);
         }
         (VmEntryBacking::Page { .. }, VmFaultMaterializationBacking::PageBacked) => {
             if outcome.backing_page_index()? != materialization.page_index {
@@ -82,7 +120,6 @@ pub fn require_fault_publication(
         }
         _ => return Err(VmFaultError::StaleRecipe),
     }
-
     Ok(())
 }
 
@@ -116,7 +153,7 @@ pub fn require_map_admission(
     entry: &VmEntry,
     placement: MapPlacement,
 ) -> Result<(), VmMapError> {
-    let guard = step_engine::guard();
+    let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
     aspace.recipes.validate_map(entry, placement, &guard)
 }
 
