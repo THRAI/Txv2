@@ -1,4 +1,4 @@
-//! Immutable boot facts recovered from the 2K1000 U-Boot EFI handoff.
+//! Immutable boot facts recovered from the 2K1000 U-Boot handoff.
 
 use core::sync::atomic::{AtomicU8, Ordering};
 
@@ -117,7 +117,7 @@ struct EfiConfigurationTable {
     table: u64,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FdtBlob {
     phys: usize,
     size: usize,
@@ -205,9 +205,16 @@ pub(crate) fn ensure_static_boot_facts() {
 fn publish() {
     let args = super::boot_args::snapshot();
     let kernel_image = linked_kernel_image();
-    let cmdline_len =
+    let fdt = unsafe { find_handoff_fdt(args.system_table.0, args.reserved) };
+    let raw_cmdline_len =
         unsafe { copy_cmdline(args.cmdline.0, &mut *core::ptr::addr_of_mut!(CMDLINE)) };
-    let fdt = unsafe { find_efi_fdt(args.system_table.0) };
+    let cmdline_len = if raw_cmdline_len != 0 {
+        raw_cmdline_len
+    } else {
+        fdt.map_or(0, |blob| unsafe {
+            copy_fdt_cmdline(blob, &mut *core::ptr::addr_of_mut!(CMDLINE))
+        })
+    };
     let initrd = fdt.and_then(|blob| unsafe { parse_fdt_initrd(blob, kernel_image) });
     let timebase = la64_detect_timebase_frequency_hz();
     let cmdline = if cmdline_len == 0 {
@@ -377,6 +384,26 @@ unsafe fn find_efi_fdt(system_table: usize) -> Option<FdtBlob> {
     None
 }
 
+/// Recover the FDT from either 2K1000 U-Boot handoff variant seen in the wild.
+///
+/// The 1 GiB factory image publishes the FDT through the EFI configuration
+/// table.  The otherwise-identical 2 GiB image still supplies the EFI system
+/// table, but passes the live FDT directly in the fifth entry argument.  Keep
+/// the EFI table authoritative and accept the direct pointer only as a
+/// fail-closed fallback through the same address, header, and RAM validation.
+unsafe fn find_handoff_fdt(system_table: usize, direct_fdt: usize) -> Option<FdtBlob> {
+    select_handoff_fdt(unsafe { find_efi_fdt(system_table) }, || unsafe {
+        validate_fdt_blob(direct_fdt)
+    })
+}
+
+fn select_handoff_fdt(
+    efi_fdt: Option<FdtBlob>,
+    direct_fdt: impl FnOnce() -> Option<FdtBlob>,
+) -> Option<FdtBlob> {
+    efi_fdt.or_else(direct_fdt)
+}
+
 unsafe fn validate_fdt_blob(address: usize) -> Option<FdtBlob> {
     let phys = normalize_firmware_address(address)?;
     let header = unsafe { read_boot::<[u8; 8]>(address)? };
@@ -451,6 +478,57 @@ unsafe fn parse_fdt_initrd(fdt_blob: FdtBlob, kernel_image: PhysRange) -> Option
     })
 }
 
+unsafe fn copy_fdt_cmdline(fdt_blob: FdtBlob, out: &mut [u8]) -> usize {
+    let Some(fdt_ptr) = boot_ptr::<u8>(fdt_blob.phys) else {
+        return 0;
+    };
+    let Ok(fdt) = (unsafe { fdt::Fdt::from_ptr_unaligned_fallible(fdt_ptr) }) else {
+        return 0;
+    };
+    let Ok(Some(chosen)) = fdt.find_node("/chosen") else {
+        return 0;
+    };
+    let Ok(Some(property)) = chosen.as_node().raw_property("bootargs") else {
+        return 0;
+    };
+    copy_fdt_cmdline_value(property.value, out)
+}
+
+fn copy_fdt_cmdline_value(value: &[u8], out: &mut [u8]) -> usize {
+    if value.last() != Some(&0) {
+        return 0;
+    }
+    let mut total = 0usize;
+    let mut count = 0usize;
+    for part in value
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+    {
+        total = total
+            .checked_add(part.len())
+            .and_then(|size| size.checked_add(usize::from(count != 0)))
+            .unwrap_or(usize::MAX);
+        count += 1;
+    }
+    if count == 0 || total > out.len() {
+        return 0;
+    }
+
+    let mut written = 0usize;
+    for part in value
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+    {
+        if written != 0 {
+            out[written] = b' ';
+            written += 1;
+        }
+        out[written..written + part.len()].copy_from_slice(part);
+        written += part.len();
+    }
+    written
+}
+
 fn ram_bytes_remaining(start: usize) -> Option<usize> {
     let ram0_end = LA2K1000_RAM0_BASE.checked_add(LA2K1000_RAM0_SIZE)?;
     let ram1_end = LA2K1000_RAM1_BASE.checked_add(LA2K1000_RAM1_SIZE)?;
@@ -515,6 +593,39 @@ mod tests {
             Some(0x9800_0000)
         );
         assert_eq!(normalize_firmware_address(0xa000_0000_9800_0000), None);
+    }
+
+    #[test]
+    fn direct_fdt_is_a_validated_fallback_without_overriding_efi() {
+        let efi = FdtBlob {
+            phys: 0x0a00_0000,
+            size: 0x1000,
+        };
+        let direct = FdtBlob {
+            phys: 0x0b00_0000,
+            size: 0x2000,
+        };
+
+        assert_eq!(select_handoff_fdt(None, || Some(direct)), Some(direct));
+        assert_eq!(
+            select_handoff_fdt(Some(efi), || panic!("direct fallback must stay lazy")),
+            Some(efi)
+        );
+    }
+
+    #[test]
+    fn fdt_bootargs_fallback_flattens_one_bounded_nul_terminated_string_list() {
+        let mut out = [0u8; 32];
+        let value = b"tx.profile=alpine\0tx.root=tmpfs\0";
+        let len = copy_fdt_cmdline_value(value, &mut out);
+        assert_eq!(&out[..len], b"tx.profile=alpine tx.root=tmpfs");
+
+        assert_eq!(copy_fdt_cmdline_value(b"missing-nul", &mut out), 0);
+        assert_eq!(copy_fdt_cmdline_value(b"\0", &mut out), 0);
+        assert_eq!(
+            copy_fdt_cmdline_value(b"this-value-is-too-long-for-output\0", &mut out),
+            0
+        );
     }
 
     #[test]

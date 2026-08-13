@@ -1,3 +1,22 @@
+- 2026-08-13 (**Loongson 2K1000 2 GiB replacement board network/Git validation complete**).
+  **Changed**: `boards/tx-hal-loongarch64-2k1000/src/boot_facts.rs` now keeps the
+  EFI FDT authoritative but accepts a fully validated direct `a3` FDT fallback,
+  and falls back from an absent raw command line to bounded `/chosen/bootargs`
+  string-list flattening. This supports the new board's U-Boot handoff without
+  touching the shared LA QEMU TLB repair. **Verification**: formatting passed,
+  2K HAL passed 31/31, the physical target full-build and uImage packaging
+  passed, and the exact deployed kernel booted 2048 MiB with both CPUs online.
+  With the actual txKernel interface `eth0` configured, LAN/NAT/DNS/TLS passed;
+  a retry completed the full non-shallow 7818-object/4137-delta/17.47 MiB clone,
+  post-clone Git/file/status/idle checks passed, and concurrent host ping was
+  1077/1077 with no loss. No pin/stack/cmdline/state invariant or kernel panic
+  appeared. **Next**: make the reusable sidecar script discover the non-loopback
+  interface instead of assuming old-board `eth1`; user-owned credential
+  push/web-edit/pull remains separate. **Blocker**: none for kernel-owned network
+  validation; one earlier long TLS connection closed with `SSL_ERROR_SYSCALL`,
+  but short TLS and the clean full retry passed. Detailed evidence is in
+  `msp/debug-logs/2026-08-13-la2k1000-2g-network-validation.md` and the LA handoff.
+
 - 2026-08-11 (**Loongson 2K1000 AHCI 可写传输、板载持久化与完整 Git/TLS 负载均已实板闭合**).
   **Changed**：以 `42cd4396` 为实现基线，先新增
   `2026-08-11-la2k1000-ahci-write` 计划与逐阶段实验协议，再按红→绿顺序实现。
