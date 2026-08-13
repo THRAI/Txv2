@@ -16,7 +16,7 @@ use crate::devfs::adapter::step_engine::{
 use tx_ext4::planner::Ext4BlockGeometry;
 use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
 use tx_ext4_format::{Ext4FormatError, Result};
-use tx_subsystems::device::{self, BlockDevice, BlockDeviceHandle, PhysicalBlockNumber};
+use tx_subsystems::device::{self, BlockDeviceHandle, BlockDeviceRegistration};
 use tx_subsystems::execution::Errno;
 use tx_subsystems::io_manager::block::DeviceKey;
 use tx_subsystems::page_backed::{Frame, PageContainer};
@@ -52,34 +52,37 @@ impl tx_ext4::mount::FilePageContainerBinder for Ext4FileIoRuntimeBinder {
 
 /// A `BlockImage` that reads through a kernel block device.
 ///
-/// The underlying `&'static dyn BlockDevice` is expected to outlive this
-/// adapter — typically by leaking the device through
-/// `Box::leak` at boot (see `crates/tx-kernel/src/devices.rs`).
+/// The handle is the single source of device identity and bounds for the
+/// image, its journal, and file-I/O runtime binder.
 pub struct BlockDeviceImage {
-    device: &'static dyn BlockDevice,
+    handle: BlockDeviceHandle,
     cache: SpinMutex<ReadBlockCache>,
 }
 
 impl BlockDeviceImage {
-    pub fn new(device: &'static dyn BlockDevice) -> Self {
+    pub fn new(handle: BlockDeviceHandle) -> Self {
         Self {
-            device,
+            handle,
             cache: SpinMutex::new(ReadBlockCache::new()),
         }
     }
 
-    fn sectors_per_ext4_block(&self) -> Option<u64> {
-        let sector = self.device.block_size() as u64;
-        if sector == 0 || !(BLOCK_SIZE as u64).is_multiple_of(sector) {
-            return None;
-        }
-        Some(BLOCK_SIZE as u64 / sector)
+    /// Compatibility constructor for callers mounting an entire device.
+    pub fn whole(reg: &'static BlockDeviceRegistration) -> Self {
+        Self::new(BlockDeviceHandle::whole(reg))
     }
 
-    /// Bind this image's 4 KiB ext4 blocks to its registered L6 device key.
-    /// The caller owns the key because `BlockDevice` deliberately exposes no
-    /// registry identity and guessing one would misroute I/O.
-    pub fn block_geometry(&self, device: DeviceKey) -> Option<Ext4BlockGeometry> {
+    pub const fn handle(&self) -> BlockDeviceHandle {
+        self.handle
+    }
+
+    fn sectors_per_ext4_block(&self) -> Option<u64> {
+        self.handle.blocks_per_frame()
+    }
+
+    /// Bind this image's 4 KiB ext4 blocks to the handle's registered device.
+    pub fn block_geometry(&self) -> Option<Ext4BlockGeometry> {
+        let device = DeviceKey::new(self.handle.registration().devt.raw());
         self.sectors_per_ext4_block()
             .map(|sectors_per_block| Ext4BlockGeometry::new(device, sectors_per_block))
     }
@@ -121,9 +124,7 @@ impl BlockDeviceImage {
         // ops ignore the guard parameter entirely.  Fall back to a fresh guard
         // when no guard is active.
         let guard = borrow_current_guard().unwrap_or_else(guard);
-        let outcome = self
-            .device
-            .read_blocks(PhysicalBlockNumber::new(lba), &mut frames, &guard);
+        let outcome = self.handle.read_blocks(lba, &mut frames, &guard);
         drop(guard);
         match outcome {
             StepOutcome::Done(()) => {}
@@ -166,7 +167,7 @@ impl BlockImage for BlockDeviceImage {
         let Some(spb) = self.sectors_per_ext4_block() else {
             return 0;
         };
-        self.device.total_blocks() / spb
+        self.handle.len_lba() / spb
     }
 
     fn read_block(&self, block: u64, out: &mut Page4K) -> Result<()> {
@@ -228,11 +229,9 @@ impl BlockImage for BlockDeviceImage {
         }
 
         let guard = borrow_current_guard().unwrap_or_else(guard);
-        let outcome = self.device.write_blocks(
-            PhysicalBlockNumber::new(lba),
-            core::slice::from_ref(&frame),
-            &guard,
-        );
+        let outcome = self
+            .handle
+            .write_blocks(lba, core::slice::from_ref(&frame), &guard);
         drop(guard);
         drop(run);
         match outcome {
@@ -250,7 +249,7 @@ impl BlockImage for BlockDeviceImage {
 
     fn barrier(&mut self) -> Result<()> {
         let guard = borrow_current_guard().unwrap_or_else(guard);
-        let outcome = self.device.barrier(&guard);
+        let outcome = self.handle.barrier(&guard);
         drop(guard);
         match outcome {
             StepOutcome::Done(()) => Ok(()),
@@ -357,7 +356,8 @@ mod tests {
     use crate::devfs::adapter::step_engine::{page_allocator, NoProgress};
     use core::sync::atomic::{AtomicUsize, Ordering};
     use tx_subsystems::device::{
-        BlockDeviceHandle, BlockDeviceOps, BlockDeviceRegistration, DevT, PhysicalBlockNumber,
+        BlockDevice, BlockDeviceHandle, BlockDeviceOps, BlockDeviceRegistration,
+        BlockDurabilityCapabilities, DevT, PhysicalBlockNumber,
     };
     use tx_subsystems::execution::Guard;
 
@@ -445,6 +445,13 @@ mod tests {
         fn barrier(&self, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
             self.outcome()
         }
+
+        fn durability_capabilities(&self) -> BlockDurabilityCapabilities {
+            BlockDurabilityCapabilities {
+                fua: false,
+                flush: true,
+            }
+        }
     }
 
     impl BlockDevice for BlockingBlockDevice {
@@ -463,6 +470,11 @@ mod tests {
         devt: DevT::new(8, 65),
         name: "ext4-test",
         ops: &CONTINUE_DEVICE,
+    };
+    static YIELD_REGISTRATION: BlockDeviceRegistration = BlockDeviceRegistration {
+        devt: DevT::new(8, 66),
+        name: "ext4-yield-test",
+        ops: &YIELD_DEVICE,
     };
 
     struct ErrorBlockDevice {
@@ -491,6 +503,13 @@ mod tests {
         fn barrier(&self, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
             StepOutcome::Err(self.error)
         }
+
+        fn durability_capabilities(&self) -> BlockDurabilityCapabilities {
+            BlockDurabilityCapabilities {
+                fua: false,
+                flush: true,
+            }
+        }
     }
 
     impl BlockDevice for ErrorBlockDevice {
@@ -507,10 +526,21 @@ mod tests {
         error: Errno::EROFS,
     };
     static IO_ERROR_DEVICE: ErrorBlockDevice = ErrorBlockDevice { error: Errno::EIO };
+    static READ_ONLY_REGISTRATION: BlockDeviceRegistration = BlockDeviceRegistration {
+        devt: DevT::new(8, 67),
+        name: "ext4-read-only-test",
+        ops: &READ_ONLY_DEVICE,
+    };
+    static IO_ERROR_REGISTRATION: BlockDeviceRegistration = BlockDeviceRegistration {
+        devt: DevT::new(8, 68),
+        name: "ext4-io-error-test",
+        ops: &IO_ERROR_DEVICE,
+    };
 
     struct RecordingBlockDevice {
         reads: AtomicUsize,
         last_frames: AtomicUsize,
+        last_lba: core::sync::atomic::AtomicU64,
         barriers: AtomicUsize,
     }
 
@@ -519,6 +549,7 @@ mod tests {
             Self {
                 reads: AtomicUsize::new(0),
                 last_frames: AtomicUsize::new(0),
+                last_lba: core::sync::atomic::AtomicU64::new(u64::MAX),
                 barriers: AtomicUsize::new(0),
             }
         }
@@ -526,6 +557,7 @@ mod tests {
         fn reset(&self) {
             self.reads.store(0, Ordering::Release);
             self.last_frames.store(0, Ordering::Release);
+            self.last_lba.store(u64::MAX, Ordering::Release);
             self.barriers.store(0, Ordering::Release);
         }
     }
@@ -539,6 +571,7 @@ mod tests {
         ) -> StepOutcome<(), NoProgress> {
             self.reads.fetch_add(1, Ordering::AcqRel);
             self.last_frames.store(target.len(), Ordering::Release);
+            self.last_lba.store(block_id.as_u64(), Ordering::Release);
             let first_ext4_block = block_id.as_u64() / 8;
             for (index, frame) in target.iter().enumerate() {
                 let ptr = page_allocator::frame_kernel_addr(frame.ppn())
@@ -569,6 +602,13 @@ mod tests {
             self.barriers.fetch_add(1, Ordering::AcqRel);
             StepOutcome::done(())
         }
+
+        fn durability_capabilities(&self) -> BlockDurabilityCapabilities {
+            BlockDurabilityCapabilities {
+                fua: false,
+                flush: true,
+            }
+        }
     }
 
     impl BlockDevice for RecordingBlockDevice {
@@ -582,6 +622,11 @@ mod tests {
     }
 
     static RECORDING_DEVICE: RecordingBlockDevice = RecordingBlockDevice::new();
+    static RECORDING_REGISTRATION: BlockDeviceRegistration = BlockDeviceRegistration {
+        devt: DevT::new(8, 69),
+        name: "ext4-recording-test",
+        ops: &RECORDING_DEVICE,
+    };
 
     fn init_bridge_test() {
         tx_test_support::init_host();
@@ -600,11 +645,11 @@ mod tests {
         let mut out = [0u8; BLOCK_SIZE];
 
         assert_eq!(
-            BlockDeviceImage::new(&CONTINUE_DEVICE).read_block(0, &mut out),
+            BlockDeviceImage::whole(&FILE_IO_REGISTRATION).read_block(0, &mut out),
             Err(Ext4FormatError::WouldBlock)
         );
         assert_eq!(
-            BlockDeviceImage::new(&YIELD_DEVICE).read_block(0, &mut out),
+            BlockDeviceImage::whole(&YIELD_REGISTRATION).read_block(0, &mut out),
             Err(Ext4FormatError::WouldBlock)
         );
     }
@@ -618,11 +663,11 @@ mod tests {
         let data = [0x5au8; BLOCK_SIZE];
 
         assert_eq!(
-            BlockDeviceImage::new(&CONTINUE_DEVICE).write_block(0, &data),
+            BlockDeviceImage::whole(&FILE_IO_REGISTRATION).write_block(0, &data),
             Err(Ext4FormatError::WouldBlock)
         );
         assert_eq!(
-            BlockDeviceImage::new(&YIELD_DEVICE).write_block(0, &data),
+            BlockDeviceImage::whole(&YIELD_REGISTRATION).write_block(0, &data),
             Err(Ext4FormatError::WouldBlock)
         );
     }
@@ -634,7 +679,7 @@ mod tests {
             .unwrap_or_else(|p| p.into_inner());
         init_bridge_test();
         RECORDING_DEVICE.reset();
-        let mut image = BlockDeviceImage::new(&RECORDING_DEVICE);
+        let mut image = BlockDeviceImage::whole(&RECORDING_REGISTRATION);
 
         assert_eq!(image.barrier(), Ok(()));
         assert_eq!(RECORDING_DEVICE.barriers.load(Ordering::Acquire), 1);
@@ -647,9 +692,9 @@ mod tests {
             .unwrap_or_else(|p| p.into_inner());
         init_bridge_test();
 
-        let mut continuing = BlockDeviceImage::new(&CONTINUE_DEVICE);
+        let mut continuing = BlockDeviceImage::whole(&FILE_IO_REGISTRATION);
         assert_eq!(continuing.barrier(), Err(Ext4FormatError::WouldBlock));
-        let mut yielding = BlockDeviceImage::new(&YIELD_DEVICE);
+        let mut yielding = BlockDeviceImage::whole(&YIELD_REGISTRATION);
         assert_eq!(yielding.barrier(), Err(Ext4FormatError::WouldBlock));
     }
 
@@ -660,9 +705,9 @@ mod tests {
             .unwrap_or_else(|p| p.into_inner());
         init_bridge_test();
 
-        let mut read_only = BlockDeviceImage::new(&READ_ONLY_DEVICE);
+        let mut read_only = BlockDeviceImage::whole(&READ_ONLY_REGISTRATION);
         assert_eq!(read_only.barrier(), Err(Ext4FormatError::ReadOnly));
-        let mut io_error = BlockDeviceImage::new(&IO_ERROR_DEVICE);
+        let mut io_error = BlockDeviceImage::whole(&IO_ERROR_REGISTRATION);
         assert_eq!(io_error.barrier(), Err(Ext4FormatError::Io));
     }
 
@@ -673,7 +718,7 @@ mod tests {
             .unwrap_or_else(|p| p.into_inner());
         init_bridge_test();
         RECORDING_DEVICE.reset();
-        let image = BlockDeviceImage::new(&RECORDING_DEVICE);
+        let image = BlockDeviceImage::whole(&RECORDING_REGISTRATION);
         let mut out = [0u8; BLOCK_SIZE];
 
         image.read_data_block(4, &mut out).unwrap();
@@ -694,6 +739,29 @@ mod tests {
     }
 
     #[test]
+    fn partition_image_uses_handle_translation_capacity_and_tail_bounds() {
+        let _serial = crate::test_support::FS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        init_bridge_test();
+        RECORDING_DEVICE.reset();
+        let handle = BlockDeviceHandle::partition(&RECORDING_REGISTRATION, 33, 17)
+            .expect("unaligned partition lies within parent");
+        let image = BlockDeviceImage::new(handle);
+        let mut out = [0u8; BLOCK_SIZE];
+
+        assert_eq!(image.total_blocks(), 2);
+        assert_eq!(image.handle().start_lba(), 33);
+        image.read_block(1, &mut out).expect("last complete block");
+        assert_eq!(RECORDING_DEVICE.last_lba.load(Ordering::Acquire), 41);
+        assert_eq!(
+            image.read_block(2, &mut out),
+            Err(Ext4FormatError::InvalidInput),
+            "the trailing single sector cannot expose a partial ext4 block"
+        );
+    }
+
+    #[test]
     fn ext4_file_io_runtime_binder_registers_supplied_block_handle() {
         let _serial = crate::test_support::FS_TEST_LOCK
             .lock()
@@ -709,7 +777,10 @@ mod tests {
             1,
         )
         .expect("page container cap");
-        let binder = Ext4FileIoRuntimeBinder::new(BlockDeviceHandle::whole(&FILE_IO_REGISTRATION));
+        let image = BlockDeviceImage::new(
+            BlockDeviceHandle::partition(&FILE_IO_REGISTRATION, 1, 63).expect("test partition"),
+        );
+        let binder = Ext4FileIoRuntimeBinder::new(image.handle());
 
         tx_ext4::mount::FilePageContainerBinder::bind_file_page_container(
             &binder,
@@ -724,6 +795,8 @@ mod tests {
             runtimes[0].handle().registration().devt,
             FILE_IO_REGISTRATION.devt
         );
+        assert_eq!(runtimes[0].handle().start_lba(), 1);
+        assert_eq!(runtimes[0].handle().len_lba(), 63);
         drop(active_guard);
         drop(container);
         let active_guard = guard();

@@ -508,6 +508,14 @@ pub struct BlockDeviceHandle {
     len_lba: u64,
 }
 
+/// Why a requested partition cannot be represented as a bounded device slice.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlockDeviceRangeError {
+    Empty,
+    Overflow,
+    OutOfBounds,
+}
+
 impl BlockDeviceHandle {
     pub fn whole(reg: &'static BlockDeviceRegistration) -> Self {
         Self {
@@ -517,16 +525,25 @@ impl BlockDeviceHandle {
         }
     }
 
-    pub const fn partition(
+    pub fn partition(
         reg: &'static BlockDeviceRegistration,
         start_lba: u64,
         len_lba: u64,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, BlockDeviceRangeError> {
+        if len_lba == 0 {
+            return Err(BlockDeviceRangeError::Empty);
+        }
+        let end_lba = start_lba
+            .checked_add(len_lba)
+            .ok_or(BlockDeviceRangeError::Overflow)?;
+        if end_lba > reg.ops.total_blocks() {
+            return Err(BlockDeviceRangeError::OutOfBounds);
+        }
+        Ok(Self {
             reg,
             start_lba,
             len_lba,
-        }
+        })
     }
 
     pub const fn registration(self) -> &'static BlockDeviceRegistration {
@@ -539,6 +556,16 @@ impl BlockDeviceHandle {
 
     pub const fn len_lba(self) -> u64 {
         self.len_lba
+    }
+
+    /// Number of parent-device blocks covered by one 4 KiB `Frame`.
+    pub fn blocks_per_frame(self) -> Option<u64> {
+        let block_size = u64::from(self.reg.ops.block_size());
+        let frame_size = crate::vm::USER_PAGE_SIZE as u64;
+        if block_size == 0 || !frame_size.is_multiple_of(block_size) {
+            return None;
+        }
+        Some(frame_size / block_size)
     }
 
     pub fn read_blocks(
@@ -633,7 +660,11 @@ impl BlockDeviceHandle {
     }
 
     fn block_id_for(self, lba_offset: u64, count: u64) -> Option<PhysicalBlockNumber> {
-        let end = lba_offset.checked_add(count)?;
+        if count == 0 {
+            return None;
+        }
+        let parent_blocks = count.checked_mul(self.blocks_per_frame()?)?;
+        let end = lba_offset.checked_add(parent_blocks)?;
         if end > self.len_lba {
             return None;
         }
@@ -1872,6 +1903,50 @@ mod tests {
         ops: &BLOCK_OPS,
     };
 
+    struct SectorRecordingBlockDevice;
+
+    impl BlockDeviceOps for SectorRecordingBlockDevice {
+        fn read_blocks(
+            &self,
+            block_id: PhysicalBlockNumber,
+            _target: &mut [Frame],
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<(), NoProgress> {
+            LAST_READ_BLOCK.store(block_id.as_u64(), Ordering::SeqCst);
+            StepOutcome::done(())
+        }
+
+        fn write_blocks(
+            &self,
+            _block_id: PhysicalBlockNumber,
+            _source: &[Frame],
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<(), NoProgress> {
+            StepOutcome::done(())
+        }
+
+        fn barrier(&self, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
+            StepOutcome::done(())
+        }
+    }
+
+    impl BlockDevice for SectorRecordingBlockDevice {
+        fn total_blocks(&self) -> u64 {
+            256
+        }
+
+        fn block_size(&self) -> u32 {
+            512
+        }
+    }
+
+    static SECTOR_BLOCK_OPS: SectorRecordingBlockDevice = SectorRecordingBlockDevice;
+    static SECTOR_BLOCK_REG: BlockDeviceRegistration = BlockDeviceRegistration {
+        devt: DevT::new(8, 2),
+        name: "sda",
+        ops: &SECTOR_BLOCK_OPS,
+    };
+
     #[test]
     fn block_device_handle_translates_partition_relative_lbas() {
         use crate::adapter::step_engine::{guard, StepOutcome as V3};
@@ -1880,7 +1955,8 @@ mod tests {
             .lock()
             .expect("epoch test lock");
         let guard = guard();
-        let handle = BlockDeviceHandle::partition(&BLOCK_REG, 32, 4);
+        let handle = BlockDeviceHandle::partition(&BLOCK_REG, 32, 4)
+            .expect("partition lies within its parent");
         let mut frames = [Frame::new(Ppn(0))];
 
         assert_eq!(handle.read_blocks(2, &mut frames, &guard), V3::Done(()));
@@ -1888,6 +1964,46 @@ mod tests {
         assert_eq!(
             handle.read_blocks(4, &mut frames, &guard),
             V3::err(Errno::EINVAL.into())
+        );
+    }
+
+    #[test]
+    fn block_device_handle_rejects_invalid_partition_geometry() {
+        assert_eq!(
+            BlockDeviceHandle::partition(&BLOCK_REG, 0, 0).unwrap_err(),
+            BlockDeviceRangeError::Empty
+        );
+        assert_eq!(
+            BlockDeviceHandle::partition(&BLOCK_REG, u64::MAX, 2).unwrap_err(),
+            BlockDeviceRangeError::Overflow
+        );
+        assert_eq!(
+            BlockDeviceHandle::partition(&BLOCK_REG, 127, 2).unwrap_err(),
+            BlockDeviceRangeError::OutOfBounds
+        );
+    }
+
+    #[test]
+    fn block_device_handle_counts_every_sector_covered_by_a_frame() {
+        use crate::adapter::step_engine::{guard, StepOutcome as V3};
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        LAST_READ_BLOCK.store(u64::MAX, Ordering::SeqCst);
+        let guard = guard();
+        // Deliberately not 4 KiB aligned: the first frame begins at LBA 33.
+        let handle =
+            BlockDeviceHandle::partition(&SECTOR_BLOCK_REG, 33, 9).expect("nine-sector partition");
+        let mut frames = [Frame::new(Ppn(0))];
+
+        assert_eq!(handle.blocks_per_frame(), Some(8));
+        assert_eq!(handle.read_blocks(1, &mut frames, &guard), V3::Done(()));
+        assert_eq!(LAST_READ_BLOCK.load(Ordering::SeqCst), 34);
+        assert_eq!(
+            handle.read_blocks(2, &mut frames, &guard),
+            V3::err(Errno::EINVAL.into()),
+            "one Frame spans eight sectors, so the partition tail must reject it"
         );
     }
 
@@ -2130,7 +2246,8 @@ mod tests {
             .expect("epoch test lock");
         LAST_READ_BLOCK.store(u64::MAX, Ordering::SeqCst);
         let guard = guard();
-        let handle = BlockDeviceHandle::partition(&BLOCK_REG, 32, 16);
+        let handle = BlockDeviceHandle::partition(&BLOCK_REG, 32, 16)
+            .expect("partition lies within its parent");
         let mut adapter = BlockDeviceDispatchAdapter::new(handle, &guard);
         let dispatch = BlockDispatch {
             tag: BlockTag::new(7),
@@ -2378,7 +2495,8 @@ mod tests {
         let mut depth = QueueDepth::new(1);
         let mut tags = crate::io_manager::block::BlockTagTable::new();
         let guard = guard();
-        let handle = BlockDeviceHandle::partition(&BLOCK_REG, 32, 16);
+        let handle = BlockDeviceHandle::partition(&BLOCK_REG, 32, 16)
+            .expect("partition lies within its parent");
 
         let turn = drive_block_device_service_once(
             handle,

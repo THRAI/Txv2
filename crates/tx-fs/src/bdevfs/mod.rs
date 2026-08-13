@@ -43,6 +43,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 pub mod adapter;
+pub mod mbr;
 
 use adapter::step_engine::{
     self as step_engine, page_allocator, Cap, NoProgress, PayloadCap, SpinMutex, StepOutcome, Weak,

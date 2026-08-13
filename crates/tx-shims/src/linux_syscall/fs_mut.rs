@@ -1360,7 +1360,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
                 Some(r) => r,
                 None => return SyscallResult::Error(ENODEV_VALUE),
             };
-            let image = tx_fs::tx_ext4::BlockDeviceImage::new(reg.ops);
+            let image = tx_fs::tx_ext4::BlockDeviceImage::whole(reg);
             // Linux's `MS_RDONLY = 1`. If set in `flags`, mount
             // through the read-only entry point so every mutating
             // `FsOps` call short-circuits with `EROFS`. The

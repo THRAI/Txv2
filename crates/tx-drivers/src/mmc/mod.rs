@@ -20,7 +20,7 @@ pub mod register;
 
 use crate::adapter::step_engine::{page_allocator, NoProgress, SpinMutex, StepOutcome};
 use tx_subsystems::{
-    device::{BlockDevice, BlockDeviceOps, PhysicalBlockNumber},
+    device::{BlockDevice, BlockDeviceOps, BlockDurabilityCapabilities, PhysicalBlockNumber},
     execution::{Errno, Guard},
     page_backed::Frame,
 };
@@ -361,6 +361,13 @@ impl BlockDeviceOps for Vf2Mmc {
         StepOutcome::Done(())
     }
 
+    fn durability_capabilities(&self) -> BlockDurabilityCapabilities {
+        BlockDurabilityCapabilities {
+            fua: false,
+            flush: true,
+        }
+    }
+
     fn read_blocks_bootstrap(
         &self,
         block_id: PhysicalBlockNumber,
@@ -419,5 +426,27 @@ impl BlockDevice for Vf2Mmc {
 
     fn block_size(&self) -> u32 {
         SD_BLOCK_SIZE as u32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vf2_mmc_reports_successful_barrier_as_flush_without_fua() {
+        let mmc = Vf2Mmc::new(0);
+
+        assert!(matches!(
+            BlockDeviceOps::barrier_bootstrap(&mmc),
+            StepOutcome::Done(())
+        ));
+        assert_eq!(
+            BlockDeviceOps::durability_capabilities(&mmc),
+            BlockDurabilityCapabilities {
+                fua: false,
+                flush: true,
+            }
+        );
     }
 }

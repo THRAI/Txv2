@@ -14,7 +14,7 @@
 //! mount slots populate, tmpfs's `/dev` mkdir succeeds, devfs's
 //! console alias resolves, and init's cwd + fds 0/1/2 are bound.
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use std::sync::Mutex;
 
@@ -493,6 +493,102 @@ static FILE_IO_RUNTIME_TEST_BLOCK_REG: tx_subsystems::device::BlockDeviceRegistr
         ops: &FILE_IO_RUNTIME_TEST_BLOCK_DEVICE,
     };
 
+struct RootSelectorTestBlockDevice;
+
+static ROOT_SELECTOR_TEST_IMAGE: Mutex<[u8; tx_subsystems::vm::USER_PAGE_SIZE]> =
+    Mutex::new([0; tx_subsystems::vm::USER_PAGE_SIZE]);
+static ROOT_SELECTOR_TEST_LAST_READ_LBA: AtomicU64 = AtomicU64::new(u64::MAX);
+const ROOT_SELECTOR_TEST_TOTAL_LBAS: u64 = 62_533_296;
+
+impl tx_subsystems::device::BlockDeviceOps for RootSelectorTestBlockDevice {
+    fn read_blocks(
+        &self,
+        block_id: tx_subsystems::device::PhysicalBlockNumber,
+        target: &mut [tx_subsystems::page_backed::Frame],
+        _guard: &tx_subsystems::execution::Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        ROOT_SELECTOR_TEST_LAST_READ_LBA.store(block_id.as_u64(), Ordering::Release);
+        let image = ROOT_SELECTOR_TEST_IMAGE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for frame in target {
+            let Ok(dst) = step_engine::page_allocator::frame_kernel_addr(frame.ppn()) else {
+                return StepOutcome::Err(tx_subsystems::execution::Errno::EIO);
+            };
+            // SAFETY: the test page allocator maps every allocated frame to a
+            // writable host page, and `image` is exactly one page long.
+            unsafe {
+                core::ptr::copy_nonoverlapping(image.as_ptr(), dst, image.len());
+            }
+        }
+        StepOutcome::done(())
+    }
+
+    fn write_blocks(
+        &self,
+        _block_id: tx_subsystems::device::PhysicalBlockNumber,
+        _source: &[tx_subsystems::page_backed::Frame],
+        _guard: &tx_subsystems::execution::Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        StepOutcome::done(())
+    }
+
+    fn barrier(
+        &self,
+        _guard: &tx_subsystems::execution::Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        StepOutcome::done(())
+    }
+}
+
+impl tx_subsystems::device::BlockDevice for RootSelectorTestBlockDevice {
+    fn total_blocks(&self) -> u64 {
+        ROOT_SELECTOR_TEST_TOTAL_LBAS
+    }
+
+    fn block_size(&self) -> u32 {
+        512
+    }
+}
+
+static ROOT_SELECTOR_TEST_BLOCK_DEVICE: RootSelectorTestBlockDevice = RootSelectorTestBlockDevice;
+static ROOT_SELECTOR_TEST_SDA_REG: tx_subsystems::device::BlockDeviceRegistration =
+    tx_subsystems::device::BlockDeviceRegistration {
+        devt: tx_subsystems::device::DevT::new(8, 0),
+        name: "sda",
+        ops: &ROOT_SELECTOR_TEST_BLOCK_DEVICE,
+    };
+static ROOT_SELECTOR_TEST_MMC_REG: tx_subsystems::device::BlockDeviceRegistration =
+    tx_subsystems::device::BlockDeviceRegistration {
+        devt: tx_subsystems::device::DevT::new(179, 0),
+        name: "mmcblk0",
+        ops: &ROOT_SELECTOR_TEST_BLOCK_DEVICE,
+    };
+static ROOT_SELECTOR_TEST_REGISTRATIONS: [&tx_subsystems::device::BlockDeviceRegistration; 2] =
+    [&ROOT_SELECTOR_TEST_SDA_REG, &ROOT_SELECTOR_TEST_MMC_REG];
+
+fn install_root_selector_test_mbr(start_lba: u32, len_lba: u32, valid_signature: bool) {
+    let mut image = ROOT_SELECTOR_TEST_IMAGE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    image.fill(0);
+    let entry = &mut image[446..462];
+    entry[4] = 0x83;
+    entry[8..12].copy_from_slice(&start_lba.to_le_bytes());
+    entry[12..16].copy_from_slice(&len_lba.to_le_bytes());
+    if valid_signature {
+        image[510] = 0x55;
+        image[511] = 0xaa;
+    }
+}
+
+fn register_root_selector_test_devices() {
+    assert!(matches!(
+        tx_subsystems::device::register_block_devices(&ROOT_SELECTOR_TEST_REGISTRATIONS),
+        StepOutcome::Done(())
+    ));
+}
+
 #[test]
 fn boot_init_submits_registered_file_io_service_runtimes() {
     let _serial = setup();
@@ -602,6 +698,10 @@ fn root_device_policy_defaults_final_qemu_to_vda_and_preserves_compatibility_roo
         Some("sda")
     );
     assert_eq!(
+        CoreInit::<TestPlatform>::root_device_name_from_boot("tx.root=sda1", true),
+        Some("sda1")
+    );
+    assert_eq!(
         CoreInit::<TestPlatform>::root_device_name_from_boot("tx.root=sdcard", false),
         Some("vda")
     );
@@ -647,6 +747,66 @@ fn root_device_policy_defaults_final_qemu_to_vda_and_preserves_compatibility_roo
         ),
         Some("vda")
     );
+}
+
+#[test]
+fn root_selector_resolves_sda1_to_one_checked_parent_partition_handle() {
+    let _serial = setup();
+    install_root_selector_test_mbr(4_194_367, 58_338_929, true);
+    register_root_selector_test_devices();
+
+    let resolved = CoreInit::<TestPlatform>::resolve_root_block_device("sda1")
+        .expect("valid primary MBR partition");
+    assert_eq!(resolved.name, "sda1");
+    assert_eq!(resolved.handle.registration().name, "sda");
+    assert_eq!(resolved.handle.start_lba(), 4_194_367);
+    assert_eq!(resolved.handle.len_lba(), 58_338_929);
+    assert_eq!(
+        ROOT_SELECTOR_TEST_LAST_READ_LBA.load(Ordering::Acquire),
+        0,
+        "partition selection reads the parent MBR at LBA 0"
+    );
+
+    let image = tx_fs::tx_ext4::BlockDeviceImage::new(resolved.handle);
+    let binder = tx_fs::tx_ext4::Ext4FileIoRuntimeBinder::new(resolved.handle);
+    assert_eq!(image.handle().start_lba(), resolved.handle.start_lba());
+    assert_eq!(image.handle().len_lba(), resolved.handle.len_lba());
+    assert_eq!(binder.handle().start_lba(), resolved.handle.start_lba());
+    assert_eq!(binder.handle().len_lba(), resolved.handle.len_lba());
+    let geometry = image.block_geometry().expect("512-byte sector geometry");
+    assert_eq!(geometry.device.raw(), ROOT_SELECTOR_TEST_SDA_REG.devt.raw());
+    assert_eq!(geometry.sectors_per_block, 8);
+}
+
+#[test]
+fn root_selector_rejects_bad_or_overrunning_sda1_without_whole_disk_fallback() {
+    let _serial = setup();
+    register_root_selector_test_devices();
+
+    install_root_selector_test_mbr(4_194_367, 58_338_929, false);
+    assert!(CoreInit::<TestPlatform>::resolve_root_block_device("sda1").is_err());
+
+    install_root_selector_test_mbr((ROOT_SELECTOR_TEST_TOTAL_LBAS - 4) as u32, 8, true);
+    assert!(CoreInit::<TestPlatform>::resolve_root_block_device("sda1").is_err());
+
+    let whole = CoreInit::<TestPlatform>::resolve_root_block_device("sda")
+        .expect("an explicitly selected whole disk remains compatible");
+    assert_eq!(whole.name, "sda");
+    assert_eq!(whole.handle.start_lba(), 0);
+    assert_eq!(whole.handle.len_lba(), ROOT_SELECTOR_TEST_TOTAL_LBAS);
+}
+
+#[test]
+fn root_selector_keeps_rv_mmcblk0_as_a_whole_device() {
+    let _serial = setup();
+    register_root_selector_test_devices();
+
+    let resolved = CoreInit::<TestPlatform>::resolve_root_block_device("mmcblk0")
+        .expect("registered RV SD device");
+    assert_eq!(resolved.name, "mmcblk0");
+    assert_eq!(resolved.handle.registration().name, "mmcblk0");
+    assert_eq!(resolved.handle.start_lba(), 0);
+    assert_eq!(resolved.handle.len_lba(), ROOT_SELECTOR_TEST_TOTAL_LBAS);
 }
 
 #[test]

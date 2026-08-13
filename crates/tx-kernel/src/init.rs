@@ -774,6 +774,24 @@ pub struct CoreInit<P: TxPlatform, D: StaticDeviceBundle<P> = EmptyDeviceBundle>
     _composition: PhantomData<fn() -> (P, D)>,
 }
 
+/// One boot-root selector resolved to either a registered whole device or a
+/// checked partition slice of its registered parent.
+#[derive(Clone, Copy, Debug)]
+struct ResolvedRootBlockDevice {
+    /// Stable boot/mount label (for example `sda1`, not its parent `sda`).
+    name: &'static str,
+    handle: tx_subsystems::device::BlockDeviceHandle,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RootBlockDeviceResolveError {
+    Missing,
+    Read,
+    InvalidPartitionTable,
+    MissingPartition,
+    InvalidPartitionRange,
+}
+
 mod boot_args;
 mod boot_plan;
 mod exec;
@@ -1244,15 +1262,14 @@ impl<P: TxPlatform> CoreInit<P> {
     /// magic (`0x53 0xef`). Boards without a selected block root silently no-op.
     fn probe_ext4_superblock_smoke() {
         use tx_fs::tx_ext4::{BlockDeviceImage, BlockImage, BLOCK_SIZE};
-        use tx_subsystems::device::block_device_by_name;
 
         let Some(root_name) = Self::root_device_name() else {
             return;
         };
-        let Some(reg) = block_device_by_name(root_name.as_bytes()) else {
+        let Ok(root) = Self::resolve_root_block_device(root_name) else {
             return;
         };
-        let image = BlockDeviceImage::new(reg.ops);
+        let image = BlockDeviceImage::new(root.handle);
         let mut buf = [0u8; BLOCK_SIZE];
         match image.read_block(0, &mut buf) {
             Ok(()) => {
@@ -1357,20 +1374,20 @@ impl<P: TxPlatform> CoreInit<P> {
             mount_ext4_read_only, mount_ext4_read_write_with_discovered_journal, BlockDeviceImage,
             Ext4FileIoRuntimeBinder, JournalPagePool,
         };
-        use tx_subsystems::device::{block_device_by_name, BlockDeviceHandle};
-        use tx_subsystems::io_manager::block::DeviceKey;
-
-        let Some(reg) = block_device_by_name(dev_name.as_bytes()) else {
+        let Ok(root) = Self::resolve_root_block_device(dev_name) else {
             Self::write_board_sentinel_prefix();
             tx_hal::console_write_str::<P>(":mount:rootfs:ext4:");
             tx_hal::console_write_str::<P>(dev_name);
-            tx_hal::console_write_str::<P>(":missing\n");
+            tx_hal::console_write_str::<P>(":resolve-err\n");
             return false;
         };
         // The parsed cmdline token may live in firmware-owned storage. Use the
-        // registry's static name for every long-lived mount label and for
-        // diagnostics emitted after filesystem allocation has started.
-        let dev_name = reg.name;
+        // static boot selector for every long-lived mount label and for
+        // diagnostics emitted after filesystem allocation has started. A
+        // partition keeps its requested child name (`sda1`), not the parent
+        // registration's name (`sda`).
+        let dev_name = root.name;
+        let handle = root.handle;
 
         let boot_info = <P as tx_hal::BootInfoIf>::boot_info();
         if dev_name == "vda"
@@ -1379,7 +1396,7 @@ impl<P: TxPlatform> CoreInit<P> {
                 boot_info.initrd.is_some(),
             )
         {
-            let probe = match mount_ext4_read_only(BlockDeviceImage::new(reg.ops)) {
+            let probe = match mount_ext4_read_only(BlockDeviceImage::new(handle)) {
                 Ok(out) => out,
                 Err(_) => {
                     Self::write_board_sentinel_prefix();
@@ -1402,8 +1419,7 @@ impl<P: TxPlatform> CoreInit<P> {
         }
 
         let read_only = Self::root_mount_is_read_only();
-        let device = DeviceKey::new(reg.devt.raw());
-        let image = BlockDeviceImage::new(reg.ops);
+        let image = BlockDeviceImage::new(handle);
         if read_only {
             let mount_output = match mount_ext4_read_only(image) {
                 Ok(out) => out,
@@ -1416,7 +1432,7 @@ impl<P: TxPlatform> CoreInit<P> {
                 }
             };
             mount_output.set_file_page_container_binder(Some(alloc::sync::Arc::new(
-                Ext4FileIoRuntimeBinder::new(BlockDeviceHandle::whole(reg)),
+                Ext4FileIoRuntimeBinder::new(handle),
             )));
             let ext4_payload = MountPayload::new_cap_with_backend_planner(
                 mount_output.fs_ops().clone(),
@@ -1434,7 +1450,7 @@ impl<P: TxPlatform> CoreInit<P> {
             mount_output.bind_mount_payload(&ext4_payload);
             return Self::publish_ext4_root_mount(dev_name, true, mount_output, ext4_payload);
         }
-        let Some(geometry) = image.block_geometry(device) else {
+        let Some(geometry) = image.block_geometry() else {
             Self::write_board_sentinel_prefix();
             tx_hal::console_write_str::<P>(":mount:rootfs:ext4:");
             tx_hal::console_write_str::<P>(dev_name);
@@ -1451,19 +1467,23 @@ impl<P: TxPlatform> CoreInit<P> {
                 return false;
             }
         };
-        let mount_output =
-            match mount_ext4_read_write_with_discovered_journal(image, geometry, device, pool) {
-                Ok(out) => out,
-                Err(_) => {
-                    Self::write_board_sentinel_prefix();
-                    tx_hal::console_write_str::<P>(":mount:rootfs:ext4:");
-                    tx_hal::console_write_str::<P>(dev_name);
-                    tx_hal::console_write_str::<P>(":err\n");
-                    return false;
-                }
-            };
+        let mount_output = match mount_ext4_read_write_with_discovered_journal(
+            image,
+            geometry,
+            geometry.device,
+            pool,
+        ) {
+            Ok(out) => out,
+            Err(_) => {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":mount:rootfs:ext4:");
+                tx_hal::console_write_str::<P>(dev_name);
+                tx_hal::console_write_str::<P>(":err\n");
+                return false;
+            }
+        };
         mount_output.set_file_page_container_binder(Some(alloc::sync::Arc::new(
-            Ext4FileIoRuntimeBinder::new(BlockDeviceHandle::whole(reg)),
+            Ext4FileIoRuntimeBinder::new(handle),
         )));
 
         let ext4_payload = MountPayload::new_cap_with_backend_planner(
@@ -1565,6 +1585,99 @@ impl<P: TxPlatform> CoreInit<P> {
             }
         }
         false
+    }
+
+    /// Resolve an explicit root name without publishing a synthetic partition
+    /// driver. Exact registry matches remain whole devices. Otherwise only a
+    /// Linux-shaped partition suffix (`sda1`, `mmcblk0p1`, ...) is accepted;
+    /// its parent MBR is read synchronously and the selected row is converted
+    /// into one bounds-checked `BlockDeviceHandle`.
+    fn resolve_root_block_device(
+        requested_name: &'static str,
+    ) -> Result<ResolvedRootBlockDevice, RootBlockDeviceResolveError> {
+        use tx_subsystems::device::{block_device_by_name, BlockDeviceHandle};
+
+        if let Some(reg) = block_device_by_name(requested_name.as_bytes()) {
+            return Ok(ResolvedRootBlockDevice {
+                name: reg.name,
+                handle: BlockDeviceHandle::whole(reg),
+            });
+        }
+
+        let (parent_name, partition_number) = Self::split_root_partition_name(requested_name)
+            .ok_or(RootBlockDeviceResolveError::Missing)?;
+        let parent = block_device_by_name(parent_name.as_bytes())
+            .ok_or(RootBlockDeviceResolveError::Missing)?;
+        let parent_handle = BlockDeviceHandle::whole(parent);
+        let sector = Self::read_root_partition_sector(parent_handle)?;
+        let table = tx_fs::bdevfs::mbr::parse_mbr(&sector, parent_handle.len_lba())
+            .map_err(|_| RootBlockDeviceResolveError::InvalidPartitionTable)?;
+        let partition = table
+            .get(partition_number)
+            .ok_or(RootBlockDeviceResolveError::MissingPartition)?;
+        let handle = BlockDeviceHandle::partition(parent, partition.start_lba, partition.len_lba)
+            .map_err(|_| RootBlockDeviceResolveError::InvalidPartitionRange)?;
+
+        Ok(ResolvedRootBlockDevice {
+            name: requested_name,
+            handle,
+        })
+    }
+
+    fn split_root_partition_name(name: &str) -> Option<(&str, u8)> {
+        let suffix_start = name
+            .as_bytes()
+            .iter()
+            .rposition(|byte| !byte.is_ascii_digit())?
+            .checked_add(1)?;
+        if suffix_start == name.len() {
+            return None;
+        }
+        let partition_number = name[suffix_start..].parse::<u8>().ok()?;
+        if partition_number == 0 {
+            return None;
+        }
+
+        let mut parent_name = &name[..suffix_start];
+        if let Some(without_p) = parent_name.strip_suffix('p') {
+            if without_p.as_bytes().last().is_some_and(u8::is_ascii_digit) {
+                parent_name = without_p;
+            }
+        }
+        if parent_name.is_empty() {
+            return None;
+        }
+        Some((parent_name, partition_number))
+    }
+
+    fn read_root_partition_sector(
+        parent: tx_subsystems::device::BlockDeviceHandle,
+    ) -> Result<[u8; 512], RootBlockDeviceResolveError> {
+        use crate::adapter::step_engine::page_allocator::{self, ZeroPolicy};
+        use tx_subsystems::page_backed::Frame;
+
+        let reservation = page_allocator::reserve_run(1, 1, ZeroPolicy::UninitFullOverwrite)
+            .map_err(|_| RootBlockDeviceResolveError::Read)?;
+        let run = reservation.commit();
+        let mut frame = Frame::new(run.base());
+        let guard = step_engine::guard();
+        let outcome = parent.read_blocks(0, core::slice::from_mut(&mut frame), &guard);
+        drop(guard);
+        if !matches!(outcome, StepOutcome::Done(())) {
+            drop(run);
+            return Err(RootBlockDeviceResolveError::Read);
+        }
+
+        let source = page_allocator::frame_kernel_addr(frame.ppn())
+            .map_err(|_| RootBlockDeviceResolveError::Read)?;
+        let mut sector = [0u8; 512];
+        // SAFETY: `source` is the direct-map address of the live one-page run;
+        // every supported block driver fills at least the first 512-byte LBA.
+        unsafe {
+            core::ptr::copy_nonoverlapping(source.cast_const(), sector.as_mut_ptr(), sector.len());
+        }
+        drop(run);
+        Ok(sector)
     }
 
     /// Resolve the root block device to mount from the boot cmdline, the way
@@ -2308,7 +2421,7 @@ impl<P: TxPlatform> CoreInit<P> {
         };
         let device_name = reg.name;
 
-        let image = BlockDeviceImage::new(reg.ops);
+        let image = BlockDeviceImage::whole(reg);
         // Plain direct backend mount, NOT the journal-discovering variant.
         //
         // `mount_ext4_read_write_with_discovered_journal` attaches a backend
