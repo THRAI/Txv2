@@ -9,7 +9,10 @@ INITRD_TRANSPORT_BASE = 0x98800000;
 RAM1_END = 0xc0000000;
 __kernel_only_mode = DEFINED(TX_KERNEL_ONLY) ? 1 : 0;
 __kernel_payload_limit = __kernel_only_mode ? RAM1_END : INITRD_TRANSPORT_BASE;
-KERNEL_RUNTIME_STACK_SIZE = __kernel_only_mode ? 256K : 128K;
+/* Persistent-ext4 writes exceed 256 KiB on the real board.  Keep the
+ * transport-constrained initramfs layout unchanged, while the kernel-only
+ * image uses the platform's conservative 512 KiB runtime-stack contract. */
+KERNEL_RUNTIME_STACK_SIZE = __kernel_only_mode ? 512K : 128K;
 
 SECTIONS
 {

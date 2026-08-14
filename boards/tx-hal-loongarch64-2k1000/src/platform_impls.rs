@@ -1198,8 +1198,14 @@ mod cpu_pin_trace_tests {
 
     #[test]
     fn linker_reserves_mode_sized_runtime_stacks_with_guards_and_bounds() {
+        // The real-board persistent-ext4 write path reached 0x41650 bytes
+        // below the AP stack top, crossing both a 256 KiB stack and its guard.
+        const OBSERVED_EXT4_WRITE_STACK_USE: usize = 0x41_650;
+        assert!(OBSERVED_EXT4_WRITE_STACK_USE > 256 * 1024);
+        assert!(512 * 1024 - OBSERVED_EXT4_WRITE_STACK_USE >= 128 * 1024);
+
         let script = include_str!("../linker-la64-2k1000.ld");
-        assert!(script.contains("KERNEL_RUNTIME_STACK_SIZE = __kernel_only_mode ? 256K : 128K;"));
+        assert!(script.contains("KERNEL_RUNTIME_STACK_SIZE = __kernel_only_mode ? 512K : 128K;"));
         assert_eq!(script.matches(". += KERNEL_RUNTIME_STACK_SIZE;").count(), 2);
         assert_eq!(script.matches(". += 4K;").count(), 2);
         assert!(script.contains("__tx_boot_stack_guard_bottom"));
