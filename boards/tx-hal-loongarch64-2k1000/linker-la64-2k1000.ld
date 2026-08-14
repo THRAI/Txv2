@@ -9,6 +9,7 @@ INITRD_TRANSPORT_BASE = 0x98800000;
 RAM1_END = 0xc0000000;
 __kernel_only_mode = DEFINED(TX_KERNEL_ONLY) ? 1 : 0;
 __kernel_payload_limit = __kernel_only_mode ? RAM1_END : INITRD_TRANSPORT_BASE;
+KERNEL_RUNTIME_STACK_SIZE = __kernel_only_mode ? 256K : 128K;
 
 SECTIONS
 {
@@ -58,7 +59,7 @@ SECTIONS
         . += 4K;
         __tx_boot_stack_guard_top = .;
         __tx_boot_stack_bottom = .;
-        . += 128K;
+        . += KERNEL_RUNTIME_STACK_SIZE;
         . = ALIGN(16);
         __tx_boot_stack_top = .;
 
@@ -66,10 +67,19 @@ SECTIONS
         . += 4K;
         __tx_ap_boot_stack_guard_top = .;
         __tx_ap_boot_stack_bottom = .;
-        . += 128K;
+        . += KERNEL_RUNTIME_STACK_SIZE;
         . = ALIGN(16);
         __tx_ap_boot_stack_top = .;
     }
+
+    ASSERT(__tx_boot_stack_guard_top - __tx_boot_stack_guard_bottom == 4K,
+           "2K1000 BSP runtime stack guard must remain 4 KiB")
+    ASSERT(__tx_boot_stack_top - __tx_boot_stack_bottom == KERNEL_RUNTIME_STACK_SIZE,
+           "2K1000 BSP runtime stack does not match the image mode")
+    ASSERT(__tx_ap_boot_stack_guard_top - __tx_ap_boot_stack_guard_bottom == 4K,
+           "2K1000 AP runtime stack guard must remain 4 KiB")
+    ASSERT(__tx_ap_boot_stack_top - __tx_ap_boot_stack_bottom == KERNEL_RUNTIME_STACK_SIZE,
+           "2K1000 AP runtime stack does not match the image mode")
 
     . = ALIGN(4K);
     __kernel_end = .;

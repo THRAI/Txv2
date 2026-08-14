@@ -1197,12 +1197,15 @@ mod cpu_pin_trace_tests {
     }
 
     #[test]
-    fn linker_reserves_guarded_128k_runtime_stacks() {
+    fn linker_reserves_mode_sized_runtime_stacks_with_guards_and_bounds() {
         let script = include_str!("../linker-la64-2k1000.ld");
-        assert_eq!(script.matches(". += 128K;").count(), 2);
+        assert!(script.contains("KERNEL_RUNTIME_STACK_SIZE = __kernel_only_mode ? 256K : 128K;"));
+        assert_eq!(script.matches(". += KERNEL_RUNTIME_STACK_SIZE;").count(), 2);
         assert_eq!(script.matches(". += 4K;").count(), 2);
         assert!(script.contains("__tx_boot_stack_guard_bottom"));
         assert!(script.contains("__tx_ap_boot_stack_guard_bottom"));
-        assert!(script.contains("INITRD_TRANSPORT_BASE"));
+        assert_eq!(script.matches("== KERNEL_RUNTIME_STACK_SIZE").count(), 2);
+        assert!(script.contains("__kernel_end_phys <= INITRD_TRANSPORT_BASE"));
+        assert!(script.contains("__kernel_end_phys <= RAM1_END"));
     }
 }
