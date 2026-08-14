@@ -8,7 +8,7 @@ use tx_ext4::journal::{
     JournalSettlementObserver,
 };
 use tx_ext4::planner::Ext4FsyncPlanSource;
-use tx_ext4_format::journal::{Jbd2Superblock, JBD2_BLOCK_SIZE};
+use tx_ext4_format::journal::{Jbd2Features, Jbd2Superblock, JBD2_BLOCK_SIZE};
 use tx_ext4_format::mutation::{
     Ext4MutationPlan, FsyncStamp, MetaRole, MetadataBlock, MutationOrigin, SealedDataWrite,
 };
@@ -43,6 +43,7 @@ fn ring() -> Arc<JournalRing> {
                     start: 0,
                     uuid: [1; 16],
                 },
+                features: Jbd2Features::REVOKE,
                 blocks: vec![9, 10, 11, 12, 13, 14, 15, 16],
                 superblock_page: None,
             },

@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
 use tx_ext4_format::journal::{
-    Jbd2MetadataUpdate, Jbd2Revoke, Jbd2TransactionImage, JBD2_BLOCK_SIZE,
+    Jbd2Features, Jbd2MetadataUpdate, Jbd2Revoke, Jbd2TransactionImage, JBD2_BLOCK_SIZE,
 };
 use tx_ext4_format::mutation::Ext4MutationPlan;
 use tx_ext4_format::pager::{JournalGeometry, Page4K};
@@ -683,6 +683,7 @@ pub struct MutationJournalLayout {
     pub device: DeviceKey,
     pub sectors_per_block: u64,
     pub journal_uuid: [u8; 16],
+    pub features: Jbd2Features,
     pub sequence: u32,
     pub records: JournalRecordLayout,
     pub superblock_state: Option<JournalSuperblockState>,
@@ -708,6 +709,7 @@ impl MutationJournalLayout {
             device,
             sectors_per_block,
             journal_uuid,
+            features: Jbd2Features::REVOKE,
             sequence,
             records,
             superblock_state: None,
@@ -716,6 +718,15 @@ impl MutationJournalLayout {
 
     pub fn with_superblock_state(mut self, state: JournalSuperblockState) -> Self {
         self.superblock_state = Some(state);
+        self
+    }
+
+    /// Select the validated descriptor/revoke layout discovered from the
+    /// journal superblock. The default constructor remains the legacy 32-bit
+    /// revoke-capable test profile; production rings always overwrite it with
+    /// discovery.
+    pub const fn with_features(mut self, features: Jbd2Features) -> Self {
+        self.features = features;
         self
     }
 
@@ -767,6 +778,7 @@ pub struct JournalRing {
     device: DeviceKey,
     sectors_per_block: u64,
     journal_uuid: [u8; 16],
+    features: Jbd2Features,
     blocks: Vec<u64>,
     first: usize,
     superblock: tx_ext4_format::journal::Jbd2Superblock,
@@ -811,6 +823,7 @@ impl JournalRing {
             device,
             sectors_per_block,
             journal_uuid: geometry.superblock.uuid,
+            features: geometry.features,
             superblock: geometry.superblock,
             superblock_page: geometry.superblock_page,
             superblock_lba,
@@ -881,7 +894,8 @@ impl JournalRing {
             state.sequence,
             JournalRecordLayout::new(descriptor, metadata, self.lba_for(end - 1)?)
                 .with_revokes(revokes),
-        );
+        )
+        .with_features(self.features);
         if let (Some(page), Some(lba)) = (self.superblock_page, self.superblock_lba) {
             let mut activate = page;
             self.superblock
@@ -935,6 +949,10 @@ impl JournalRing {
 
     fn lba_for(&self, logical: usize) -> Result<LbaRange, JournalRingError> {
         Self::lba_for_parts(&self.blocks, self.sectors_per_block, logical)
+    }
+
+    fn revoke_page_count(&self, block_count: usize) -> usize {
+        Jbd2Revoke::page_count_with_features(block_count, self.features)
     }
 
     fn lba_for_parts(
@@ -997,7 +1015,8 @@ impl MutationJournalImage {
             return Err(MutationJournalImageError::EmptyMetadata);
         }
         if layout.records.metadata.len() != mutation.metadata.len()
-            || layout.records.revokes.len() != Jbd2Revoke::page_count(mutation.revokes.len())
+            || layout.records.revokes.len()
+                != Jbd2Revoke::page_count_with_features(mutation.revokes.len(), layout.features)
         {
             return Err(MutationJournalImageError::RecordLayout);
         }
@@ -1013,29 +1032,36 @@ impl MutationJournalImage {
         let mut updates = Vec::new();
         let mut checkpoint_writes = Vec::new();
         for metadata in &mutation.metadata {
-            let home = u32::try_from(metadata.home)
-                .map_err(|_| MutationJournalImageError::MetadataHomeOutOfRange)?;
-            updates.push(Jbd2MetadataUpdate::new(home, metadata.after));
+            if !layout.features.block_64bit && metadata.home > u32::MAX as u64 {
+                return Err(MutationJournalImageError::MetadataHomeOutOfRange);
+            }
+            updates.push(Jbd2MetadataUpdate::new64(metadata.home, metadata.after));
             checkpoint_writes.push(MutationBlockWrite {
                 lba: layout.block_lba(metadata.home)?,
                 bytes: metadata.after,
             });
         }
 
+        if !layout.features.block_64bit
+            && mutation
+                .revokes
+                .iter()
+                .any(|revoke| revoke.physical_block > u32::MAX as u64)
+        {
+            return Err(MutationJournalImageError::RevokeHomeOutOfRange);
+        }
         let revoked_blocks = mutation
             .revokes
             .iter()
-            .map(|revoke| {
-                u32::try_from(revoke.physical_block)
-                    .map_err(|_| MutationJournalImageError::RevokeHomeOutOfRange)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|revoke| revoke.physical_block)
+            .collect();
         Ok(Self {
-            image: Jbd2TransactionImage::encode_legacy_with_revokes(
+            image: Jbd2TransactionImage::encode_with_features_and_revokes(
                 layout.sequence,
                 layout.journal_uuid,
                 updates,
                 revoked_blocks,
+                layout.features,
             )?,
             layout,
             data_writes,
@@ -1874,7 +1900,7 @@ impl JournalMutationRuntime {
         let reservation = ring
             .reserve_with_revoke_pages(
                 mutation.metadata.len(),
-                Jbd2Revoke::page_count(mutation.revokes.len()),
+                ring.revoke_page_count(mutation.revokes.len()),
             )
             .map_err(|_| JournalMutationRuntimeError::Busy(JournalTransactionStateError::Busy))?;
         Ok((
@@ -1998,6 +2024,7 @@ mod tests {
                 start: 0,
                 uuid: [0x3c; 16],
             },
+            features: Jbd2Features::REVOKE,
             blocks: vec![40, 41, 42, 50, 51, 52, 53, 54],
             superblock_page: None,
         };
@@ -2055,6 +2082,7 @@ mod tests {
                 start: 0,
                 uuid: [0x3c; 16],
             },
+            features: Jbd2Features::REVOKE,
             blocks: vec![40, 41, 42, 50, 51, 52, 53, 54],
             superblock_page: None,
         };
@@ -2105,6 +2133,7 @@ mod tests {
             8,
             JournalGeometry {
                 superblock,
+                features: Jbd2Features::REVOKE,
                 blocks: vec![40, 41, 42, 50, 51, 52, 53, 54],
                 superblock_page: Some(superblock_page),
             },
@@ -2196,6 +2225,56 @@ mod tests {
                 .header
                 .sequence,
             44
+        );
+    }
+
+    #[test]
+    fn mutation_journal_image_roundtrips_64bit_descriptor_and_revoke_blocks() {
+        let high_metadata = u64::from(u32::MAX) + 17;
+        let high_revoke = u64::from(u32::MAX) + 33;
+        let mut mutation = Ext4MutationPlan::new(MutationOrigin::Unlink, 12, FsyncStamp::new(9));
+        mutation
+            .push_metadata(MetadataBlock {
+                home: high_metadata,
+                role: MetaRole::InodeTable,
+                before_version: 1,
+                after: [0x6D; JBD2_BLOCK_SIZE],
+                depends_on: Vec::new(),
+            })
+            .unwrap();
+        mutation.defer_free(high_revoke);
+        let features = Jbd2Features::REVOKE_64BIT;
+        let layout = MutationJournalLayout::new(
+            DeviceKey::new(9),
+            8,
+            [0xAB; 16],
+            45,
+            JournalRecordLayout::new(
+                LbaRange::new(100, 8),
+                vec![LbaRange::new(108, 8)],
+                LbaRange::new(124, 8),
+            )
+            .with_revoke(LbaRange::new(116, 8)),
+        )
+        .with_features(features);
+
+        let image = MutationJournalImage::from_plan(&mutation, layout).unwrap();
+        let descriptor = tx_ext4_format::journal::Jbd2Descriptor::parse_with_features(
+            &image.image.descriptor,
+            features,
+        )
+        .unwrap();
+        let revoke = tx_ext4_format::journal::Jbd2Revoke::parse_with_features(
+            &image.image.revokes[0],
+            features,
+        )
+        .unwrap();
+
+        assert_eq!(descriptor.tags[0].target_block, high_metadata);
+        assert_eq!(revoke.blocks, vec![high_revoke]);
+        assert_eq!(
+            image.checkpoint_writes[0].lba,
+            LbaRange::new(high_metadata * 8, 8)
         );
     }
 }

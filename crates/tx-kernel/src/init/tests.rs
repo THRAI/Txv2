@@ -822,6 +822,32 @@ fn root_mount_mode_honors_the_last_standard_ro_or_rw_token() {
 }
 
 #[test]
+fn root_ext4_rw_profile_is_explicit_and_rejects_unknown_values() {
+    use tx_fs::tx_ext4::RwProfile;
+
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_ext4_rw_profile_from_boot("tx.root=sda1 rw"),
+        Ok(RwProfile::Tier1)
+    );
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_ext4_rw_profile_from_boot(
+            "tx.root=sda1 rw tx.ext4.rw-profile=legacy-nocsum"
+        ),
+        Ok(RwProfile::LegacyNoMetadataCsum)
+    );
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_ext4_rw_profile_from_boot(
+            "tx.ext4.rw-profile=legacy-nocsum tx.ext4.rw-profile=tier1"
+        ),
+        Ok(RwProfile::Tier1)
+    );
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_ext4_rw_profile_from_boot("tx.ext4.rw-profile=automatic"),
+        Err(())
+    );
+}
+
+#[test]
 fn automatic_media_layout_only_applies_without_an_explicit_boot_selector() {
     assert!(CoreInit::<TestPlatform>::should_autodetect_boot_media_layout("", false));
     assert!(

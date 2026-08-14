@@ -1371,8 +1371,8 @@ impl<P: TxPlatform> CoreInit<P> {
 
         tx_ext4::install_diagnostic_sink(ext4_writeback_diagnostic::<P>);
         use tx_fs::tx_ext4::{
-            mount_ext4_read_only, mount_ext4_read_write_with_discovered_journal, BlockDeviceImage,
-            Ext4FileIoRuntimeBinder, JournalPagePool,
+            mount_ext4_read_only, mount_ext4_read_write_with_discovered_journal_profile,
+            BlockDeviceImage, Ext4FileIoRuntimeBinder, JournalPagePool,
         };
         let Ok(root) = Self::resolve_root_block_device(dev_name) else {
             Self::write_board_sentinel_prefix();
@@ -1467,18 +1467,38 @@ impl<P: TxPlatform> CoreInit<P> {
                 return false;
             }
         };
-        let mount_output = match mount_ext4_read_write_with_discovered_journal(
+        // The read-only branch returned above. Profile selection is therefore
+        // consulted only for an explicitly writable root mount.
+        let profile = match Self::root_ext4_rw_profile() {
+            Ok(profile) => profile,
+            Err(()) => {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(
+                    ":mount:rootfs:ext4:stage=profile-select:errno=EINVAL\n",
+                );
+                return false;
+            }
+        };
+        let mount_output = match mount_ext4_read_write_with_discovered_journal_profile(
             image,
             geometry,
             geometry.device,
             pool,
+            profile,
         ) {
             Ok(out) => out,
-            Err(_) => {
+            Err(errno) => {
                 Self::write_board_sentinel_prefix();
                 tx_hal::console_write_str::<P>(":mount:rootfs:ext4:");
                 tx_hal::console_write_str::<P>(dev_name);
-                tx_hal::console_write_str::<P>(":err\n");
+                tx_hal::console_write_str::<P>(":stage=rw-discovered:errno=");
+                tx_hal::console_write_str::<P>(match errno {
+                    tx_subsystems::execution::Errno::EIO => "EIO",
+                    tx_subsystems::execution::Errno::EOPNOTSUPP => "EOPNOTSUPP",
+                    tx_subsystems::execution::Errno::EINVAL => "EINVAL",
+                    _ => "OTHER",
+                });
+                tx_hal::console_write_str::<P>("\n");
                 return false;
             }
         };
@@ -1712,6 +1732,26 @@ impl<P: TxPlatform> CoreInit<P> {
             }
         }
         read_only
+    }
+
+    fn root_ext4_rw_profile() -> Result<tx_fs::tx_ext4::RwProfile, ()> {
+        let cmdline = <P as tx_hal::BootInfoIf>::boot_info().cmdline.unwrap_or("");
+        Self::root_ext4_rw_profile_from_boot(cmdline)
+    }
+
+    fn root_ext4_rw_profile_from_boot(cmdline: &str) -> Result<tx_fs::tx_ext4::RwProfile, ()> {
+        let mut selected = tx_fs::tx_ext4::RwProfile::Tier1;
+        for token in cmdline.split_ascii_whitespace() {
+            let Some(value) = token.strip_prefix("tx.ext4.rw-profile=") else {
+                continue;
+            };
+            selected = match value {
+                "tier1" => tx_fs::tx_ext4::RwProfile::Tier1,
+                "legacy-nocsum" => tx_fs::tx_ext4::RwProfile::LegacyNoMetadataCsum,
+                _ => return Err(()),
+            };
+        }
+        Ok(selected)
     }
 
     fn root_device_name_from_boot(cmdline: &'static str, has_initrd: bool) -> Option<&'static str> {

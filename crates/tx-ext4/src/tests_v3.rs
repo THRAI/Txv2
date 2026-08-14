@@ -34,7 +34,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::adapter::step_engine::{
     self as epoch, page_allocator, Errno as V3Errno, NoProgress, StepOp, StepOutcome as V3,
 };
-use tx_ext4_format::journal::JBD2_BLOCK_SIZE;
+use tx_ext4_format::capability::RwProfile;
+use tx_ext4_format::journal::{Jbd2Features, JBD2_BLOCK_SIZE};
 use tx_ext4_format::ondisk::{
     BitmapMut, BitmapView, Extent, ExtentHeader, ExtentIdx, ExtentNode, GroupDesc, Inode,
     Superblock,
@@ -71,7 +72,9 @@ use crate::{
     },
     mount::{
         mount_ext4_read_only, mount_ext4_read_write,
+        mount_ext4_read_write_with_discovered_journal_profile,
         mount_ext4_read_write_with_mutation_journal_io_manager_planner,
+        mount_ext4_read_write_with_profile,
     },
 };
 
@@ -602,6 +605,59 @@ fn build_tier1_mount_image_with_orphan_file_compat() -> MemImage {
     image
 }
 
+fn build_legacy_no_metadata_csum_mount_image() -> MemImage {
+    let mut image = build_image();
+    let mut superblock = Superblock::parse(&image.block_mut(0)[1024..2048]).expect("superblock");
+    superblock.feature_compat = 0x0000_003c;
+    superblock.feature_incompat = 0x0000_02c2;
+    superblock.feature_ro_compat = 0x0000_006b;
+    superblock
+        .encode(&mut image.block_mut(0)[1024..2048])
+        .expect("encode legacy no-metadata-csum superblock");
+    image
+}
+
+fn build_legacy_mount_image_with_journal_features(feature_incompat: u32) -> MemImage {
+    build_legacy_mount_image_with_journal_header(
+        tx_ext4_format::journal::JBD2_BLOCK_SUPERBLOCK_V2,
+        feature_incompat,
+    )
+}
+
+fn build_legacy_mount_image_with_journal_header(
+    block_type: u32,
+    feature_incompat: u32,
+) -> MemImage {
+    let mut image = build_legacy_no_metadata_csum_mount_image();
+    let mut journal_inode = Inode::default();
+    journal_inode.mode = 0x8000 | 0o600;
+    journal_inode.size = (8 * BLOCK_SIZE) as u64;
+    journal_inode.blocks_512 = (8 * BLOCK_SIZE / 512) as u64;
+    journal_inode.links_count = 1;
+    journal_inode.flags = Inode::EXTENTS_FL;
+    journal_inode
+        .set_extent_root(&[Extent {
+            logical_block: 0,
+            len: 8,
+            physical_start: 24,
+        }])
+        .unwrap();
+    write_inode_at(&mut image, 8, &journal_inode);
+
+    let journal_superblock = image.block_mut(24);
+    journal_superblock.fill(0);
+    journal_superblock[..4].copy_from_slice(&tx_ext4_format::journal::JBD2_MAGIC.to_be_bytes());
+    journal_superblock[4..8].copy_from_slice(&block_type.to_be_bytes());
+    journal_superblock[12..16].copy_from_slice(&(BLOCK_SIZE as u32).to_be_bytes());
+    journal_superblock[16..20].copy_from_slice(&8u32.to_be_bytes());
+    journal_superblock[20..24].copy_from_slice(&1u32.to_be_bytes());
+    journal_superblock[24..28].copy_from_slice(&11u32.to_be_bytes());
+    journal_superblock[28..32].copy_from_slice(&0u32.to_be_bytes());
+    journal_superblock[40..44].copy_from_slice(&feature_incompat.to_be_bytes());
+    journal_superblock[48..64].copy_from_slice(&[0x5A; 16]);
+    image
+}
+
 fn build_tier1_destroy_image() -> MemImage {
     let mut image = build_tier1_mount_image();
     mark_inode_bitmap_used(&mut image, 12);
@@ -1069,6 +1125,7 @@ fn mutation_runtime_for_test_with_ring_pool(
                     start: 0,
                     uuid: [1; 16],
                 },
+                features: Jbd2Features::REVOKE,
                 blocks: vec![
                     9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
                 ],
@@ -3553,6 +3610,108 @@ fn rw_mount_stores_the_accepted_tier1_profile_hash() {
         mounted.capability_profile_hash().map(|hash| hash.0),
         Some(tx_ext4_format::capability::Tier1Capabilities::generated().profile_hash()),
     );
+}
+
+#[test]
+fn plain_rw_mount_rejects_legacy_even_when_explicit_without_journal_runtime() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    assert!(matches!(
+        mount_ext4_read_write(build_legacy_no_metadata_csum_mount_image()),
+        Err(V3Errno::EOPNOTSUPP)
+    ));
+    assert!(matches!(
+        mount_ext4_read_write_with_profile(
+            build_legacy_no_metadata_csum_mount_image(),
+            RwProfile::LegacyNoMetadataCsum,
+        ),
+        Err(V3Errno::EOPNOTSUPP)
+    ));
+}
+
+#[test]
+fn legacy_profile_rejects_unknown_filesystem_features_before_any_write() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let mut image = build_legacy_mount_image_with_journal_features(
+        tx_ext4_format::journal::JBD2_FEATURE_INCOMPAT_REVOKE
+            | tx_ext4_format::journal::JBD2_FEATURE_INCOMPAT_64BIT,
+    );
+    let mut superblock = Superblock::parse(&image.block_mut(0)[1024..2048]).expect("superblock");
+    superblock.feature_ro_compat |= 0x8000_0000;
+    superblock
+        .encode(&mut image.block_mut(0)[1024..2048])
+        .expect("encode unknown feature");
+    let writes = Arc::new(AtomicUsize::new(0));
+    let image = CountingImage {
+        image,
+        writes: Arc::clone(&writes),
+    };
+    let geometry = Ext4BlockGeometry::new(DeviceKey::new(7), 8);
+
+    assert!(matches!(
+        mount_ext4_read_write_with_discovered_journal_profile(
+            image,
+            geometry,
+            geometry.device,
+            JournalPagePool::new(8).unwrap(),
+            RwProfile::LegacyNoMetadataCsum,
+        ),
+        Err(V3Errno::EOPNOTSUPP)
+    ));
+    assert_eq!(writes.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn legacy_discovered_mount_rejects_nonexact_or_csum_journal_before_any_write() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    for (block_type, feature_incompat, expected) in [
+        (
+            tx_ext4_format::journal::JBD2_BLOCK_SUPERBLOCK_V2,
+            tx_ext4_format::journal::JBD2_FEATURE_INCOMPAT_REVOKE,
+            V3Errno::EOPNOTSUPP,
+        ),
+        (
+            tx_ext4_format::journal::JBD2_BLOCK_SUPERBLOCK_V2,
+            tx_ext4_format::journal::JBD2_FEATURE_INCOMPAT_REVOKE
+                | tx_ext4_format::journal::JBD2_FEATURE_INCOMPAT_64BIT
+                | tx_ext4_format::journal::JBD2_FEATURE_INCOMPAT_CSUM_V2,
+            V3Errno::EIO,
+        ),
+        (
+            tx_ext4_format::journal::JBD2_BLOCK_SUPERBLOCK_V1,
+            tx_ext4_format::journal::JBD2_FEATURE_INCOMPAT_REVOKE
+                | tx_ext4_format::journal::JBD2_FEATURE_INCOMPAT_64BIT,
+            V3Errno::EIO,
+        ),
+    ] {
+        let writes = Arc::new(AtomicUsize::new(0));
+        let image = CountingImage {
+            image: build_legacy_mount_image_with_journal_header(block_type, feature_incompat),
+            writes: Arc::clone(&writes),
+        };
+        let geometry = Ext4BlockGeometry::new(DeviceKey::new(7), 8);
+
+        assert!(matches!(
+            mount_ext4_read_write_with_discovered_journal_profile(
+                image,
+                geometry,
+                geometry.device,
+                JournalPagePool::new(8).unwrap(),
+                RwProfile::LegacyNoMetadataCsum,
+            ),
+            Err(errno) if errno == expected
+        ));
+        assert_eq!(
+            writes.load(Ordering::Acquire),
+            0,
+            "journal feature rejection must happen before recovery or RECOVER-state writes"
+        );
+    }
 }
 
 #[test]

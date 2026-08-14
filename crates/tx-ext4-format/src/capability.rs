@@ -18,6 +18,18 @@ pub enum Tier1Reject {
     ProfileMismatch,
 }
 
+/// Explicit read-write filesystem profile selection.
+///
+/// Callers must name the legacy profile; `Default` and the existing
+/// `Tier1Capabilities::generated()` constructor continue to select Tier 1.
+/// There is deliberately no admission fallback between profiles.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum RwProfile {
+    #[default]
+    Tier1,
+    LegacyNoMetadataCsum,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CapabilityProfileHash(pub [u8; 32]);
 
@@ -67,6 +79,12 @@ pub struct Tier1Capabilities {
     profile_hash: [u8; 32],
     feature_bits: Tier1FeatureBits,
     geometry: Tier1Geometry,
+    required_compat: u32,
+    required_incompat: u32,
+    required_ro_compat: u32,
+    ignored_compat: u32,
+    accepts_inode_128: bool,
+    exact_stable_features: bool,
 }
 
 const GENERATED_TIER1_PROFILE: Tier1Capabilities = Tier1Capabilities {
@@ -88,11 +106,97 @@ const GENERATED_TIER1_PROFILE: Tier1Capabilities = Tier1Capabilities {
         block_size: 4096,
         inode_size: 256,
     },
+    required_compat: 0,
+    required_incompat: Superblock::FEATURE_INCOMPAT_EXTENTS,
+    required_ro_compat: 0,
+    ignored_compat: Superblock::FEATURE_COMPAT_ORPHAN_FILE,
+    accepts_inode_128: true,
+    exact_stable_features: false,
 };
+
+// Exact stable feature shape of the factory-style legacy filesystem. RECOVER
+// is the sole optional bit because a clean detach clears it and RW admission
+// sets it again before the first mutation.
+const FEATURE_COMPAT_EXT_ATTR: u32 = 0x0000_0008;
+const FEATURE_COMPAT_RESIZE_INODE: u32 = 0x0000_0010;
+const FEATURE_COMPAT_DIR_INDEX: u32 = 0x0000_0020;
+const FEATURE_INCOMPAT_FILETYPE: u32 = 0x0000_0002;
+const FEATURE_INCOMPAT_FLEX_BG: u32 = 0x0000_0200;
+const FEATURE_RO_COMPAT_SPARSE_SUPER: u32 = 0x0000_0001;
+const FEATURE_RO_COMPAT_LARGE_FILE: u32 = 0x0000_0002;
+const FEATURE_RO_COMPAT_DIR_NLINK: u32 = 0x0000_0020;
+const FEATURE_RO_COMPAT_EXTRA_ISIZE: u32 = 0x0000_0040;
+
+const LEGACY_COMPAT_EXACT: u32 = Superblock::FEATURE_COMPAT_HAS_JOURNAL
+    | FEATURE_COMPAT_EXT_ATTR
+    | FEATURE_COMPAT_RESIZE_INODE
+    | FEATURE_COMPAT_DIR_INDEX;
+// `FEATURE_INCOMPAT_64BIT` is an ext4 filesystem geometry bit. This profile
+// does not admit JBD2's separate 64-bit journal feature.
+const LEGACY_INCOMPAT_STABLE_EXACT: u32 = FEATURE_INCOMPAT_FILETYPE
+    | Superblock::FEATURE_INCOMPAT_EXTENTS
+    | Superblock::FEATURE_INCOMPAT_64BIT
+    | FEATURE_INCOMPAT_FLEX_BG;
+const LEGACY_INCOMPAT_ALLOWED: u32 =
+    LEGACY_INCOMPAT_STABLE_EXACT | Superblock::FEATURE_INCOMPAT_RECOVER;
+const LEGACY_RO_COMPAT_EXACT: u32 = FEATURE_RO_COMPAT_SPARSE_SUPER
+    | FEATURE_RO_COMPAT_LARGE_FILE
+    | Superblock::FEATURE_RO_COMPAT_HUGE_FILE
+    | FEATURE_RO_COMPAT_DIR_NLINK
+    | FEATURE_RO_COMPAT_EXTRA_ISIZE;
+
+pub const LEGACY_NO_METADATA_CSUM_PROFILE_DESCRIPTOR: &[u8] = b"tx-ext4-rw-profile:legacy-no-metadata-csum:v1\ncompat_exact=0x0000003c\nincompat_exact=0x000002c2\nincompat_optional=0x00000004\nro_compat_exact=0x0000006b\nblock_size=4096\ninode_size=256\njournal=internal\n";
+
+const LEGACY_NO_METADATA_CSUM_PROFILE: Tier1Capabilities = Tier1Capabilities {
+    // SHA-256 of the versioned exact-profile descriptor documented by the
+    // constants above. This must never alias the generated Tier 1 ledger.
+    profile_hash: [
+        0xdd, 0x7a, 0xb7, 0xb1, 0xab, 0x8e, 0x4d, 0xb3, 0x1b, 0x97, 0xe6, 0xb6, 0x89, 0x28, 0x0c,
+        0xd1, 0x33, 0xcd, 0x83, 0xbf, 0xb3, 0xd9, 0x7d, 0xa5, 0x0c, 0x08, 0x84, 0x4a, 0xa3, 0xc7,
+        0x0a, 0x90,
+    ],
+    feature_bits: Tier1FeatureBits {
+        compat: LEGACY_COMPAT_EXACT,
+        incompat: LEGACY_INCOMPAT_ALLOWED,
+        ro_compat: LEGACY_RO_COMPAT_EXACT,
+        metadata_csum: false,
+        ordered_jbd2: true,
+    },
+    geometry: Tier1Geometry {
+        block_size: 4096,
+        inode_size: 256,
+    },
+    required_compat: LEGACY_COMPAT_EXACT,
+    required_incompat: LEGACY_INCOMPAT_STABLE_EXACT,
+    required_ro_compat: LEGACY_RO_COMPAT_EXACT,
+    ignored_compat: 0,
+    accepts_inode_128: false,
+    exact_stable_features: true,
+};
+
+impl RwProfile {
+    pub const fn capabilities(self) -> Tier1Capabilities {
+        Tier1Capabilities::for_rw_profile(self)
+    }
+
+    pub const fn admit_mount(
+        self,
+        facts: Tier1MountFacts,
+    ) -> Result<CapabilityProfileHash, Tier1Reject> {
+        self.capabilities().admit_mount(facts)
+    }
+}
 
 impl Tier1Capabilities {
     pub const fn generated() -> Self {
-        GENERATED_TIER1_PROFILE
+        Self::for_rw_profile(RwProfile::Tier1)
+    }
+
+    pub const fn for_rw_profile(profile: RwProfile) -> Self {
+        match profile {
+            RwProfile::Tier1 => GENERATED_TIER1_PROFILE,
+            RwProfile::LegacyNoMetadataCsum => LEGACY_NO_METADATA_CSUM_PROFILE,
+        }
     }
 
     pub const fn profile_hash(self) -> [u8; 32] {
@@ -119,15 +223,25 @@ impl Tier1Capabilities {
         let features = facts.feature_bits;
         let geometry = facts.geometry;
         if geometry.block_size != self.geometry.block_size
-            || (geometry.inode_size != 128 && geometry.inode_size != self.geometry.inode_size)
-            || features.compat
-                & !(self.feature_bits.compat | Superblock::FEATURE_COMPAT_ORPHAN_FILE)
-                != 0
+            || (geometry.inode_size != self.geometry.inode_size
+                && !(self.accepts_inode_128 && geometry.inode_size == 128))
+            || features.compat & !(self.feature_bits.compat | self.ignored_compat) != 0
             || features.incompat & !self.feature_bits.incompat != 0
-            || features.incompat & Superblock::FEATURE_INCOMPAT_EXTENTS == 0
             || features.ro_compat & !self.feature_bits.ro_compat != 0
-            || !features.metadata_csum
-            || !features.ordered_jbd2
+            || features.compat & self.required_compat != self.required_compat
+            || features.incompat & self.required_incompat != self.required_incompat
+            || features.ro_compat & self.required_ro_compat != self.required_ro_compat
+            || features.metadata_csum != self.feature_bits.metadata_csum
+            || features.ordered_jbd2 != self.feature_bits.ordered_jbd2
+            // Exact profiles set every stable admitted bit. The generated
+            // Tier 1 profile keeps its historical subset admission.
+            || (self.exact_stable_features
+                && features.compat != self.feature_bits.compat)
+            || (self.exact_stable_features
+                && features.ro_compat != self.feature_bits.ro_compat)
+            || (self.exact_stable_features
+                && features.incompat & !Superblock::FEATURE_INCOMPAT_RECOVER
+                    != self.required_incompat)
         {
             return Err(Tier1Reject::ProfileMismatch);
         }

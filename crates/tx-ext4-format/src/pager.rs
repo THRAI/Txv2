@@ -1,4 +1,4 @@
-use crate::journal::Jbd2Superblock;
+use crate::journal::{Jbd2Features, Jbd2Superblock};
 use crate::ondisk::{
     block_bitmap_csum32, crc32c, encode_dir_entry, encode_journal_commit,
     encode_journal_descriptor, group_desc_csum16, inode_bitmap_csum32, inode_csum32,
@@ -191,6 +191,10 @@ pub struct ReplayReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalGeometry {
     pub superblock: Jbd2Superblock,
+    /// Strictly validated record-layout token parsed from the journal
+    /// superblock. Replay and runtime encoding must use this exact token;
+    /// callers may not infer a legacy layout from ext4 filesystem features.
+    pub features: Jbd2Features,
     pub blocks: Vec<u64>,
     /// Original JBD2 superblock page, retained for a later state update.
     /// Pure replay only needs parsed geometry; a writer needs this page to
@@ -492,7 +496,7 @@ impl<I: BlockImage> Ext4Pager<I> {
         }
         let mut superblock_page = [0; BLOCK_SIZE];
         self.read_block(blocks[0], &mut superblock_page)?;
-        let superblock = Jbd2Superblock::parse(&superblock_page)?;
+        let (superblock, features) = Jbd2Superblock::parse_with_features(&superblock_page)?;
         let max_len = superblock.max_len as usize;
         if max_len > blocks.len() {
             return Err(Ext4FormatError::Corrupt);
@@ -500,6 +504,7 @@ impl<I: BlockImage> Ext4Pager<I> {
         blocks.truncate(max_len);
         Ok(JournalGeometry {
             superblock,
+            features,
             blocks,
             superblock_page: Some(superblock_page),
         })
@@ -625,7 +630,7 @@ impl<I: BlockImage> Ext4Pager<I> {
             self.read_block(loc.block, &mut inode_table_before)?;
             let mut inode_table_after = inode_table_before;
             let inode_bytes = &mut inode_table_after[loc.offset..loc.offset + loc.len];
-            inode_after.encode(inode_bytes)?;
+            inode_after.encode_preserving_unknown(inode_bytes)?;
             self.refresh_inode_checksum(inode, &inode_after, inode_bytes)?;
             plan.push_metadata(MetadataBlock {
                 home: loc.block,
@@ -701,7 +706,7 @@ impl<I: BlockImage> Ext4Pager<I> {
                 self.read_block(loc.block, &mut inode_table_before)?;
                 let mut inode_table_after = inode_table_before;
                 let inode_bytes = &mut inode_table_after[loc.offset..loc.offset + loc.len];
-                inode_after.encode(inode_bytes)?;
+                inode_after.encode_preserving_unknown(inode_bytes)?;
                 self.refresh_inode_checksum(inode, &inode_after, inode_bytes)?;
                 plan.push_metadata(MetadataBlock {
                     home: loc.block,
@@ -775,7 +780,7 @@ impl<I: BlockImage> Ext4Pager<I> {
                     self.read_block(loc.block, &mut inode_table_before)?;
                     let mut inode_table_after = inode_table_before;
                     let inode_bytes = &mut inode_table_after[loc.offset..loc.offset + loc.len];
-                    inode_after.encode(inode_bytes)?;
+                    inode_after.encode_preserving_unknown(inode_bytes)?;
                     self.refresh_inode_checksum(inode, &inode_after, inode_bytes)?;
 
                     for group in &allocation.groups {
@@ -836,11 +841,15 @@ impl<I: BlockImage> Ext4Pager<I> {
             let loc = self.inode_location(inode)?;
             let mut inode_table_before = [0u8; BLOCK_SIZE];
             self.read_block(loc.block, &mut inode_table_before)?;
+            let mut inode_table_after = inode_table_before;
+            disk_inode.encode_preserving_unknown(
+                &mut inode_table_after[loc.offset..loc.offset + loc.len],
+            )?;
             plan.push_metadata(MetadataBlock {
                 home: loc.block,
                 role: MetaRole::InodeTable,
                 before_version: crc32c(0, &inode_table_before) as u64,
-                after: inode_table_before,
+                after: inode_table_after,
                 depends_on: Vec::new(),
             })
             .map_err(|_| Ext4FormatError::Corrupt)?;
@@ -1607,11 +1616,14 @@ impl<I: BlockImage> Ext4Pager<I> {
         let loc = self.inode_location(inode)?;
         let mut inode_table_before = [0u8; BLOCK_SIZE];
         self.read_block(loc.block, &mut inode_table_before)?;
+        let mut inode_table_after = inode_table_before;
+        disk_inode
+            .encode_preserving_unknown(&mut inode_table_after[loc.offset..loc.offset + loc.len])?;
         plan.push_metadata(MetadataBlock {
             home: loc.block,
             role: MetaRole::InodeTable,
             before_version: crc32c(0, &inode_table_before) as u64,
-            after: inode_table_before,
+            after: inode_table_after,
             depends_on: Vec::new(),
         })
         .map_err(|_| Ext4FormatError::Corrupt)?;

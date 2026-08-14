@@ -1,3 +1,4 @@
+use tx_ext4_format::journal::Jbd2Features;
 use tx_ext4_format::mutation::{FsyncStamp, MutationOrigin, SetAttr};
 use tx_ext4_format::ondisk::{
     block_bitmap_csum32, crc32c, crc32c_append, dirblock_csum32, group_desc_csum16,
@@ -342,7 +343,8 @@ fn pager_rejects_non_4k_images_and_hole_writeback() {
 
 #[test]
 fn pager_plans_mapped_write_without_mutating_home_block() {
-    let image = mock_image();
+    let mut image = mock_image();
+    set_inode_unknown_sentinel(&mut image, 12, 0xA1);
     let original = *image.block(21);
     let mut pager = Ext4Pager::open(image).unwrap();
     let page = filled_page(0xEE);
@@ -365,7 +367,49 @@ fn pager_plans_mapped_write_without_mutating_home_block() {
     assert_eq!(plan.data[0].logical_page, 1);
     assert_eq!(plan.data[0].physical_block, 21);
     assert_eq!(plan.data[0].bytes, page);
+    assert_inode_unknown_sentinel(&plan, 12, 0xA1);
     assert_eq!(pager.image().block(21), &original);
+}
+
+#[test]
+fn pager_preserves_inode256_unknown_bytes_for_hole_write() {
+    let mut image = mock_image();
+    mark_block_bitmap_used(&mut image, 48);
+    set_inode_unknown_sentinel(&mut image, 12, 0xB2);
+    let mut pager = Ext4Pager::open(image).unwrap();
+
+    let plan = pager
+        .plan_write_page(InodeNo::new(12), 4, &filled_page(0xE4), FsyncStamp::new(71))
+        .unwrap();
+
+    assert_inode_unknown_sentinel(&plan, 12, 0xB2);
+}
+
+#[test]
+fn pager_preserves_inode256_unknown_bytes_for_unwritten_write() {
+    let mut image = mock_image();
+    let mut inode = Inode::default();
+    inode.mode = Inode::S_IFREG | 0o600;
+    inode.size = 3 * BLOCK_SIZE as u64;
+    inode.blocks_512 = 24;
+    inode.links_count = 1;
+    inode.flags = Inode::EXTENTS_FL;
+    inode
+        .set_extent_root(&[Extent {
+            logical_block: 0,
+            len: Extent::UNINITIALIZED_MASK | 3,
+            physical_start: 20,
+        }])
+        .unwrap();
+    write_inode(&mut image, 12, &inode);
+    set_inode_unknown_sentinel(&mut image, 12, 0xC3);
+    let mut pager = Ext4Pager::open(image).unwrap();
+
+    let plan = pager
+        .plan_write_page(InodeNo::new(12), 1, &filled_page(0xD0), FsyncStamp::new(72))
+        .unwrap();
+
+    assert_inode_unknown_sentinel(&plan, 12, 0xC3);
 }
 
 #[test]
@@ -4309,6 +4353,7 @@ fn pager_derives_journal_ring_from_journal_inode_mapping() {
     assert_eq!(geometry.superblock.first, 1);
     assert_eq!(geometry.superblock.sequence, 24);
     assert_eq!(geometry.superblock.start, 3);
+    assert_eq!(geometry.features, Jbd2Features::NONE);
     assert_eq!(
         geometry.blocks.as_slice(),
         &[40, 41, 42, 50, 51, 52, 53, 54]
@@ -4358,6 +4403,33 @@ fn write_inode_at_table(image: &mut MemImage, inode_table_block: u64, ino: u32, 
     inode
         .encode(&mut image.block_mut(block as u64)[in_block..in_block + 256])
         .unwrap();
+}
+
+const INODE256_UNKNOWN_SENTINEL_OFFSET: usize = 200;
+
+fn set_inode_unknown_sentinel(image: &mut MemImage, ino: u32, value: u8) {
+    let index = (ino - 1) as usize;
+    let offset = index * 256;
+    let block = 4 + offset / BLOCK_SIZE;
+    let in_block = offset % BLOCK_SIZE;
+    image.block_mut(block as u64)[in_block + INODE256_UNKNOWN_SENTINEL_OFFSET] = value;
+}
+
+fn assert_inode_unknown_sentinel(
+    plan: &tx_ext4_format::mutation::Ext4MutationPlan,
+    ino: u32,
+    expected: u8,
+) {
+    let inode_table = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::InodeTable)
+        .expect("inode-table after-image");
+    let inode_offset = (ino as usize - 1) * 256 % BLOCK_SIZE;
+    assert_eq!(
+        inode_table.after[inode_offset + INODE256_UNKNOWN_SENTINEL_OFFSET],
+        expected
+    );
 }
 
 fn filled_page(byte: u8) -> [u8; BLOCK_SIZE] {

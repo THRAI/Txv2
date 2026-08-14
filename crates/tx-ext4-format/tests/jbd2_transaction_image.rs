@@ -1,5 +1,5 @@
 use tx_ext4_format::journal::{
-    Jbd2Commit, Jbd2Descriptor, Jbd2MetadataUpdate, Jbd2Revoke, Jbd2TransactionImage,
+    Jbd2Commit, Jbd2Descriptor, Jbd2Features, Jbd2MetadataUpdate, Jbd2Revoke, Jbd2TransactionImage,
     JBD2_BLOCK_SIZE, JBD2_MAGIC,
 };
 
@@ -74,5 +74,36 @@ fn freeing_transaction_image_splits_revokes_across_pages() {
     assert_eq!(
         Jbd2Revoke::parse(&image.revokes[1]).unwrap().blocks,
         revokes[Jbd2Revoke::MAX_BLOCKS_PER_PAGE..]
+            .iter()
+            .copied()
+            .map(u64::from)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn transaction_image_carries_64bit_descriptor_and_revoke_layouts() {
+    let features = Jbd2Features::REVOKE_64BIT;
+    let home_block = 0x0102_0304_0506_0708;
+    let revoked_block = 0x1112_1314_1516_1718;
+    let image = Jbd2TransactionImage::encode_with_features_and_revokes(
+        77,
+        [0x44; 16],
+        vec![Jbd2MetadataUpdate::new64(
+            home_block,
+            [0x5A; JBD2_BLOCK_SIZE],
+        )],
+        vec![revoked_block],
+        features,
+    )
+    .unwrap();
+
+    let descriptor = Jbd2Descriptor::parse_with_features(&image.descriptor, features).unwrap();
+    assert_eq!(descriptor.tags[0].target_block, home_block);
+    assert_eq!(
+        Jbd2Revoke::parse_with_features(&image.revokes[0], features)
+            .unwrap()
+            .blocks,
+        vec![revoked_block]
     );
 }
