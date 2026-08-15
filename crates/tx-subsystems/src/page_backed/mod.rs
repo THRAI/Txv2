@@ -7,7 +7,7 @@
 //! typed page-substrate contributors.
 
 use alloc::collections::BTreeMap;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak as ArcWeak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -33,8 +33,8 @@ use crate::io_manager::page::{
         PageCompletionRoute, PageServiceBackendContext, PageServiceBackendDriven,
         PageServiceBackendOutcome, PageServiceBackendPrepared, PageServiceBackendSubmitError,
         PageServiceBackendSubmitOutcome, PageServiceDrivenWork, PageServiceNext,
-        PageServiceTaggedBlockCompletionError, PageServiceTurn, PageServiceWork, PageWaitInterest,
-        PageWaiter,
+        PageServiceTaggedBlockCompletionError, PageServiceTurn, PageServiceWake, PageServiceWork,
+        PageWaitInterest, PageWaiter,
     },
     PageContainerKey, PageGeneration, PageIoCompletion, PageIoCompletionKind, PageIoFlags,
     PageIoOp, PageIoPriority, PageIoRange, PageIoRequest, PageIoRequestId, PageIoResult,
@@ -610,6 +610,7 @@ pub struct FileFsyncState {
     frontier: Option<FileFsyncFrontier>,
     request: Option<PageIoRequestId>,
     backend_result: Option<Result<(), Errno>>,
+    wait: Option<Arc<notification::PageReadyWait>>,
 }
 
 impl FileFsyncState {
@@ -618,6 +619,7 @@ impl FileFsyncState {
             frontier: None,
             request: None,
             backend_result: None,
+            wait: None,
         }
     }
 
@@ -626,6 +628,7 @@ impl FileFsyncState {
             frontier: Some(frontier),
             request: None,
             backend_result: None,
+            wait: None,
         }
     }
 
@@ -634,7 +637,9 @@ impl FileFsyncState {
     }
 
     pub fn advance(&mut self, pc: &PageContainer) -> Result<FileFsyncFrontierAdvance, Errno> {
+        self.prepare_wait(pc);
         if let Some(result) = self.backend_result {
+            self.finish_wait(pc);
             return result.map(|()| FileFsyncFrontierAdvance::Complete);
         }
         let frontier = self.frontier.get_or_insert_with(|| {
@@ -644,7 +649,10 @@ impl FileFsyncState {
         match pc.advance_file_fsync_frontier(frontier) {
             advance @ (FileFsyncFrontierAdvance::Submitted { .. }
             | FileFsyncFrontierAdvance::Waiting) => Ok(advance),
-            FileFsyncFrontierAdvance::Error(errno) => Err(errno),
+            FileFsyncFrontierAdvance::Error(errno) => {
+                self.finish_wait(pc);
+                Err(errno)
+            }
             FileFsyncFrontierAdvance::Complete => {
                 let Some(request) = self.request else {
                     return Ok(FileFsyncFrontierAdvance::Complete);
@@ -652,22 +660,61 @@ impl FileFsyncState {
                 match pc.file_fsync_submission_state(request) {
                     Some(FsyncSubmissionState::Queued) => Ok(FileFsyncFrontierAdvance::Waiting),
                     Some(FsyncSubmissionState::Complete(_)) => {
-                        let result = pc.take_file_fsync_submission(request).ok_or(Errno::EIO)?;
+                        let Some(result) = pc.take_file_fsync_submission(request) else {
+                            self.finish_wait(pc);
+                            return Err(Errno::EIO);
+                        };
                         self.request = None;
                         self.backend_result = Some(result);
+                        self.finish_wait(pc);
                         result.map(|()| FileFsyncFrontierAdvance::Complete)
                     }
-                    Some(FsyncSubmissionState::Consumed) | None => Err(Errno::EIO),
+                    Some(FsyncSubmissionState::Consumed) | None => {
+                        self.finish_wait(pc);
+                        Err(Errno::EIO)
+                    }
                 }
             }
         }
     }
 
     pub(crate) fn submit_backend_fsync(&mut self, pc: &PageContainer) -> Result<(), Errno> {
+        self.prepare_wait(pc);
         if self.request.is_none() && self.backend_result.is_none() {
-            self.request = Some(pc.submit_file_fsync().ok_or(Errno::EIO)?);
+            let Some(request) = pc.submit_file_fsync() else {
+                self.finish_wait(pc);
+                return Err(Errno::EIO);
+            };
+            self.request = Some(request);
         }
         Ok(())
+    }
+
+    pub(crate) fn pending_outcome<P: adapter::step_engine::StepProgress>(
+        &self,
+        progress: P,
+    ) -> StepOutcome<(), P> {
+        let wait = self
+            .wait
+            .as_ref()
+            .expect("pending fsync state has a completion wait source");
+        notification::yield_on_page_ready_source(
+            progress,
+            notification::page_ready_endpoint(wait.as_ref()),
+        )
+    }
+
+    pub(crate) fn finish_wait(&mut self, pc: &PageContainer) {
+        if let Some(wait) = self.wait.take() {
+            pc.unregister_file_fsync_wait(wait.as_ref());
+        }
+    }
+
+    fn prepare_wait(&mut self, pc: &PageContainer) {
+        let wait = self
+            .wait
+            .get_or_insert_with(|| Arc::new(notification::new_page_ready_wait()));
+        pc.register_file_fsync_wait(wait);
     }
 
     pub(crate) const fn backend_finished(&self) -> bool {
@@ -876,6 +923,17 @@ struct PageContainerState {
     page_slots: BTreeMap<PageIndex, Arc<PageSlot>>,
     in_flight_file_pages: BTreeMap<PageIndex, FilePageFetch>,
     fsync_submissions: BTreeMap<PageIoRequestId, fsync_submission::FsyncSubmission>,
+    /// Fire-and-forget commit barrier admitted after plain-close writeback.
+    /// This is deliberately separate from `fsync_submissions`: no userspace
+    /// fsync operation owns or waits for this request.
+    background_commit_submission: Option<PageIoRequestId>,
+    background_commit_needed: bool,
+    /// Strong custody transferred from the terminal close-writeback owner.
+    /// It deliberately forms a bounded self-cycle until the internal commit
+    /// and optional checkpoint graph reach a terminal route.
+    background_commit_keepalive: Option<Cap<PageContainer>>,
+    background_checkpoints_in_flight: usize,
+    file_fsync_waits: BTreeMap<u64, ArcWeak<notification::PageReadyWait>>,
     #[cfg(test)]
     // Test-only alias for the manager-owned L4 state. It must not become a
     // second service instance or production PageContainer ownership.
@@ -1273,6 +1331,11 @@ impl PageContainer {
                 page_slots: BTreeMap::new(),
                 in_flight_file_pages: BTreeMap::new(),
                 fsync_submissions: BTreeMap::new(),
+                background_commit_submission: None,
+                background_commit_needed: false,
+                background_commit_keepalive: None,
+                background_checkpoints_in_flight: 0,
+                file_fsync_waits: BTreeMap::new(),
                 #[cfg(test)]
                 file_io_service: page_submission.clone(),
                 range_reservations: RangeReservationTable::new(),
@@ -1412,17 +1475,46 @@ impl PageContainer {
         self.state.lock().pages.len()
     }
 
+    /// Snapshot the manager-owned file-I/O queues without retaining any
+    /// request, frame, device, or page-container capability.
+    pub fn file_io_diagnostic_counts(
+        &self,
+    ) -> (usize, usize, usize, usize, usize, usize, usize, bool) {
+        let page_in_flight = self.state.lock().in_flight_file_pages.len();
+        let (page_queued, page_admitted, wake_attached) = self.page_submission.diagnostic_counts();
+        let (block_queued, block_tracked, block_tags, block_in_flight) =
+            self.block_submission.diagnostic_counts();
+        (
+            page_in_flight,
+            page_queued,
+            page_admitted,
+            block_queued,
+            block_tracked,
+            block_tags,
+            block_in_flight,
+            wake_attached,
+        )
+    }
+
     #[cfg(tx_vm_pmap_boot_diag)]
     pub fn file_io_boot_diag_counts(&self) -> (usize, usize, usize, usize, usize, bool) {
-        let state = self.state.lock();
+        let (
+            page_in_flight,
+            page_queued,
+            page_admitted,
+            block_queued,
+            block_tracked,
+            _,
+            _,
+            wake_attached,
+        ) = self.file_io_diagnostic_counts();
         (
-            state.in_flight_file_pages.len(),
-            self.page_submission
-                .with_service(|service| service.submission_len()),
-            self.page_submission.admitted_file_request_count(),
-            self.block_submission.queue_len_for_test(),
-            self.block_submission.tracker_len_for_test(),
-            self.page_submission.has_wake_source(),
+            page_in_flight,
+            page_queued,
+            page_admitted,
+            block_queued,
+            block_tracked,
+            wake_attached,
         )
     }
 
@@ -1989,6 +2081,40 @@ impl PageContainer {
         self.page_submission.kick(service);
     }
 
+    fn register_file_fsync_wait(&self, wait: &Arc<notification::PageReadyWait>) {
+        let source_id = notification::page_ready_source_id(wait.as_ref());
+        self.state
+            .lock()
+            .file_fsync_waits
+            .entry(source_id)
+            .or_insert_with(|| Arc::downgrade(wait));
+    }
+
+    fn unregister_file_fsync_wait(&self, wait: &notification::PageReadyWait) {
+        let source_id = notification::page_ready_source_id(wait);
+        self.state.lock().file_fsync_waits.remove(&source_id);
+    }
+
+    fn notify_file_fsync_progress(&self) {
+        let notifiers = {
+            let mut state = self.state.lock();
+            let mut notifiers = Vec::new();
+            state.file_fsync_waits.retain(|_, weak| {
+                let Some(wait) = weak.upgrade() else {
+                    return false;
+                };
+                notifiers.push(wait.notifier());
+                true
+            });
+            notifiers
+        };
+        for notifier in notifiers {
+            notification::notify_page_ready_with_post(&notifier, |mailbox, event| {
+                mailbox.post(event)
+            });
+        }
+    }
+
     /// Move one dirty file page into the L4 writeback queue.
     ///
     /// This is only admission: the backend planner and L6 executor own later
@@ -2203,10 +2329,10 @@ impl PageContainer {
             return None;
         }
         let mut state = self.state.lock();
-        let id = self
+        let outcome = self
             .page_submission
             .with_service(|service| {
-                service.submit(
+                service.submit_with_wake(
                     self.io_manager_key(),
                     PageIoRange::new(0, self.page_count.max(1)),
                     PageIoOp::Fsync,
@@ -2216,11 +2342,107 @@ impl PageContainer {
                 )
             })
             .ok()?;
+        let id = outcome.id;
         let previous = state
             .fsync_submissions
             .insert(id, fsync_submission::FsyncSubmission::new(id));
         debug_assert!(previous.is_none(), "L4 request identifiers are unique");
+        drop(state);
+        if outcome.wake == PageServiceWake::Wake {
+            self.kick_file_io_service(IoServiceKind::Page);
+        }
         Some(id)
+    }
+
+    /// Publish one internal durability barrier after fire-and-forget
+    /// writeback. Close remains nonblocking: the Page service owns the commit
+    /// request and the existing background-graph route owns its checkpoint.
+    ///
+    /// An explicit fsync waiter takes precedence, because that operation will
+    /// submit the same planner barrier once its dirty frontier completes.
+    fn submit_file_background_commit(&self) {
+        if !matches!(self.kind, PageContainerKind::File { .. }) {
+            return;
+        }
+        {
+            let mut state = self.state.lock();
+            state.background_commit_needed = true;
+        }
+        self.retry_file_background_commit();
+    }
+
+    fn retry_file_background_commit(&self) {
+        let wake = {
+            let mut state = self.state.lock();
+            state
+                .file_fsync_waits
+                .retain(|_, wait| wait.upgrade().is_some());
+            if !state.background_commit_needed || state.background_commit_submission.is_some() {
+                return;
+            }
+            if !state.fsync_submissions.is_empty() || !state.file_fsync_waits.is_empty() {
+                // The explicit operation already owns the durability barrier.
+                state.background_commit_needed = false;
+                drop(state);
+                self.release_file_background_commit_keepalive_if_idle();
+                return;
+            }
+            let Ok(outcome) = self.page_submission.with_service(|service| {
+                service.submit_with_wake(
+                    self.io_manager_key(),
+                    PageIoRange::new(0, self.page_count.max(1)),
+                    PageIoOp::Fsync,
+                    PageIoPriority::BackgroundWriteback,
+                    PageIoFlags::BARRIER,
+                    None,
+                )
+            }) else {
+                // The terminal writeback just retired one ordinary request,
+                // so this path is only a defensive bounded-queue fallback.
+                // Keep the service awake; the next bounded Page turn retries
+                // after draining ordinary work without making close wait.
+                self.kick_file_io_service(IoServiceKind::Page);
+                return;
+            };
+            state.background_commit_needed = false;
+            state.background_commit_submission = Some(outcome.id);
+            outcome.wake
+        };
+        if wake == PageServiceWake::Wake {
+            self.kick_file_io_service(IoServiceKind::Page);
+        }
+    }
+
+    fn take_file_background_commit(&self, request: PageIoRequestId) -> bool {
+        let mut state = self.state.lock();
+        if state.background_commit_submission != Some(request) {
+            return false;
+        }
+        state.background_commit_submission = None;
+        true
+    }
+
+    fn release_file_background_commit_keepalive_if_idle(&self) {
+        let keepalive = {
+            let mut state = self.state.lock();
+            if state.background_commit_needed
+                || state.background_commit_submission.is_some()
+                || state.background_checkpoints_in_flight != 0
+            {
+                return;
+            }
+            state.background_commit_keepalive.take()
+        };
+        drop(keepalive);
+    }
+
+    fn finish_file_background_checkpoint(&self) {
+        {
+            let mut state = self.state.lock();
+            state.background_checkpoints_in_flight =
+                state.background_checkpoints_in_flight.saturating_sub(1);
+        }
+        self.release_file_background_commit_keepalive_if_idle();
     }
 
     fn file_fsync_submission_state(&self, id: PageIoRequestId) -> Option<FsyncSubmissionState> {
@@ -2244,6 +2466,7 @@ impl PageContainer {
     ) -> FileFsyncFrontierAdvance {
         let mut submitted = 0u32;
         let mut waiting = false;
+        let mut admission_blocked = false;
         let mut candidates = Vec::new();
         for &(page, generation) in frontier.pages() {
             let status = self
@@ -2284,14 +2507,20 @@ impl PageContainer {
                         submitted = submitted.saturating_add(1);
                     } else {
                         waiting = true;
+                        admission_blocked = true;
                     }
                 }
             }
             start = end;
         }
         if submitted != 0 {
+            self.kick_file_io_service(IoServiceKind::Page);
             FileFsyncFrontierAdvance::Submitted { pages: submitted }
         } else if waiting {
+            if admission_blocked {
+                self.kick_file_io_service(IoServiceKind::Page);
+                self.notify_file_fsync_progress();
+            }
             FileFsyncFrontierAdvance::Waiting
         } else {
             FileFsyncFrontierAdvance::Complete
@@ -2575,6 +2804,11 @@ impl PageContainer {
             }
         }
 
+        // A saturated submission queue can temporarily defer the
+        // fire-and-forget barrier. Retry after this turn has retired bounded
+        // Page work; explicit fsync still wins if it arrived meanwhile.
+        self.retry_file_background_commit();
+
         let next = self
             .page_submission
             .with_service(|service| service.drive_turn(ServiceBudget::new(0)).next);
@@ -2707,6 +2941,10 @@ impl PageContainer {
         route: &PageCompletionRoute,
     ) -> Option<Result<PageSlotSnapshot, PageSlotCompletionError>> {
         if route.completion.kind == PageIoCompletionKind::Noop {
+            if self.take_file_background_commit(route.completion.id) {
+                self.notify_file_backend_completion(&route.completion, PageIoOp::Fsync);
+                return None;
+            }
             if self
                 .page_submission
                 .take_background_graph(route.completion.id)
@@ -2716,6 +2954,7 @@ impl PageContainer {
             }
             if self.terminalize_file_fsync_submission(&route.completion) {
                 self.notify_file_backend_completion(&route.completion, PageIoOp::Fsync);
+                self.notify_file_fsync_progress();
             }
             return None;
         }
@@ -2800,7 +3039,16 @@ impl PageContainer {
                 ) {
                     Ok(PageServiceBackendSubmitOutcome::Err { errno, .. }) => Err(errno),
                     Ok(_) => {
+                        let mut state = self.state.lock();
+                        state.background_checkpoints_in_flight =
+                            state.background_checkpoints_in_flight.saturating_add(1);
+                        drop(state);
                         self.page_submission.mark_background_graph(request.id);
+                        // Fsync completions are applied in the composite
+                        // runtime's page-after turn, after Block has already
+                        // consumed its budget. Publish the newly dispatchable
+                        // checkpoint graph so the next runtime turn drives L6.
+                        self.kick_file_io_service(IoServiceKind::Block);
                         Ok(())
                     }
                     Err(_) => Err(Errno::EIO),
@@ -2810,6 +3058,7 @@ impl PageContainer {
         };
         if let Err(errno) = queued {
             planner.complete_background_graph(object, Err(errno));
+            self.release_file_background_commit_keepalive_if_idle();
         }
     }
 
@@ -2852,9 +3101,11 @@ impl PageContainer {
             PageIoResult::Err(errno) => Err(errno),
         };
         let Some(planner) = mount.payload().backend_planner() else {
+            self.finish_file_background_checkpoint();
             return;
         };
         planner.complete_background_graph(FsObjectKey::new(fs_object_id.as_u64()), result);
+        self.finish_file_background_checkpoint();
     }
 
     fn terminalize_file_fsync_submission(
@@ -2894,6 +3145,9 @@ impl PageContainer {
             return;
         };
         let Some(planner) = mount.payload().backend_planner() else {
+            if op == PageIoOp::Writeback && result == PageIoResult::Done || op == PageIoOp::Fsync {
+                self.release_file_background_commit_keepalive_if_idle();
+            }
             return;
         };
         planner.complete_page_io(crate::fs_iface::BackendPageCompletion::new(
@@ -2902,13 +3156,21 @@ impl PageContainer {
             op,
             result,
         ));
-        if op != PageIoOp::Fsync || result != PageIoResult::Done {
+        if op == PageIoOp::Writeback && result == PageIoResult::Done {
+            self.submit_file_background_commit();
+            return;
+        }
+        if op != PageIoOp::Fsync {
+            return;
+        }
+        if result != PageIoResult::Done {
+            self.release_file_background_commit_keepalive_if_idle();
             return;
         }
         let object = FsObjectKey::new(fs_object_id.as_u64());
         match planner.take_background_graph(object) {
             Ok(Some(graph)) => self.queue_file_background_graph(planner, object, graph),
-            Ok(None) | Err(_) => {}
+            Ok(None) | Err(_) => self.release_file_background_commit_keepalive_if_idle(),
         }
     }
 
@@ -3030,11 +3292,20 @@ impl PageContainer {
 
         match request.op {
             PageIoOp::Writeback => {
-                let lease = owner.and_then(|owner| match owner.take_payload() {
-                    FileIoPayload::Writeback { lease } => Some(lease),
-                    FileIoPayload::Read { .. } | FileIoPayload::Control => None,
-                })?;
-                let state = self.state.lock();
+                let (lease, mut container_keepalive) =
+                    owner.and_then(|owner| match owner.take_payload_and_keepalive() {
+                        (FileIoPayload::Writeback { lease }, keepalive) => Some((lease, keepalive)),
+                        (FileIoPayload::Read { .. } | FileIoPayload::Control, _) => None,
+                    })?;
+                let retain_for_background_commit = matches!(
+                    terminal,
+                    FileIoTerminalResult::Completion {
+                        result: PageIoResult::Done,
+                        kind: PageIoCompletionKind::WritebackFinished,
+                        ..
+                    }
+                );
+                let mut state = self.state.lock();
                 let first_result = match terminal {
                     FileIoTerminalResult::SubmitFailure => {
                         let mut first_snapshot = None;
@@ -3108,7 +3379,13 @@ impl PageContainer {
                     }
                     FileIoTerminalResult::Completion { .. } => None,
                 };
+                if retain_for_background_commit && state.background_commit_keepalive.is_none() {
+                    state.background_commit_keepalive = container_keepalive.take();
+                }
                 drop(lease);
+                drop(state);
+                drop(container_keepalive);
+                self.notify_file_fsync_progress();
                 first_result
             }
             PageIoOp::Read | PageIoOp::Readahead => match terminal {
@@ -3130,10 +3407,11 @@ impl PageContainer {
                     notify_waiters,
                 } => {
                     let page = PageIndex::new(request.range.start_page());
-                    let target = owner.and_then(|owner| match owner.take_payload() {
-                        FileIoPayload::Read { target } => Some(target),
-                        FileIoPayload::Writeback { .. } | FileIoPayload::Control => None,
-                    });
+                    let target =
+                        owner.and_then(|owner| match owner.take_payload_and_keepalive().0 {
+                            FileIoPayload::Read { target } => Some(target),
+                            FileIoPayload::Writeback { .. } | FileIoPayload::Control => None,
+                        });
                     let result = match result {
                         PageIoResult::Err(errno) => {
                             let state = self.state.lock();

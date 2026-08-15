@@ -1100,6 +1100,7 @@ pub struct PageContainerFileIoServiceRuntimeSnapshot {
     container: Weak<PageContainer>,
     handle: BlockDeviceHandle,
     source_id: u64,
+    claimed: bool,
 }
 
 impl PageContainerFileIoServiceRuntimeSnapshot {
@@ -1111,8 +1112,21 @@ impl PageContainerFileIoServiceRuntimeSnapshot {
         self.source_id
     }
 
+    pub const fn is_claimed(&self) -> bool {
+        self.claimed
+    }
+
     pub fn is_live(&self, guard: &Guard<'_>) -> bool {
         self.container.upgrade(guard).is_some()
+    }
+
+    pub fn diagnostic_counts(
+        &self,
+        guard: &Guard<'_>,
+    ) -> Option<(usize, usize, usize, usize, usize, usize, usize, bool)> {
+        self.container
+            .upgrade(guard)
+            .map(|container| container.file_io_diagnostic_counts())
     }
 }
 
@@ -1239,6 +1253,7 @@ pub fn page_container_file_io_service_runtimes_snapshot(
             container: entry.container,
             handle: entry.handle,
             source_id: entry.source_id,
+            claimed: matches!(entry.state, FileIoManagerRuntimeState::Claimed),
         })
         .collect()
 }
@@ -1271,20 +1286,26 @@ async fn page_container_file_io_service_task_loop_claim(
     config: PageContainerFileIoServiceTaskConfig,
 ) -> PageContainerFileIoServiceTaskReport {
     let mut report = PageContainerFileIoServiceTaskReport::default();
+    let mut next = PageContainerFileIoServiceNext::Sleeping;
     while config
         .max_ready_turns
         .is_none_or(|max_ready_turns| report.ready_turns < max_ready_turns)
     {
-        let wait = crate::wait_source::wait_on_registered_endpoint(
-            claim.wake_source.wake_endpoint(),
-            file_io_service_interest_mask(),
-        );
-        if wait.await != WaitOutcome::Ready {
-            report.waits_failed += 1;
-            break;
+        // A bounded turn may publish follow-up Page/Block work after consuming
+        // its mailbox registration. Honor the returned runnable state before
+        // registering again; the yield below remains the fairness boundary.
+        if next != PageContainerFileIoServiceNext::Runnable {
+            let wait = crate::wait_source::wait_on_registered_endpoint(
+                claim.wake_source.wake_endpoint(),
+                file_io_service_interest_mask(),
+            );
+            if wait.await != WaitOutcome::Ready {
+                report.waits_failed += 1;
+                break;
+            }
+            report.waits_ready += 1;
         }
 
-        report.waits_ready += 1;
         report.ready_turns += 1;
         let container = {
             let guard = step_engine::guard();
@@ -1324,6 +1345,7 @@ async fn page_container_file_io_service_task_loop_claim(
                 .map(|turn| turn.kicks)
                 .unwrap_or(0)
             + turn.page_after.as_ref().map(|turn| turn.kicks).unwrap_or(0);
+        next = turn.next;
         report.last_turn = Some(turn);
         if config
             .max_ready_turns
@@ -1343,20 +1365,26 @@ pub async fn page_container_file_io_service_task_loop(
     config: PageContainerFileIoServiceTaskConfig,
 ) -> PageContainerFileIoServiceTaskReport {
     let mut report = PageContainerFileIoServiceTaskReport::default();
+    let mut next = PageContainerFileIoServiceNext::Sleeping;
     while config
         .max_ready_turns
         .is_none_or(|max_ready_turns| report.ready_turns < max_ready_turns)
     {
-        let wait = crate::wait_source::wait_on_registered_endpoint(
-            wake_source.wake_endpoint(),
-            file_io_service_interest_mask(),
-        );
-        if wait.await != WaitOutcome::Ready {
-            report.waits_failed += 1;
-            break;
+        // A bounded turn may publish follow-up Page/Block work after consuming
+        // its mailbox registration. Honor the returned runnable state before
+        // registering again; the yield below remains the fairness boundary.
+        if next != PageContainerFileIoServiceNext::Runnable {
+            let wait = crate::wait_source::wait_on_registered_endpoint(
+                wake_source.wake_endpoint(),
+                file_io_service_interest_mask(),
+            );
+            if wait.await != WaitOutcome::Ready {
+                report.waits_failed += 1;
+                break;
+            }
+            report.waits_ready += 1;
         }
 
-        report.waits_ready += 1;
         report.ready_turns += 1;
         let turn = match drive_page_container_file_io_service_once_compact(
             container,
@@ -1382,6 +1410,7 @@ pub async fn page_container_file_io_service_task_loop(
                 .map(|turn| turn.kicks)
                 .unwrap_or(0)
             + turn.page_after.as_ref().map(|turn| turn.kicks).unwrap_or(0);
+        next = turn.next;
         report.last_turn = Some(turn);
         if config
             .max_ready_turns

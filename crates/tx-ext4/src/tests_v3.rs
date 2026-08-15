@@ -43,12 +43,13 @@ use tx_ext4_format::ondisk::{
 use tx_ext4_format::pager::{BlockImage, Ext4Pager, InodeNo, Page4K, BLOCK_SIZE};
 use tx_substrate::step::PageProgress;
 use tx_subsystems::fs_iface::{
-    BackendPageRequest, BackendPlan, FsObjectKey, IoDataLeaseId, IoDataSource, IoDataTarget,
-    PageFrameRef,
+    BackendPageCompletion, BackendPageRequest, BackendPlan, FsObjectKey, IoDataLeaseId,
+    IoDataSource, IoDataTarget, PageFrameRef,
 };
 use tx_subsystems::io_manager::block::{BioVec, DeviceKey};
 use tx_subsystems::io_manager::page::{
-    PageGeneration, PageIoFlags, PageIoOp, PageIoRange, PageIoRequestId,
+    PageGeneration, PageIoCompletionKind, PageIoFlags, PageIoOp, PageIoRange, PageIoRequestId,
+    PageIoResult,
 };
 use tx_subsystems::mount::{
     DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, MountPayloadPin,
@@ -1158,6 +1159,29 @@ fn mounted_counting_mutation_fs(
     (mounted, runtime, writes)
 }
 
+fn counting_mutation_backend(
+    sequence: u32,
+) -> (
+    Arc<Ext4FsInstance<CountingImage>>,
+    Arc<JournalMutationRuntime>,
+    Arc<AtomicUsize>,
+) {
+    let writes = Arc::new(AtomicUsize::new(0));
+    let runtime = mutation_runtime_for_test(sequence);
+    let backend = Ext4FsInstance::open(
+        CountingImage {
+            image: build_tier1_mount_image(),
+            writes: Arc::clone(&writes),
+        },
+        false,
+    )
+    .expect("open Tier 1 mutation ext4 backend");
+    backend.disable_legacy_writeback();
+    backend.bind_metadata_mutation_runtime(Arc::clone(&runtime));
+    runtime.source().bind_settlement_observer(backend.clone());
+    (backend, runtime, writes)
+}
+
 fn mounted_counting_truncate_free_fs(
     sequence: u32,
 ) -> (
@@ -1675,6 +1699,67 @@ where
     (root_dentry, root_mount, payload)
 }
 
+fn ext4_root_and_target_for_backend<I>(
+    backend: &Arc<Ext4FsInstance<I>>,
+    target_id: FsObjectId,
+    dev: u32,
+    mount_id: u64,
+) -> (
+    epoch::Cap<DEntry>,
+    epoch::Cap<DEntry>,
+    epoch::Cap<MountIdentity>,
+)
+where
+    I: BlockImage + Send + 'static,
+{
+    let payload = MountPayload::new_cap(
+        backend.clone().fs_ops_arc(),
+        backend.clone().fs_page_backing_arc(),
+        None,
+        DevId::new(dev),
+        MountOptions::default(),
+        "ext4",
+        SourceLabel::Static("ext4"),
+    )
+    .expect("ext4 mount payload for resumed attribute op");
+    backend.bind_mount_payload(&payload);
+
+    let guard = epoch::guard();
+    let fs_ops = backend.clone().fs_ops_arc();
+    let root_id = FsObjectId::new(2);
+    let root_meta = match fs_ops.load_inode_meta(root_id, &guard) {
+        V3::Done(meta) => meta,
+        other => panic!("load ext4 root metadata: {other:?}"),
+    };
+    let root_rnode = RNode::new_cap_in_mount(root_id, root_meta, RNodeBacking::Directory, &payload)
+        .expect("ext4 root rnode for resumed attribute op");
+    let root_dentry = DEntry::new_cap(InlineName::ROOT, root_rnode).expect("ext4 root dentry");
+
+    let target_meta = match fs_ops.load_inode_meta(target_id, &guard) {
+        V3::Done(meta) => meta,
+        other => panic!("load ext4 target metadata: {other:?}"),
+    };
+    let target_rnode = match fs_ops.materialise_rnode(target_id, target_meta, &payload, &guard) {
+        V3::Done(rnode) => rnode,
+        other => panic!("materialise ext4 target: {other:?}"),
+    };
+    let target_dentry = DEntry::new_cap(
+        InlineName::new(b"pre-resolved").expect("inline target name"),
+        target_rnode,
+    )
+    .expect("ext4 pre-resolved target dentry");
+    let root_mount = MountIdentity::new_cap_with_root_dentry(
+        MountId::new(mount_id),
+        None,
+        root_dentry.clone(),
+        None,
+        payload,
+        MountFlags::empty(),
+    )
+    .expect("ext4 root mount for resumed attribute op");
+    (root_dentry, target_dentry, root_mount)
+}
+
 #[test]
 fn ext4_materialise_regular_file_reuses_live_page_container_for_same_inode() {
     let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -1707,6 +1792,11 @@ fn ext4_materialise_regular_file_reuses_live_page_container_for_same_inode() {
         RNodeBacking::PageBacked { pc } => pc.clone(),
         other => panic!("first materialise returned non-page-backed rnode: {other:?}"),
     };
+    assert_eq!(
+        first_pc.page_count(),
+        crate::namespace::EXT4_FILE_PAGE_CAP,
+        "regular ext4 files retain the sparse 256 MiB growth window",
+    );
     first_pc.set_size_bytes(meta.size + 7);
 
     let second = match fs_ops.materialise_rnode(file_id, meta, &mount, &guard) {
@@ -1773,17 +1863,23 @@ fn ext4_metadata_serialize_admits_a_journal_mutation_without_home_write() {
         V3::<(), NoProgress>::done(())
     );
     assert_metadata_settled(&runtime, &writes);
-    assert!(matches!(
-        runtime.source().plan_fsync(&BackendPageRequest::new(
-            FsObjectKey::new(12),
-            PageIoRequestId::new(91),
-            PageIoRange::new(0, 1),
-            PageIoOp::Fsync,
-            PageIoFlags::BARRIER,
-            None,
-        )),
-        BackendPlan::Err(V3Errno::EAGAIN)
-    ));
+    let request = BackendPageRequest::new(
+        FsObjectKey::new(12),
+        PageIoRequestId::new(91),
+        PageIoRange::new(0, 1),
+        PageIoOp::Fsync,
+        PageIoFlags::BARRIER,
+        None,
+    );
+    let BackendPlan::Complete(completions) = runtime.source().plan_fsync(&request) else {
+        panic!("fsync after background settlement must complete as a no-op");
+    };
+    assert_eq!(completions.as_slice().len(), 1);
+    let completion = &completions.as_slice()[0];
+    assert_eq!(completion.id, request.id);
+    assert_eq!(completion.range, request.range);
+    assert_eq!(completion.result, PageIoResult::Done);
+    assert_eq!(completion.kind, PageIoCompletionKind::Noop);
 }
 
 #[test]
@@ -1808,6 +1904,73 @@ fn ext4_chmod_and_chown_public_paths_admit_metadata_mutations() {
         V3::<(), NoProgress>::done(())
     );
     assert_metadata_settled(&chown_runtime, &chown_writes);
+}
+
+#[test]
+fn ext4_chmod_op_retains_pre_resolved_target_across_admission_yield() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let cred = tx_subsystems::vfs::Credential::root();
+    let (backend, runtime, writes) = counting_mutation_backend(63);
+    let (root_dentry, target_dentry, _root_mount) =
+        ext4_root_and_target_for_backend(&backend, FsObjectId::new(12), 63, 63);
+    let permit = backend
+        .try_lock_metadata_mutation_admission()
+        .expect("hold ext4 metadata admission for chmod contention");
+    let mut op = tx_subsystems::vfs::composite::ChmodOp {
+        rooted_at: &root_dentry,
+        path: b"/path-must-not-be-walked-after-yield",
+        mode: 0o600,
+        cred: &cred,
+        target: Some(target_dentry),
+    };
+    let mut script_ctx = epoch::ScriptCtx::<tx_subsystems::process::ProcessIdentity>::new();
+
+    match op.step(&mut script_ctx) {
+        V3::Yield {
+            shape: tx_substrate::step::YieldShape::OnWaitSource { interests, .. },
+            ..
+        } => assert_eq!(interests.raw(), 1),
+        other => panic!("contended ext4 chmod must yield: {other:?}"),
+    }
+
+    drop(permit);
+    assert_eq!(op.step(&mut script_ctx), V3::<(), NoProgress>::done(()));
+    assert_metadata_settled(&runtime, &writes);
+}
+
+#[test]
+fn ext4_chown_op_retains_pre_resolved_target_across_admission_yield() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let cred = tx_subsystems::vfs::Credential::root();
+    let (backend, runtime, writes) = counting_mutation_backend(64);
+    let (root_dentry, target_dentry, _root_mount) =
+        ext4_root_and_target_for_backend(&backend, FsObjectId::new(12), 64, 64);
+    let permit = backend
+        .try_lock_metadata_mutation_admission()
+        .expect("hold ext4 metadata admission for chown contention");
+    let mut op = tx_subsystems::vfs::composite::ChownOp {
+        rooted_at: &root_dentry,
+        path: b"/path-must-not-be-walked-after-yield",
+        uid: Some(1000),
+        gid: Some(1000),
+        cred: &cred,
+        target: Some(target_dentry),
+    };
+    let mut script_ctx = epoch::ScriptCtx::<tx_subsystems::process::ProcessIdentity>::new();
+
+    match op.step(&mut script_ctx) {
+        V3::Yield {
+            shape: tx_substrate::step::YieldShape::OnWaitSource { interests, .. },
+            ..
+        } => assert_eq!(interests.raw(), 1),
+        other => panic!("contended ext4 chown must yield: {other:?}"),
+    }
+
+    drop(permit);
+    assert_eq!(op.step(&mut script_ctx), V3::<(), NoProgress>::done(()));
+    assert_metadata_settled(&runtime, &writes);
 }
 
 #[test]
@@ -2377,6 +2540,150 @@ fn ext4_metadata_mutation_settles_prior_ordered_data_transaction_before_admissio
         V3::<(), NoProgress>::done(())
     );
     assert_metadata_settled(&runtime, &writes);
+}
+
+#[test]
+fn ext4_checkpoint_pending_keeps_truncate_and_unlink_on_metadata_admission_wait() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let guard = epoch::guard();
+    let (mounted, runtime, _writes) = mounted_counting_mutation_fs(30);
+    let backing = mounted.fs_page_backing();
+    let planner = mounted
+        .backend_planner()
+        .expect("mounted ext4 exposes I/O-manager planner");
+    let data = BackendPageRequest::new_with_source(
+        FsObjectKey::new(12),
+        PageIoRequestId::new(729),
+        PageIoRange::new(0, 1),
+        PageIoOp::Writeback,
+        PageIoFlags::WRITEBACK,
+        Some(PageGeneration::new(7)),
+        IoDataSource::page_cache(
+            IoDataLeaseId::new(730),
+            PageFrameRef::new(page_allocator::zero_frame_ppn().expect("zero frame")),
+            0,
+            BLOCK_SIZE as u32,
+        ),
+    );
+    planner
+        .prepare_page_io(&data, &guard)
+        .expect("writeback admission stages mutation");
+    assert!(matches!(
+        planner.plan_page_io(data.clone()),
+        BackendPlan::SubmitGraph(_)
+    ));
+    planner.complete_page_io(BackendPageCompletion::new(
+        data.object,
+        data.id,
+        data.op,
+        PageIoResult::Done,
+    ));
+    let fsync = BackendPageRequest::new(
+        FsObjectKey::new(12),
+        PageIoRequestId::new(730),
+        PageIoRange::new(0, 1),
+        PageIoOp::Fsync,
+        PageIoFlags::BARRIER,
+        None,
+    );
+    let source = runtime.source();
+    assert!(matches!(
+        source.plan_fsync(&fsync),
+        BackendPlan::SubmitGraph(_)
+    ));
+    source.complete_fsync(BackendPageCompletion::new(
+        fsync.object,
+        fsync.id,
+        fsync.op,
+        PageIoResult::Done,
+    ));
+    assert!(source
+        .take_checkpoint_graph()
+        .expect("durable commit exposes checkpoint")
+        .is_some());
+
+    let truncate_wait = match backing.truncate(FsObjectId::new(12), 0, &guard) {
+        V3::Yield {
+            shape: tx_substrate::step::YieldShape::OnWaitSource { source, interests },
+            ..
+        } => {
+            assert_eq!(interests.raw(), 1);
+            source
+        }
+        other => panic!("checkpoint-pending truncate must wait for admission: {other:?}"),
+    };
+    let unlink_wait =
+        match mounted
+            .fs_ops()
+            .unlink(FsObjectId::new(2), b"hello", FsObjectId::new(12), &guard)
+        {
+            V3::Yield {
+                shape: tx_substrate::step::YieldShape::OnWaitSource { source, interests },
+                ..
+            } => {
+                assert_eq!(interests.raw(), 1);
+                source
+            }
+            other => panic!("checkpoint-pending unlink must wait for admission: {other:?}"),
+        };
+    assert_eq!(truncate_wait, unlink_wait);
+
+    source
+        .complete_checkpoint_result(Ok(()))
+        .expect("checkpoint terminal releases metadata admission");
+    let endpoint = tx_substrate::wake::lookup_source(truncate_wait)
+        .expect("metadata admission wait source remains registered");
+    assert_eq!(endpoint.pending_mask_snapshot(), 1);
+
+    let failed_data = BackendPageRequest::new_with_source(
+        FsObjectKey::new(12),
+        PageIoRequestId::new(731),
+        PageIoRange::new(0, 1),
+        PageIoOp::Writeback,
+        PageIoFlags::WRITEBACK,
+        Some(PageGeneration::new(8)),
+        IoDataSource::page_cache(
+            IoDataLeaseId::new(731),
+            PageFrameRef::new(page_allocator::zero_frame_ppn().expect("zero frame")),
+            0,
+            BLOCK_SIZE as u32,
+        ),
+    );
+    planner
+        .prepare_page_io(&failed_data, &guard)
+        .expect("second writeback admission stages mutation");
+    assert!(matches!(
+        planner.plan_page_io(failed_data.clone()),
+        BackendPlan::SubmitGraph(_)
+    ));
+    planner.complete_page_io(BackendPageCompletion::new(
+        failed_data.object,
+        failed_data.id,
+        failed_data.op,
+        PageIoResult::Err(V3Errno::EIO),
+    ));
+    let retry_data = BackendPageRequest {
+        id: PageIoRequestId::new(732),
+        generation_hint: Some(PageGeneration::new(9)),
+        ..failed_data.clone()
+    };
+    planner
+        .prepare_page_io(&retry_data, &guard)
+        .expect("retry writeback stages after abort");
+    assert!(
+        matches!(
+            planner.plan_page_io(retry_data.clone()),
+            BackendPlan::SubmitGraph(_)
+        ),
+        "ordered-data failure must abort the handle and release admission"
+    );
+    planner.complete_page_io(BackendPageCompletion::new(
+        retry_data.object,
+        retry_data.id,
+        retry_data.op,
+        PageIoResult::Err(V3Errno::EIO),
+    ));
 }
 
 #[test]

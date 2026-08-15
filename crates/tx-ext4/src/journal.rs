@@ -1583,21 +1583,11 @@ pub trait Ext4MutationPlanSource: Send + Sync + 'static {
 pub struct JournalMutationWriteSource<P> {
     planner: P,
     runtime: Arc<JournalMutationRuntime>,
-    active_admission: SpinMutex<
-        Option<(
-            tx_subsystems::io_manager::page::PageIoRequestId,
-            JournalMetadataMutationPermit,
-        )>,
-    >,
 }
 
 impl<P> JournalMutationWriteSource<P> {
     pub const fn new(planner: P, runtime: Arc<JournalMutationRuntime>) -> Self {
-        Self {
-            planner,
-            runtime,
-            active_admission: SpinMutex::new(None),
-        }
+        Self { planner, runtime }
     }
 }
 
@@ -1652,35 +1642,23 @@ impl<P: Ext4MutationPlanSource> Ext4WritePlanSource for JournalMutationWriteSour
             }
             Err(error) => return BackendPlan::Err(journal_mutation_runtime_errno(error)),
         }
+        if self.runtime.attach_metadata_admission(permit).is_err() {
+            self.runtime.abort_unsubmitted_data(Errno::EBUSY);
+            return BackendPlan::Err(Errno::EBUSY);
+        }
         if let Err(errno) = self.planner.stage_writeback_after_images(&mutation) {
             self.runtime.abort_unsubmitted_data(errno);
             return BackendPlan::Err(errno);
         }
-        {
-            let mut active = self.active_admission.lock();
-            if active.is_some() {
-                self.runtime.abort_unsubmitted_data(Errno::EBUSY);
-                return BackendPlan::Err(Errno::EBUSY);
-            }
-            *active = Some((request.id, permit));
-        }
         let plan = self.runtime.plan_data(request);
         if matches!(plan, BackendPlan::Err(_)) {
             self.runtime.abort_unsubmitted_data(Errno::EIO);
-            self.active_admission.lock().take();
         }
         plan
     }
 
     fn complete_writeback(&self, completion: BackendPageCompletion) {
         self.runtime.complete_data(completion);
-        let mut active = self.active_admission.lock();
-        if active
-            .as_ref()
-            .is_some_and(|(request, _)| *request == completion.id)
-        {
-            active.take();
-        }
     }
 }
 
@@ -1877,6 +1855,13 @@ impl JournalMutationRuntime {
 
     pub fn complete_data(&self, completion: BackendPageCompletion) {
         self.source.complete_data(completion);
+    }
+
+    fn attach_metadata_admission(
+        &self,
+        permit: JournalMetadataMutationPermit,
+    ) -> Result<(), JournalTransactionStateError> {
+        self.source.attach_metadata_admission(permit)
     }
 
     pub(crate) fn abort_unsubmitted_data(&self, error: Errno) {

@@ -2037,9 +2037,7 @@ impl<I: SubjectIdentity> StepOp<I> for FileFsyncOp {
                 Ok(
                     crate::page_backed::FileFsyncFrontierAdvance::Submitted { .. }
                     | crate::page_backed::FileFsyncFrontierAdvance::Waiting,
-                ) => V3::Continue {
-                    progress: NoProgress,
-                },
+                ) => self.state.pending_outcome(NoProgress),
                 Ok(crate::page_backed::FileFsyncFrontierAdvance::Error(errno)) => {
                     V3::Err(errno.into())
                 }
@@ -2049,20 +2047,24 @@ impl<I: SubjectIdentity> StepOp<I> for FileFsyncOp {
                     }
                     let guard = step_engine::guard();
                     match self.page_backing.fsync_file(self.fs_object_id, &guard) {
-                        V3::Done(()) => V3::Done(()),
+                        V3::Done(()) => {
+                            self.state.finish_wait(container);
+                            V3::Done(())
+                        }
                         V3::Err(e)
                             if e == step_engine::Errno::ENOSYS
                                 && mount.payload().backend_planner().is_some() =>
                         {
                             drop(guard);
                             match self.state.submit_backend_fsync(container) {
-                                Ok(()) => V3::Continue {
-                                    progress: NoProgress,
-                                },
+                                Ok(()) => self.state.pending_outcome(NoProgress),
                                 Err(errno) => V3::Err(errno.into()),
                             }
                         }
-                        V3::Err(e) => V3::Err(e),
+                        V3::Err(e) => {
+                            self.state.finish_wait(container);
+                            V3::Err(e)
+                        }
                         V3::Continue { .. } => V3::Continue {
                             progress: NoProgress,
                         },

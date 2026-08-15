@@ -287,6 +287,16 @@ impl PageIoSubmissionHandle {
         self.0.lock_state().wake_source.is_some()
     }
 
+    /// Bounded, value-only queue state used by kernel stall diagnostics.
+    pub(crate) fn diagnostic_counts(&self) -> (usize, usize, bool) {
+        let state = self.0.lock_state();
+        (
+            state.service.submission_len(),
+            state.admitted_file_requests.len(),
+            state.wake_source.is_some(),
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn find_submission(
         &self,

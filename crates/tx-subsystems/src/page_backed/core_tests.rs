@@ -1915,6 +1915,131 @@ fn file_close_writeback_admission_queues_dirty_pages_without_fsync() {
 }
 
 #[test]
+fn file_fsync_frontier_admission_kicks_sleeping_page_service() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let planner: Arc<dyn BackendPlanner> = Arc::new(SourceRecordingPlanner::new());
+    let pc = file_page_container_with_planner(fs.clone(), fs, FsObjectId::new(197), 4, planner);
+    let page = PageIndex::new(1);
+    let frame = cached_frame_for_test();
+    let ppn = frame.ppn;
+    {
+        let mut state = pc.state.lock();
+        state
+            .install_resident_if_absent(page, frame)
+            .expect("seed page");
+        let slot = state.page_slots.entry(page).or_default();
+        let PageSlotFetch::Owner { generation } = slot.begin_fetch() else {
+            panic!("slot fetch owner");
+        };
+        slot.complete_fetch(generation, Ok(ppn))
+            .expect("resident slot");
+        slot.mark_dirty().expect("dirty slot");
+    }
+
+    let wake_source = Arc::new(ServiceWakeSource::new(0x7115));
+    assert!(pc.attach_file_io_wake_source(Arc::clone(&wake_source)));
+    let mailbox = Arc::new(tx_substrate::wake::TaskMailbox::new());
+    let generation = mailbox.next_generation();
+    let _subscription =
+        wake_source.subscribe(IoServiceKind::Page, Arc::downgrade(&mailbox), generation);
+
+    let mut fsync = FileFsyncState::new();
+    assert!(matches!(
+        fsync.advance(&pc),
+        Ok(FileFsyncFrontierAdvance::Submitted { pages: 1 })
+    ));
+    assert!(matches!(
+        mailbox.poll(),
+        Some(tx_substrate::wake::MailboxEvent::SourceFired {
+            generation: seen_generation,
+            source,
+            interests,
+        }) if seen_generation == generation
+            && source.raw() == 0x7115
+            && interests.raw() == IoServiceKind::Page.mask_bits()
+    ));
+}
+
+#[test]
+fn file_fsync_wait_wakes_when_writeback_submission_aborts() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let planner: Arc<dyn BackendPlanner> = Arc::new(SourceRecordingPlanner::new());
+    let pc = file_page_container_with_planner(fs.clone(), fs, FsObjectId::new(198), 4, planner);
+    assert!(pc.attach_file_io_wake_source(Arc::new(ServiceWakeSource::new(0x7118))));
+    let page = PageIndex::new(1);
+    let frame = cached_frame_for_test();
+    let ppn = frame.ppn;
+    {
+        let mut state = pc.state.lock();
+        state
+            .install_resident_if_absent(page, frame)
+            .expect("seed page");
+        let slot = state.page_slots.entry(page).or_default();
+        let PageSlotFetch::Owner { generation } = slot.begin_fetch() else {
+            panic!("slot fetch owner");
+        };
+        slot.complete_fetch(generation, Ok(ppn))
+            .expect("resident slot");
+        slot.mark_dirty().expect("dirty slot");
+    }
+
+    let mut fsync = FileFsyncState::new();
+    assert!(matches!(
+        fsync.advance(&pc),
+        Ok(FileFsyncFrontierAdvance::Submitted { pages: 1 })
+    ));
+    let (wait_source_id, wait_interests) = match fsync.pending_outcome(NoProgress) {
+        V3Out::Yield { shape, .. } => {
+            notification::wait_source_parts(&shape).expect("pending fsync should expose PageReady")
+        }
+        other => panic!("pending fsync should yield, got {other:?}"),
+    };
+    let wait_source =
+        tx_substrate::wake::lookup_source(tx_substrate::step::WaitSourceId::new(wait_source_id))
+            .expect("fsync PageReady source should be registered");
+    let mailbox = Arc::new(tx_substrate::wake::TaskMailbox::new());
+    let generation = mailbox.next_generation();
+    let _subscription = wait_source.register(
+        Arc::downgrade(&mailbox),
+        generation,
+        tx_substrate::step::InterestMask::new(wait_interests),
+    );
+    let writeback = pc
+        .state
+        .lock()
+        .file_io_service
+        .find_submission(
+            pc.io_manager_key(),
+            PageIoRange::new(page.as_u64(), 1),
+            PageIoOp::Writeback,
+        )
+        .expect("dirty frontier writeback");
+
+    pc.fail_unsubmitted_file_io_request(&writeback, Errno::EIO);
+
+    assert!(matches!(
+        mailbox.poll(),
+        Some(tx_substrate::wake::MailboxEvent::SourceFired {
+            generation: seen_generation,
+            source,
+            interests,
+        }) if seen_generation == generation
+            && source.raw() == wait_source_id
+            && interests.raw() == wait_interests
+    ));
+    assert!(matches!(
+        pc.page_slot_snapshot_for_test(page)
+            .expect("aborted writeback slot")
+            .state,
+        PageSlotState::Dirty { .. }
+    ));
+}
+
+#[test]
 fn file_close_without_service_runtime_leaves_pages_dirty_for_synchronous_backing() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
     setup_host_substrate();
@@ -4441,7 +4566,7 @@ fn file_page_io_service_task_loop_yields_between_self_kicked_turns() {
         core::task::Poll::Pending => panic!("second poll should finish the bounded service task"),
     };
 
-    assert_eq!(report.waits_ready, 2);
+    assert_eq!(report.waits_ready, 1);
     assert_eq!(report.ready_turns, 2);
     assert_eq!(report.waits_failed, 0);
     assert_eq!(report.dispatched, 1);
@@ -4550,7 +4675,7 @@ fn file_page_io_service_owned_task_loop_holds_typed_claim_for_static_submission(
         }
     };
 
-    assert_eq!(report.waits_ready, 2);
+    assert_eq!(report.waits_ready, 1);
     assert_eq!(report.ready_turns, 2);
     assert_eq!(report.waits_failed, 0);
     assert_eq!(report.dispatched, 1);
@@ -5346,6 +5471,414 @@ fn file_checkpoint_completion_notifies_background_graph_owner_only() {
 }
 
 #[test]
+fn file_checkpoint_graph_queued_from_fsync_page_after_kicks_block_service() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+
+    struct PageAfterCheckpointPlanner {
+        graph: SpinMutex<Option<BackendBioGraph>>,
+    }
+
+    impl BackendPlanner for PageAfterCheckpointPlanner {
+        fn plan_page_io(&self, _request: BackendPageRequest) -> BackendPlan {
+            BackendPlan::Err(Errno::ENOSYS)
+        }
+
+        fn take_background_graph(
+            &self,
+            _object: crate::fs_iface::FsObjectKey,
+        ) -> Result<Option<BackendBioGraph>, Errno> {
+            Ok(self.graph.lock().take())
+        }
+    }
+
+    let graph = BackendBioGraph::new(
+        alloc::vec![BackendBioNode::new(
+            BackendBioNodeId::new(95),
+            BioPlan::new(
+                DeviceKey::new(8),
+                BlockOp::Write,
+                LbaRange::new(120, 1),
+                alloc::vec![BioVec::new(0x600, 0, 512)],
+                BlockFlags::BARRIER,
+            ),
+            IoDataSource::None,
+        )],
+        alloc::vec![],
+    )
+    .expect("valid checkpoint graph");
+    let fs = Arc::new(RecordingFs::new());
+    let planner = Arc::new(PageAfterCheckpointPlanner {
+        graph: SpinMutex::new(Some(graph)),
+    });
+    let pc =
+        file_page_container_with_planner(fs.clone(), fs, FsObjectId::new(115), 2, planner.clone());
+    let wake_source = Arc::new(ServiceWakeSource::new(0x7119));
+    assert!(pc.attach_file_io_wake_source(Arc::clone(&wake_source)));
+    let mailbox = Arc::new(tx_substrate::wake::TaskMailbox::new());
+    let generation = mailbox.next_generation();
+    let _subscription =
+        wake_source.subscribe(IoServiceKind::Block, Arc::downgrade(&mailbox), generation);
+
+    // This models the composite runtime's page-after turn: the fsync BIO has
+    // completed and the Block service has already ended its turn before L4
+    // discovers and queues the follow-up checkpoint graph.
+    pc.notify_file_backend_completion_with_result(
+        PageIoRequestId::new(115),
+        PageIoOp::Fsync,
+        PageIoResult::Done,
+    );
+
+    assert_eq!(pc.file_io_block_queue_len_for_test(), 1);
+    assert!(matches!(
+        mailbox.poll(),
+        Some(tx_substrate::wake::MailboxEvent::SourceFired {
+            generation: seen_generation,
+            source,
+            interests,
+        }) if seen_generation == generation
+            && source.raw() == 0x7119
+            && interests.raw() == IoServiceKind::Block.mask_bits()
+    ));
+}
+
+#[test]
+fn plain_close_task_loop_retains_container_and_drives_commit_checkpoint_to_settlement() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+
+    const DATA_PENDING: usize = 0;
+    const PREPARED: usize = 1;
+    const COMMIT_PENDING: usize = 2;
+    const CHECKPOINT_READY: usize = 3;
+    const CHECKPOINT_PENDING: usize = 4;
+    const SETTLED: usize = 5;
+
+    struct PlainCloseLifecyclePlanner {
+        phase: AtomicUsize,
+        metadata_wakes: AtomicUsize,
+    }
+
+    impl PlainCloseLifecyclePlanner {
+        fn graph(node: u64, lba: u64) -> BackendPlan {
+            BackendPlan::SubmitGraph(
+                BackendBioGraph::new(
+                    alloc::vec![BackendBioNode::new(
+                        BackendBioNodeId::new(node),
+                        BioPlan::new(
+                            DeviceKey::new(8),
+                            BlockOp::Write,
+                            LbaRange::new(lba, 1),
+                            alloc::vec![BioVec::new(0x800 + node, 0, 512)],
+                            BlockFlags::BARRIER,
+                        ),
+                        IoDataSource::None,
+                    )],
+                    alloc::vec![],
+                )
+                .expect("valid lifecycle graph"),
+            )
+        }
+    }
+
+    impl BackendPlanner for PlainCloseLifecyclePlanner {
+        fn plan_page_io(&self, request: BackendPageRequest) -> BackendPlan {
+            match request.op {
+                PageIoOp::Writeback => {
+                    assert_eq!(self.phase.load(Ordering::Acquire), DATA_PENDING);
+                    Self::graph(121, 200)
+                }
+                PageIoOp::Fsync => {
+                    assert_eq!(
+                        self.phase.compare_exchange(
+                            PREPARED,
+                            COMMIT_PENDING,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        ),
+                        Ok(PREPARED),
+                        "background commit may start only after ordered data is durable",
+                    );
+                    Self::graph(122, 201)
+                }
+                other => panic!("unexpected lifecycle request: {other:?}"),
+            }
+        }
+
+        fn complete_page_io(&self, completion: crate::fs_iface::BackendPageCompletion) {
+            assert_eq!(completion.result, PageIoResult::Done);
+            match completion.op {
+                PageIoOp::Writeback => {
+                    assert_eq!(
+                        self.phase.compare_exchange(
+                            DATA_PENDING,
+                            PREPARED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        ),
+                        Ok(DATA_PENDING),
+                    );
+                }
+                PageIoOp::Fsync => {
+                    assert_eq!(
+                        self.phase.compare_exchange(
+                            COMMIT_PENDING,
+                            CHECKPOINT_READY,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        ),
+                        Ok(COMMIT_PENDING),
+                    );
+                }
+                other => panic!("unexpected lifecycle completion: {other:?}"),
+            }
+        }
+
+        fn take_background_graph(
+            &self,
+            _object: crate::fs_iface::FsObjectKey,
+        ) -> Result<Option<BackendBioGraph>, Errno> {
+            assert_eq!(
+                self.phase.compare_exchange(
+                    CHECKPOINT_READY,
+                    CHECKPOINT_PENDING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ),
+                Ok(CHECKPOINT_READY),
+            );
+            match Self::graph(123, 202) {
+                BackendPlan::SubmitGraph(graph) => Ok(Some(graph)),
+                _ => unreachable!("graph helper always returns SubmitGraph"),
+            }
+        }
+
+        fn complete_background_graph(
+            &self,
+            _object: crate::fs_iface::FsObjectKey,
+            result: Result<(), Errno>,
+        ) {
+            assert_eq!(result, Ok(()));
+            assert_eq!(
+                self.phase.compare_exchange(
+                    CHECKPOINT_PENDING,
+                    SETTLED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ),
+                Ok(CHECKPOINT_PENDING),
+            );
+            self.metadata_wakes.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    let fs = Arc::new(RecordingFs::new());
+    let planner = Arc::new(PlainCloseLifecyclePlanner {
+        phase: AtomicUsize::new(DATA_PENDING),
+        metadata_wakes: AtomicUsize::new(0),
+    });
+    let pc = file_page_container_cap_with_planner(
+        fs.clone(),
+        fs,
+        FsObjectId::new(116),
+        2,
+        planner.clone(),
+    );
+    let wake_source = Arc::new(ServiceWakeSource::new(0x711a));
+    assert!(pc.attach_file_io_wake_source(Arc::clone(&wake_source)));
+    let page = PageIndex::new(0);
+    let frame = cached_frame_for_test();
+    let ppn = frame.ppn;
+    {
+        let mut state = pc.state.lock();
+        state
+            .install_resident_if_absent(page, frame)
+            .expect("seed page");
+        let slot = state.page_slots.entry(page).or_default();
+        let PageSlotFetch::Owner { generation } = slot.begin_fetch() else {
+            panic!("fetch owner");
+        };
+        slot.complete_fetch(generation, Ok(ppn))
+            .expect("resident slot");
+        slot.mark_dirty().expect("dirty slot");
+    }
+    assert_eq!(pc.queue_dirty_file_writeback_retained(pc.clone()), 1);
+
+    let weak = pc.downgrade();
+    let claim = crate::device::FileIoManagerRuntimeClaim::detached_for_test(
+        pc.clone(),
+        BlockDeviceHandle::whole(&PAGE_BACKED_SERVICE_BLOCK_REG),
+        wake_source,
+    );
+    let _ = claim.kick(IoServiceKind::Page);
+    drop(pc);
+    let mut task = core::pin::pin!(
+        crate::device::page_container_file_io_service_task_loop_owned(
+            claim,
+            crate::device::PageContainerFileIoServiceTaskConfig::run_turns(
+                3,
+                ServiceBudget::new(1),
+                ServiceBudget::new(1),
+            ),
+        )
+    );
+    let waker = core::task::Waker::noop();
+    let mut cx = core::task::Context::from_waker(waker);
+
+    assert!(matches!(task.as_mut().poll(&mut cx), Poll::Pending));
+
+    assert_eq!(planner.phase.load(Ordering::Acquire), PREPARED);
+    {
+        let guard = step_engine::guard();
+        let pc = weak
+            .upgrade(&guard)
+            .expect("background commit must retain the container after writeback owner retires");
+        assert!(
+            pc.state.lock().fsync_submissions.is_empty(),
+            "the close-owned barrier must not manufacture a userspace fsync row",
+        );
+        assert!(
+            pc.state
+                .lock()
+                .file_io_service
+                .find_submission(pc.io_manager_key(), PageIoRange::new(0, 2), PageIoOp::Fsync,)
+                .is_some(),
+            "plain-close writeback completion must publish an internal commit barrier",
+        );
+    }
+
+    assert!(matches!(task.as_mut().poll(&mut cx), Poll::Pending));
+    assert_eq!(planner.phase.load(Ordering::Acquire), CHECKPOINT_PENDING);
+    {
+        let guard = step_engine::guard();
+        assert!(
+            weak.upgrade(&guard).is_some(),
+            "checkpoint graph must retain the container after commit owner retires",
+        );
+    }
+
+    let report = match task.as_mut().poll(&mut cx) {
+        Poll::Ready(report) => report,
+        Poll::Pending => panic!("runnable checkpoint turn must not await a second mailbox event"),
+    };
+
+    assert_eq!(planner.phase.load(Ordering::Acquire), SETTLED);
+    assert_eq!(planner.metadata_wakes.load(Ordering::Acquire), 1);
+    assert_eq!(report.waits_ready, 2);
+    assert_eq!(report.ready_turns, 3);
+    assert_eq!(report.waits_failed, 0);
+    assert_eq!(
+        report.last_turn.expect("checkpoint service turn").next,
+        crate::device::PageContainerFileIoServiceNext::Sleeping,
+    );
+    let guard = step_engine::guard();
+    if let Some(pc) = weak.upgrade(&guard) {
+        assert!(
+            pc.state.lock().background_commit_keepalive.is_none(),
+            "checkpoint terminal route must release background container custody",
+        );
+    }
+}
+
+#[test]
+fn background_commit_keepalive_releases_on_failed_or_graphless_commit() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+
+    for (object, result) in [
+        (FsObjectId::new(118), PageIoResult::Err(Errno::EIO)),
+        (FsObjectId::new(119), PageIoResult::Done),
+    ] {
+        let fs = Arc::new(RecordingFs::new());
+        let pc = file_page_container_cap_with_planner(
+            fs.clone(),
+            fs,
+            object,
+            1,
+            Arc::new(RecordingPlanner),
+        );
+        pc.state.lock().background_commit_keepalive = Some(pc.clone());
+
+        pc.notify_file_backend_completion_with_result(
+            PageIoRequestId::new(object.as_u64()),
+            PageIoOp::Fsync,
+            result,
+        );
+
+        assert!(
+            pc.state.lock().background_commit_keepalive.is_none(),
+            "failed and graphless commits are terminal for background custody",
+        );
+    }
+}
+
+#[test]
+fn plain_close_background_commit_retries_after_page_queue_backpressure() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+
+    struct BackpressurePlanner;
+
+    impl BackendPlanner for BackpressurePlanner {
+        fn plan_page_io(&self, request: BackendPageRequest) -> BackendPlan {
+            match request.op {
+                PageIoOp::Read => BackendPlan::Complete(PageCompletionList::default()),
+                PageIoOp::Fsync => {
+                    BackendPlan::Complete(PageCompletionList::from_vec(alloc::vec![
+                        PageCompletion::new(
+                            request.id,
+                            request.range,
+                            PageIoResult::Done,
+                            PageGeneration::new(0),
+                            PageIoCompletionKind::Noop,
+                        )
+                    ]))
+                }
+                other => panic!("unexpected backpressure request: {other:?}"),
+            }
+        }
+    }
+
+    let fs = Arc::new(RecordingFs::new());
+    let pc = file_page_container_with_planner(
+        fs.clone(),
+        fs,
+        FsObjectId::new(117),
+        2,
+        Arc::new(BackpressurePlanner),
+    );
+    for page in 0..1024 {
+        pc.state
+            .lock()
+            .file_io_service
+            .submit(
+                pc.io_manager_key(),
+                PageIoRange::new(page, 1),
+                PageIoOp::Read,
+                PageIoPriority::Demand,
+                PageIoFlags::DEMAND,
+                None,
+            )
+            .expect("fill Page submission queue");
+    }
+
+    pc.submit_file_background_commit();
+    assert!(pc.state.lock().background_commit_needed);
+    assert!(pc.state.lock().background_commit_submission.is_none());
+
+    pc.drive_file_io_service_once_owned(ServiceBudget::new(1), |_| true)
+        .expect("drain one ordinary Page request and retry commit admission");
+
+    let state = pc.state.lock();
+    assert!(!state.background_commit_needed);
+    assert!(state.background_commit_submission.is_some());
+    assert!(state
+        .file_io_service
+        .find_submission(pc.io_manager_key(), PageIoRange::new(0, 2), PageIoOp::Fsync,)
+        .is_some());
+}
+
+#[test]
 fn file_background_admission_failure_notifies_planner_after_releasing_state_lock() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
     setup_host_substrate();
@@ -5637,14 +6170,180 @@ fn vfs_fsync_op_uses_backend_fallback_to_terminal_success() {
     };
     let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
 
-    assert!(matches!(op.step(&mut ctx), V3Out::Continue { .. }));
+    let (wait_source_id, wait_interests) = match op.step(&mut ctx) {
+        V3Out::Yield { shape, .. } => crate::page_backed::notification::wait_source_parts(&shape)
+            .expect("async fsync should yield on a PageReady source"),
+        other => panic!("async fsync should wait for backend completion, got {other:?}"),
+    };
+    match op.step(&mut ctx) {
+        V3Out::Yield { shape, .. } => assert_eq!(
+            crate::page_backed::notification::wait_source_parts(&shape),
+            Some((wait_source_id, wait_interests)),
+            "one fsync operation must retain one stable wait source",
+        ),
+        other => panic!("pending fsync should keep yielding, got {other:?}"),
+    }
+    let wait_source =
+        tx_substrate::wake::lookup_source(tx_substrate::step::WaitSourceId::new(wait_source_id))
+            .expect("fsync PageReady source should be registered");
+    let mailbox = Arc::new(tx_substrate::wake::TaskMailbox::new());
+    let generation = mailbox.next_generation();
+    let _subscription = wait_source.register(
+        Arc::downgrade(&mailbox),
+        generation,
+        tx_substrate::step::InterestMask::new(wait_interests),
+    );
     pc.drive_file_io_service_once_owned(ServiceBudget::new(1), |_| true)
         .expect("plan backend fsync");
     pc.drive_file_io_service_once_owned(ServiceBudget::new(1), |_| true)
         .expect("route backend fsync completion");
+    assert!(matches!(
+        mailbox.poll(),
+        Some(tx_substrate::wake::MailboxEvent::SourceFired {
+            generation: seen_generation,
+            source,
+            interests,
+        }) if seen_generation == generation
+            && source.raw() == wait_source_id
+            && interests.raw() == wait_interests
+    ));
     assert_eq!(op.step(&mut ctx), V3Out::Done(()));
     assert_eq!(fs.fsyncs.load(Ordering::Acquire), 1);
     assert_eq!(planner.completions.lock().len(), 1);
+}
+
+#[test]
+fn vfs_fsync_op_wakes_when_dirty_frontier_writeback_completes() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let planner: Arc<dyn BackendPlanner> = Arc::new(SourceRecordingPlanner::new());
+    let pc = file_page_container_cap_with_planner(
+        fs.clone(),
+        fs.clone(),
+        FsObjectId::new(212),
+        2,
+        planner,
+    );
+    assert!(pc.attach_file_io_wake_source(Arc::new(ServiceWakeSource::new(0x7117))));
+    let page = PageIndex::new(0);
+    let frame = cached_frame_for_test();
+    let ppn = frame.ppn;
+    let generation = {
+        let mut state = pc.state.lock();
+        state
+            .install_resident_if_absent(page, frame)
+            .expect("seed page");
+        let slot = state.page_slots.entry(page).or_default();
+        let PageSlotFetch::Owner { generation } = slot.begin_fetch() else {
+            panic!("fetch owner");
+        };
+        slot.complete_fetch(generation, Ok(ppn))
+            .expect("resident slot");
+        slot.mark_dirty().expect("dirty slot").generation
+    };
+    let mut op = crate::vfs::FileFsyncOp {
+        page_backing: fs.clone(),
+        fs_object_id: FsObjectId::new(212),
+        page_container: Some(pc.clone()),
+        raw_block_device: false,
+        state: FileFsyncState::new(),
+    };
+    let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
+
+    let (wait_source_id, wait_interests) = match op.step(&mut ctx) {
+        V3Out::Yield { shape, .. } => crate::page_backed::notification::wait_source_parts(&shape)
+            .expect("dirty fsync frontier should yield on PageReady"),
+        other => panic!("dirty fsync frontier should wait, got {other:?}"),
+    };
+    let wait_source =
+        tx_substrate::wake::lookup_source(tx_substrate::step::WaitSourceId::new(wait_source_id))
+            .expect("dirty fsync PageReady source should be registered");
+    let mailbox = Arc::new(tx_substrate::wake::TaskMailbox::new());
+    let mailbox_generation = mailbox.next_generation();
+    let _subscription = wait_source.register(
+        Arc::downgrade(&mailbox),
+        mailbox_generation,
+        tx_substrate::step::InterestMask::new(wait_interests),
+    );
+    let writeback = pc
+        .state
+        .lock()
+        .file_io_service
+        .find_submission(
+            pc.io_manager_key(),
+            PageIoRange::new(0, 1),
+            PageIoOp::Writeback,
+        )
+        .expect("writeback precedes filesystem durability fence");
+    let _ = pc.prepare_owned_file_io_request(&writeback);
+    pc.state
+        .lock()
+        .file_io_service
+        .push_completion(PageIoCompletion::new(
+            writeback.id,
+            writeback.range,
+            PageIoResult::Done,
+            generation,
+            PageIoCompletionKind::WritebackFinished,
+        ));
+    let mut block_queue = BlockQueue::new(4);
+    pc.drive_file_io_service_once(ServiceBudget::new(1), &mut block_queue, |_| true)
+        .expect("writeback completion drive");
+
+    assert!(matches!(
+        mailbox.poll(),
+        Some(tx_substrate::wake::MailboxEvent::SourceFired {
+            generation: seen_generation,
+            source,
+            interests,
+        }) if seen_generation == mailbox_generation
+            && source.raw() == wait_source_id
+            && interests.raw() == wait_interests
+    ));
+    assert_eq!(op.step(&mut ctx), V3Out::done(()));
+    assert_eq!(fs.fsyncs.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn vfs_fsync_backend_admission_kicks_sleeping_page_service() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::fsync_fallback());
+    let planner = Arc::new(FsyncCompletionPlanner::new(Ok(())));
+    let pc = file_page_container_cap_with_planner(
+        fs.clone(),
+        fs.clone(),
+        FsObjectId::new(211),
+        2,
+        planner,
+    );
+    let wake_source = Arc::new(ServiceWakeSource::new(0x7116));
+    assert!(pc.attach_file_io_wake_source(Arc::clone(&wake_source)));
+    let mailbox = Arc::new(tx_substrate::wake::TaskMailbox::new());
+    let generation = mailbox.next_generation();
+    let _subscription =
+        wake_source.subscribe(IoServiceKind::Page, Arc::downgrade(&mailbox), generation);
+    let mut op = crate::vfs::FileFsyncOp {
+        page_backing: fs,
+        fs_object_id: FsObjectId::new(211),
+        page_container: Some(pc),
+        raw_block_device: false,
+        state: FileFsyncState::new(),
+    };
+    let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
+
+    assert!(matches!(op.step(&mut ctx), V3Out::Yield { .. }));
+    assert!(matches!(
+        mailbox.poll(),
+        Some(tx_substrate::wake::MailboxEvent::SourceFired {
+            generation: seen_generation,
+            source,
+            interests,
+        }) if seen_generation == generation
+            && source.raw() == 0x7116
+            && interests.raw() == IoServiceKind::Page.mask_bits()
+    ));
 }
 
 #[test]

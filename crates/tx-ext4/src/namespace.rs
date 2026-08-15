@@ -125,9 +125,10 @@ use tx_subsystems::vfs::FsOps;
 /// Static writable capacity for ext4 regular-file PageContainers.
 ///
 /// PageContainer currently has a fixed `page_count` capacity. Match tmpfs'
-/// day-1 growth window so newly-created ext4 files can grow through ordinary
-/// PageBacked writes instead of failing after one page.
-const EXT4_FILE_PAGE_CAP: u64 = 2048;
+/// 256 MiB day-1 growth window so regular ext4 files, including Git packfiles,
+/// can grow through ordinary PageBacked writes. The resident page index is
+/// sparse, so this capacity does not allocate 256 MiB up front.
+pub(crate) const EXT4_FILE_PAGE_CAP: u64 = 65536;
 
 /// Factory for `MountOutput::fs_ops`.
 ///
