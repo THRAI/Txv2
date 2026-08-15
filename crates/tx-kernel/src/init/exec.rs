@@ -349,6 +349,11 @@ impl<P: TxPlatform> CoreInit<P> {
         // precedes the legacy OSComp sdcard lane only when no explicit
         // developer init/profile selected another BootPlan.
         if final_testcode_autorun_enabled::<P>() {
+            // Formal CAgent/BuildStorm timing is observation-free by default.
+            // A generic syscall otherwise writes eight 80-byte records before
+            // the filesystem and VM probes beneath it. Diagnostics remain
+            // explicitly available with `tx.oscomp.observe=1`.
+            tx_observe::set_enabled(oscomp_bench_observe_enabled::<P>());
             let default_envp: &[&[u8]] = &[
                 b"PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
                 b"HOME=/root",
@@ -849,8 +854,8 @@ impl<P: TxPlatform> CoreInit<P> {
         Self::deadline_timer().enable_timer_wakeups();
 
         // Enable concurrent poll on all harts (Phase 1a poll lease).
-        Self::reset_smp_stall_diagnostic();
         super::USE_CONCURRENT_POLL.store(true, core::sync::atomic::Ordering::Release);
+        Self::reset_smp_stall_diagnostic();
 
         // Drive the BSP reactor loop until init zombifies. Each
         // iteration is a `step_hart_loop_at` step: advance time, run
@@ -950,29 +955,33 @@ impl<P: TxPlatform> CoreInit<P> {
                 && !ebr_active
                 && !init.is_zombie()
             {
-                // When the reactor has no pending deadline, the platform
-                // timer was cancelled by the reactor time-driver deadline
-                // programming path.
-                // Re-arm it here so WFI wakes periodically — the drain
-                // calls below need to fire on every tick. This must only
-                // happen in the userspace reactor loop (not in boot smoke
-                // tests) because the timer interrupt fires
-                // `try_bounded_maintenance_tick`, which acquires zone
-                // locks that boot-time code may already hold.
-                if matches!(
-                    step.deadline_action,
-                    boot_runtime::hart_loop::HartLoopDeadlineAction::Cancel
-                ) {
+                // Keep one periodic BSP wake while userspace is alive. LA64
+                // uses per-hart one-shot timers, whereas the reactor publishes
+                // one shared `deadline_changed` bit. An AP can consume that
+                // bit and arm its own timer; after that one-shot fires, the BSP
+                // must not trust `step.deadline_action == Arm` as proof that
+                // its *local* timer is still armed. Doing so can leave every
+                // hart in `idle` with TCFG=0 while loopback/socket waiters are
+                // still parked. Re-arm the BSP to the earlier of the shared
+                // deadline and the bounded maintenance tick on LA64. Other
+                // platforms retain the old no-deadline-only fallback.
+                if !matches!(P::ARCH, tx_hal::Arch::LoongArch64)
+                    && matches!(
+                        step.deadline_action,
+                        boot_runtime::hart_loop::HartLoopDeadlineAction::Cancel
+                    )
+                {
                     let mut timer = Self::deadline_timer();
                     timer.set_current_hart_deadline_ns(
                         Self::monotonic_now_ns().saturating_add(crate::init::IDLE_TIMER_PERIOD_NS),
                     );
                 }
                 if Self::poll_boot_reactor_idle_window(boot_runtime::HartId(loop_cpu.0)) {
+                    Self::note_reactor_hart_active(loop_cpu);
                     continue;
                 }
-                P::service_pending_tlb_shootdown();
                 Self::note_reactor_hart_idle(loop_cpu);
+                P::service_pending_tlb_shootdown();
                 let wait_state = P::prepare_interrupt_wait();
                 if Self::boot_reactor_has_runnable_work(boot_runtime::HartId(loop_cpu.0)) {
                     Self::note_reactor_hart_active(loop_cpu);
@@ -988,9 +997,22 @@ impl<P: TxPlatform> CoreInit<P> {
                     P::cancel_interrupt_wait(wait_state);
                     continue;
                 }
+                if matches!(P::ARCH, tx_hal::Arch::LoongArch64) {
+                    // Program the LA64 one-shot only after IE is masked and
+                    // every abort-to-runnable check has passed. Arming it
+                    // above `prepare_interrupt_wait` lets a short deadline
+                    // fire and be cleared before `idle`, after which the hart
+                    // can sleep forever with TCFG=0.
+                    let fallback =
+                        Self::monotonic_now_ns().saturating_add(crate::init::IDLE_TIMER_PERIOD_NS);
+                    let deadline_ns = step
+                        .next_deadline_ns
+                        .map_or(fallback, |deadline| core::cmp::min(deadline, fallback));
+                    Self::deadline_timer().set_current_hart_deadline_ns(deadline_ns);
+                }
                 P::wait_for_interrupt_prepared(wait_state);
-                P::service_pending_tlb_shootdown();
                 Self::note_reactor_hart_active(loop_cpu);
+                P::service_pending_tlb_shootdown();
                 if P::pending_ipi(IpiKind::Reschedule) {
                     P::ack_ipi(IpiKind::Reschedule);
                 }
@@ -1415,14 +1437,14 @@ fn oscomp_groups_from_cmdline<P: tx_hal::TxPlatform>() -> Option<&'static str> {
 
 fn oscomp_bench_observe_enabled_from_cmdline(cmdline: Option<&str>) -> bool {
     let Some(cmdline) = cmdline else {
-        return true;
+        return false;
     };
     for token in cmdline.split_ascii_whitespace() {
         if let Some(value) = token.strip_prefix("tx.oscomp.observe=") {
             return !matches!(value, "0" | "false" | "off" | "no");
         }
     }
-    true
+    false
 }
 
 fn oscomp_bench_observe_threshold_from_cmdline(cmdline: Option<&str>) -> Option<u64> {
@@ -2353,9 +2375,9 @@ mod tests {
     }
 
     #[test]
-    fn oscomp_bench_observe_cmdline_flag_defaults_on_and_accepts_off_values() {
-        assert!(oscomp_bench_observe_enabled_from_cmdline(None));
-        assert!(oscomp_bench_observe_enabled_from_cmdline(Some(
+    fn oscomp_bench_observe_cmdline_flag_defaults_off_and_accepts_explicit_values() {
+        assert!(!oscomp_bench_observe_enabled_from_cmdline(None));
+        assert!(!oscomp_bench_observe_enabled_from_cmdline(Some(
             "tx.oscomp.groups=libcbench-musl"
         )));
         assert!(!oscomp_bench_observe_enabled_from_cmdline(Some(

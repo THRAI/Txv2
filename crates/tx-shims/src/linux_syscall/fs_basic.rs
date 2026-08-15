@@ -7,7 +7,7 @@ use super::*;
 use crate::adapter::step_engine::{self as step_engine, Cap, NoProgress, SpinMutex, StepOutcome};
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tx_substrate::wake::{MailboxEvent, TaskMailbox};
 use tx_subsystems::vfs::structure::{OpenFileBacking, RNodeBacking, StructPayload};
 use tx_subsystems::vfs::{FsObjectId, FsOps};
@@ -27,6 +27,11 @@ struct StatTimeOverride {
 
 static STAT_META_OVERRIDES: SpinMutex<BTreeMap<FsObjectId, StatTimeOverride>> =
     SpinMutex::new(BTreeMap::new());
+// `utimensat` is rare, while Cargo issues thousands of stat-family calls.
+// Avoid taking the global override-map lock in the overwhelmingly common
+// empty-table case. The Release/Acquire pair ensures a reader that observes
+// `true` also observes the map insertion performed before publication.
+static STAT_META_OVERRIDES_PRESENT: AtomicBool = AtomicBool::new(false);
 static FCNTL_RECORD_LOCKS: SpinMutex<BTreeMap<FsObjectId, Vec<RecordLock>>> =
     SpinMutex::new(BTreeMap::new());
 
@@ -50,12 +55,16 @@ pub(super) fn record_stat_meta_override(fs_object_id: FsObjectId, meta: InodeMet
             ctime: meta.ctime,
         },
     );
+    STAT_META_OVERRIDES_PRESENT.store(true, Ordering::Release);
 }
 
 pub(super) fn stat_meta_override_or(
     fs_object_id: FsObjectId,
     mut fallback: InodeMeta,
 ) -> InodeMeta {
+    if !STAT_META_OVERRIDES_PRESENT.load(Ordering::Acquire) {
+        return fallback;
+    }
     if let Some(times) = STAT_META_OVERRIDES.lock().get(&fs_object_id).copied() {
         fallback.atime = times.atime;
         fallback.mtime = times.mtime;
@@ -71,6 +80,7 @@ pub(super) fn stat_meta_override_or(
 #[cfg(test)]
 pub(crate) fn clear_stat_meta_overrides() {
     STAT_META_OVERRIDES.lock().clear();
+    STAT_META_OVERRIDES_PRESENT.store(false, Ordering::Release);
 }
 
 fn apply_stat_meta_override(fs_object_id: FsObjectId, meta: &mut InodeMeta) {
@@ -78,8 +88,8 @@ fn apply_stat_meta_override(fs_object_id: FsObjectId, meta: &mut InodeMeta) {
 }
 
 fn ensure_fd_room_under_limit<'a>(ctx: &SyscallCtx<'a>) -> Result<(), SyscallResult> {
-    let fd = ctx.process.next_fd_above(0);
-    let (soft_limit, _) = ctx.process.rlimit_nofile();
+    let fd = ctx.next_fd_above(0);
+    let (soft_limit, _) = ctx.rlimit_nofile();
     if fd >= soft_limit {
         Err(SyscallResult::Error(EMFILE_VALUE))
     } else {
@@ -288,7 +298,7 @@ pub(super) fn sys_memfd_secret<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
         Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
     };
 
-    let Some(fd) = ctx.process.install_new_fd(open_file, false) else {
+    let Some(fd) = ctx.install_new_fd(open_file, false) else {
         return SyscallResult::Error(EMFILE_VALUE);
     };
 
@@ -320,7 +330,7 @@ pub(super) fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
     // `FD_TABLE_SIZE` ceiling — the fd table is now a sparse
     // `BTreeMap<u32, Cap<OpenFile>>`, so any `u32` could be a key;
     // openness is the only meaningful EBADF discriminant.
-    let file = match ctx.process.fd(fd) {
+    let file = match ctx.fd(fd) {
         Some(file) => file,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
@@ -351,7 +361,7 @@ pub(super) fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                 Ok(min) => min,
                 Err(_) => return SyscallResult::Error(EINVAL_VALUE),
             };
-            let (soft_limit, _) = ctx.process.rlimit_nofile();
+            let (soft_limit, _) = ctx.rlimit_nofile();
             if min >= soft_limit {
                 return SyscallResult::Error(EINVAL_VALUE);
             }
@@ -695,6 +705,118 @@ pub(super) fn sys_close_range<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
 // Resolve/create, truncate and final open are driven as waitable StepOps.
 // This is required by ext4's mount-local metadata admission: contention is
 // an internal scheduling event and must not escape from openat as EBUSY/EIO.
+pub(super) fn sys_openat_cached_oneshot(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'_>,
+) -> Option<SyscallResult> {
+    let dirfd = args[0] as i32;
+    let path_uaddr = args[1];
+    let flags = args[2] as u32;
+    let mode = args[3] as u32;
+
+    if let Err(result) = ensure_fd_room_under_limit(ctx) {
+        return Some(result);
+    }
+    let path = match ctx.aspace.read_user_cstr_resident(
+        tx_hal::UserPtr::<u8>::new(path_uaddr as usize),
+        EXECVE_PATH_MAX,
+    )? {
+        Ok(path) => path,
+        Err(Errno::ENAMETOOLONG) => return Some(SyscallResult::Error(ENAMETOOLONG_VALUE)),
+        Err(errno) => return Some(SyscallResult::error_from(errno)),
+    };
+    // Keep projected namespace files on their dedicated open path. Ordinary
+    // compiler source/dependency paths never enter this carve-out.
+    if path.is_empty() || path.starts_with(b"/proc/") || path.starts_with(b"proc/") {
+        return None;
+    }
+
+    let want_path_only = flags & O_PATH != 0;
+    let (want_read, want_write) = if want_path_only {
+        (false, false)
+    } else {
+        decode_access_mode(flags)
+    };
+    let want_create = !want_path_only && flags & O_CREAT != 0;
+    let want_trunc = !want_path_only && flags & O_TRUNC != 0;
+    let want_tmpfile = flags & __O_TMPFILE != 0;
+    if flags & __O_TMPFILE != 0 && flags & O_TMPFILE != O_TMPFILE {
+        return Some(SyscallResult::Error(EINVAL_VALUE));
+    }
+    // Creation, truncation, and unnamed inode publication have side effects
+    // that belong to the wait-capable open transaction.
+    if want_create || want_trunc || want_tmpfile {
+        return None;
+    }
+
+    let want_directory = flags & O_DIRECTORY != 0;
+    let want_cloexec = flags & O_CLOEXEC != 0;
+    let open_flags = OpenFileFlags {
+        read: want_read && !want_path_only,
+        write: want_write && !want_path_only,
+        append: flags & O_APPEND != 0,
+        cloexec: want_cloexec,
+        nonblocking: flags & O_NONBLOCK != 0,
+        packet: false,
+    };
+
+    if dirfd != AT_FDCWD && (dirfd < 0 || ctx.fd(dirfd as u32).is_none()) {
+        return Some(SyscallResult::Error(EBADF_VALUE));
+    }
+    let (cwd, origin_mount) = if path.starts_with(b"/") || dirfd == AT_FDCWD {
+        match ctx.cwd_binding() {
+            Some(binding) => (binding.dentry, binding.mount),
+            None => return None,
+        }
+    } else {
+        let open_file = match ctx.fd(dirfd as u32) {
+            Some(file) => file,
+            None => return Some(SyscallResult::Error(EBADF_VALUE)),
+        };
+        let dentry = match open_file.opendir_dentry() {
+            Some(dentry) => dentry,
+            None => return Some(SyscallResult::Error(ENOTDIR_VALUE)),
+        };
+        let Some(mount) = mount_identity_for_dentry(ctx, &dentry) else {
+            return None;
+        };
+        (dentry, mount)
+    };
+    let namespace = ctx.process.mount_namespace_cap()?;
+    let walker_cred = ctx.walker_cred();
+    let opened = {
+        // A trap-local syscall may run while its hart already owns the
+        // thread-runtime epoch guard. Reuse it instead of nesting `guard()`.
+        let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
+        step_open_cached_in_mount_namespace_with_origin_mount(
+            cwd,
+            &origin_mount,
+            &path,
+            open_flags,
+            mode as u16,
+            &walker_cred,
+            &namespace,
+            &guard,
+        )
+    };
+    let openfile = match opened {
+        StepOutcome::Done(opened) => opened.open_file,
+        StepOutcome::Err(errno) if Errno::from(errno) == Errno::EAGAIN => return None,
+        StepOutcome::Err(errno) => return Some(SyscallResult::error_from(Errno::from(errno))),
+        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => return None,
+    };
+    if want_directory && openfile.rnode().meta().kind() != InodeKind::Directory {
+        return Some(SyscallResult::Error(ENOTDIR_VALUE));
+    }
+    if want_write && openfile.rnode().meta().kind() == InodeKind::Directory {
+        return Some(SyscallResult::Error(EISDIR_VALUE));
+    }
+    let Some(fd) = ctx.install_new_fd(openfile, want_cloexec) else {
+        return Some(SyscallResult::Error(EMFILE_VALUE));
+    };
+    Some(SyscallResult::Return(fd as i64))
+}
+
 pub(super) async fn sys_openat<'a, P: PmapIf + tx_hal::ConsoleIf>(
     dirfd: i32,
     path_uaddr: u64,
@@ -771,7 +893,7 @@ pub(super) async fn sys_openat<'a, P: PmapIf + tx_hal::ConsoleIf>(
     };
 
     if dirfd != AT_FDCWD {
-        if dirfd < 0 || ctx.process.fd(dirfd as u32).is_none() {
+        if dirfd < 0 || ctx.fd(dirfd as u32).is_none() {
             return SyscallResult::Error(EBADF_VALUE);
         }
     }
@@ -787,7 +909,7 @@ pub(super) async fn sys_openat<'a, P: PmapIf + tx_hal::ConsoleIf>(
             Ok(file) => file,
             Err(result) => return result,
         };
-        let Some(fd) = ctx.process.install_new_fd(openfile, want_cloexec) else {
+        let Some(fd) = ctx.install_new_fd(openfile, want_cloexec) else {
             return SyscallResult::Error(EMFILE_VALUE);
         };
         return SyscallResult::Return(fd as i64);
@@ -807,14 +929,14 @@ pub(super) async fn sys_openat<'a, P: PmapIf + tx_hal::ConsoleIf>(
             Ok(file) => file,
             Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
         };
-        let Some(fd) = ctx.process.install_new_fd(file, want_cloexec) else {
+        let Some(fd) = ctx.install_new_fd(file, want_cloexec) else {
             return SyscallResult::Error(EMFILE_VALUE);
         };
         return SyscallResult::Return(fd as i64);
     }
 
     if !want_create && !want_trunc {
-        if let Some(cwd) = ctx.process.cwd() {
+        if let Some(cwd) = ctx.cwd() {
             if let Some(pid) = procfs_root_relative_netns_pid(path.as_slice(), &cwd) {
                 if want_directory {
                     return SyscallResult::Error(ENOTDIR_VALUE);
@@ -832,7 +954,7 @@ pub(super) async fn sys_openat<'a, P: PmapIf + tx_hal::ConsoleIf>(
                     Ok(file) => file,
                     Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
                 };
-                let Some(fd) = ctx.process.install_new_fd(file, want_cloexec) else {
+                let Some(fd) = ctx.install_new_fd(file, want_cloexec) else {
                     return SyscallResult::Error(EMFILE_VALUE);
                 };
                 return SyscallResult::Return(fd as i64);
@@ -848,9 +970,9 @@ pub(super) async fn sys_openat<'a, P: PmapIf + tx_hal::ConsoleIf>(
         Cap<DEntry>,
         Option<Cap<tx_subsystems::mount::MountIdentity>>,
     ) = if path.starts_with(b"/") || dirfd == AT_FDCWD {
-        match ctx.process.cwd_binding() {
+        match ctx.cwd_binding() {
             Some(binding) => (binding.dentry, Some(binding.mount)),
-            None => match ctx.process.cwd() {
+            None => match ctx.cwd() {
                 Some(dentry) => {
                     let mount = mount_identity_for_dentry(ctx, &dentry);
                     (dentry, mount)
@@ -861,7 +983,7 @@ pub(super) async fn sys_openat<'a, P: PmapIf + tx_hal::ConsoleIf>(
     } else if dirfd < 0 {
         return SyscallResult::Error(EBADF_VALUE);
     } else {
-        let open_file = match ctx.process.fd(dirfd as u32) {
+        let open_file = match ctx.fd(dirfd as u32) {
             Some(f) => f,
             None => return SyscallResult::Error(EBADF_VALUE),
         };
@@ -965,7 +1087,7 @@ pub(super) async fn sys_openat<'a, P: PmapIf + tx_hal::ConsoleIf>(
         let Some(openfile) = opened else {
             return SyscallResult::Error(EEXIST_VALUE);
         };
-        let Some(fd) = ctx.process.install_new_fd(openfile, want_cloexec) else {
+        let Some(fd) = ctx.install_new_fd(openfile, want_cloexec) else {
             return SyscallResult::Error(EMFILE_VALUE);
         };
         return SyscallResult::Return(fd as i64);
@@ -1039,7 +1161,7 @@ pub(super) async fn sys_openat<'a, P: PmapIf + tx_hal::ConsoleIf>(
         if want_write && openfile.rnode().meta().kind() == InodeKind::Directory {
             return SyscallResult::Error(EISDIR_VALUE);
         }
-        let Some(fd) = ctx.process.install_new_fd(openfile, want_cloexec) else {
+        let Some(fd) = ctx.install_new_fd(openfile, want_cloexec) else {
             return SyscallResult::Error(EMFILE_VALUE);
         };
         return SyscallResult::Return(fd as i64);
@@ -1223,7 +1345,7 @@ pub(super) async fn sys_openat<'a, P: PmapIf + tx_hal::ConsoleIf>(
     // Step 4: install at the lowest unused fd ≥ 0. Per fd-ops Wave 1
     // the fd table is a sparse `BTreeMap<u32, Cap<OpenFile>>`;
     // `allocate_fd()` scans for the lowest unused key.
-    let Some(fd) = ctx.process.install_new_fd(openfile, want_cloexec) else {
+    let Some(fd) = ctx.install_new_fd(openfile, want_cloexec) else {
         return SyscallResult::Error(EMFILE_VALUE);
     };
 
@@ -1291,7 +1413,7 @@ pub(super) async fn sys_close<'a>(fd: u32, ctx: &SyscallCtx<'a>) -> SyscallResul
 /// (we clone the `Cap<OpenFile>`); both fds reference the same
 /// epoch-managed identity.
 pub(super) fn sys_dup<'a>(oldfd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
-    if ctx.process.fd(oldfd).is_none() {
+    if ctx.fd(oldfd).is_none() {
         return SyscallResult::Error(EBADF_VALUE);
     }
     let mut script_ctx = build_subject_script_ctx(ctx);
@@ -1327,7 +1449,7 @@ pub(super) fn sys_dup3<'a>(
     flags: u32,
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
-    let (soft_limit, _) = ctx.process.rlimit_nofile();
+    let (soft_limit, _) = ctx.rlimit_nofile();
     if newfd >= soft_limit {
         return SyscallResult::Error(EBADF_VALUE);
     }
@@ -1410,20 +1532,15 @@ pub(super) async fn sys_pipe2<'a>(
         }
     };
 
-    // Install at the lowest two unused fds. `allocate_fd()` returns
-    // the lowest unused slot; install_fd() commits. Allocate the
-    // reader first so on a fresh process it lands at 0 and the
-    // writer at 1, matching Linux's user-visible (3, 4) pattern
-    // post-stdin/out/err.
-    let Some(reader_fd) = ctx.process.install_new_fd(reader_cap, pipe_flags.cloexec) else {
+    // Linux publishes a pipe's two descriptors as one fd-table operation.
+    // Besides matching that visibility rule, the paired install avoids a
+    // close/reuse race in multithreaded Cargo processes: rollback must never
+    // remove an unrelated file that reused the first descriptor while the
+    // second end was being allocated.
+    let Some((reader_fd, writer_fd)) =
+        ctx.install_new_fd_pair(reader_cap, writer_cap, pipe_flags.cloexec)
+    else {
         return SyscallResult::Error(EMFILE_VALUE);
-    };
-    let writer_fd = match ctx.process.install_new_fd(writer_cap, pipe_flags.cloexec) {
-        Some(fd) => fd,
-        None => {
-            let _ = ctx.process.set_fd(reader_fd, None);
-            return SyscallResult::Error(EMFILE_VALUE);
-        }
     };
 
     // Write the (reader_fd, writer_fd) pair back to userspace as the
@@ -1465,7 +1582,7 @@ pub(super) fn sys_lseek<'a>(
     whence: u32,
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
-    let file = match resolve_fd(&ctx.process, fd) {
+    let file = match ctx.fd(fd) {
         Some(f) => f,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
@@ -1553,7 +1670,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
     if fd < 0 {
         return SyscallResult::Error(EBADF_VALUE);
     }
-    let file = match resolve_fd(&ctx.process, fd as u32) {
+    let file = match ctx.fd(fd as u32) {
         Some(f) => f,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
@@ -2478,6 +2595,31 @@ fn stat_meta_for_open_file(file: &Cap<OpenFile>) -> InodeMeta {
     meta
 }
 
+/// Non-blocking counterpart of [`stat_meta_for_open_file`].  VFS-backed
+/// descriptors are accepted only when their filesystem already holds a
+/// coherent metadata snapshot; this avoids issuing ext4 metadata I/O from the
+/// trap shell.  Page-container size and timestamp overrides remain the live
+/// authorities used by the ordinary `fstat` path.
+fn stat_meta_for_rnode_cached(rnode: &Cap<tx_subsystems::vfs::RNode>) -> Option<InodeMeta> {
+    let fs_object_id = rnode.fs_object_id();
+    let mut meta = match fs_ops_for_rnode(rnode) {
+        Some(fs_ops) => fs_ops.cached_inode_meta(fs_object_id)?,
+        None => rnode.meta(),
+    };
+    if let RNodeBacking::PageBacked { pc } = rnode.backing() {
+        meta.size = pc.size_bytes();
+    }
+    apply_stat_meta_override(fs_object_id, &mut meta);
+    Some(meta)
+}
+
+fn stat_meta_for_open_file_cached(file: &Cap<OpenFile>) -> Option<InodeMeta> {
+    if let Some(meta) = stat_meta_for_non_vfs_open_file(file) {
+        return Some(meta);
+    }
+    stat_meta_for_rnode_cached(file.rnode())
+}
+
 fn stat_meta_for_non_vfs_open_file(file: &OpenFile) -> Option<InodeMeta> {
     match file.backing() {
         OpenFileBacking::Rnode { .. } => None,
@@ -2530,7 +2672,7 @@ pub(super) fn sys_fstat<'a, P: tx_hal::ConsoleIf>(
     if statbuf_uaddr == 0 {
         return SyscallResult::Error(EFAULT_VALUE);
     }
-    let file = match resolve_fd(&ctx.process, fd as u32) {
+    let file = match ctx.fd(fd as u32) {
         Some(f) => f,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
@@ -2550,11 +2692,45 @@ pub(super) fn sys_fstat<'a, P: tx_hal::ConsoleIf>(
     SyscallResult::Return(0)
 }
 
+/// Trap-local `fstat` fast path.  It performs no cache fill and writes only
+/// through an already-resident single user page. `None` is a zero-side-effect
+/// request to run the canonical syscall future.
+pub(super) fn sys_fstat_cached_oneshot(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'_>,
+) -> Option<SyscallResult> {
+    let fd = args[0] as i32;
+    let statbuf_uaddr = args[1];
+    if fd < 0 {
+        return Some(SyscallResult::Error(EBADF_VALUE));
+    }
+    if statbuf_uaddr == 0 {
+        return Some(SyscallResult::Error(EFAULT_VALUE));
+    }
+    let file = match ctx.fd(fd as u32) {
+        Some(file) => file,
+        None => return Some(SyscallResult::Error(EBADF_VALUE)),
+    };
+    let meta = stat_meta_for_open_file_cached(&file)?;
+    let ino = match file.backing() {
+        OpenFileBacking::Rnode { rnode } => rnode.fs_object_id().as_u64(),
+        _ => fd as u64,
+    };
+    let stat = inode_meta_to_stat(&meta, ino, stat_rdev_for_open_file(&file));
+    match ctx.aspace.write_user_resident(
+        tx_hal::UserPtr::<StatLayout>::new(statbuf_uaddr as usize),
+        stat,
+    )? {
+        Ok(()) => Some(SyscallResult::Return(0)),
+        Err(errno) => Some(SyscallResult::error_from(errno)),
+    }
+}
+
 /// `fchdir(fd)`. Linux RV64 ABI `__NR_fchdir = 50`.
 pub(super) async fn sys_fchdir<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let _ = core::marker::PhantomData::<P>;
     let fd = args[0] as u32;
-    let open_file = match ctx.process.fd(fd) {
+    let open_file = match ctx.fd(fd) {
         Some(f) => f,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
@@ -2568,48 +2744,58 @@ pub(super) async fn sys_fchdir<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) 
     }
 }
 
-/// `statx/// `statx(dirfd, path, flags, mask, statxbuf)`. Linux generic ABI
-/// `__NR_statx = 291`.
-///
-/// This is the metadata probe LA64 musl/busybox uses before `ls`
-/// opens a directory and, on LA64 musl, for some `fstat(fd)` wrappers
-/// via `statx(fd, "", AT_EMPTY_PATH, ...)`. Txv2 reports the same
-/// inode metadata already used by `newfstatat`; unsupported sync
-/// policy bits are accepted because there is no cache coherency
-/// distinction in the current VFS layer.
-pub(super) async fn sys_statx<'a, P: tx_hal::ConsoleIf>(
-    args: [u64; 6],
-    ctx: &SyscallCtx<'a>,
-) -> SyscallResult {
-    let dirfd = args[0] as i32;
-    let path_uaddr = args[1];
-    let flags = args[2] as u32;
+/// Decoded and validated `statx(2)` arguments shared by the synchronous
+/// post-handoff lane and the wait-capable fallback.
+#[derive(Clone, Copy)]
+struct StatxArgs {
+    dirfd: i32,
+    path_uaddr: u64,
+    flags: u32,
+    statxbuf_uaddr: u64,
+}
+
+fn decode_statx_args(args: [u64; 6]) -> Result<StatxArgs, SyscallResult> {
+    let decoded = StatxArgs {
+        dirfd: args[0] as i32,
+        path_uaddr: args[1],
+        flags: args[2] as u32,
+        statxbuf_uaddr: args[4],
+    };
     let mask = args[3] as u32;
-    let statxbuf_uaddr = args[4];
 
-    if path_uaddr == 0 || statxbuf_uaddr == 0 {
-        return SyscallResult::Error(EFAULT_VALUE);
+    if decoded.path_uaddr == 0 || decoded.statxbuf_uaddr == 0 {
+        return Err(SyscallResult::Error(EFAULT_VALUE));
     }
-
     let known_flags = AT_EMPTY_PATH
         | AT_NO_AUTOMOUNT
         | numbers::AT_STATX_SYNC_TYPE
         | (AT_SYMLINK_NOFOLLOW as u32);
-    if flags & !known_flags != 0 {
-        return SyscallResult::Error(EINVAL_VALUE);
+    if decoded.flags & !known_flags != 0 {
+        return Err(SyscallResult::Error(EINVAL_VALUE));
     }
     let known_mask = numbers::STATX_BASIC_STATS | numbers::STATX_BTIME | numbers::STATX_MNT_ID;
     if mask & !known_mask != 0 {
-        return SyscallResult::Error(EINVAL_VALUE);
+        return Err(SyscallResult::Error(EINVAL_VALUE));
     }
+    Ok(decoded)
+}
 
-    let path = match read_user_cstr_wait(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX).await {
-        Ok(p) => p,
-        Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
-        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
-    };
+fn statx_path_error(error: ReadCStrError) -> SyscallResult {
+    match error {
+        ReadCStrError::TooLong => SyscallResult::Error(ENAMETOOLONG_VALUE),
+        ReadCStrError::Fault(errno) => SyscallResult::error_from(errno),
+    }
+}
 
-    let cwd = match ctx.process.cwd() {
+fn sys_statx_with_path(decoded: StatxArgs, path: &[u8], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let StatxArgs {
+        dirfd,
+        flags,
+        statxbuf_uaddr,
+        ..
+    } = decoded;
+
+    let cwd = match ctx.cwd() {
         Some(d) => d,
         None => return SyscallResult::Error(ENOENT_VALUE),
     };
@@ -2634,7 +2820,7 @@ pub(super) async fn sys_statx<'a, P: tx_hal::ConsoleIf>(
                 if fd < 0 {
                     return SyscallResult::Error(EBADF_VALUE);
                 }
-                let file = match resolve_fd(&ctx.process, fd as u32) {
+                let file = match ctx.fd(fd as u32) {
                     Some(f) => f,
                     None => return SyscallResult::Error(EBADF_VALUE),
                 };
@@ -2664,7 +2850,7 @@ pub(super) async fn sys_statx<'a, P: tx_hal::ConsoleIf>(
             } else if dirfd < 0 {
                 return SyscallResult::Error(EBADF_VALUE);
             } else {
-                let open_file = match ctx.process.fd(dirfd as u32) {
+                let open_file = match ctx.fd(dirfd as u32) {
                     Some(file) => file,
                     None => return SyscallResult::Error(EBADF_VALUE),
                 };
@@ -2675,12 +2861,15 @@ pub(super) async fn sys_statx<'a, P: tx_hal::ConsoleIf>(
             };
             let walker_cred = ctx.walker_cred();
             let result = {
-                let mut script_ctx = build_subject_script_ctx(ctx);
+                // `StatxOp` performs permission checks through the explicit
+                // walker credential and never reads `ScriptCtx::subject()`.
+                // Avoid minting a per-call restriction-stack capability on
+                // Cargo's hottest metadata syscall.
+                let mut script_ctx = crate::KernelScriptCtx::new();
                 let mut op = StatxOp {
                     rooted_at: &rooted_at,
-                    path: &path,
+                    path,
                     cred: &walker_cred,
-                    target: None,
                 };
                 step_engine::drive_oneshot(&mut op, &mut script_ctx)
             };
@@ -2696,6 +2885,147 @@ pub(super) async fn sys_statx<'a, P: tx_hal::ConsoleIf>(
         return SyscallResult::error_from(errno);
     }
     SyscallResult::Return(0)
+}
+
+/// Trap-local `statx` fast path for the compiler's metadata-probe workload.
+///
+/// This lane is deliberately cache-only: both user buffers must already be
+/// resident, every path component must have an authoritative positive dentry,
+/// and the terminal inode metadata must already be present in the filesystem
+/// cache. A miss returns `None` before modifying user memory and lets the
+/// ordinary reactor-backed syscall perform lookup or I/O.
+pub(super) fn sys_statx_cached_oneshot(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'_>,
+) -> Option<SyscallResult> {
+    let decoded = match decode_statx_args(args) {
+        Ok(decoded) => decoded,
+        Err(result) => return Some(result),
+    };
+    let path = match ctx.aspace.read_user_cstr_resident(
+        tx_hal::UserPtr::<u8>::new(decoded.path_uaddr as usize),
+        EXECVE_PATH_MAX,
+    )? {
+        Ok(path) => path,
+        Err(Errno::ENAMETOOLONG) => return Some(SyscallResult::Error(ENAMETOOLONG_VALUE)),
+        Err(errno) => return Some(SyscallResult::error_from(errno)),
+    };
+
+    let (mut meta, ino, rdev_major, rdev_minor) = if path.is_empty()
+        && decoded.flags & AT_EMPTY_PATH != 0
+    {
+        if decoded.dirfd == AT_FDCWD {
+            let cwd = match ctx.cwd() {
+                Some(cwd) => cwd,
+                None => return Some(SyscallResult::Error(ENOENT_VALUE)),
+            };
+            let meta = stat_meta_for_rnode_cached(cwd.rnode())?;
+            (meta, cwd.rnode().fs_object_id(), 0, 0)
+        } else {
+            if decoded.dirfd < 0 {
+                return Some(SyscallResult::Error(EBADF_VALUE));
+            }
+            let file = match ctx.fd(decoded.dirfd as u32) {
+                Some(file) => file,
+                None => return Some(SyscallResult::Error(EBADF_VALUE)),
+            };
+            let meta = stat_meta_for_open_file_cached(&file)?;
+            let (rdev_major, rdev_minor) = rdev_major_minor_for_open_file(&file);
+            let ino = match file.backing() {
+                OpenFileBacking::Rnode { rnode } => rnode.fs_object_id(),
+                _ => FsObjectId::new(decoded.dirfd as u64),
+            };
+            (meta, ino, rdev_major, rdev_minor)
+        }
+    } else {
+        // The common Cargo/rustc shape is AT_FDCWD. Real dirfd-relative
+        // paths need a reliable dentry-to-mount binding and remain on the
+        // canonical path for now. Absolute paths ignore dirfd per Linux.
+        if !path.starts_with(b"/") && decoded.dirfd != AT_FDCWD {
+            return None;
+        }
+        let binding = ctx.cwd_binding()?;
+        let namespace = ctx.process.mount_namespace_cap()?;
+        let cred = ctx.walker_cred();
+        let final_symlink_policy = if decoded.flags & (AT_SYMLINK_NOFOLLOW as u32) != 0 {
+            tx_subsystems::vfs::resolution::state::FinalSymlinkPolicy::NoFollow
+        } else {
+            tx_subsystems::vfs::resolution::state::FinalSymlinkPolicy::Follow
+        };
+        let resolved = {
+            let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
+            tx_subsystems::vfs::resolution::driver::walk_cached_to_completion_with_mount_namespace_and_origin(
+                    binding.dentry,
+                    &path,
+                    tx_subsystems::vfs::resolution::state::WalkMode::Entity,
+                    final_symlink_policy,
+                    &cred,
+                    Some(&namespace),
+                    Some(&binding.mount),
+                    &guard,
+                )
+        };
+        let resolved = match resolved {
+            Ok(resolved) => resolved,
+            Err(Errno::EAGAIN) => return None,
+            Err(errno) => return Some(SyscallResult::error_from(errno)),
+        };
+        let meta = stat_meta_for_rnode_cached(&resolved.rnode)?;
+        (meta, resolved.fs_object_id, 0, 0)
+    };
+
+    apply_stat_meta_override(ino, &mut meta);
+    let statx = inode_meta_to_statx(&meta, ino.as_u64(), rdev_major, rdev_minor);
+    match ctx.aspace.write_user_resident(
+        tx_hal::UserPtr::<StatxLayout>::new(decoded.statxbuf_uaddr as usize),
+        statx,
+    )? {
+        Ok(()) => Some(SyscallResult::Return(0)),
+        Err(errno) => Some(SyscallResult::error_from(errno)),
+    }
+}
+
+/// Synchronous `statx` lane used after the ordinary trap handoff. A transient
+/// user-path materialisation collision returns `None` before any VFS work and
+/// lets the wait-capable boxed future retry; all other outcomes use the same
+/// authoritative walker and metadata logic as [`sys_statx`].
+pub(super) fn sys_statx_post_handoff_oneshot(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'_>,
+) -> Option<SyscallResult> {
+    let decoded = match decode_statx_args(args) {
+        Ok(decoded) => decoded,
+        Err(result) => return Some(result),
+    };
+    let path = match read_user_cstr_oneshot(&ctx.aspace, decoded.path_uaddr, EXECVE_PATH_MAX)? {
+        Ok(path) => path,
+        Err(error) => return Some(statx_path_error(error)),
+    };
+    Some(sys_statx_with_path(decoded, &path, ctx))
+}
+
+/// `statx(dirfd, path, flags, mask, statxbuf)`. Linux generic ABI
+/// `__NR_statx = 291`.
+///
+/// This is the metadata probe LA64 musl/busybox uses before `ls`
+/// opens a directory and, on LA64 musl, for some `fstat(fd)` wrappers
+/// via `statx(fd, "", AT_EMPTY_PATH, ...)`. Txv2 reports the same
+/// inode metadata already used by `newfstatat`; unsupported sync
+/// policy bits are accepted because there is no cache coherency
+/// distinction in the current VFS layer.
+pub(super) async fn sys_statx<'a, P: tx_hal::ConsoleIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
+    let decoded = match decode_statx_args(args) {
+        Ok(decoded) => decoded,
+        Err(result) => return result,
+    };
+    let path = match read_user_cstr_wait(&ctx.aspace, decoded.path_uaddr, EXECVE_PATH_MAX).await {
+        Ok(p) => p,
+        Err(error) => return statx_path_error(error),
+    };
+    sys_statx_with_path(decoded, &path, ctx)
 }
 
 /// `newfstatat(dirfd, path, statbuf, flags)`. Linux RV64 generic ABI
@@ -2750,7 +3080,7 @@ pub(super) async fn sys_newfstatat<'a, P: tx_hal::ConsoleIf>(
     // AT_EMPTY_PATH + empty path: stat the cwd itself for AT_FDCWD,
     // or mirror fstat(fd) for a real fd. Otherwise use StatOp +
     // drive_oneshot from the same cwd/dirfd anchor as openat/mkdirat.
-    let cwd = match ctx.process.cwd() {
+    let cwd = match ctx.cwd() {
         Some(d) => d,
         None => return SyscallResult::Error(ENOENT_VALUE),
     };
@@ -2766,7 +3096,7 @@ pub(super) async fn sys_newfstatat<'a, P: tx_hal::ConsoleIf>(
         } else if dirfd < 0 {
             return SyscallResult::Error(EBADF_VALUE);
         } else {
-            let open_file = match ctx.process.fd(dirfd as u32) {
+            let open_file = match ctx.fd(dirfd as u32) {
                 Some(file) => file,
                 None => return SyscallResult::Error(EBADF_VALUE),
             };

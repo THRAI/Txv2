@@ -119,6 +119,59 @@ where
     open_ext4_with_backend_planner(image, false, None)
 }
 
+/// Recover an image's on-disk JBD2 state, then mount it through the legacy
+/// synchronous pager.
+///
+/// This is the compatibility counterpart of
+/// [`mount_ext4_read_write_with_discovered_journal`]. It provides the same
+/// mount-time recovery view but deliberately does not install an I/O-manager
+/// planner or disable the synchronous `FsPageBacking` hooks. Boot/test roots
+/// can therefore consume an image left with `needs_recovery` without creating
+/// one long-lived file-I/O runtime for every opened inode.
+pub fn mount_ext4_read_write_with_recovery<I>(image: I) -> Result<MountedExt4<I>, Errno>
+where
+    I: BlockImage + Send + 'static,
+{
+    validate_tier1_rw_profile(&image)?;
+    let mut pager = Ext4Pager::open(image).map_err(|_| Errno::EIO)?;
+    let superblock = pager.superblock();
+    let journal_geometry = pager.journal_geometry().map_err(|_| Errno::EIO)?;
+    let mut image = pager.into_inner();
+    let _recovery =
+        recover_if_required(&mut image, &superblock, &journal_geometry).map_err(|_| Errno::EIO)?;
+    let mut pager = Ext4Pager::open(image).map_err(|_| Errno::EIO)?;
+    let _orphan_recovery = pager
+        .recover_classic_orphan_chain()
+        .map_err(|_| Errno::EIO)?;
+    open_ext4_with_backend_planner(pager.into_inner(), false, None)
+}
+
+/// Recover JBD2 state, then retain synchronous compatibility writeback while
+/// installing the I/O-manager planner for parallel file reads.  This is the
+/// competition-root profile: read faults may use merged readahead BIOs, but
+/// newly created build outputs still allocate holes and publish inode size
+/// through the proven pager transaction rather than the mutation journal.
+pub fn mount_ext4_read_write_with_recovery_and_io_manager_planner<I>(
+    image: I,
+    geometry: Ext4BlockGeometry,
+) -> Result<MountedExt4<I>, Errno>
+where
+    I: BlockImage + Send + 'static,
+{
+    validate_tier1_rw_profile(&image)?;
+    let mut pager = Ext4Pager::open(image).map_err(|_| Errno::EIO)?;
+    let superblock = pager.superblock();
+    let journal_geometry = pager.journal_geometry().map_err(|_| Errno::EIO)?;
+    let mut image = pager.into_inner();
+    let _recovery =
+        recover_if_required(&mut image, &superblock, &journal_geometry).map_err(|_| Errno::EIO)?;
+    let mut pager = Ext4Pager::open(image).map_err(|_| Errno::EIO)?;
+    let _orphan_recovery = pager
+        .recover_classic_orphan_chain()
+        .map_err(|_| Errno::EIO)?;
+    open_ext4_with_planner_binding(pager.into_inner(), false, Ext4PlannerBinding::new(geometry))
+}
+
 /// Read-write counterpart of [`mount_ext4_read_only_with_backend_planner`].
 pub fn mount_ext4_read_write_with_backend_planner<I>(
     image: I,
@@ -281,10 +334,12 @@ where
     if let Some(profile_hash) = profile_hash {
         backend.set_capability_profile_hash(profile_hash);
     }
-    let root_fs_object_id = FsObjectId::new(EXT4_ROOT_INODE as u64);
-    let root_inode_meta = backend
-        .with_pager(|pager| pager.inode_meta(tx_ext4_format::pager::InodeNo::new(EXT4_ROOT_INODE)))
-        .map(map_inode_meta)?;
+    let root_disk_meta = backend.with_pager(|pager| {
+        pager.inode_meta(tx_ext4_format::pager::InodeNo::new(EXT4_ROOT_INODE))
+    })?;
+    let root_fs_object_id =
+        FsObjectId::from_inode_generation(EXT4_ROOT_INODE, root_disk_meta.generation);
+    let root_inode_meta = map_inode_meta(root_disk_meta);
 
     Ok(MountedExt4 {
         backend,

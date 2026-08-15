@@ -46,6 +46,7 @@ pub struct AddressSpace {
     pub(in crate::vm) range_lock: RangeLock,
     pub(in crate::vm) stats: AddressSpaceStatsCell,
     pub(in crate::vm) next_private_anon_write_fault_page: AtomicUsize,
+    pub(in crate::vm) next_file_read_fault_page: AtomicUsize,
     pub(in crate::vm) next_mmap_search_start: AtomicUsize,
 }
 
@@ -70,6 +71,7 @@ impl AddressSpace {
             range_lock: RangeLock::new(),
             stats: AddressSpaceStatsCell::new(),
             next_private_anon_write_fault_page: AtomicUsize::new(0),
+            next_file_read_fault_page: AtomicUsize::new(0),
             next_mmap_search_start: AtomicUsize::new(0),
         })
     }

@@ -47,16 +47,18 @@ use tx_subsystems::vm::AddressSpace;
 use tx_subsystems::zones;
 
 use super::{
-    dispatch, dispatch_cap_only_immediate, dispatch_clone_oneshot,
-    dispatch_direct_trap_payload_oneshot, dispatch_process_aspace_immediate,
-    dispatch_thread_aspace_oneshot, dispatch_thread_payload_aspace_oneshot, dispatch_vm_hot,
-    dispatch_writev_hot, SyscallCtx, SyscallResult, BRK_LINEAR_HEAP_SOFT_LIMIT_BYTES, CLONE_VFORK,
-    EINVAL_VALUE, ENOSYS_VALUE, FD_CLOEXEC, F_GETFD, F_SETFD, NR_BRK, NR_CLONE, NR_EXECVE, NR_EXIT,
-    NR_EXIT_GROUP, NR_FCNTL, NR_GETPGID, NR_GETPID, NR_GETPPID, NR_GETSID, NR_GET_ROBUST_LIST,
-    NR_MEMBARRIER, NR_READ, NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_SCHED_GETAFFINITY,
-    NR_SCHED_SETAFFINITY, NR_SETPGID, NR_SETSID, NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS,
-    NR_TIMERFD_CREATE, NR_TX_OBSERVE_BEGIN, NR_TX_OBSERVE_TRACE_OFF, NR_TX_OBSERVE_TRACE_ON,
-    NR_WAIT4, NR_WRITE, NR_WRITEV, SIGCHLD, WNOHANG,
+    dispatch, dispatch_cap_only_immediate, dispatch_clone_oneshot, dispatch_direct_trap_oneshot,
+    dispatch_direct_trap_payload_oneshot, dispatch_fs_hot_oneshot,
+    dispatch_process_aspace_immediate, dispatch_thread_aspace_oneshot,
+    dispatch_thread_payload_aspace_oneshot, dispatch_vm_hot, dispatch_writev_hot,
+    is_direct_trap_syscall, SyscallCtx, SyscallResult, AT_FDCWD, BRK_LINEAR_HEAP_SOFT_LIMIT_BYTES,
+    CLONE_VFORK, EBADF_VALUE, EFAULT_VALUE, EINVAL_VALUE, ENOSYS_VALUE, FD_CLOEXEC, F_GETFD,
+    F_SETFD, MAP_ANONYMOUS, MAP_PRIVATE, NR_BRK, NR_CLONE, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP,
+    NR_FCNTL, NR_FSTAT, NR_GETPGID, NR_GETPID, NR_GETPPID, NR_GETSID, NR_GET_ROBUST_LIST, NR_LSEEK,
+    NR_MEMBARRIER, NR_MMAP, NR_OPENAT, NR_READ, NR_RT_SIGACTION, NR_RT_SIGPROCMASK,
+    NR_SCHED_GETAFFINITY, NR_SCHED_SETAFFINITY, NR_SETPGID, NR_SETSID, NR_SET_ROBUST_LIST,
+    NR_SET_TID_ADDRESS, NR_STATX, NR_TIMERFD_CREATE, NR_TX_OBSERVE_BEGIN, NR_TX_OBSERVE_TRACE_OFF,
+    NR_TX_OBSERVE_TRACE_ON, NR_WAIT4, NR_WRITE, NR_WRITEV, PROT_READ, SIGCHLD, WNOHANG,
 };
 
 // ---------------------------------------------------------------------------
@@ -1366,6 +1368,109 @@ fn dispatch_direct_trap_payload_oneshot_routes_sigprocmask_through_payload_lane(
 
     assert_eq!(query_result, Some(SyscallResult::Return(0)));
     assert_eq!(oldset, SIGUSR1_BIT);
+}
+
+#[test]
+fn dispatch_direct_trap_payload_oneshot_routes_cached_io_and_nonblocking_fd_ops() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let payload = thread.payload_cap().expect("thread payload alive");
+    let aspace = proc_cap.aspace_cap().expect("alive aspace");
+    for request in [
+        SyscallRequest::new(NR_READ, [u32::MAX as u64, 0, 1, 0, 0, 0]),
+        SyscallRequest::new(NR_WRITE, [u32::MAX as u64, 0, 1, 0, 0, 0]),
+        SyscallRequest::new(NR_LSEEK, [u32::MAX as u64, 0, 0, 0, 0, 0]),
+        SyscallRequest::new(NR_FCNTL, [u32::MAX as u64, F_GETFD as u64, 0, 0, 0, 0]),
+        SyscallRequest::new(NR_FSTAT, [u32::MAX as u64, 1, 0, 0, 0, 0]),
+    ] {
+        assert!(is_direct_trap_syscall(request.nr));
+        assert_eq!(
+            dispatch_direct_trap_payload_oneshot::<ShimsTestPmap>(
+                &request, &proc_cap, &thread, &payload, &aspace,
+            ),
+            Some(SyscallResult::Error(EBADF_VALUE))
+        );
+    }
+
+    let waiting_fcntl = SyscallRequest::new(NR_FCNTL, [0, 7, 0, 0, 0, 0]);
+    assert!(is_direct_trap_syscall(waiting_fcntl.nr));
+    assert_eq!(
+        dispatch_direct_trap_payload_oneshot::<ShimsTestPmap>(
+            &waiting_fcntl,
+            &proc_cap,
+            &thread,
+            &payload,
+            &aspace,
+        ),
+        None,
+        "fcntl commands that may wait must fall back to the reactor"
+    );
+
+    let brk_query = SyscallRequest::new(NR_BRK, [0, 0, 0, 0, 0, 0]);
+    assert!(is_direct_trap_syscall(brk_query.nr));
+    assert_eq!(
+        dispatch_direct_trap_payload_oneshot::<ShimsTestPmap>(
+            &brk_query, &proc_cap, &thread, &payload, &aspace,
+        ),
+        Some(SyscallResult::Return(proc_cap.current_brk() as i64))
+    );
+
+    let invalid_mmap = SyscallRequest::new(
+        NR_MMAP,
+        [0, 0, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, u64::MAX, 0],
+    );
+    assert!(is_direct_trap_syscall(invalid_mmap.nr));
+    assert_eq!(
+        dispatch_direct_trap_payload_oneshot::<ShimsTestPmap>(
+            &invalid_mmap,
+            &proc_cap,
+            &thread,
+            &payload,
+            &aspace,
+        ),
+        Some(SyscallResult::Error(EINVAL_VALUE))
+    );
+}
+
+#[test]
+fn statx_is_direct_eligible_and_invalid_pointer_finishes_without_handoff() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let aspace = proc_cap.aspace_cap().expect("alive aspace");
+    let ctx = SyscallCtx::new(proc_cap, thread, aspace);
+    let request = SyscallRequest::new(NR_STATX, [AT_FDCWD as u64, 0, 0, 0, 1, 0]);
+
+    assert!(is_direct_trap_syscall(request.nr));
+    assert_eq!(
+        dispatch_direct_trap_oneshot::<ShimsTestPmap>(
+            &request,
+            &ctx.process,
+            &ctx.thread,
+            &ctx.aspace,
+        ),
+        Some(SyscallResult::Error(EFAULT_VALUE))
+    );
+    assert_eq!(
+        dispatch_fs_hot_oneshot::<ShimsTestPmap>(&request, &ctx),
+        Some(SyscallResult::Error(EFAULT_VALUE))
+    );
+}
+
+#[test]
+fn openat_is_direct_eligible_and_invalid_pointer_finishes_without_handoff() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let aspace = proc_cap.aspace_cap().expect("alive aspace");
+    let request = SyscallRequest::new(NR_OPENAT, [AT_FDCWD as u64, 0, 0, 0, 0, 0]);
+
+    assert!(is_direct_trap_syscall(request.nr));
+    assert_eq!(
+        dispatch_direct_trap_oneshot::<ShimsTestPmap>(&request, &proc_cap, &thread, &aspace,),
+        Some(SyscallResult::Error(EFAULT_VALUE))
+    );
 }
 
 /// `rt_sigprocmask` with `sigsetsize != 8` is rejected with `-EINVAL`

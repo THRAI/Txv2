@@ -181,6 +181,22 @@ fn static_raw_queue_storage_produces_cloneable_raw_handles_without_arc_allocatio
 }
 
 #[test]
+fn raw_queue_take_preserves_a_same_bit_refire_after_claim() {
+    let queue = RawQueue::new();
+
+    queue.fire(0x1);
+    assert_eq!(queue.take(0x1), 0x1);
+    assert_eq!(queue.peek(), 0);
+
+    // This fire represents a producer arriving after the consumer atomically
+    // claimed the previous request. It must remain pending for the next pass.
+    queue.fire(0x1);
+    assert_eq!(queue.peek(), 0x1);
+    assert_eq!(queue.take(0x1), 0x1);
+    assert_eq!(queue.peek(), 0);
+}
+
+#[test]
 fn static_raw_port_storage_produces_cloneable_raw_handles_without_arc_allocation() {
     let port = STATIC_TEST_PORT.raw();
     let port_from_static = RawPort::from_static(&STATIC_TEST_PORT);

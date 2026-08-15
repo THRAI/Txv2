@@ -319,7 +319,7 @@ impl<P: TxPlatform> CoreInit<P> {
                     task_payload.clone(),
                     crate::thread_future::run_thread::<P>(child_thread, task_payload),
                 ),
-                Self::userspace_child_thread_sched_meta_for(submit_cpu).preempted_on_submit(),
+                Self::userspace_child_thread_sched_meta_for(submit_cpu),
                 submit_hart,
                 &mut signal,
             )

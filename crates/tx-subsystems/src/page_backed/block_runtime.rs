@@ -20,7 +20,7 @@ use crate::io_manager::backend::PageFrameRef;
 use crate::io_manager::backend::{BlockPageCompletion, BlockPageRequestTracker};
 use crate::io_manager::block::{
     BioPlan, BlockCompletion, BlockDeviceCompletion, BlockDispatch, BlockQueue, BlockRequestId,
-    BlockServiceDriver, BlockTagTable, QueueError, SubmitOutcome,
+    BlockServiceDriver, BlockServiceNext, BlockTagTable, QueueError, SubmitOutcome,
 };
 #[cfg(test)]
 use crate::io_manager::page::service::{PageService, PageServiceBlockCompletionOutcome};
@@ -75,6 +75,18 @@ struct BlockSubmissionState {
 /// Typed L6 ownership token retained by a PageContainer.
 #[derive(Clone, Debug)]
 pub(crate) struct BlockSubmissionHandle(Arc<BlockSubmissionManager>);
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct BlockSubmissionDiagnosticSnapshot {
+    pub(crate) queued: usize,
+    pub(crate) dispatch_blocked: usize,
+    pub(crate) front_dispatch_blocked: bool,
+    pub(crate) page_routes: usize,
+    pub(crate) direct_routes: usize,
+    pub(crate) depth_limit: usize,
+    pub(crate) depth_in_flight: usize,
+    pub(crate) tags_in_flight: usize,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BlockManagerDriven {
@@ -151,6 +163,50 @@ impl BlockSubmissionHandle {
 
     pub(crate) fn has_in_flight(&self) -> bool {
         !self.0.lock_state().tags.is_empty()
+    }
+
+    pub(crate) fn has_immediate_work(&self) -> bool {
+        let state = self.0.lock_state();
+        state
+            .queue
+            .can_dispatch_next_tagged(&state.depth, &state.tags)
+            || !state.tags.is_empty()
+    }
+
+    /// Re-observe L6 after dispatch completions have returned their tags.
+    ///
+    /// `BlockServiceDriver::drive_once` decides `next` before the concrete
+    /// device is polled.  A synchronous device can complete every dispatched
+    /// request in the same service turn, reopening queue depth that was full
+    /// when that preliminary decision was made.  Callers must use this value
+    /// after completion processing instead of carrying the stale pre-poll
+    /// decision into the task's sleep protocol.
+    pub(crate) fn service_next(&self) -> BlockServiceNext {
+        let state = self.0.lock_state();
+        if state
+            .queue
+            .can_dispatch_next_tagged(&state.depth, &state.tags)
+        {
+            BlockServiceNext::Runnable
+        } else if state.queue.is_empty() && state.tags.is_empty() {
+            BlockServiceNext::Sleeping
+        } else {
+            BlockServiceNext::WaitingForCompletion
+        }
+    }
+
+    pub(crate) fn diagnostic_snapshot(&self) -> BlockSubmissionDiagnosticSnapshot {
+        let state = self.0.lock_state();
+        BlockSubmissionDiagnosticSnapshot {
+            queued: state.queue.len(),
+            dispatch_blocked: state.queue.dispatch_blocked_len(),
+            front_dispatch_blocked: state.queue.front_dispatch_blocked(),
+            page_routes: state.tracker.len(),
+            direct_routes: state.direct_tracker.pending.len(),
+            depth_limit: state.depth.limit(),
+            depth_in_flight: state.depth.in_flight(),
+            tags_in_flight: state.tags.len(),
+        }
     }
 
     pub(crate) fn submit_direct(

@@ -26,7 +26,10 @@ pub(super) struct MountedNode {
 
 impl MountedDentry {
     pub(super) fn find_ascending(dentry: &Cap<DEntry>) -> Option<Self> {
-        let guard = step_engine::guard();
+        // Mounted-object discovery is also used from path walkers that
+        // already own an epoch read window. Reuse that window instead of
+        // entering a nested guard, which the EBR domain deliberately rejects.
+        let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
         let mut cursor = dentry.clone();
         loop {
             if let Some(weak) = cursor.rnode().containing_mount_weak() {
@@ -56,7 +59,7 @@ impl MountedDentry {
 
 impl MountedNode {
     pub(super) fn from_rnode_direct(rnode: &Cap<RNode>) -> Option<Self> {
-        let guard = step_engine::guard();
+        let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
         let payload = rnode.containing_mount_weak()?.upgrade(&guard)?;
         Some(Self {
             _rnode: rnode.clone(),

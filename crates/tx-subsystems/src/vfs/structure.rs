@@ -10,7 +10,9 @@
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
+use core::hash::{BuildHasher, Hash, Hasher};
 use core::sync::atomic::{AtomicI8, AtomicU64, Ordering};
+use hashbrown::HashMap;
 
 use crate::vfs::adapter::step_engine::{
     self, Cap, PayloadCap, SpinMutex, Weak, Zone, ZoneAllocated, ZoneError,
@@ -403,6 +405,21 @@ impl Ord for InlineName {
 impl PartialOrd for InlineName {
     fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
         Some(self.cmp(other))
+    }
+}
+
+impl Hash for InlineName {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Match the borrowed `[u8]` representation used by the path-walk
+        // lookup. Hashing `len` plus the entire padded array would make
+        // `HashMap::get(name: &[u8])` probe a different bucket.
+        self.as_bytes().hash(state);
+    }
+}
+
+impl core::borrow::Borrow<[u8]> for InlineName {
+    fn borrow(&self) -> &[u8] {
+        self.as_bytes()
     }
 }
 
@@ -873,10 +890,54 @@ impl core::fmt::Debug for RNode {
 #[derive(Debug)]
 pub struct DEntry {
     name: InlineName,
-    parent: Option<Cap<DEntry>>,
+    parent: Option<Weak<DEntry>>,
     rnode: Cap<RNode>,
     mounted: Option<Weak<MountIdentity>>,
-    children: SpinMutex<BTreeMap<InlineName, Weak<DEntry>>>,
+    children: SpinMutex<HashMap<InlineName, CachedChild, VfsNameHashBuilder>>,
+}
+
+/// Fast deterministic hasher for bounded VFS component names.
+///
+/// The dentry cache is an in-kernel performance cache rather than a trust
+/// boundary, and every key is limited to `VFS_NAME_MAX`. FNV-1a keeps lookup
+/// allocation-free and avoids pulling an entropy-dependent standard hasher
+/// into the no-std kernel.
+#[derive(Clone, Copy, Debug, Default)]
+struct VfsNameHashBuilder;
+
+impl BuildHasher for VfsNameHashBuilder {
+    type Hasher = VfsNameHasher;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        VfsNameHasher::default()
+    }
+}
+
+struct VfsNameHasher(u64);
+
+impl Default for VfsNameHasher {
+    fn default() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl Hasher for VfsNameHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CachedChild {
+    dentry: Cap<DEntry>,
+    lookup_version: Option<u64>,
 }
 
 impl DEntry {
@@ -886,7 +947,7 @@ impl DEntry {
             parent: None,
             rnode,
             mounted: None,
-            children: SpinMutex::new(BTreeMap::new()),
+            children: SpinMutex::new(HashMap::with_hasher(VfsNameHashBuilder)),
         }
     }
 
@@ -903,19 +964,20 @@ impl DEntry {
     }
 
     pub fn set_parent_hint(&mut self, parent: &Cap<DEntry>) {
-        self.parent = Some(parent.clone());
+        self.parent = Some(parent.downgrade());
     }
 
     pub fn set_mounted_hint(&mut self, mount: &Cap<MountIdentity>) {
         self.mounted = Some(mount.downgrade());
     }
 
-    /// Return the parent-hint `Cap<DEntry>` if installed. The parent is held
-    /// strongly so live cwd/path dentries keep their ancestor chain renderable;
-    /// the child cache is weak, so parent/child cache cycles do not retain
-    /// removed directory subtrees.
+    /// Return the parent-hint `Cap<DEntry>` if its directory is still live.
+    /// Parent directories retain cached children; children therefore keep only
+    /// a weak parent hint so the cache tree contains no reference cycle.
     pub fn parent_hint(&self) -> Option<Cap<DEntry>> {
-        self.parent.clone()
+        let parent = self.parent?;
+        let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
+        parent.upgrade(&guard)
     }
 
     /// Snapshot the `mounted` weak hint. Used by the VFS walker
@@ -929,27 +991,65 @@ impl DEntry {
     }
 
     pub fn cached_child(&self, name: InlineName) -> Option<Cap<DEntry>> {
-        let mut children = self.children.lock();
-        let child = children.get(&name).copied()?;
-        let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
-        match child.upgrade(&guard) {
-            Some(cap) => Some(cap),
-            None => {
-                children.remove(&name);
-                None
-            }
-        }
+        self.cached_child_by_name(name.as_bytes())
+    }
+
+    /// Borrowed-name lookup for the path-walk hot path. Constructing an
+    /// `InlineName` clears and copies the full 255-byte inline buffer; most
+    /// walks only probe an already cached child and do not need an owned key.
+    pub fn cached_child_by_name(&self, name: &[u8]) -> Option<Cap<DEntry>> {
+        self.cached_child_with_version_by_name(name)
+            .map(|(child, _)| child)
+    }
+
+    pub fn cached_child_with_version_by_name(
+        &self,
+        name: &[u8],
+    ) -> Option<(Cap<DEntry>, Option<u64>)> {
+        let children = self.children.lock();
+        let child = children.get(name)?;
+        Some((child.dentry.clone(), child.lookup_version))
     }
 
     pub fn cache_child(&self, child: Cap<DEntry>) -> Cap<DEntry> {
+        // The first dentry published for a component remains canonical until
+        // an explicit cache invalidation. Keeping that capability strong makes
+        // positive lookup results reusable after the opening file is closed.
+        let name = child.name();
         let mut children = self.children.lock();
-        if let Some(existing) = children.get(&child.name()).copied() {
-            let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
-            if let Some(canonical) = existing.upgrade(&guard) {
-                return canonical;
+        if let Some(existing) = children.get(&name) {
+            return existing.dentry.clone();
+        }
+        children.insert(
+            name,
+            CachedChild {
+                dentry: child.clone(),
+                lookup_version: None,
+            },
+        );
+        child
+    }
+
+    pub fn cache_child_with_version(
+        &self,
+        child: Cap<DEntry>,
+        lookup_version: Option<u64>,
+    ) -> Cap<DEntry> {
+        let name = child.name();
+        let mut children = self.children.lock();
+        if let Some(existing) = children.get_mut(&name) {
+            if existing.dentry.rnode().fs_object_id() == child.rnode().fs_object_id() {
+                existing.lookup_version = lookup_version;
+                return existing.dentry.clone();
             }
         }
-        children.insert(child.name(), child.downgrade());
+        children.insert(
+            name,
+            CachedChild {
+                dentry: child.clone(),
+                lookup_version,
+            },
+        );
         child
     }
 
@@ -958,9 +1058,7 @@ impl DEntry {
     }
 
     pub fn remove_cached_child_by_name(&self, name: &[u8]) {
-        if let Ok(name) = InlineName::new(name) {
-            self.remove_cached_child(name);
-        }
+        self.children.lock().remove(name);
     }
 
     pub fn clear_cached_children(&self) {

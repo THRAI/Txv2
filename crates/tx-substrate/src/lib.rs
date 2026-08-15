@@ -40,7 +40,10 @@ pub use publication::{
     ReservedCommitInvariant,
 };
 pub use slot::AtomicSlot;
-pub use sync::{LockMetricsOff, LockMetricsOn, SpinMutex, SpinMutexGuard};
+pub use sync::{
+    LockMetricsOff, LockMetricsOn, RwSpinLock, RwSpinReadGuard, RwSpinWriteGuard, SpinMutex,
+    SpinMutexGuard,
+};
 pub use zone::{BindingToken, PublishedBinding};
 
 #[doc(hidden)]

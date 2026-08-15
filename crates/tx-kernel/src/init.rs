@@ -53,30 +53,98 @@ const BSP_REACTOR_TIMER_WAIT_SPINS: usize = 20_000;
 /// reactor has no pending deadline. Without this, WFI never wakes when all
 /// tasks block on WaitSources rather than timer-backed futures.
 pub(crate) const IDLE_TIMER_PERIOD_NS: u64 = 5_000_000; // 5 ms
+/// Maximum timer interval while one userspace task owns a hart and no other
+/// runnable work or expired reactor deadline needs that hart.
+///
+/// The scheduler still starts every userspace poll with its ordinary 10 ms
+/// slice.  At the slice interrupt, an uncontended task can stay in userspace
+/// and re-arm this bounded check instead of longjmp'ing through the complete
+/// userspace-slot/reactor/requeue path.  Runnable publication and device wake
+/// paths retain their reschedule IPI/IRQ preemption, while this cap remains a
+/// fallback for a missed notification.
+const UNCONTENDED_USER_SLICE_EXTENSION_NS: u64 = 50_000_000;
 const POLLING_IDLE_SPINS: usize = 256;
-/// Emit one wait-chain snapshot after the whole SMP reactor has made no task
-/// progress for this long. The snapshot is globally one-shot, so a real hang
-/// produces useful evidence without turning normal BuildStorm output into a
-/// periodic diagnostic stream.
-const SMP_STALL_DIAG_NS: u64 = 15_000_000_000;
+/// One-shot reactor-state dump used by the explicit `tx.profile=cagentdiag`
+/// lane. CAgent normally finishes in about a second, so a snapshot five
+/// seconds after userspace starts captures a lost-progress run without being
+/// masked by periodically-polled kernel service tasks.
+const SMP_STALL_DIAG_NS: u64 = 5_000_000_000;
 /// Return from the reactor after each future poll so task-context device IRQ
 /// work runs promptly on the hart that claimed the interrupt.
 const REACTOR_POLLS_PER_DEVICE_IRQ_CHECK: usize = 1;
 /// Maximum EBR callbacks reclaimed at one reactor quiescent boundary.
+///
+/// Reclaim one useful batch per epoch scan.  A budget of one turns a teardown
+/// graph into one global CPU scan and (potentially) one maintenance IPI per
+/// object; under BuildStorm that degenerates into an EBR maintenance livelock.
+/// Sixty-four keeps the pass bounded while amortising the scan over the local
+/// retire pool and any destructor cascade it releases.
 const REACTOR_EPOCH_MAINTENANCE_BUDGET: usize = 64;
+/// Amortise ordinary EBR cleanup across userspace scheduler turns.  Exhausted
+/// retire storage bypasses this cadence and is serviced immediately.
+const REACTOR_EPOCH_MAINTENANCE_CADENCE: u64 = 16;
 
-/// Service one bounded EBR pass between reactor task polls.
+#[repr(align(64))]
+struct ReactorEpochCadence {
+    pending_turns: AtomicU64,
+}
+
+impl ReactorEpochCadence {
+    const fn new() -> Self {
+        Self {
+            pending_turns: AtomicU64::new(0),
+        }
+    }
+}
+
+// Each physical hart owns one counter.  Keeping the counters on separate
+// cache lines avoids replacing the old global EBR lock traffic with a single
+// contended cadence counter.
+static REACTOR_EPOCH_CADENCE: [ReactorEpochCadence; tx_hal::MAX_HARTS] =
+    [const { ReactorEpochCadence::new() }; tx_hal::MAX_HARTS];
+
+/// Service EBR retirement between reactor task polls when it is needed.
 ///
 /// A continuously runnable workload does not necessarily enter the idle-only
 /// zone-maintenance path. Resident-root publication and other RCU writers can
 /// therefore fill a hart's local retire storage even though every task poll
 /// releases its epoch guard correctly. The poll boundary is the common
 /// quiescent seam for userspace threads, file-I/O services, and other kernel
-/// tasks, so service a pending remote request there or run one ordinary pass
-/// when no request is armed.
-fn service_reactor_epoch_boundary() {
+/// tasks.  Do not run a full epoch scan after every poll: BuildStorm executes
+/// this boundary at very high frequency, while most turns have no retire work.
+/// The per-CPU summary is an atomic-only test for pending local work.  It lets
+/// us reclaim incrementally while work is produced, without running the
+/// global epoch scan on empty scheduler turns and without deferring all work
+/// until the fixed-size reservation pool is exhausted.
+fn service_reactor_epoch_boundary(cpu_id: CpuId) {
     debug_assert!(step_engine::borrow_current_guard().is_none());
-    if !service_pending_reactor_epoch_maintenance() {
+    if service_pending_reactor_epoch_maintenance() {
+        return;
+    }
+    let Some(local) = step_engine::cpu_summary(cpu_id) else {
+        return;
+    };
+    if local.bag_retired == 0 && local.publication_pending == 0 {
+        return;
+    }
+
+    // A full reservation pool must make progress before the next writer.  In
+    // the ordinary non-full case, spread cleanup over several task polls so a
+    // process teardown graph cannot consume every runnable turn on all harts.
+    let retire_pool_full = match step_engine::epoch::try_reserve_local_retire() {
+        Ok(probe) => {
+            drop(probe);
+            false
+        }
+        Err(step_engine::epoch::EpochError::LocalRetireExhausted) => true,
+        Err(_) => false,
+    };
+    let Some(cadence) = REACTOR_EPOCH_CADENCE.get(cpu_id.0) else {
+        let _ = step_engine::drain_with_budget(REACTOR_EPOCH_MAINTENANCE_BUDGET);
+        return;
+    };
+    let pending_turn = cadence.pending_turns.fetch_add(1, Ordering::Relaxed);
+    if retire_pool_full || pending_turn % REACTOR_EPOCH_MAINTENANCE_CADENCE == 0 {
         let _ = step_engine::drain_with_budget(REACTOR_EPOCH_MAINTENANCE_BUDGET);
     }
 }
@@ -133,6 +201,9 @@ pub(super) static USE_CONCURRENT_POLL: core::sync::atomic::AtomicBool =
 pub(crate) static CONSOLE_WRITE_LOCK: SpinMutex<()> =
     spin_mutex((), b"debug.lock.kernel.console_write");
 static AP_REACTOR_TASK_DONE_CPUS: AtomicU64 = AtomicU64::new(0);
+static REACTOR_IDLE_CPUS: AtomicU64 = AtomicU64::new(0);
+static REACTOR_LAST_PROGRESS_NS: AtomicU64 = AtomicU64::new(0);
+static REACTOR_STALL_DUMPED: AtomicBool = AtomicBool::new(false);
 static BSP_REACTOR_TIMER_DONE_CPUS: AtomicU64 = AtomicU64::new(0);
 static BSP_REACTOR_TIMER_DEADLINE_NS: AtomicU64 = AtomicU64::new(0);
 static OWNER_WAKE_SMP_STAGE: AtomicU64 = AtomicU64::new(0);
@@ -141,7 +212,7 @@ static OWNER_WAKE_SMP_DELEGATE_TOKEN: SpinMutex<Option<boot_runtime::DelegateTok
 static OWNER_WAKE_SMP_DELEGATE_REGISTRY: SpinMutex<Option<Arc<boot_runtime::DelegateRegistry>>> =
     spin_mutex(None, b"debug.lock.kernel.owner_wake_registry");
 static RCU_SMP_STAGE: AtomicU64 = AtomicU64::new(0);
-static FILE_IO_SERVICE_REACTOR_TASKS: SpinMutex<Vec<boot_runtime::TaskId>> =
+static FILE_IO_SERVICE_REACTOR_TASKS: SpinMutex<Vec<(u64, boot_runtime::TaskId)>> =
     spin_mutex(Vec::new(), b"debug.lock.kernel.file_io_service_tasks");
 
 struct FileIoRuntimeTaskSpawner<P: TxPlatform>(PhantomData<fn() -> P>);
@@ -150,6 +221,7 @@ impl<P: TxPlatform> tx_subsystems::device::FileIoServiceRuntimeSpawner
     for FileIoRuntimeTaskSpawner<P>
 {
     fn spawn_file_io_service(&self, runtime: tx_subsystems::device::FileIoManagerRuntimeClaim) {
+        let source_id = runtime.wake_source().source_id();
         let mut submitted_task = None;
         let submitted = CoreInit::<P>::submit_file_io_runtime_task_with(
             runtime,
@@ -175,7 +247,7 @@ impl<P: TxPlatform> tx_subsystems::device::FileIoServiceRuntimeSpawner
             "file I/O runtime spawner requires an initialized reactor"
         );
         if let Some(task) = submitted_task {
-            FILE_IO_SERVICE_REACTOR_TASKS.lock().push(task);
+            FILE_IO_SERVICE_REACTOR_TASKS.lock().push((source_id, task));
         }
     }
 }
@@ -368,13 +440,21 @@ impl Future for OwnerWakeSmpPark {
 /// every AP has returned from its current task poll and published itself here.
 static AP_REACTOR_STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 static AP_REACTOR_STOPPED_CPUS: AtomicU64 = AtomicU64::new(0);
-static REACTOR_IDLE_CPUS: AtomicU64 = AtomicU64::new(0);
-static REACTOR_LAST_PROGRESS_NS: AtomicU64 = AtomicU64::new(0);
-static REACTOR_STALL_DUMPED: AtomicBool = AtomicBool::new(false);
-/// Debugger-set one-shot request. Checked from an already-idle hart so a
-/// single runnable-but-livelocked task cannot suppress the normal all-idle
-/// detector by continuously reporting scheduler polls as progress.
-static REACTOR_STALL_DUMP_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// Harts whose scheduling deadline expired while they were still executing
+/// the kernel half of a userspace reactor poll.
+///
+/// A timer trap in supervisor mode cannot longjmp through an in-flight Future
+/// poll. Retain the event until `run_thread` reaches its next safe
+/// kernel-to-user boundary instead of forgetting an already-consumed slice.
+static DEFERRED_USER_PREEMPT_CPUS: AtomicU64 = AtomicU64::new(0);
+pub(crate) fn defer_userspace_preempt(cpu_id: CpuId) {
+    DEFERRED_USER_PREEMPT_CPUS.fetch_or(CpuMask::single(cpu_id).bits(), Ordering::Release);
+}
+
+pub(crate) fn take_deferred_userspace_preempt(cpu_id: CpuId) -> bool {
+    let bit = CpuMask::single(cpu_id).bits();
+    DEFERRED_USER_PREEMPT_CPUS.fetch_and(!bit, Ordering::AcqRel) & bit != 0
+}
 
 /// Global root-mount slot retained for the kernel lifetime after
 /// `mount_rootfs_tmpfs` bootstraps the process subsystem.
@@ -584,6 +664,40 @@ pub(crate) fn mark_boot_reactor_userspace_preempt(cpu_id: CpuId) {
     let _ = BOOT_REACTOR.with(|reactor| {
         reactor.mark_userspace_preempt(boot_runtime::HartId(cpu_id.0));
     });
+}
+
+/// Keep the current userspace run in place when its scheduling tick finds no
+/// competing work.
+///
+/// This is called only from a from-user timer trap, so the current task is the
+/// dispatching owner and is intentionally absent from its local runqueue.  A
+/// queued task, a pending wake, or a reschedule marker makes the normal full
+/// preemption path authoritative.  Reactor deadlines are never hidden: an
+/// already-due deadline forces a handoff, and a future deadline shortens the
+/// extension interval.
+pub(crate) fn try_extend_uncontended_userspace_slice<P: TxPlatform>(cpu_id: CpuId) -> bool {
+    let now_ns = P::read_ns();
+    let hart = boot_runtime::HartId(cpu_id.0);
+    let next = BOOT_REACTOR
+        .with(|reactor| {
+            if reactor.should_leave_polling_idle(hart) {
+                return None;
+            }
+
+            let extension = now_ns.saturating_add(UNCONTENDED_USER_SLICE_EXTENSION_NS);
+            match reactor.next_deadline_ns() {
+                Some(deadline) if deadline <= now_ns => None,
+                Some(deadline) => Some(core::cmp::min(extension, deadline)),
+                None => Some(extension),
+            }
+        })
+        .flatten();
+
+    let Some(deadline_ns) = next else {
+        return false;
+    };
+    HalDeadlineTimer::<P>::new().set_current_hart_deadline_ns(deadline_ns);
+    true
 }
 
 pub(crate) fn post_mailbox_event_from_current_hart<P: TxPlatform>(
@@ -948,7 +1062,13 @@ impl<P: TxPlatform> CoreInit<P> {
     {
         let config = Self::file_io_service_task_config();
         let current_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
-        let meta = tx_reactor::InitialSchedMeta::kernel()
+        // A per-PageContainer I/O service is a long-lived background worker,
+        // not an unbounded kernel-critical section.  Keep it on the creating
+        // hart (its runtime handles are local) but put it in the fair queues
+        // so a self-kicked writeback stream cannot starve the userspace task
+        // waiting for that I/O to complete.
+        let meta = tx_reactor::InitialSchedMeta::fair()
+            .pinned()
             .with_affinity(tx_hal::CpuMask::single(current_cpu).bits());
         submit(runtime, config, meta)
     }
@@ -1238,10 +1358,9 @@ impl<P: TxPlatform> CoreInit<P> {
 
         tx_ext4::install_diagnostic_sink(ext4_writeback_diagnostic::<P>);
         use tx_fs::tx_ext4::{
-            mount_ext4_read_only, mount_ext4_read_write_with_discovered_journal, BlockDeviceImage,
-            Ext4FileIoRuntimeBinder, JournalPagePool,
+            mount_ext4_read_only, mount_ext4_read_write_with_recovery, BlockDeviceImage,
         };
-        use tx_subsystems::device::{block_device_by_name, BlockDeviceHandle};
+        use tx_subsystems::device::block_device_by_name;
         use tx_subsystems::io_manager::block::DeviceKey;
 
         let Some(reg) = block_device_by_name(dev_name.as_bytes()) else {
@@ -1283,37 +1402,27 @@ impl<P: TxPlatform> CoreInit<P> {
 
         let device = DeviceKey::new(reg.devt.raw());
         let image = BlockDeviceImage::new(reg.ops);
-        let Some(geometry) = image.block_geometry(device) else {
+        let Some(_geometry) = image.block_geometry(device) else {
             Self::write_board_sentinel_prefix();
             tx_hal::console_write_str::<P>(":mount:rootfs:ext4:");
             tx_hal::console_write_str::<P>(dev_name);
             tx_hal::console_write_str::<P>(":geometry-err\n");
             return false;
         };
-        let pool = match JournalPagePool::new(32) {
-            Ok(pool) => pool,
+        // Recover any transaction left by a previous journal-backed boot and
+        // keep the competition root on the synchronous pager. Registering one
+        // long-lived file-I/O reactor task for every large inode makes Cargo's
+        // short-lived file workload accumulate hundreds of parked workers.
+        let mount_output = match mount_ext4_read_write_with_recovery(image) {
+            Ok(out) => out,
             Err(_) => {
                 Self::write_board_sentinel_prefix();
                 tx_hal::console_write_str::<P>(":mount:rootfs:ext4:");
                 tx_hal::console_write_str::<P>(dev_name);
-                tx_hal::console_write_str::<P>(":journal-pool-err\n");
+                tx_hal::console_write_str::<P>(":err\n");
                 return false;
             }
         };
-        let mount_output =
-            match mount_ext4_read_write_with_discovered_journal(image, geometry, device, pool) {
-                Ok(out) => out,
-                Err(_) => {
-                    Self::write_board_sentinel_prefix();
-                    tx_hal::console_write_str::<P>(":mount:rootfs:ext4:");
-                    tx_hal::console_write_str::<P>(dev_name);
-                    tx_hal::console_write_str::<P>(":err\n");
-                    return false;
-                }
-            };
-        mount_output.set_file_page_container_binder(Some(alloc::sync::Arc::new(
-            Ext4FileIoRuntimeBinder::new(BlockDeviceHandle::whole(reg)),
-        )));
 
         let ext4_payload = MountPayload::new_cap_with_backend_planner(
             mount_output.fs_ops().clone(),
@@ -2962,6 +3071,7 @@ impl<P: TxPlatform> CoreInit<P> {
             crate::zones::try_bounded_maintenance_tick();
             let hart = boot_runtime::HartId(cpu_id.0);
             if Self::poll_boot_reactor_idle_window(hart) {
+                Self::note_reactor_hart_active(cpu_id);
                 continue;
             }
             Self::note_reactor_hart_idle(cpu_id);
@@ -2983,8 +3093,8 @@ impl<P: TxPlatform> CoreInit<P> {
                 continue;
             }
             P::wait_for_interrupt_prepared(wait_state);
-            P::service_pending_tlb_shootdown();
             Self::note_reactor_hart_active(cpu_id);
+            P::service_pending_tlb_shootdown();
             if P::pending_ipi(IpiKind::Reschedule) {
                 P::ack_ipi(IpiKind::Reschedule);
             }
@@ -3064,10 +3174,10 @@ impl<P: TxPlatform> CoreInit<P> {
                 boot_runtime::HartPollBudget::up_to(REACTOR_POLLS_PER_DEVICE_IRQ_CHECK),
             )
         })?;
-        service_reactor_epoch_boundary();
         if step.ran_work() {
             Self::note_reactor_progress(cpu_id, now_ns);
         }
+        service_reactor_epoch_boundary(cpu_id);
         Self::program_boot_reactor_deadline(hart);
         Some(step)
     }
@@ -3108,58 +3218,73 @@ impl<P: TxPlatform> CoreInit<P> {
             &mut slice_clock,
             boot_runtime::HartPollBudget::up_to(REACTOR_POLLS_PER_DEVICE_IRQ_CHECK),
         )?;
-        service_reactor_epoch_boundary();
         if step.ran_work() {
             Self::note_reactor_progress(cpu_id, now_ns);
         }
+        service_reactor_epoch_boundary(cpu_id);
         Self::program_boot_reactor_deadline(hart);
         Some(step)
     }
 
+    pub(crate) fn reactor_stall_diag_enabled() -> bool {
+        matches!(P::ARCH, tx_hal::Arch::LoongArch64)
+            && <P as tx_hal::BootInfoIf>::boot_info()
+                .cmdline
+                .is_some_and(|cmdline| {
+                    cmdline.split_ascii_whitespace().any(|token| {
+                        token == "tx.profile=cagentdiag" || token == "tx.la64_stall_diag=1"
+                    })
+                })
+    }
+
     pub(super) fn reset_smp_stall_diagnostic() {
+        if !Self::reactor_stall_diag_enabled() {
+            return;
+        }
         REACTOR_IDLE_CPUS.store(0, Ordering::Release);
         REACTOR_LAST_PROGRESS_NS.store(P::read_ns(), Ordering::Release);
         REACTOR_STALL_DUMPED.store(false, Ordering::Release);
     }
 
-    fn note_reactor_progress(cpu_id: CpuId, now_ns: u64) {
+    fn note_reactor_progress(cpu_id: CpuId, _now_ns: u64) {
+        if !Self::reactor_stall_diag_enabled() {
+            return;
+        }
         REACTOR_IDLE_CPUS.fetch_and(!Self::cpu_bit(cpu_id), Ordering::AcqRel);
-        REACTOR_LAST_PROGRESS_NS.store(now_ns, Ordering::Release);
+        Self::maybe_dump_reactor_diagnostics(cpu_id);
     }
 
     pub(super) fn note_reactor_hart_active(cpu_id: CpuId) {
-        REACTOR_IDLE_CPUS.fetch_and(!Self::cpu_bit(cpu_id), Ordering::AcqRel);
+        if Self::reactor_stall_diag_enabled() {
+            REACTOR_IDLE_CPUS.fetch_and(!Self::cpu_bit(cpu_id), Ordering::AcqRel);
+        }
     }
 
     pub(super) fn note_reactor_hart_idle(cpu_id: CpuId) {
-        if REACTOR_STALL_DUMP_REQUESTED.swap(false, Ordering::AcqRel) {
-            tx_hal::console_write_str::<P>("txkernel:smp-stall:forced\n");
-            tx_subsystems::zones::dump_smp_wait_diagnostics::<P>();
-            Self::dump_reactor_task_diagnostics();
-            tx_hal::console_write_str::<P>("txkernel:smp-stall:end\n");
+        if !Self::reactor_stall_diag_enabled() {
+            return;
         }
         let online = P::online_cpus().bits();
-        if online.count_ones() <= 1 {
-            return;
-        }
         let idle = REACTOR_IDLE_CPUS.fetch_or(Self::cpu_bit(cpu_id), Ordering::AcqRel)
             | Self::cpu_bit(cpu_id);
-        if idle & online != online {
-            return;
-        }
+        Self::maybe_dump_reactor_diagnostics_with_masks(cpu_id, idle, online);
+    }
 
-        let now_ns = P::read_ns();
-        let last_ns = REACTOR_LAST_PROGRESS_NS.load(Ordering::Acquire);
-        if last_ns == 0 {
-            let _ = REACTOR_LAST_PROGRESS_NS.compare_exchange(
-                0,
-                now_ns,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
+    fn maybe_dump_reactor_diagnostics(cpu_id: CpuId) {
+        let online = P::online_cpus().bits();
+        let idle = REACTOR_IDLE_CPUS.load(Ordering::Acquire);
+        Self::maybe_dump_reactor_diagnostics_with_masks(cpu_id, idle, online);
+    }
+
+    fn maybe_dump_reactor_diagnostics_with_masks(cpu_id: CpuId, idle: u64, online: u64) {
+        // Dump from one known reactor boundary only. Requiring every hart to
+        // be idle hid the failure when a periodic kernel task kept getting
+        // polled even though no CAgent process made userspace progress.
+        if cpu_id.0 != 0 {
             return;
         }
-        let stalled_ns = now_ns.saturating_sub(last_ns);
+        let stalled_ns =
+            P::read_ns().saturating_sub(REACTOR_LAST_PROGRESS_NS.load(Ordering::Acquire));
         if stalled_ns < SMP_STALL_DIAG_NS
             || REACTOR_STALL_DUMPED
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -3168,30 +3293,44 @@ impl<P: TxPlatform> CoreInit<P> {
             return;
         }
 
-        tx_hal::console_write_str::<P>("txkernel:smp-stall:begin:idle_mask=");
+        tx_hal::console_write_str::<P>("txkernel:la64-stall:begin:idle_mask=");
         Self::write_u64(idle & online);
         tx_hal::console_write_str::<P>(":online_mask=");
         Self::write_u64(online);
         tx_hal::console_write_str::<P>(":stalled_ms=");
         Self::write_u64(stalled_ns / 1_000_000);
         tx_hal::console_write_str::<P>("\n");
-        tx_subsystems::zones::dump_smp_wait_diagnostics::<P>();
         Self::dump_reactor_task_diagnostics();
-        tx_hal::console_write_str::<P>("txkernel:smp-stall:end\n");
+        tx_hal::console_write_str::<P>("txkernel:la64-stall:end\n");
     }
 
     fn dump_reactor_task_diagnostics() {
         let _ = BOOT_REACTOR.with(|reactor| {
-            tx_hal::console_write_str::<P>("txkernel:smp-stall:reactor:queued_wakes=");
+            let file_io_tasks = FILE_IO_SERVICE_REACTOR_TASKS.lock().clone();
+            tx_hal::console_write_str::<P>("txkernel:la64-stall:queued_wakes=");
             Self::write_u64(reactor.queued_wake_count() as u64);
             tx_hal::console_write_str::<P>("\n");
 
-            let service_tasks = FILE_IO_SERVICE_REACTOR_TASKS.lock().clone();
+            for hart in 0..P::online_cpus().count() {
+                let (depth, queued) =
+                    reactor.scheduler_queued_tasks(boot_runtime::HartId(hart), 32);
+                tx_hal::console_write_str::<P>("txkernel:la64-stall:queue:hart=");
+                Self::write_u64(hart as u64);
+                tx_hal::console_write_str::<P>(":depth=");
+                Self::write_u64(depth as u64);
+                tx_hal::console_write_str::<P>(":tasks=");
+                for (index, (task, _)) in queued.into_iter().enumerate() {
+                    if index != 0 {
+                        tx_hal::console_write_str::<P>(",");
+                    }
+                    Self::write_u64(task.0 as u64);
+                }
+                tx_hal::console_write_str::<P>("\n");
+            }
+
             for task in reactor.task_runtime_diagnostics() {
-                tx_hal::console_write_str::<P>("txkernel:smp-stall:all-task:id=");
+                tx_hal::console_write_str::<P>("txkernel:la64-stall:task:id=");
                 Self::write_u64(task.id.0 as u64);
-                tx_hal::console_write_str::<P>(":file_io=");
-                Self::write_u64(service_tasks.contains(&task.id) as u64);
                 tx_hal::console_write_str::<P>(":status=");
                 Self::write_u64(match task.status {
                     boot_runtime::TaskStatus::Runnable => 1,
@@ -3213,6 +3352,10 @@ impl<P: TxPlatform> CoreInit<P> {
                         tx_hal::console_write_str::<P>("queued@");
                         Self::write_u64(hart.0 as u64);
                     }
+                    Some(boot_runtime::TaskRunOwner::Dispatching { hart }) => {
+                        tx_hal::console_write_str::<P>("dispatching@");
+                        Self::write_u64(hart.0 as u64);
+                    }
                     Some(boot_runtime::TaskRunOwner::Polling { hart }) => {
                         tx_hal::console_write_str::<P>("polling@");
                         Self::write_u64(hart.0 as u64);
@@ -3226,18 +3369,23 @@ impl<P: TxPlatform> CoreInit<P> {
                 Self::write_u64(task.mailbox_len as u64);
                 tx_hal::console_write_str::<P>(":mailbox_waker=");
                 Self::write_u64(task.mailbox_has_waker as u64);
-                tx_hal::console_write_str::<P>("\n");
-            }
-
-            for runtime in tx_subsystems::device::page_container_file_io_service_runtimes_snapshot()
-            {
-                tx_hal::console_write_str::<P>("txkernel:smp-stall:file-io:source=");
-                Self::write_u64(runtime.source_id());
-                tx_hal::console_write_str::<P>(":device=");
-                Self::write_u64(runtime.handle().registration().devt.raw());
-                let guard = step_engine::guard();
-                tx_hal::console_write_str::<P>(":live=");
-                Self::write_u64(runtime.is_live(&guard) as u64);
+                tx_hal::console_write_str::<P>(":stop=");
+                Self::write_u64(match task.last_stop_reason {
+                    Some(boot_runtime::StopReason::Blocked) => 1,
+                    Some(boot_runtime::StopReason::Completed) => 2,
+                    Some(boot_runtime::StopReason::Yielded) => 3,
+                    Some(boot_runtime::StopReason::SliceExpired) => 4,
+                    Some(boot_runtime::StopReason::UserspaceTrap) => 5,
+                    Some(boot_runtime::StopReason::PreemptedExternal) => 6,
+                    None => 0,
+                });
+                tx_hal::console_write_str::<P>(":file_io_source=");
+                Self::write_u64(
+                    file_io_tasks
+                        .iter()
+                        .find_map(|(source, id)| (*id == task.id).then_some(*source))
+                        .unwrap_or(0),
+                );
                 tx_hal::console_write_str::<P>("\n");
             }
 
@@ -3253,49 +3401,171 @@ impl<P: TxPlatform> CoreInit<P> {
                     else {
                         continue;
                     };
-                    let task = boot_runtime::TaskId(mailbox.task_id_low() as usize);
-                    tx_hal::console_write_str::<P>("txkernel:smp-stall:reactor-task:pid=");
+                    tx_hal::console_write_str::<P>("txkernel:la64-stall:thread:pid=");
                     Self::write_u64(pid.0 as u64);
                     tx_hal::console_write_str::<P>(":tid=");
                     Self::write_u64(thread.tid.0 as u64);
                     tx_hal::console_write_str::<P>(":task=");
-                    Self::write_u64(task.0 as u64);
-                    tx_hal::console_write_str::<P>(":status=");
-                    let status = match reactor.task_status(task) {
-                        Some(boot_runtime::TaskStatus::Runnable) => 1,
-                        Some(boot_runtime::TaskStatus::Polling) => 2,
-                        Some(boot_runtime::TaskStatus::Parked) => 3,
-                        Some(boot_runtime::TaskStatus::Completed) => 4,
-                        Some(boot_runtime::TaskStatus::Cancelled) => 5,
-                        None => 0,
-                    };
-                    Self::write_u64(status);
-                    tx_hal::console_write_str::<P>(":wake=");
-                    Self::write_u64(reactor.task_wake_requested(task).unwrap_or(false) as u64);
-                    tx_hal::console_write_str::<P>(":queued=");
-                    Self::write_u64(reactor.task_is_queued(task) as u64);
-                    tx_hal::console_write_str::<P>(":owner=");
-                    match reactor.task_run_owner(task) {
-                        Some(boot_runtime::TaskRunOwner::Parked) => {
-                            tx_hal::console_write_str::<P>("parked")
-                        }
-                        Some(boot_runtime::TaskRunOwner::Queued { hart, .. }) => {
-                            tx_hal::console_write_str::<P>("queued@");
-                            Self::write_u64(hart.0 as u64);
-                        }
-                        Some(boot_runtime::TaskRunOwner::Polling { hart }) => {
-                            tx_hal::console_write_str::<P>("polling@");
-                            Self::write_u64(hart.0 as u64);
-                        }
-                        Some(boot_runtime::TaskRunOwner::Terminal) => {
-                            tx_hal::console_write_str::<P>("terminal")
-                        }
-                        None => tx_hal::console_write_str::<P>("none"),
+                    Self::write_u64(mailbox.task_id_low() as u64);
+                    tx_hal::console_write_str::<P>(":syscall=");
+                    if let Some((nr, arg0, arg1)) = payload.active_syscall_diagnostic() {
+                        Self::write_u64(nr);
+                        tx_hal::console_write_str::<P>(":a0=");
+                        Self::write_u64(arg0);
+                        tx_hal::console_write_str::<P>(":a1=");
+                        Self::write_u64(arg1);
+                    } else {
+                        tx_hal::console_write_str::<P>("none");
+                    }
+                    let (_, _, _, _, last_syscall, last_hart) = payload.user_entry_diagnostic();
+                    tx_hal::console_write_str::<P>(":last_syscall=");
+                    Self::write_u64(last_syscall);
+                    tx_hal::console_write_str::<P>(":last_hart=");
+                    Self::write_u64(last_hart);
+                    if let Some(aspace) = process.aspace_cap() {
+                        let range = aspace.range_lock().diagnostic_snapshot();
+                        tx_hal::console_write_str::<P>(":aspace=");
+                        Self::write_u64(aspace.futex_identity());
+                        tx_hal::console_write_str::<P>(":range_source=");
+                        Self::write_u64(range.wait_source_id);
+                        tx_hal::console_write_str::<P>(":range_active=");
+                        Self::write_u64(range.active as u64);
+                        tx_hal::console_write_str::<P>(":range_pending=");
+                        Self::write_u64(range.pending_writers as u64);
                     }
                     tx_hal::console_write_str::<P>(":mailbox_len=");
                     Self::write_u64(mailbox.len() as u64);
-                    tx_hal::console_write_str::<P>(":mailbox_waker=");
-                    Self::write_u64(mailbox.has_waker() as u64);
+                    tx_hal::console_write_str::<P>("\n");
+                }
+            }
+
+            for wait in tx_substrate::wake::all_subscriber_diagnostics() {
+                tx_hal::console_write_str::<P>("txkernel:la64-stall:wait:task=");
+                Self::write_u64(wait.task_id_low as u64);
+                tx_hal::console_write_str::<P>(":source=");
+                Self::write_u64(wait.source.raw());
+                tx_hal::console_write_str::<P>(":kind=");
+                tx_hal::console_write_str::<P>(
+                    tx_subsystems::wait_source::registered_wait_source_diagnostic_kind(
+                        wait.source.raw(),
+                    )
+                    .unwrap_or("unregistered"),
+                );
+                tx_hal::console_write_str::<P>(":pending=");
+                Self::write_u64(wait.source_pending_mask);
+                tx_hal::console_write_str::<P>(":subscribers=");
+                Self::write_u64(wait.source_subscribers as u64);
+                tx_hal::console_write_str::<P>(":generation=");
+                Self::write_u64(wait.generation.raw());
+                tx_hal::console_write_str::<P>(":interests=");
+                Self::write_u64(wait.interests.raw());
+                tx_hal::console_write_str::<P>(":mailbox_len=");
+                Self::write_u64(wait.mailbox_len as u64);
+                tx_hal::console_write_str::<P>(":mailbox_waker=");
+                Self::write_u64(wait.mailbox_has_waker as u64);
+                tx_hal::console_write_str::<P>("\n");
+            }
+
+            // Connect object-level WaitSource ids back to the exact file page
+            // and every stage of its L4/L6 pipeline.  Restrict the output to
+            // sources with live subscribers so this opt-in dump stays bounded
+            // even after CAgent has populated many page-cache identities.
+            let guard = step_engine::guard();
+            for wait in tx_subsystems::page_backed::all_file_page_wait_diagnostic_snapshots(&guard)
+                .into_iter()
+                .filter(|wait| wait.source_subscribers != 0)
+            {
+                tx_hal::console_write_str::<P>("txkernel:la64-stall:file-page-all:object=");
+                Self::write_u64(wait.fs_object_id);
+                tx_hal::console_write_str::<P>(":page=");
+                Self::write_u64(wait.page);
+                tx_hal::console_write_str::<P>(":source=");
+                Self::write_u64(wait.source_id);
+                tx_hal::console_write_str::<P>(":pending=");
+                Self::write_u64(wait.source_pending_mask);
+                tx_hal::console_write_str::<P>(":subscribers=");
+                Self::write_u64(wait.source_subscribers as u64);
+                tx_hal::console_write_str::<P>(":resident=");
+                Self::write_u64(wait.resident as u64);
+                tx_hal::console_write_str::<P>(":slot=");
+                Self::write_u64(wait.slot_state as u64);
+                tx_hal::console_write_str::<P>(":slot_gen=");
+                Self::write_u64(wait.slot_generation);
+                tx_hal::console_write_str::<P>(":fetch=");
+                Self::write_u64(wait.fetch_present as u64);
+                tx_hal::console_write_str::<P>(":fetch_id=");
+                Self::write_u64(wait.fetch_id);
+                tx_hal::console_write_str::<P>(":fetch_gen=");
+                Self::write_u64(wait.fetch_generation);
+                tx_hal::console_write_str::<P>(":request=");
+                Self::write_u64(wait.request_id);
+                tx_hal::console_write_str::<P>(":joined=");
+                Self::write_u64(wait.joined as u64);
+                tx_hal::console_write_str::<P>(":compat=");
+                Self::write_u64(wait.compatibility_only as u64);
+                tx_hal::console_write_str::<P>("\n");
+            }
+            for runtime in tx_subsystems::device::page_container_file_io_service_runtimes_snapshot()
+            {
+                let waits = runtime.page_wait_diagnostic_snapshots(&guard);
+                if !waits.iter().any(|wait| wait.source_subscribers != 0) {
+                    continue;
+                }
+                if let Some(io) = runtime.diagnostic_snapshot(&guard) {
+                    tx_hal::console_write_str::<P>("txkernel:la64-stall:file-io:object=");
+                    Self::write_u64(io.fs_object_id);
+                    tx_hal::console_write_str::<P>(":service_source=");
+                    Self::write_u64(runtime.source_id());
+                    tx_hal::console_write_str::<P>(":fetches=");
+                    Self::write_u64(io.file_fetches as u64);
+                    tx_hal::console_write_str::<P>(":l4_submit=");
+                    Self::write_u64(io.l4_submissions as u64);
+                    tx_hal::console_write_str::<P>(":l4_complete=");
+                    Self::write_u64(io.l4_completions as u64);
+                    tx_hal::console_write_str::<P>(":l4_pending_l6=");
+                    Self::write_u64(io.l4_pending_l6 as u64);
+                    tx_hal::console_write_str::<P>(":l4_waiters=");
+                    Self::write_u64(io.l4_waiters as u64);
+                    tx_hal::console_write_str::<P>(":l6_queued=");
+                    Self::write_u64(io.l6_queued as u64);
+                    tx_hal::console_write_str::<P>(":l6_depth=");
+                    Self::write_u64(io.l6_depth_in_flight as u64);
+                    tx_hal::console_write_str::<P>(":l6_tags=");
+                    Self::write_u64(io.l6_tags_in_flight as u64);
+                    tx_hal::console_write_str::<P>("\n");
+                }
+                for wait in waits
+                    .into_iter()
+                    .filter(|wait| wait.source_subscribers != 0)
+                {
+                    tx_hal::console_write_str::<P>("txkernel:la64-stall:file-page:object=");
+                    Self::write_u64(wait.fs_object_id);
+                    tx_hal::console_write_str::<P>(":page=");
+                    Self::write_u64(wait.page);
+                    tx_hal::console_write_str::<P>(":source=");
+                    Self::write_u64(wait.source_id);
+                    tx_hal::console_write_str::<P>(":pending=");
+                    Self::write_u64(wait.source_pending_mask);
+                    tx_hal::console_write_str::<P>(":subscribers=");
+                    Self::write_u64(wait.source_subscribers as u64);
+                    tx_hal::console_write_str::<P>(":resident=");
+                    Self::write_u64(wait.resident as u64);
+                    tx_hal::console_write_str::<P>(":slot=");
+                    Self::write_u64(wait.slot_state as u64);
+                    tx_hal::console_write_str::<P>(":slot_gen=");
+                    Self::write_u64(wait.slot_generation);
+                    tx_hal::console_write_str::<P>(":fetch=");
+                    Self::write_u64(wait.fetch_present as u64);
+                    tx_hal::console_write_str::<P>(":fetch_id=");
+                    Self::write_u64(wait.fetch_id);
+                    tx_hal::console_write_str::<P>(":fetch_gen=");
+                    Self::write_u64(wait.fetch_generation);
+                    tx_hal::console_write_str::<P>(":request=");
+                    Self::write_u64(wait.request_id);
+                    tx_hal::console_write_str::<P>(":joined=");
+                    Self::write_u64(wait.joined as u64);
+                    tx_hal::console_write_str::<P>(":compat=");
+                    Self::write_u64(wait.compatibility_only as u64);
                     tx_hal::console_write_str::<P>("\n");
                 }
             }
@@ -3486,10 +3756,9 @@ impl<P: TxPlatform> CoreInit<P> {
 
     fn userspace_thread_sched_meta_for(cpu_id: CpuId) -> boot_runtime::InitialSchedMeta {
         // Expose every online hart to userspace from the first task so
-        // sched_getaffinity/nproc observe the SMP machine. The initial task is
-        // still pinned and has no spread-on-submit flag, so it starts on the
-        // first online hart (normally CPU0) and never migrates while a
-        // userspace trap round-trip is active.
+        // sched_getaffinity/nproc observe the SMP machine. Keep the initial
+        // userspace task pinned: the merged userspace/trap state still has
+        // per-hart ownership which cannot safely migrate between polls.
         let fallback = Self::cpu_bit(cpu_id);
         let online = P::online_cpus().bits();
         let affinity = if online == 0 { fallback } else { online };
@@ -3503,13 +3772,13 @@ impl<P: TxPlatform> CoreInit<P> {
         let fallback = Self::cpu_bit(cpu_id);
         let online = P::online_cpus().bits();
         let affinity = if online == 0 { fallback } else { online };
-        // Distribute newly submitted children round-robin across online
-        // hart, then keep each child pinned there. This activates parallel
-        // Cargo/rustc processes without enabling post-trap userspace migration
-        // or userspace work stealing yet.
+        // Distribute newly submitted children round-robin across online harts.
+        // A child starts in the unstealable New queue. Only after its first
+        // poll returns and clears the per-hart userspace/trap slots can an idle
+        // hart pull it from a preempted queue.
         boot_runtime::InitialSchedMeta::fair()
             .with_affinity(affinity)
-            .pinned()
+            .movable()
             .spread_on_submit()
             .userspace_thread()
     }

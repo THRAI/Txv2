@@ -42,8 +42,9 @@ pub use mailbox::{
     TaskMailbox, WaitGeneration, MAILBOX_QUEUE_BOUND,
 };
 pub use wait_source::{
-    lookup_source, register_source, registry_summary, unregister_source, PreparedWaitRegistration,
-    RegistrySummary, SubscriberId, WaitEndpoint, WaitRegistrationGuard, WaitSource,
+    all_subscriber_diagnostics, lookup_source, register_source, registry_summary,
+    subscriber_diagnostics_for_task, unregister_source, PreparedWaitRegistration, RegistrySummary,
+    SubscriberId, WaitEndpoint, WaitRegistrationGuard, WaitSource, WaitSubscriberDiagnostic,
 };
 
 /// Construct a new `WaitSource` wrapped in an `Arc`, keyed by `id`.

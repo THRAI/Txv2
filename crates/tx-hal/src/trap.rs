@@ -138,10 +138,24 @@ pub struct UserFpContext {
     pub flags: u32,
     pub _reserved1: u32,
     pub _reserved2: [u64; 2],
-    /// Architecture extension state. LA64 uses one 256-bit slot per
-    /// vector register; scalar-only platforms leave this area zeroed.
-    pub simd_regs: [u64; 128],
+    /// Architecture extension state. LA64 uses one 256-bit slot per vector
+    /// register. The storage is enabled only in an LA64 kernel graph: keeping
+    /// the 1 KiB LASX image in every RV64 `UserTrapContext` made each syscall,
+    /// page fault and timer preemption copy state that RV64 can never use.
+    pub simd_regs: UserVectorContext,
 }
+
+#[cfg(feature = "extended-user-vector-context")]
+pub type UserVectorContext = [u64; 128];
+
+#[cfg(not(feature = "extended-user-vector-context"))]
+pub type UserVectorContext = [u64; 0];
+
+#[cfg(feature = "extended-user-vector-context")]
+const USER_VECTOR_CONTEXT_WORDS: usize = 128;
+
+#[cfg(not(feature = "extended-user-vector-context"))]
+const USER_VECTOR_CONTEXT_WORDS: usize = 0;
 
 impl UserFpContext {
     pub const FLAG_VALID: u32 = 1 << 0;
@@ -158,7 +172,7 @@ impl UserFpContext {
             flags: 0,
             _reserved1: 0,
             _reserved2: [0; 2],
-            simd_regs: [0; 128],
+            simd_regs: [0; USER_VECTOR_CONTEXT_WORDS],
         }
     }
 

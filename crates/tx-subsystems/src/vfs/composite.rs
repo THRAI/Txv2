@@ -50,8 +50,8 @@ impl<'a, I: SubjectIdentity> StepOp<I> for ChmodOp<'a> {
 
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
         let __guard = step_engine::guard();
-        let target = match self.target.take() {
-            Some(d) => d,
+        let target = match self.target.as_ref() {
+            Some(d) => d.clone(),
             None => {
                 let rooted_at = self.rooted_at.clone();
                 let d = match walker::step_walk(rooted_at, self.path, self.cred, &__guard) {
@@ -73,9 +73,6 @@ impl<'a, I: SubjectIdentity> StepOp<I> for ChmodOp<'a> {
     }
 }
 
-impl OneShotStepOp<ProcessIdentity> for ChmodOp<'_> {}
-impl OneShotStepOp<crate::process::ProcessIdentity> for ChmodOp<'_> {}
-
 // ============================================================================
 // ChownOp — fchownat
 // ============================================================================
@@ -95,8 +92,8 @@ impl<'a, I: SubjectIdentity> StepOp<I> for ChownOp<'a> {
 
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
         let __guard = step_engine::guard();
-        let target = match self.target.take() {
-            Some(d) => d,
+        let target = match self.target.as_ref() {
+            Some(d) => d.clone(),
             None => {
                 let rooted_at = self.rooted_at.clone();
                 let d = match walker::step_walk(rooted_at, self.path, self.cred, &__guard) {
@@ -118,9 +115,6 @@ impl<'a, I: SubjectIdentity> StepOp<I> for ChownOp<'a> {
         )
     }
 }
-
-impl OneShotStepOp<ProcessIdentity> for ChownOp<'_> {}
-impl OneShotStepOp<crate::process::ProcessIdentity> for ChownOp<'_> {}
 
 // ============================================================================
 // AccessOp — faccessat / faccessat2
@@ -173,8 +167,8 @@ impl<'a, I: SubjectIdentity> StepOp<I> for MkdirOp<'a> {
         // reserve — create_inode reserves zone slot
         // commit
         // publish — N/A: inode published via dentry
-        let (parent, name) = match self.parent.take() {
-            Some(p) => p,
+        let (parent, name) = match self.parent.as_ref() {
+            Some((parent, name)) => (parent.clone(), *name),
             None => {
                 let rooted_at = self.rooted_at.clone();
                 let (parent_path, name_bytes) = split_parent_and_name(self.path);
@@ -287,9 +281,6 @@ impl<'a, I: SubjectIdentity> StepOp<I> for MknodOp<'a> {
         }
     }
 }
-
-impl OneShotStepOp<ProcessIdentity> for MknodOp<'_> {}
-impl OneShotStepOp<crate::process::ProcessIdentity> for MknodOp<'_> {}
 
 // ============================================================================
 // UnlinkOp — unlinkat
@@ -693,7 +684,6 @@ pub struct StatxOp<'a> {
     pub rooted_at: &'a Cap<DEntry>,
     pub path: &'a [u8],
     pub cred: &'a Credential,
-    pub target: Option<Cap<DEntry>>,
 }
 
 #[derive(Clone, Debug)]
@@ -710,18 +700,16 @@ impl<'a, I: SubjectIdentity> StepOp<I> for StatxOp<'a> {
         _ctx: &mut ScriptCtx<I>,
     ) -> StepOutcome<(StatxResult, FsObjectId), NoProgress> {
         let __guard = step_engine::guard();
-        let target = match self.target.take() {
-            Some(d) => d,
-            None => {
-                let rooted_at = self.rooted_at.clone();
-                let d = match walker::step_walk(rooted_at, self.path, self.cred, &__guard) {
-                    StepOutcome::Done(d) => d,
-                    StepOutcome::Err(e) => return StepOutcome::err(e),
-                    _ => return StepOutcome::err(step_engine::Errno::EIO),
-                };
-                self.target = Some(d.clone());
-                d
-            }
+        // `StatxOp` is a `OneShotStepOp`: `drive_oneshot` invokes this step
+        // exactly once and rejects every non-terminal outcome.  Retaining a
+        // second capability to the resolved dentry therefore cannot help a
+        // retry, but it did add a capability refcount round trip to Cargo's
+        // hottest metadata syscall.
+        let rooted_at = self.rooted_at.clone();
+        let target = match walker::step_walk(rooted_at, self.path, self.cred, &__guard) {
+            StepOutcome::Done(d) => d,
+            StepOutcome::Err(e) => return StepOutcome::err(e),
+            _ => return StepOutcome::err(step_engine::Errno::EIO),
         };
         let ino = target.rnode().fs_object_id();
         let meta = live_meta_for_dentry(&target, &__guard);

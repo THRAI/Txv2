@@ -238,6 +238,48 @@ fn process_payload_allocate_fd_returns_lowest_unused() {
     assert_eq!(proc_cap.next_fd_above(10), 10);
 }
 
+#[test]
+fn process_payload_install_fd_pair_uses_two_lowest_slots_and_cloexec() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    proc_cap.set_fd(0, Some(fresh_open_file()));
+    proc_cap.set_fd(2, Some(fresh_open_file()));
+    let payload = proc_cap.payload_cap().expect("live process payload");
+
+    let installed = payload
+        .install_new_fd_pair(fresh_open_file(), fresh_open_file(), true)
+        .expect("two descriptors fit");
+
+    assert_eq!(installed, (1, 3));
+    assert!(proc_cap.fd(1).is_some());
+    assert!(proc_cap.fd(3).is_some());
+    assert!(proc_cap.fd_cloexec(1));
+    assert!(proc_cap.fd_cloexec(3));
+}
+
+#[test]
+fn process_payload_install_fd_pair_has_no_partial_commit_at_limit() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    proc_cap.set_rlimit_nofile(4, 4);
+    proc_cap.set_fd(0, Some(fresh_open_file()));
+    proc_cap.set_fd(1, Some(fresh_open_file()));
+    proc_cap.set_fd(2, Some(fresh_open_file()));
+    let payload = proc_cap.payload_cap().expect("live process payload");
+
+    assert!(
+        payload
+            .install_new_fd_pair(fresh_open_file(), fresh_open_file(), true)
+            .is_none(),
+        "one remaining slot cannot publish half a pair"
+    );
+    assert!(
+        proc_cap.fd(3).is_none(),
+        "failed pair leaves fd table unchanged"
+    );
+    assert!(!proc_cap.fd_cloexec(3));
+}
+
 /// fd-ops Wave 1: `install_fd` returns the previous occupant so the
 /// caller can EBR-defer-drop the displaced `Cap<OpenFile>`. Matches
 /// the `dup2`/`dup3` shape (Wave 4).

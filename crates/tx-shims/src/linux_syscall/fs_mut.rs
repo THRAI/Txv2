@@ -145,6 +145,29 @@ pub(super) fn fs_page_backing_for_dentry(
     }
 }
 
+/// Drive a short filesystem namespace mutation through transient frontend
+/// contention.  Journal-backed ext4 deliberately returns `Yield` when another
+/// task owns the metadata-mutation admission permit; that is a scheduling
+/// result, not an I/O failure.  Drop the step guard, yield the current task and
+/// retry so the permit owner can finish without turning ordinary concurrent
+/// namespace activity into a spurious userspace `EIO`.
+pub(super) async fn drive_namespace_mutation_yield_retry(
+    mut step: impl for<'g> FnMut(&Guard<'g>) -> StepOutcome<(), step_engine::NoProgress>,
+) -> Result<(), Errno> {
+    loop {
+        let outcome = {
+            let guard = step_engine::guard();
+            step(&guard)
+        };
+        match outcome {
+            StepOutcome::Done(()) => return Ok(()),
+            StepOutcome::Err(errno) => return Err(Errno::from(errno)),
+            StepOutcome::Continue { .. } => continue,
+            StepOutcome::Yield { .. } => tx_reactor::yield_now().await,
+        }
+    }
+}
+
 /// `mkdirat(dirfd, pathname, mode)`. Linux RV64 generic ABI
 /// `__NR_mkdirat = 34`.
 ///
@@ -818,7 +841,7 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
         if dirfd < 0 {
             return SyscallResult::Error(EBADF_VALUE);
         }
-        let file = match ctx.process.fd(dirfd as u32) {
+        let file = match ctx.fd(dirfd as u32) {
             Some(file) => file,
             None => return SyscallResult::Error(EBADF_VALUE),
         };
@@ -873,31 +896,49 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
         Some(o) => o,
         None => return SyscallResult::Error(ENOSYS_VALUE),
     };
-    // Resolve the basename in the parent directly via `FsOps::lookup`
-    // — bypasses the walker's symlink-chase loop so the symlink's
-    // own inode (not its target's) is what we read.
-    let target_id = {
-        let mut script_ctx = build_subject_script_ctx(ctx);
-        let mut op = tx_subsystems::vfs::LookupInParentOp {
-            fs_ops: &fs_ops,
-            parent: parent_id,
-            name: basename,
+    // A normal path walk already materialises the terminal DEntry and records
+    // the backend's directory-version token beside it. Cargo probes the same
+    // regular-file paths with readlinkat thousands of times while resolving
+    // tool and dependency paths; repeating ext4 lookup + inode metadata I/O
+    // merely to return EINVAL throws that cache work away. Reuse the exact
+    // authority rule used by the walker. A miss or stale version still takes
+    // the backend path below, so namespace mutation remains authoritative.
+    let lookup_version = fs_ops.lookup_cache_version(parent_id);
+    let cached_target = parent_dentry
+        .cached_child_with_version_by_name(basename)
+        .filter(|(_, cached_version)| {
+            lookup_version.is_none() || *cached_version == lookup_version
+        });
+    let (target_id, target_meta) = if let Some((target, _)) = cached_target {
+        (target.rnode().fs_object_id(), target.rnode().meta())
+    } else {
+        // Resolve the basename in the parent directly via `FsOps::lookup`
+        // — bypasses the walker's symlink-chase loop so the symlink's
+        // own inode (not its target's) is what we read.
+        let target_id = {
+            let mut script_ctx = build_subject_script_ctx(ctx);
+            let mut op = tx_subsystems::vfs::LookupInParentOp {
+                fs_ops: &fs_ops,
+                parent: parent_id,
+                name: basename,
+            };
+            match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+                Ok(id) => id,
+                Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
+            }
         };
-        match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
-            Ok(id) => id,
-            Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
-        }
-    };
-    let target_meta = {
-        let mut script_ctx = build_subject_script_ctx(ctx);
-        let mut op = tx_subsystems::vfs::LoadInodeMetaOp {
-            fs_ops: &fs_ops,
-            target: target_id,
+        let target_meta = {
+            let mut script_ctx = build_subject_script_ctx(ctx);
+            let mut op = tx_subsystems::vfs::LoadInodeMetaOp {
+                fs_ops: &fs_ops,
+                target: target_id,
+            };
+            match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+                Ok(meta) => meta,
+                Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
+            }
         };
-        match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
-            Ok(meta) => meta,
-            Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
-        }
+        (target_id, target_meta)
     };
     if target_meta.kind() != InodeKind::Symlink {
         return SyscallResult::Error(EINVAL_VALUE);
@@ -1600,18 +1641,27 @@ pub(super) async fn sys_mknodat<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>)
     if let Err(e) = cred_checks::authorize_link(ctx.cred_snapshot(), &parent_meta) {
         return SyscallResult::error_from(e);
     }
-    let result = {
-        let mut script_ctx = build_subject_script_ctx(ctx);
-        let mut op = MknodOp {
+    use tx_scripts::drive;
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    let result = drive(
+        MknodOp {
             rooted_at: &rooted_at,
             path: &path,
             mode: mode as u16,
             kind,
             cred: &cred,
             parent: None,
-        };
-        step_engine::drive_oneshot(&mut op, &mut script_ctx)
-    };
+        },
+        &mut script_ctx,
+        step_engine::DriveMode::Waiting,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
+        timer_registrar_handle.as_ref(),
+    )
+    .await;
     match result {
         Ok(()) => SyscallResult::Return(0),
         Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
@@ -1906,80 +1956,82 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
         const EXDEV_VALUE: i32 = 18;
         return SyscallResult::Error(EXDEV_VALUE);
     }
-    let outcome = if (flags & RENAME_EXCHANGE) != 0 {
+    if (flags & RENAME_EXCHANGE) != 0 {
         const TMP_NAME: &[u8] = b".tx_rename_exchange_tmp";
-        let guard = step_engine::guard();
-        match fs_ops.rename(
-            old_parent_dentry.rnode().fs_object_id(),
-            old_basename,
-            old_parent_dentry.rnode().fs_object_id(),
-            TMP_NAME,
-            &guard,
-        ) {
-            StepOutcome::Done(()) => {}
-            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
-                return SyscallResult::Error(EIO_VALUE);
-            }
-            StepOutcome::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
+        if let Err(errno) = drive_namespace_mutation_yield_retry(|guard| {
+            fs_ops.rename(
+                old_parent_dentry.rnode().fs_object_id(),
+                old_basename,
+                old_parent_dentry.rnode().fs_object_id(),
+                TMP_NAME,
+                guard,
+            )
+        })
+        .await
+        {
+            return SyscallResult::error_from(errno);
         }
-        match fs_ops.rename(
-            new_parent_dentry.rnode().fs_object_id(),
-            new_basename,
-            old_parent_dentry.rnode().fs_object_id(),
-            old_basename,
-            &guard,
-        ) {
-            StepOutcome::Done(()) => {}
-            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
-                return SyscallResult::Error(EIO_VALUE);
-            }
-            StepOutcome::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
+        if let Err(errno) = drive_namespace_mutation_yield_retry(|guard| {
+            fs_ops.rename(
+                new_parent_dentry.rnode().fs_object_id(),
+                new_basename,
+                old_parent_dentry.rnode().fs_object_id(),
+                old_basename,
+                guard,
+            )
+        })
+        .await
+        {
+            return SyscallResult::error_from(errno);
         }
-        fs_ops.rename(
-            old_parent_dentry.rnode().fs_object_id(),
-            TMP_NAME,
-            new_parent_dentry.rnode().fs_object_id(),
-            new_basename,
-            &guard,
-        )
+        if let Err(errno) = drive_namespace_mutation_yield_retry(|guard| {
+            fs_ops.rename(
+                old_parent_dentry.rnode().fs_object_id(),
+                TMP_NAME,
+                new_parent_dentry.rnode().fs_object_id(),
+                new_basename,
+                guard,
+            )
+        })
+        .await
+        {
+            return SyscallResult::error_from(errno);
+        }
     } else {
-        let guard = step_engine::guard();
-        fs_ops.rename(
-            old_parent_dentry.rnode().fs_object_id(),
-            old_basename,
-            new_parent_dentry.rnode().fs_object_id(),
-            new_basename,
-            &guard,
-        )
-    };
-    match outcome {
-        StepOutcome::Done(()) => {
-            old_parent_dentry.remove_cached_child_by_name(b".tx_rename_exchange_tmp");
-            old_parent_dentry.remove_cached_child_by_name(old_basename);
-            new_parent_dentry.remove_cached_child_by_name(new_basename);
-            // Namespace mutation only drops the destination's link count. The
-            // backend owns the final lifetime decision: tmpfs reclaims a
-            // zero-link inode now, while ext4 defers it if a coherent page
-            // container/open file still holds the orphan alive.
-            if (flags & RENAME_EXCHANGE) == 0 {
-                if let Some(displaced) = displaced_dentry.as_ref() {
-                    let guard = step_engine::guard();
-                    match fs_ops.destroy_inode(displaced.rnode().fs_object_id(), &guard) {
-                        StepOutcome::Done(()) => {}
-                        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
-                            return SyscallResult::Error(EIO_VALUE);
-                        }
-                        StepOutcome::Err(errno) => {
-                            return SyscallResult::error_from(Errno::from(errno));
-                        }
-                    }
-                }
-            }
-            SyscallResult::Return(0)
+        if let Err(errno) = drive_namespace_mutation_yield_retry(|guard| {
+            fs_ops.rename(
+                old_parent_dentry.rnode().fs_object_id(),
+                old_basename,
+                new_parent_dentry.rnode().fs_object_id(),
+                new_basename,
+                guard,
+            )
+        })
+        .await
+        {
+            return SyscallResult::error_from(errno);
         }
-        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        StepOutcome::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
     }
+
+    old_parent_dentry.remove_cached_child_by_name(b".tx_rename_exchange_tmp");
+    old_parent_dentry.remove_cached_child_by_name(old_basename);
+    new_parent_dentry.remove_cached_child_by_name(new_basename);
+    // Namespace commit has already made the rename visible and dropped the
+    // destination's link count. Attempt immediate reclamation so backends
+    // which support the old object's shape (notably tmpfs) release it now,
+    // but do not turn a post-commit cleanup limitation into a false rename
+    // failure. The VFS object-lifetime hook may retry when its final pin falls;
+    // ext4 can meanwhile leave a zero-link shape for later orphan cleanup.
+    if flags & RENAME_EXCHANGE == 0 {
+        if let Some(displaced) = displaced_dentry.as_ref() {
+            let _ = drive_namespace_mutation_yield_retry(|guard| {
+                fs_ops.destroy_inode(displaced.rnode().fs_object_id(), guard)
+            })
+            .await;
+        }
+    }
+    drop(displaced_dentry);
+    SyscallResult::Return(0)
 }
 
 /// sys_syslog(2). Minimal stub — returns success for all log types.

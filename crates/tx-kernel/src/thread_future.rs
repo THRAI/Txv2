@@ -77,6 +77,7 @@
 
 use core::future::Future;
 use core::pin::Pin;
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll};
 
 use alloc::{
@@ -92,17 +93,21 @@ use boot_runtime::userspace::{
     UserspaceRunRequest, UserspaceTrapInfo,
 };
 use tx_hal::{PercpuIf, TrapIf, TxPlatform};
-use tx_services::time::{DeadlineRegistrar, DeadlineRegistrarHandle};
+use tx_services::time::{platform::HalDeadlineTimer, DeadlineRegistrar, DeadlineRegistrarHandle};
 use tx_shims::linux_syscall::numbers::{
-    FUTEX_CMD_MASK, FUTEX_WAKE, FUTEX_WAKE_BITSET, NR_CLONE, NR_EXIT, NR_EXIT_GROUP, NR_FUTEX,
-    NR_MMAP, NR_MPROTECT, NR_MUNMAP, NR_READ, NR_READV, NR_RT_SIGPROCMASK, NR_WRITE, NR_WRITEV,
+    FUTEX_CMD_MASK, FUTEX_WAKE, FUTEX_WAKE_BITSET, NR_CLONE, NR_CLOSE, NR_DUP3, NR_EXECVE,
+    NR_EXIT, NR_EXIT_GROUP, NR_FACCESSAT, NR_FACCESSAT2, NR_FUTEX, NR_GETDENTS64, NR_MMAP,
+    NR_MPROTECT, NR_MUNMAP, NR_NEWFSTATAT, NR_OPENAT, NR_PIPE2, NR_READ, NR_READLINKAT,
+    NR_READV, NR_RT_SIGPROCMASK, NR_STATX, NR_WRITE, NR_WRITEV,
 };
 use tx_shims::linux_syscall::SyscallResult;
 use tx_substrate::wake::MailboxSchedulerHint;
-use tx_subsystems::process::{ExitStatus, ProcessIdentity};
+use tx_subsystems::process::{ExitStatus, ProcessIdentity, ProcessPayload};
 use tx_subsystems::signal::deliver_synchronous_fault;
 use tx_subsystems::signal::Signum;
-use tx_subsystems::signal::{ast_dispatch, refresh_deliverable_signal_summary, AstOutcome};
+use tx_subsystems::signal::{
+    ast_dispatch_with_payload, refresh_deliverable_signal_summary, AstOutcome,
+};
 use tx_subsystems::thread_runtime::execution::prepare_userspace_entry_payload_into;
 use tx_subsystems::thread_runtime::{
     clear_current_thread_identity, clear_current_thread_payload, clear_current_userspace_payload,
@@ -117,6 +122,55 @@ use tx_subsystems::vm::{
 
 const HOT_SYSCALL_HANDOFF_BUDGET: u8 = 64;
 const POST_TRAP_EBR_BUDGET: usize = 512;
+static USER_SEGV_PROBE_CLAIMED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "syscall-profile")]
+const PROFILE_PF_ACCESS_COUNT: usize = 4;
+#[cfg(feature = "syscall-profile")]
+static PROFILE_PF_COUNTS: [core::sync::atomic::AtomicU64; PROFILE_PF_ACCESS_COUNT] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; PROFILE_PF_ACCESS_COUNT];
+#[cfg(feature = "syscall-profile")]
+static PROFILE_PF_NS: [core::sync::atomic::AtomicU64; PROFILE_PF_ACCESS_COUNT] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; PROFILE_PF_ACCESS_COUNT];
+#[cfg(feature = "syscall-profile")]
+static PROFILE_PF_MAX_NS: [core::sync::atomic::AtomicU64; PROFILE_PF_ACCESS_COUNT] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; PROFILE_PF_ACCESS_COUNT];
+#[cfg(feature = "syscall-profile")]
+static PROFILE_PF_TOTAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "syscall-profile")]
+static PROFILE_PF_NEXT_DUMP: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(100);
+
+/// One poll boundary after the architecture trap shell has already marked
+/// this hart's userspace task as preempted.
+///
+/// Unlike the generic reactor `yield_now`, this future deliberately does not
+/// call `cx.waker().wake_by_ref()` on its first poll. The caller requests a
+/// re-poll through the stable task waker retained by `ThreadPayload`; the trap
+/// path's per-hart `userspace_preempt` marker remains scheduler accounting but
+/// is not the sole wake source. Avoiding the stack-local `Context` here is
+/// load-bearing because the architecture returns from userspace through a
+/// non-local trap handoff.
+#[derive(Default)]
+struct UserspacePreemptBoundary {
+    yielded: bool,
+}
+
+impl Future for UserspacePreemptBoundary {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.yielded {
+            Poll::Ready(())
+        } else {
+            self.yielded = true;
+            Poll::Pending
+        }
+    }
+}
+
+fn userspace_preempt_boundary() -> UserspacePreemptBoundary {
+    UserspacePreemptBoundary::default()
+}
 
 /// Run deferred destructors after the architecture trap shell has longjmped
 /// back to the saved reactor stack.
@@ -432,10 +486,10 @@ where
             //
             // Local wait futures are allowed to replace/clear the mailbox
             // waker while they are polled, so install it both before and
-            // after the inner poll.  The post-poll pending check closes the
-            // register-vs-post race: an event published before registration
-            // is observed in the queue; an event published afterwards sees
-            // the registered waker.
+            // after the inner poll. Registering before the poll closes the
+            // register-vs-post race: an older matching event is observed by
+            // the wait while it polls, and a concurrent/new event sees this
+            // registered waker.
             mailbox.register_waker(cx.waker().clone());
         }
 
@@ -520,7 +574,14 @@ where
         if out.is_pending() {
             if let Some(mailbox) = task_mailbox.as_ref() {
                 mailbox.register_waker(cx.waker().clone());
-                if !mailbox.is_empty() || mailbox.overflow() {
+                // LA64's mainline IRQ/mailbox handoff still relies on the
+                // post-poll mailbox check to close a register-vs-park race.
+                // RV64 uses the newer polling wake-commit handshake instead;
+                // retaining this fallback there can spin forever on an event
+                // owned by a different nested wait.
+                if matches!(P::ARCH, tx_hal::Arch::LoongArch64)
+                    && (!mailbox.is_empty() || mailbox.overflow())
+                {
                     cx.waker().wake_by_ref();
                 }
             }
@@ -548,8 +609,30 @@ pub async fn run_thread<P: TxPlatform>(
     thread: Cap<ThreadIdentity>,
     payload: PayloadCap<ThreadPayload>,
 ) -> ThreadTaskResult {
+    // A thread's owning process is immutable for the lifetime of the thread.
+    // Retain it once instead of upgrading the same Weak binding at every AST,
+    // userspace-entry, syscall, and page-fault boundary. Process teardown is
+    // still observed through the payload/aspace liveness check below.
+    let Some(process) = thread.upgrade_owner_proc() else {
+        return ThreadTaskResult::Complete;
+    };
+    // ProcessIdentity never replaces its payload while live; exec swaps the
+    // address-space slot inside that payload.  Retain the payload alongside
+    // the owning process so every userspace round and syscall does not first
+    // take the outer ProcessIdentity payload lock.  Thread-slot liveness below
+    // remains authoritative for teardown, and the VM cap is refreshed from
+    // the payload on every round so exec is still observed immediately.
+    let Some(process_payload) = process.payload_cap() else {
+        return ThreadTaskResult::Complete;
+    };
     let mut state = ThreadLoopState::new();
     loop {
+        // Exec/group-exit may detach this identity while the task future still
+        // owns `payload`. Observe the terminal state without restoring the
+        // old ThreadIdentity.payload lock and clone on every userspace round.
+        if payload.exit_intent() {
+            return state.take_task_result();
+        }
         if let Some(sysno) = state.last_entry_sysno {
             emit_syscall_roundtrip_marker(sysno, b"debug.thread.loop.top");
         }
@@ -596,6 +679,11 @@ pub async fn run_thread<P: TxPlatform>(
         // disposition). A stopped thread must park until SIGCONT
         // clears the flag.
         while payload.is_stopped() {
+            if payload.exit_intent() {
+                payload.set_active_userspace_request(None);
+                drop(entry_wait);
+                return state.take_task_result();
+            }
             // Busy-wait placeholder.  On real hardware this spins
             // until Gewalt routing for SIGCONT clears the flag.  TODO:
             // replace with a reactor-managed wait-source woken by
@@ -603,9 +691,10 @@ pub async fn run_thread<P: TxPlatform>(
             core::hint::spin_loop();
         }
 
-        if !poll_entry_timers_and_liveness::<P>(&thread) {
-            return state.take_task_result();
-        }
+        // One address-space snapshot covers this complete userspace round.
+        // exec may replace the process VM while handling the syscall, so the
+        // next loop iteration deliberately takes a fresh snapshot.
+        let aspace = poll_entry_timers_and_address_space::<P>(&process, &process_payload);
 
         // Phase D (AST checkpoint): run ast_dispatch *before* entering
         // userspace. This is the entry-side AST checkpoint — it drains
@@ -621,14 +710,16 @@ pub async fn run_thread<P: TxPlatform>(
         if let Some(sysno) = state.last_entry_sysno {
             emit_syscall_roundtrip_marker(sysno, b"debug.thread.ast.before");
         }
-        let ast_outcome = ast_dispatch(&thread);
+        let ast_outcome = ast_dispatch_with_payload(&thread, &payload);
         if let Some(sysno) = state.last_entry_sysno {
             emit_syscall_roundtrip_marker(sysno, b"debug.thread.ast.after");
         }
         match ast_outcome {
             AstOutcome::DeliverHandler { sig, action } => {
                 if matches!(
-                    deliver_entry_signal_handler::<P>(&thread, &payload, sig, action),
+                    deliver_entry_signal_handler::<P>(
+                        &thread, &payload, &process, &aspace, sig, action,
+                    ),
                     ThreadLoopControl::Exit
                 ) {
                     return state.take_task_result();
@@ -653,11 +744,25 @@ pub async fn run_thread<P: TxPlatform>(
             _ => {}
         }
 
+        // Close the common race between the loop-head checkpoint and entry.
+        // `set_thread_zombie` publishes this bit before resolving the active
+        // userspace request and before exec replaces the process address space.
+        if payload.exit_intent() {
+            payload.set_active_userspace_request(None);
+            drop(entry_wait);
+            return state.take_task_result();
+        }
+
         let decision = payload.userspace_slot().checkpoint_userspace_entry_batch(
             entry_token,
             AstBatch::default(),
             |_ckpt| UserspaceEntryDecision::EnterUserspace,
         );
+        if decision.is_err() && payload.exit_intent() {
+            payload.set_active_userspace_request(None);
+            drop(entry_wait);
+            return state.take_task_result();
+        }
         debug_assert!(
             decision.is_ok(),
             "checkpoint_userspace_entry_batch must succeed with the freshly-started \
@@ -700,12 +805,31 @@ pub async fn run_thread<P: TxPlatform>(
         // exit_group between userspace round-trips, in which case
         // bailing out cleanly here is safer than dereferencing a
         // stale Cap.
-        if matches!(
-            enter_userspace_once::<P>(&thread, &payload, entry_token, state.last_entry_sysno),
-            ThreadLoopControl::Exit
-        ) {
-            return state.take_task_result();
+        let entry_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
+        if crate::init::take_deferred_userspace_preempt(entry_cpu) {
+            // The slice expired while this Future was still doing entry-side
+            // kernel work. The trap handler re-armed a short fallback solely
+            // to cover the check-to-sret race. Once this boundary consumes the
+            // durable marker, that fallback belongs to the expired poll and
+            // must not cross the yield: otherwise it fires in supervisor mode
+            // again and can keep this task in an endless mark/yield loop.
+            HalDeadlineTimer::<P>::new().cancel_deadline();
+            // Drop the unopened userspace request and cross an ordinary
+            // scheduler boundary; the next poll installs a fresh slice.
+            payload.set_active_userspace_request(None);
+            drop(entry_wait);
+            crate::adapter::boot_runtime::yield_now().await;
+            continue;
         }
+        let Some(entry_hart) = enter_userspace_once::<P>(
+            &thread,
+            &payload,
+            &aspace,
+            entry_token,
+            state.last_entry_sysno,
+        ) else {
+            return state.take_task_result();
+        };
 
         // ----------------------------------------------------------------
         // (3) AWAIT THE RESOLVED WAIT.
@@ -720,13 +844,17 @@ pub async fn run_thread<P: TxPlatform>(
         // ----------------------------------------------------------------
         let trap = entry_wait.await;
 
-        let entry_hart = <P as tx_hal::SmpIf>::current_cpu_id().0;
-        if !matches!(trap, UserspaceTrapInfo::TimerPreempt) {
-            let _ = clear_current_userspace_payload(entry_hart);
-            let _ = clear_current_userspace_thread_identity(entry_hart);
-        }
+        // Clear the slot on the hart that actually entered userspace. The
+        // woken task may be polled on another hart after preemption; clearing
+        // the current hart would leave the old context available to a later
+        // trap on `entry_hart`.
+        let _ = clear_current_userspace_payload(entry_hart);
+        let _ = clear_current_userspace_thread_identity(entry_hart);
 
         payload.set_active_userspace_request(None);
+        if payload.exit_intent() {
+            return state.take_task_result();
+        }
         drain_post_trap_epoch_maintenance();
 
         if let UserspaceTrapInfo::Syscall(req) = trap {
@@ -737,7 +865,17 @@ pub async fn run_thread<P: TxPlatform>(
         // ----------------------------------------------------------------
         // (4) DISPATCH THE RESOLVED TRAP.
         // ----------------------------------------------------------------
-        match dispatch_userspace_trap::<P>(&thread, &payload, trap, &mut state).await {
+        match dispatch_userspace_trap::<P>(
+            &thread,
+            &payload,
+            &process,
+            &process_payload,
+            &aspace,
+            trap,
+            &mut state,
+        )
+        .await
+        {
             ThreadLoopControl::Continue => {}
             ThreadLoopControl::YieldBeforeContinue => {
                 crate::adapter::boot_runtime::yield_now().await;
@@ -750,10 +888,10 @@ pub async fn run_thread<P: TxPlatform>(
     }
 }
 
-fn poll_entry_timers_and_liveness<P: TxPlatform>(thread: &Cap<ThreadIdentity>) -> bool {
-    let Some(process) = thread.upgrade_owner_proc() else {
-        return false;
-    };
+fn poll_entry_timers_and_address_space<P: TxPlatform>(
+    process: &Cap<ProcessIdentity>,
+    process_payload: &PayloadCap<ProcessPayload>,
+) -> Cap<AddressSpace> {
     let timer_ctx = current_entry_timer_poll_context::<P>();
     if let Some(mailbox) = timer_ctx.mailbox.as_ref() {
         drain_signal_timer_events(mailbox);
@@ -777,7 +915,13 @@ fn poll_entry_timers_and_liveness<P: TxPlatform>(thread: &Cap<ThreadIdentity>) -
         timer_mailbox,
         &mut post,
     );
-    thread.payload_cap().is_some() && process.aspace_cap().is_some()
+    // `run_thread` itself owns this thread payload.  A group-exit publisher
+    // sets its atomic termination summary before waking the task, and a direct
+    // thread exit never reaches the next entry iteration.  Re-locking
+    // `ThreadIdentity.payload` here therefore did not add a distinct liveness
+    // guarantee; it only cloned the same payload cap once per syscall.  Keep
+    // exec visibility by taking a fresh address-space snapshot each round.
+    process_payload.aspace_cap()
 }
 
 fn drain_signal_timer_events(mailbox: &boot_runtime::TaskMailbox) {
@@ -795,6 +939,8 @@ fn drain_signal_timer_events(mailbox: &boot_runtime::TaskMailbox) {
 fn deliver_entry_signal_handler<P: TxPlatform>(
     thread: &Cap<ThreadIdentity>,
     payload: &PayloadCap<ThreadPayload>,
+    process: &Cap<ProcessIdentity>,
+    aspace: &Cap<AddressSpace>,
     sig: Signum,
     action: tx_subsystems::signal::SigActionEntry,
 ) -> ThreadLoopControl {
@@ -808,13 +954,6 @@ fn deliver_entry_signal_handler<P: TxPlatform>(
     let Some(orig_ctx) = payload.saved_user_context() else {
         return ThreadLoopControl::Continue;
     };
-    let Some(process) = thread.upgrade_owner_proc() else {
-        return ThreadLoopControl::Exit;
-    };
-    let Some(aspace) = process.aspace_cap() else {
-        return ThreadLoopControl::Exit;
-    };
-
     // If a syscall return is pending (e.g. wait4 just resolved, child
     // exit raised SIGCHLD, and the AST is now delivering the handler),
     // apply that return value to the parked pre-signal context's `a0`
@@ -866,7 +1005,7 @@ fn deliver_entry_signal_handler<P: TxPlatform>(
     } else {
         tx_hal::UserPtr::<u8>::new(current_sp)
     };
-    let restorer_pc = tx_subsystems::vm::vdso_rt_sigreturn_addr(&aspace)
+    let restorer_pc = tx_subsystems::vm::vdso_rt_sigreturn_addr(aspace)
         .map(|address| address.as_usize())
         .unwrap_or(0);
     let setup = tx_hal::SignalFrameWrite {
@@ -887,10 +1026,10 @@ fn deliver_entry_signal_handler<P: TxPlatform>(
     match prepared {
         Ok((handler_ctx, frame_bytes)) => {
             let frame_addr = user_sp_from_context::<P>(&handler_ctx);
-            if !reserve_signal_frame_storage(&aspace, frame_addr, frame_bytes.as_slice().len()) {
+            if !reserve_signal_frame_storage(aspace, frame_addr, frame_bytes.as_slice().len()) {
                 return fatal_signal_teardown_from_current_hart::<P>(&process, thread, sig);
             }
-            if !copy_signal_frame_to_user(&aspace, frame_addr, frame_bytes.as_slice()) {
+            if !copy_signal_frame_to_user(aspace, frame_addr, frame_bytes.as_slice()) {
                 return fatal_signal_teardown_from_current_hart::<P>(&process, thread, sig);
             }
             if restorer_pc == 0 {
@@ -934,16 +1073,10 @@ fn copy_signal_frame_to_user(aspace: &Cap<AddressSpace>, frame_addr: usize, byte
 fn enter_userspace_once<P: TxPlatform>(
     thread: &Cap<ThreadIdentity>,
     payload: &PayloadCap<ThreadPayload>,
+    aspace: &Cap<AddressSpace>,
     entry_token: UserspaceRunRequest,
     last_entry_sysno: Option<u64>,
-) -> ThreadLoopControl {
-    let Some(process) = thread.upgrade_owner_proc() else {
-        return ThreadLoopControl::Exit;
-    };
-    let Some(aspace) = process.aspace_cap() else {
-        return ThreadLoopControl::Exit;
-    };
-
+) -> Option<usize> {
     let root = aspace.pmap().root_handle();
     let mut ctx = tx_hal::UserTrapContext::empty();
     if let Some(sysno) = last_entry_sysno {
@@ -974,25 +1107,38 @@ fn enter_userspace_once<P: TxPlatform>(
     }
     <P as TrapIf>::enter_userspace_with_context(&ctx, root);
     tx_substrate::slab::enable_vmalloc_after_kernel_pmap_activation();
-    ThreadLoopControl::Continue
+    Some(entry_hart)
 }
 
 async fn dispatch_userspace_trap<P: TxPlatform>(
     thread: &Cap<ThreadIdentity>,
     payload: &PayloadCap<ThreadPayload>,
+    process: &Cap<ProcessIdentity>,
+    process_payload: &PayloadCap<ProcessPayload>,
+    aspace: &Cap<AddressSpace>,
     trap: UserspaceTrapInfo,
     state: &mut ThreadLoopState,
 ) -> ThreadLoopControl {
     match trap {
         UserspaceTrapInfo::TimerPreempt => {
-            crate::adapter::boot_runtime::yield_now().await;
+            payload.request_task_repoll();
+            userspace_preempt_boundary().await;
             ThreadLoopControl::Continue
         }
         UserspaceTrapInfo::Syscall(req) => {
-            dispatch_syscall_trap::<P>(thread, payload, req, state).await
+            dispatch_syscall_trap::<P>(
+                thread,
+                payload,
+                process,
+                process_payload,
+                aspace,
+                req,
+                state,
+            )
+            .await
         }
         UserspaceTrapInfo::PageFault(info) => {
-            handle_page_fault_trap::<P>(thread, payload, info).await
+            handle_page_fault_trap::<P>(thread, payload, process, aspace, info).await
         }
         UserspaceTrapInfo::Fatal(info) => {
             // Report the REAL trap cause/tval. The previous placeholder
@@ -1026,6 +1172,9 @@ async fn dispatch_userspace_trap<P: TxPlatform>(
 async fn dispatch_syscall_trap<P: TxPlatform>(
     thread: &Cap<ThreadIdentity>,
     payload: &PayloadCap<ThreadPayload>,
+    process: &Cap<ProcessIdentity>,
+    process_payload: &PayloadCap<ProcessPayload>,
+    aspace: &Cap<AddressSpace>,
     req: SyscallRequest,
     state: &mut ThreadLoopState,
 ) -> ThreadLoopControl {
@@ -1035,24 +1184,41 @@ async fn dispatch_syscall_trap<P: TxPlatform>(
         crate::adapter::boot_runtime::yield_now().await;
     }
     emit_syscall_roundtrip_marker(req.nr, b"debug.thread.await.ready");
-    let Some(process) = thread.upgrade_owner_proc() else {
-        return ThreadLoopControl::Exit;
-    };
     emit_syscall_roundtrip_marker(req.nr, b"debug.thread.process.after");
 
     let sigreturn_ctx = payload.saved_user_context();
     payload.begin_syscall_diagnostic(req.nr, req.args[0], req.args[1]);
     payload.set_proc_sleeping(true);
-    let result = match run_syscall_dispatch::<P>(thread, payload, &process, req).await {
-        Some(result) => result,
-        None => return ThreadLoopControl::Exit,
+    #[cfg(feature = "syscall-profile")]
+    let profile_start = {
+        let now = <P as tx_hal::TimeIf>::read_ns();
+        if let Some(trap_start) = crate::trap::take_profiled_trap_start::<P>(req.nr) {
+            crate::trap::record_profiled_syscall_handoff(req.nr, now.saturating_sub(trap_start));
+        }
+        now
     };
+    let result =
+        match run_syscall_dispatch::<P>(thread, payload, process, process_payload, aspace, req)
+            .await
+        {
+            Some(result) => result,
+            None => return ThreadLoopControl::Exit,
+        };
+    #[cfg(feature = "syscall-profile")]
+    if process_is_profiled_compiler(process) {
+        crate::trap::record_profiled_syscall_duration::<P>(
+            req.nr,
+            <P as tx_hal::TimeIf>::read_ns().saturating_sub(profile_start),
+            false,
+        );
+    }
     payload.set_proc_sleeping(false);
     payload.end_syscall_diagnostic();
 
     if matches!(result, SyscallResult::Error(5)) {
-        log_syscall_eio::<P>(&req, &process, thread, payload);
+        log_syscall_eio::<P>(&req, process, thread, payload);
     }
+    log_cagent_spawn_path::<P>(&req, &result, process, thread);
     dump_observe_threshold_if_ready::<P>();
 
     if req.nr == NR_EXIT && matches!(result, SyscallResult::NoReturn) {
@@ -1060,7 +1226,7 @@ async fn dispatch_syscall_trap<P: TxPlatform>(
     }
 
     if matches!(
-        store_syscall_result::<P>(thread, payload, &process, &sigreturn_ctx, &result),
+        store_syscall_result::<P>(thread, payload, process, aspace, &sigreturn_ctx, &result,),
         ThreadLoopControl::Exit
     ) {
         return ThreadLoopControl::Exit;
@@ -1072,16 +1238,98 @@ async fn dispatch_syscall_trap<P: TxPlatform>(
     ThreadLoopControl::Continue
 }
 
+/// Temporary, profile-gated LA64 diagnostic for the complete libc `popen`
+/// process-creation path. Keep this deliberately narrow: the former all-error
+/// logger emitted thousands of expected ENOENT/ENOSYS probes from multiple
+/// harts, changed scheduling, and made the useful fd transition unreadable.
+fn log_cagent_spawn_path<P: TxPlatform>(
+    req: &SyscallRequest,
+    result: &SyscallResult,
+    process: &Cap<ProcessIdentity>,
+    thread: &Cap<ThreadIdentity>,
+) {
+    if !crate::init::CoreInit::<P>::reactor_stall_diag_enabled()
+        || !matches!(P::ARCH, tx_hal::Arch::LoongArch64)
+    {
+        return;
+    }
+
+    let relevant = match req.nr {
+        NR_PIPE2 | NR_DUP3 | NR_EXECVE => true,
+        NR_CLONE => req.args[0] & tx_shims::linux_syscall::numbers::CLONE_VFORK != 0,
+        NR_CLOSE => matches!(result, SyscallResult::Error(_)) && process.comm()[0] == 0,
+        _ => false,
+    };
+    if !relevant {
+        return;
+    }
+
+    let fds = process.open_fd_numbers();
+    let cloexec = process.fd_cloexec_snapshot();
+    let child = match result {
+        SyscallResult::CloneReturn { value, .. } if *value > 0 => {
+            tx_subsystems::process::process_by_pid(tx_subsystems::process::Pid(*value as u32))
+                .map(|child| {
+                    alloc::format!(
+                        ":child_pid={}:child_comm={:?}:child_fds={:?}:child_cloexec={:?}",
+                        child.pid.0,
+                        child.comm(),
+                        child.open_fd_numbers(),
+                        child.fd_cloexec_snapshot(),
+                    )
+                })
+                .unwrap_or_else(|| alloc::format!(":child_pid={value}:child_gone=1"))
+        }
+        _ => alloc::string::String::new(),
+    };
+    let line = alloc::format!(
+        "txkernel:la64-spawn-path:pid={}:ppid={}:tid={}:hart={}:comm={:?}:nr={}:args=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]:result={:?}:fds={:?}:cloexec={:?}{child}\n",
+        process.pid.0,
+        process.parent_pid().0,
+        thread.tid.0,
+        <P as tx_hal::SmpIf>::current_cpu_id().0,
+        process.comm(),
+        req.nr,
+        req.args[0],
+        req.args[1],
+        req.args[2],
+        req.args[3],
+        req.args[4],
+        req.args[5],
+        result,
+        fds,
+        cloexec,
+    );
+    let _console = crate::init::CONSOLE_WRITE_LOCK.lock();
+    tx_hal::console_write_str::<P>(&line);
+}
+
+#[cfg(feature = "syscall-profile")]
+fn process_is_profiled_compiler(process: &Cap<ProcessIdentity>) -> bool {
+    let comm = process.comm();
+    let comm_len = comm
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(comm.len());
+    matches!(
+        &comm[..comm_len],
+        b"cargo" | b"tg-xtask" | b"rustc" | b"axbuild"
+    )
+}
+
 async fn run_syscall_dispatch<P: TxPlatform>(
     thread: &Cap<ThreadIdentity>,
     payload: &PayloadCap<ThreadPayload>,
     process: &Cap<ProcessIdentity>,
+    process_payload: &PayloadCap<ProcessPayload>,
+    aspace: &Cap<AddressSpace>,
     req: SyscallRequest,
 ) -> Option<SyscallResult> {
     if req.nr == NR_EXIT {
         // The outer PerHartSlotted wrapper owns the resumable exit operation.
         // Returning only the intent here prevents a simultaneous group-exit
         // publication from creating a second operation for the same tid.
+        payload.mark_exit_intent();
         return Some(SyscallResult::NoReturn);
     }
     if let Some(result) = tx_shims::linux_syscall::dispatch_cap_only_immediate(&req, process) {
@@ -1089,34 +1337,31 @@ async fn run_syscall_dispatch<P: TxPlatform>(
         return Some(result);
     }
 
-    let Some(aspace) = process.aspace_cap() else {
-        return None;
-    };
     emit_syscall_roundtrip_marker(req.nr, b"debug.thread.aspace.after");
     if let Some(result) = tx_shims::linux_syscall::dispatch_thread_payload_aspace_oneshot(
-        &req, thread, payload, &aspace,
+        &req, thread, payload, aspace,
     ) {
         emit_syscall_roundtrip_marker(req.nr, b"debug.thread.oneshot.after");
         return Some(result);
     }
-    if let Some(result) = tx_shims::linux_syscall::dispatch_vm_try_oneshot(&req, &aspace) {
+    if let Some(result) = tx_shims::linux_syscall::dispatch_vm_try_oneshot(&req, aspace) {
         emit_syscall_roundtrip_marker(req.nr, b"debug.thread.oneshot.after");
         return Some(result);
     }
     if let Some(result) =
-        tx_shims::linux_syscall::dispatch_clone_oneshot::<P>(&req, process, thread, &aspace)
+        tx_shims::linux_syscall::dispatch_clone_oneshot::<P>(&req, process, thread, aspace)
     {
         emit_syscall_roundtrip_marker(req.nr, b"debug.thread.oneshot.after");
         return Some(result);
     }
     if let Some(result) =
-        tx_shims::linux_syscall::dispatch_process_aspace_immediate(&req, process, &aspace)
+        tx_shims::linux_syscall::dispatch_process_aspace_immediate(&req, process, aspace)
     {
         emit_syscall_roundtrip_marker(req.nr, b"debug.thread.immediate.after");
         return Some(result);
     }
 
-    let ctx = build_syscall_ctx::<P>(&req, thread, process, &aspace);
+    let ctx = build_syscall_ctx::<P>(&req, thread, process, process_payload, aspace);
     if req.nr == NR_EXIT_GROUP {
         loop {
             let result = dispatch_full_syscall::<P>(req, &ctx).await;
@@ -1135,6 +1380,7 @@ fn build_syscall_ctx<P: TxPlatform>(
     req: &SyscallRequest,
     thread: &Cap<ThreadIdentity>,
     process: &Cap<ProcessIdentity>,
+    process_payload: &PayloadCap<ProcessPayload>,
     aspace: &Cap<AddressSpace>,
 ) -> tx_shims::linux_syscall::SyscallCtx<'static> {
     let ctx_process = process.clone();
@@ -1143,12 +1389,12 @@ fn build_syscall_ctx<P: TxPlatform>(
     emit_syscall_roundtrip_marker(req.nr, b"debug.thread.ctx.thread_clone.after");
     let ctx_aspace = aspace.clone();
     emit_syscall_roundtrip_marker(req.nr, b"debug.thread.ctx.aspace_clone.after");
-    let cred_snapshot = process
-        .cred_snapshot()
-        .unwrap_or_else(tx_subsystems::cred::CredSnapshot::root);
+    let process_payload = process_payload.clone();
+    let cred_snapshot = process_payload.cred_snapshot();
     emit_syscall_roundtrip_marker(req.nr, b"debug.thread.ctx.cred_snapshot.after");
     let mut ctx = tx_shims::linux_syscall::SyscallCtx::from_parts_with_cred_snapshot(
         ctx_process,
+        process_payload,
         ctx_thread,
         ctx_aspace,
         cred_snapshot,
@@ -1181,28 +1427,51 @@ async fn dispatch_full_syscall<P: TxPlatform>(
     req: SyscallRequest,
     ctx: &tx_shims::linux_syscall::SyscallCtx<'_>,
 ) -> SyscallResult {
-    let result =
-        if let Some(result) = tx_shims::linux_syscall::dispatch_pthread_hot_oneshot(req, ctx) {
-            result
-        } else if let Some(result) =
-            tx_shims::linux_syscall::dispatch_writev_pagebacked_oneshot(&req, ctx)
-        {
-            emit_syscall_roundtrip_marker(req.nr, b"debug.thread.dispatch.writev_pagebacked.after");
-            result
-        } else if req.nr == NR_WRITEV {
-            let fut = tx_shims::linux_syscall::dispatch_writev_hot(req, ctx);
-            emit_syscall_roundtrip_marker(req.nr, b"debug.thread.dispatch.writev_future.after");
-            let fut = Box::pin(fut);
-            emit_syscall_roundtrip_marker(req.nr, b"debug.thread.dispatch.writev_box.after");
-            fut.await
-                .expect("writev hot dispatch prefilter covers writev")
-        } else if matches!(req.nr, NR_MMAP | NR_MPROTECT | NR_MUNMAP) {
-            Box::pin(tx_shims::linux_syscall::dispatch_vm_hot(req, ctx))
-                .await
-                .expect("VM hot dispatch prefilter covers mmap/mprotect/munmap")
-        } else {
-            Box::pin(tx_shims::linux_syscall::dispatch::<P>(req, ctx)).await
-        };
+    let result = if let Some(result) =
+        tx_shims::linux_syscall::dispatch_pthread_hot_oneshot(req, ctx)
+    {
+        result
+    } else if let Some(result) = tx_shims::linux_syscall::dispatch_fs_hot_oneshot::<P>(&req, ctx) {
+        result
+    } else if let Some(result) = tx_shims::linux_syscall::dispatch_pagebacked_io_oneshot(&req, ctx)
+    {
+        result
+    } else if let Some(result) =
+        tx_shims::linux_syscall::dispatch_writev_pagebacked_oneshot(&req, ctx)
+    {
+        emit_syscall_roundtrip_marker(req.nr, b"debug.thread.dispatch.writev_pagebacked.after");
+        result
+    } else if req.nr == NR_WRITEV {
+        let fut = tx_shims::linux_syscall::dispatch_writev_hot(req, ctx);
+        emit_syscall_roundtrip_marker(req.nr, b"debug.thread.dispatch.writev_future.after");
+        let fut = Box::pin(fut);
+        emit_syscall_roundtrip_marker(req.nr, b"debug.thread.dispatch.writev_box.after");
+        fut.await
+            .expect("writev hot dispatch prefilter covers writev")
+    } else if req.nr == NR_OPENAT {
+        Box::pin(tx_shims::linux_syscall::dispatch_openat_hot::<P>(req, ctx))
+            .await
+            .expect("openat hot dispatch prefilter covers openat")
+    } else if req.nr == NR_CLOSE {
+        Box::pin(tx_shims::linux_syscall::dispatch_close_hot::<P>(req, ctx))
+            .await
+            .expect("close hot dispatch prefilter covers close")
+    } else if matches!(
+        req.nr,
+        NR_FACCESSAT | NR_FACCESSAT2 | NR_NEWFSTATAT | NR_GETDENTS64 | NR_STATX | NR_READLINKAT
+    ) {
+        Box::pin(tx_shims::linux_syscall::dispatch_fs_lookup_hot::<P>(
+            req, ctx,
+        ))
+        .await
+        .expect("filesystem lookup hot dispatch prefilter covers metadata syscall")
+    } else if matches!(req.nr, NR_MMAP | NR_MPROTECT | NR_MUNMAP) {
+        Box::pin(tx_shims::linux_syscall::dispatch_vm_hot(req, ctx))
+            .await
+            .expect("VM hot dispatch prefilter covers mmap/mprotect/munmap")
+    } else {
+        Box::pin(tx_shims::linux_syscall::dispatch::<P>(req, ctx)).await
+    };
     emit_syscall_roundtrip_marker(req.nr, b"debug.thread.dispatch.after");
     result
 }
@@ -1211,6 +1480,7 @@ fn store_syscall_result<P: TxPlatform>(
     thread: &Cap<ThreadIdentity>,
     payload: &PayloadCap<ThreadPayload>,
     process: &Cap<ProcessIdentity>,
+    aspace: &Cap<AddressSpace>,
     sigreturn_ctx: &Option<tx_hal::UserTrapContext>,
     result: &SyscallResult,
 ) -> ThreadLoopControl {
@@ -1237,10 +1507,7 @@ fn store_syscall_result<P: TxPlatform>(
                     Signum::SIGSEGV,
                 );
             };
-            let Some(aspace) = process.aspace_cap() else {
-                return ThreadLoopControl::Exit;
-            };
-            if restore_sigreturn_frame::<P>(thread, &aspace, payload, sigreturn_ctx).is_err() {
+            if restore_sigreturn_frame::<P>(thread, aspace, payload, sigreturn_ctx).is_err() {
                 return fatal_signal_teardown_from_current_hart::<P>(
                     process,
                     thread,
@@ -1268,8 +1535,12 @@ fn update_syscall_handoff_state(
 async fn handle_page_fault_trap<P: TxPlatform>(
     thread: &Cap<ThreadIdentity>,
     payload: &PayloadCap<ThreadPayload>,
+    process: &Cap<ProcessIdentity>,
+    aspace: &Cap<AddressSpace>,
     info: ReactorPageFaultInfo,
 ) -> ThreadLoopControl {
+    #[cfg(feature = "syscall-profile")]
+    let profile_start = process_is_profiled_compiler(process).then(<P as tx_hal::TimeIf>::read_ns);
     emit_thread_debug_value(b"debug.thread.page_fault.before", 1);
     emit_thread_debug_value(b"debug.thread.page_fault.addr", info.addr.raw() as i64);
     emit_thread_debug_value(
@@ -1281,12 +1552,6 @@ async fn handle_page_fault_trap<P: TxPlatform>(
         "thread future only sees PageFault for from-user faults; \
          trap shell terminates non-user faults at the shell"
     );
-    let Some(process) = thread.upgrade_owner_proc() else {
-        return ThreadLoopControl::Exit;
-    };
-    let Some(aspace) = process.aspace_cap() else {
-        return ThreadLoopControl::Exit;
-    };
     let fault = VmFault::new(
         UserVirtAddr::new(info.addr.raw() as usize),
         pf_access_to_vm_access(info.access),
@@ -1295,7 +1560,7 @@ async fn handle_page_fault_trap<P: TxPlatform>(
     let fault_result = if let Some(mailbox) = payload.mailbox_handle() {
         Box::pin(aspace.fault_script_for_process_with_post(
             fault,
-            &process,
+            process,
             mailbox,
             crate::init::post_mailbox_ref_event_with_hint_from_current_hart::<P>,
         ))
@@ -1303,6 +1568,13 @@ async fn handle_page_fault_trap<P: TxPlatform>(
     } else {
         Box::pin(aspace.fault_script(fault)).await
     };
+    #[cfg(feature = "syscall-profile")]
+    if let Some(start) = profile_start {
+        record_profiled_page_fault::<P>(
+            info.access,
+            <P as tx_hal::TimeIf>::read_ns().saturating_sub(start),
+        );
+    }
     match fault_result {
         Ok(_) => {
             emit_thread_debug_value(b"debug.thread.page_fault.ok", 1);
@@ -1311,15 +1583,20 @@ async fn handle_page_fault_trap<P: TxPlatform>(
         }
         Err(e) => {
             emit_thread_debug_value(b"debug.thread.page_fault.err", vm_fault_error_code(e));
-            let pc = log_user_segv::<P>(thread, payload, info.addr.raw(), info.access, "pf", e);
-            log_nearby_recipes::<P>(&aspace, info.addr.raw() as usize, "fault");
-            if pc as usize != info.addr.raw() as usize {
-                log_nearby_recipes::<P>(&aspace, pc as usize, "pc");
+            if USER_SEGV_PROBE_CLAIMED
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                let pc = log_user_segv::<P>(thread, payload, info.addr.raw(), info.access, "pf", e);
+                log_nearby_recipes::<P>(aspace, info.addr.raw() as usize, "fault");
+                if pc as usize != info.addr.raw() as usize {
+                    log_nearby_recipes::<P>(aspace, pc as usize, "pc");
+                }
+                dump_syscall_history::<P>();
+                dump_user_regs::<P>(payload);
+                dump_user_mem_windows::<P>(aspace, payload);
+                dump_all_recipes::<P>(aspace);
             }
-            dump_syscall_history::<P>();
-            dump_user_regs::<P>(payload);
-            dump_user_mem_windows::<P>(&aspace, payload);
-            dump_all_recipes::<P>(&aspace);
             match deliver_synchronous_fault(thread, Signum::SIGSEGV) {
                 tx_subsystems::process::ProcessExitOutcome::Completed => ThreadLoopControl::Exit,
                 tx_subsystems::process::ProcessExitOutcome::Retry => {
@@ -1327,6 +1604,57 @@ async fn handle_page_fault_trap<P: TxPlatform>(
                 }
             }
         }
+    }
+}
+
+#[cfg(feature = "syscall-profile")]
+fn record_profiled_page_fault<P: TxPlatform>(access: PageFaultAccess, elapsed_ns: u64) {
+    use core::sync::atomic::Ordering;
+
+    let index = match access {
+        PageFaultAccess::Read => 0,
+        PageFaultAccess::Write => 1,
+        PageFaultAccess::Execute => 2,
+        PageFaultAccess::Unknown => 3,
+    };
+    PROFILE_PF_COUNTS[index].fetch_add(1, Ordering::Relaxed);
+    PROFILE_PF_NS[index].fetch_add(elapsed_ns, Ordering::Relaxed);
+    PROFILE_PF_MAX_NS[index].fetch_max(elapsed_ns, Ordering::Relaxed);
+    let total = PROFILE_PF_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+    let threshold = PROFILE_PF_NEXT_DUMP.load(Ordering::Relaxed);
+    if total != threshold {
+        return;
+    }
+    let next = match threshold {
+        100 => 500,
+        500 => 1_000,
+        1_000 => 5_000,
+        _ => threshold.saturating_add(5_000),
+    };
+    if PROFILE_PF_NEXT_DUMP
+        .compare_exchange(threshold, next, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+
+    tx_hal::console_write_str::<P>("txkernel:page-fault-profile:total=");
+    crate::trap::write_u64::<P>(total);
+    tx_hal::console_write_str::<P>("\n");
+    for access_index in 0..PROFILE_PF_ACCESS_COUNT {
+        let count = PROFILE_PF_COUNTS[access_index].load(Ordering::Relaxed);
+        if count == 0 {
+            continue;
+        }
+        tx_hal::console_write_str::<P>("txkernel:page-fault-profile:access=");
+        crate::trap::write_usize::<P>(access_index);
+        tx_hal::console_write_str::<P>(":count=");
+        crate::trap::write_u64::<P>(count);
+        tx_hal::console_write_str::<P>(":total_ns=");
+        crate::trap::write_u64::<P>(PROFILE_PF_NS[access_index].load(Ordering::Relaxed));
+        tx_hal::console_write_str::<P>(":max_ns=");
+        crate::trap::write_u64::<P>(PROFILE_PF_MAX_NS[access_index].load(Ordering::Relaxed));
+        tx_hal::console_write_str::<P>("\n");
     }
 }
 
@@ -1605,6 +1933,8 @@ fn log_user_segv<P: TxPlatform>(
     write_hex_u64::<P>(entry_syscall);
     tx_hal::console_write_str::<P>(":last-entry-hart=0x");
     write_hex_u64::<P>(entry_hart);
+    tx_hal::console_write_str::<P>(":exit-intent=0x");
+    write_hex_u64::<P>(u64::from(payload.exit_intent()));
     tx_hal::console_write_str::<P>("\n");
     pc
 }

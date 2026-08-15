@@ -215,6 +215,14 @@ impl<P: SlabPageProvider> SlabHeap<P> {
             debug_assert_eq!((*page).class_index, index);
             debug_assert!((*page).free_count > 0);
 
+            // Keep duplicate-allocation diagnostics out of the production
+            // allocator fast path.  The bitmap and its pointer-validation
+            // assertions are a debug aid; release builds rely on the typed
+            // allocation/deallocation contract and retain the original
+            // free-list operation cost.
+            #[cfg(debug_assertions)]
+            mark_small_object_allocated(page, object, index);
+
             (*page).free_list = (*object).next;
             if (*page).retained_empty {
                 debug_assert_eq!((*page).state, SlabPageState::Empty);
@@ -249,6 +257,9 @@ impl<P: SlabPageProvider> SlabHeap<P> {
             debug_assert_ne!((*header).state, SlabPageState::Detached);
             debug_assert_ne!((*header).state, SlabPageState::Empty);
             debug_assert!((*header).free_count < (*header).capacity);
+
+            #[cfg(debug_assertions)]
+            mark_small_object_free(header, ptr, index);
 
             let object = ptr as *mut FreeObject;
             (*object).next = (*header).free_list;
@@ -376,6 +387,8 @@ impl<P: SlabPageProvider> SlabHeap<P> {
                     class_index: index,
                     capacity,
                     free_count: capacity,
+                    #[cfg(debug_assertions)]
+                    allocation_bitmap: 0,
                     free_list: ptr::null_mut(),
                     state: SlabPageState::Detached,
                     retained_empty: false,
@@ -1210,6 +1223,14 @@ struct SlabPageHeader {
     class_index: usize,
     capacity: usize,
     free_count: usize,
+    /// Allocation state for size classes with at most 64 objects per page.
+    ///
+    /// Medium and large slab objects are the ones most likely to carry owned
+    /// pointer graphs.  Debug builds keep their state in the page header and
+    /// reject a duplicate free or duplicate allocation in O(1), before the
+    /// free list can silently hand live storage to a second owner.
+    #[cfg(debug_assertions)]
+    allocation_bitmap: u64,
     free_list: *mut FreeObject,
     state: SlabPageState,
     retained_empty: bool,
@@ -1252,6 +1273,81 @@ fn class_index(layout: Layout) -> Result<Option<usize>, SlabError> {
 
 fn page_header_for_object(ptr: *mut u8, page_size: usize) -> *mut SlabPageHeader {
     (ptr as usize & !(page_size - 1)) as *mut SlabPageHeader
+}
+
+#[cfg(debug_assertions)]
+unsafe fn tracked_small_object_bit(
+    header: *mut SlabPageHeader,
+    ptr: *mut u8,
+    index: usize,
+) -> Option<u64> {
+    unsafe {
+        assert_eq!((*header).magic, SLAB_PAGE_MAGIC, "invalid slab page header");
+        assert_eq!((*header).class_index, index, "slab size class mismatch");
+        assert!((*header).capacity > 0, "zero-capacity slab page");
+
+        let class_size = CLASS_SIZES[index];
+        let object_start = align_up(core::mem::size_of::<SlabPageHeader>(), class_size)
+            .expect("valid slab object start");
+        let page_start = header as usize;
+        let object_offset = (ptr as usize)
+            .checked_sub(page_start.saturating_add(object_start))
+            .expect("slab object precedes object area");
+        assert_eq!(
+            object_offset % class_size,
+            0,
+            "slab object is not size-class aligned"
+        );
+        let object_index = object_offset / class_size;
+        assert!(
+            object_index < (*header).capacity,
+            "slab object lies outside page capacity"
+        );
+
+        // The bitmap covers the medium/large classes.  Pointer validation
+        // above is intentionally unconditional: the smaller classes also
+        // carry their free-list link in the object itself, so an overwrite or
+        // duplicate free must be caught before a corrupted link is returned
+        // as a kernel allocation.
+        if (*header).capacity > u64::BITS as usize {
+            return None;
+        }
+        Some(1u64 << object_index)
+    }
+}
+
+#[cfg(debug_assertions)]
+unsafe fn mark_small_object_allocated(
+    header: *mut SlabPageHeader,
+    object: *mut FreeObject,
+    index: usize,
+) {
+    let Some(bit) = (unsafe { tracked_small_object_bit(header, object.cast(), index) }) else {
+        return;
+    };
+    unsafe {
+        assert_eq!(
+            (*header).allocation_bitmap & bit,
+            0,
+            "slab object allocated twice"
+        );
+        (*header).allocation_bitmap |= bit;
+    }
+}
+
+#[cfg(debug_assertions)]
+unsafe fn mark_small_object_free(header: *mut SlabPageHeader, ptr: *mut u8, index: usize) {
+    let Some(bit) = (unsafe { tracked_small_object_bit(header, ptr, index) }) else {
+        return;
+    };
+    unsafe {
+        assert_ne!(
+            (*header).allocation_bitmap & bit,
+            0,
+            "slab object freed twice"
+        );
+        (*header).allocation_bitmap &= !bit;
+    }
 }
 
 unsafe fn page_list_head(class: &SlabClass, state: SlabPageState) -> *mut *mut SlabPageHeader {

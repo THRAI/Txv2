@@ -6,6 +6,7 @@
 use super::*;
 use crate::adapter::step_engine::{Cap, SpinMutex};
 use alloc::collections::{BTreeMap, BTreeSet};
+use core::sync::atomic::{AtomicBool, Ordering};
 use tx_services::time::{
     timekeeper_clock, ClockRead, DeadlineNs, DeadlineRegistrar, DeadlineRegistrarHandle,
     RealtimeControl, RealtimeSetPolicy, TimekeeperClock, TimekeeperIf, TimerGuard, TimerRole,
@@ -402,10 +403,42 @@ struct IntervalTimer {
 static INTERVAL_TIMERS: SpinMutex<Option<BTreeMap<(u32, u32), IntervalTimer>>> =
     SpinMutex::new(None);
 
+// Almost every syscall crosses the ITIMER_REAL delivery checkpoint, while
+// ordinary compiler workloads never arm an interval timer. Keep that common
+// case out of the global timer-map lock. Writers publish this summary while
+// holding `INTERVAL_TIMERS`; a stale `true` only causes one harmless lookup,
+// and a concurrently armed timer is observed no later than the next syscall.
+static ANY_ITIMER_REAL_ARMED: AtomicBool = AtomicBool::new(false);
+// The entry-side timer checkpoint also asks for the earliest timer of any
+// itimer class. Keep its timer-free path out of the same global map lock.
+static ANY_ITIMER_ARMED: AtomicBool = AtomicBool::new(false);
+
+fn refresh_any_itimer_real_armed(timers: &BTreeMap<(u32, u32), IntervalTimer>) {
+    let any_armed = timers.values().any(|timer| timer.deadline_ns != 0);
+    let real_armed = timers
+        .iter()
+        .any(|((_, which), timer)| *which == ITIMER_REAL && timer.deadline_ns != 0);
+    ANY_ITIMER_ARMED.store(any_armed, Ordering::Release);
+    ANY_ITIMER_REAL_ARMED.store(real_armed, Ordering::Release);
+}
+
 fn with_interval_timers<R>(f: impl FnOnce(&mut BTreeMap<(u32, u32), IntervalTimer>) -> R) -> R {
     let mut guard = INTERVAL_TIMERS.lock();
     let timers = guard.get_or_insert_with(BTreeMap::new);
     f(timers)
+}
+
+fn next_itimer_deadline_for_pid(pid: u32) -> Option<u64> {
+    if !ANY_ITIMER_ARMED.load(Ordering::Acquire) {
+        return None;
+    }
+    let guard = INTERVAL_TIMERS.lock();
+    guard.as_ref().and_then(|timers| {
+        timers
+            .range((pid, 0)..=(pid, u32::MAX))
+            .filter_map(|(_, timer)| (timer.deadline_ns != 0).then_some(timer.deadline_ns))
+            .min()
+    })
 }
 
 fn valid_itimer(which: u32) -> bool {
@@ -552,6 +585,7 @@ where
         } else {
             timers.insert(key, timer);
         }
+        refresh_any_itimer_real_armed(timers);
     });
     SyscallResult::Return(0)
 }
@@ -567,14 +601,18 @@ where
     F: FnMut(alloc::sync::Weak<tx_substrate::wake::TaskMailbox>, tx_substrate::wake::MailboxEvent),
 {
     let pid = process.pid.0;
+    let next_hint = next_itimer_deadline_for_pid(pid)?;
     let now_ns = timekeeper_clock::<P>().monotonic_now_ns();
+    if next_hint > now_ns {
+        return Some(next_hint);
+    }
     let mut to_deliver = [None; 3];
     let mut deliver_len = 0usize;
 
     let next_deadline = with_interval_timers(|timers| {
         let mut next_deadline: Option<u64> = None;
-        for ((timer_pid, which), timer) in timers.iter_mut() {
-            if *timer_pid != pid || timer.deadline_ns == 0 {
+        for ((_, which), timer) in timers.range_mut((pid, 0)..=(pid, u32::MAX)) {
+            if timer.deadline_ns == 0 {
                 continue;
             }
 
@@ -612,6 +650,7 @@ where
                 });
             }
         }
+        refresh_any_itimer_real_armed(timers);
         next_deadline
     });
 
@@ -699,6 +738,9 @@ where
 }
 
 pub(super) fn itimer_real_deadline_ns(pid: u32) -> Option<u64> {
+    if !ANY_ITIMER_REAL_ARMED.load(Ordering::Acquire) {
+        return None;
+    }
     with_interval_timers(|timers| {
         timers
             .get(&(pid, ITIMER_REAL))
@@ -713,6 +755,8 @@ pub(super) fn consume_itimer_real_delivered_interrupt(pid: u32) -> bool {
 #[cfg(test)]
 pub(super) fn reset_itimer_registry_for_test() {
     with_interval_timers(|timers| timers.clear());
+    ANY_ITIMER_ARMED.store(false, Ordering::Release);
+    ANY_ITIMER_REAL_ARMED.store(false, Ordering::Release);
     ITIMER_REAL_DELIVERED_INTERRUPTS.lock().clear();
 }
 /// `nanosleep(req, rem)`. Linux RV64 generic ABI
@@ -898,9 +942,11 @@ where
                 timer.deadline_ns = now_ns.saturating_add(interval);
                 timer.timer_guard = register_rearm(timer.deadline_ns);
             }
+            refresh_any_itimer_real_armed(timers);
         }),
         Some(_) => with_interval_timers(|timers| {
             timers.remove(&key);
+            refresh_any_itimer_real_armed(timers);
         }),
         None => {}
     }

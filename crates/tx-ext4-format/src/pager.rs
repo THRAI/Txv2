@@ -70,10 +70,83 @@ impl PhysicalBlockRange {
     }
 }
 
+/// Collapse a sequence of planner snapshots into one atomic mutation.
+/// Metadata homes must form an exact checksum chain; the first snapshot owns
+/// the on-disk before-version and the last snapshot owns the committed bytes.
+fn merge_chained_mutation(combined: &mut Ext4MutationPlan, next: &Ext4MutationPlan) -> Result<()> {
+    if combined.object != next.object {
+        return Err(Ext4FormatError::Corrupt);
+    }
+    for metadata in &next.metadata {
+        if let Some(existing) = combined
+            .metadata
+            .iter_mut()
+            .find(|existing| existing.home == metadata.home)
+        {
+            if existing.role != metadata.role
+                || crc32c(0, &existing.after) as u64 != metadata.before_version
+            {
+                return Err(Ext4FormatError::Corrupt);
+            }
+            existing.after = metadata.after;
+            for dependency in &metadata.depends_on {
+                if !existing.depends_on.contains(dependency) {
+                    existing.depends_on.push(*dependency);
+                }
+            }
+        } else {
+            combined
+                .push_metadata(metadata.clone())
+                .map_err(|_| Ext4FormatError::Corrupt)?;
+        }
+    }
+    combined.data.extend(next.data.iter().cloned());
+    combined
+        .allocations
+        .extend(next.allocations.iter().copied());
+    combined.revokes.extend(next.revokes.iter().copied());
+    combined
+        .deferred_frees
+        .extend(next.deferred_frees.iter().copied());
+    combined
+        .allocations
+        .sort_unstable_by_key(|claim| claim.physical_block);
+    combined
+        .allocations
+        .dedup_by_key(|claim| claim.physical_block);
+    combined.revokes.sort_unstable();
+    combined.revokes.dedup();
+    combined.deferred_frees.sort_unstable();
+    combined.deferred_frees.dedup();
+    Ok(())
+}
+
 pub trait BlockImage {
     fn total_blocks(&self) -> u64;
     fn read_block(&self, block: u64, out: &mut Page4K) -> Result<()>;
+
+    /// Read one file-data block, allowing the image adapter to prefetch
+    /// adjacent blocks into its private cache. Metadata callers continue to
+    /// use `read_block` so a speculative data read cannot widen metadata I/O.
+    fn read_data_block(&self, block: u64, out: &mut Page4K) -> Result<()> {
+        self.read_block(block, out)
+    }
+
     fn write_block(&mut self, block: u64, data: &Page4K) -> Result<()>;
+
+    /// Write one physically contiguous block run. Image adapters with a
+    /// scatter/gather-capable device should override this method; the default
+    /// preserves existing format tests and compatibility images.
+    fn write_blocks(&mut self, first_block: u64, data: &[&Page4K]) -> Result<()> {
+        for (index, page) in data.iter().enumerate() {
+            let block = first_block
+                .checked_add(index as u64)
+                .ok_or(Ext4FormatError::OutOfBounds)?;
+            self.write_block(block, page)?;
+        }
+        Ok(())
+    }
+
     fn barrier(&mut self) -> Result<()>;
 
     /// Drop any cache entry that could hold a stale copy after an external
@@ -100,6 +173,7 @@ impl InodeNo {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InodeMetaLite {
+    pub generation: u32,
     pub mode: u16,
     pub uid: u32,
     pub gid: u32,
@@ -197,6 +271,11 @@ pub struct Ext4Pager<I> {
     groups: Vec<GroupDesc>,
     inode_table: InodeTableLayout,
     reserved_blocks: BTreeSet<u64>,
+    /// Non-authoritative next-fit hints. Allocation bitmaps remain the source
+    /// of truth; advancing either hint for a plan which is later abandoned is
+    /// therefore harmless and only changes the next scan's starting point.
+    next_block_hint: u64,
+    next_inode_hint: u64,
     journal_start: Option<u64>,
     next_sequence: u32,
 }
@@ -234,6 +313,8 @@ impl<I: BlockImage> Ext4Pager<I> {
                 first_inode_table_block: 0,
             },
             reserved_blocks: BTreeSet::new(),
+            next_block_hint: 0,
+            next_inode_hint: 0,
             journal_start: None,
             next_sequence: 1,
         };
@@ -423,10 +504,52 @@ impl<I: BlockImage> Ext4Pager<I> {
     /// Publish metadata after-images that have been accepted by the mounted
     /// mutation runtime but not yet checkpointed to their home blocks.
     pub fn stage_mutation_after_images(&mut self, mutation: &Ext4MutationPlan) {
+        // Ordered data may target a block which still has an old incarnation
+        // in the image adapter's read cache.  Invalidate exactly those homes
+        // at admission; the later write repopulates them with current bytes.
+        for data in &mutation.data {
+            self.image.invalidate_block(data.physical_block);
+        }
         for metadata in &mutation.metadata {
             self.pending_metadata.insert(metadata.home, metadata.after);
             self.image.invalidate_block(metadata.home);
         }
+    }
+
+    /// Apply an immutable mutation directly to its home blocks.
+    ///
+    /// This is the compatibility executor for mounts which deliberately do
+    /// not install the asynchronous JBD2 runtime.  The mount-wide mutation
+    /// admission permit keeps planning and application serialized, so the
+    /// plan cannot become stale between those two steps.  `BlockImage` writes
+    /// complete before returning; writing ordered data first therefore keeps
+    /// metadata from exposing an uninitialised data block without paying for
+    /// descriptor, commit, and checkpoint I/O on every short-lived file.
+    ///
+    /// No barrier is issued here.  This path has the same graceful-shutdown
+    /// (rather than power-loss journal) contract as `mount_ext4_read_write`.
+    pub fn apply_mutation_direct(&mut self, mutation: &Ext4MutationPlan) -> Result<()> {
+        let mut first = 0usize;
+        while first < mutation.data.len() {
+            let mut end = first + 1;
+            while end < mutation.data.len()
+                && mutation.data[end].physical_block
+                    == mutation.data[end - 1].physical_block.saturating_add(1)
+            {
+                end += 1;
+            }
+            let pages: Vec<&Page4K> = mutation.data[first..end]
+                .iter()
+                .map(|write| &write.bytes)
+                .collect();
+            self.image
+                .write_blocks(mutation.data[first].physical_block, &pages)?;
+            first = end;
+        }
+        for metadata in &mutation.metadata {
+            self.image.write_block(metadata.home, &metadata.after)?;
+        }
+        Ok(())
     }
 
     pub fn apply_l6_write_page(
@@ -440,7 +563,6 @@ impl<I: BlockImage> Ext4Pager<I> {
         }
         let block = start_lba / sectors_per_block;
         self.image.write_block(block, page)?;
-        self.image.invalidate_block(block);
         Ok(())
     }
 
@@ -448,11 +570,15 @@ impl<I: BlockImage> Ext4Pager<I> {
         self.image.barrier()
     }
 
-    /// Invalidate the image adapter's derived block cache after an L6-owned
-    /// checkpoint. The format pager itself retains no metadata cache.
+    /// Retire the after-image overlay after an L6-owned checkpoint.
+    ///
+    /// Admission invalidates every data and metadata home touched by the
+    /// transaction, and `write_block` makes the checkpointed bytes visible to
+    /// subsequent reads.  Clearing the entire image cache here would evict
+    /// unrelated executable, library, and source blocks after every namespace
+    /// operation.
     pub fn settle_image_cache(&mut self) {
         self.pending_metadata.clear();
-        self.image.invalidate_all();
     }
 
     pub fn inode_meta(&mut self, inode: InodeNo) -> Result<InodeMetaLite> {
@@ -516,7 +642,7 @@ impl<I: BlockImage> Ext4Pager<I> {
         }
         match self.resolve_inode_block(&disk_inode, logical_block(file_page_index)?)? {
             BlockMapping::Data(block) => {
-                self.read_block(block, out)?;
+                self.image.read_data_block(block, out)?;
                 let valid_len = core::cmp::min(BLOCK_SIZE as u64, disk_inode.size - page_start);
                 out[valid_len as usize..].fill(0);
                 Ok(PageRead::Data { block })
@@ -591,7 +717,12 @@ impl<I: BlockImage> Ext4Pager<I> {
         // to depth one, and the very next extending buffered write regresses to
         // `Unsupported` even though the selected leaf still has ample room.
         let indexed_update = if indexed_uninitialized.is_none() && inline_uninitialized.is_none() {
-            self.plan_depth_one_hole_allocation(&disk_inode, logical)?
+            let depth_one = self.plan_depth_one_hole_allocation(&disk_inode, logical)?;
+            if depth_one.is_some() {
+                depth_one
+            } else {
+                self.plan_depth_two_hole_allocation(&disk_inode, logical)?
+            }
         } else {
             indexed_uninitialized
         };
@@ -701,7 +832,8 @@ impl<I: BlockImage> Ext4Pager<I> {
             match self.resolve_inode_block(&disk_inode, logical)? {
                 BlockMapping::Data(block) => block,
                 BlockMapping::Hole => {
-                    let mut allocation = self.plan_block_allocations(1)?;
+                    let goal = self.extent_allocation_goal(&disk_inode, logical)?;
+                    let mut allocation = self.plan_block_allocations_near(1, goal)?;
                     let physical_block = allocation.claims[0];
                     let mut inode_after = disk_inode;
                     let mut extents = match ExtentNode::parse(inode_after.extent_root_bytes())? {
@@ -711,7 +843,8 @@ impl<I: BlockImage> Ext4Pager<I> {
                     coalesce_insert_extent(&mut extents, logical, physical_block);
                     let mut extent_metadata = Vec::new();
                     if extents.len() > 4 {
-                        let replanned = self.plan_block_allocations(2)?;
+                        let replanned =
+                            self.plan_block_allocations_near(2, Some(physical_block))?;
                         if replanned.claims[0] != physical_block {
                             return Err(Ext4FormatError::Corrupt);
                         }
@@ -838,8 +971,8 @@ impl<I: BlockImage> Ext4Pager<I> {
         Ok(plan)
     }
 
-    /// Allocate one hole below a non-full depth-one extent leaf and describe
-    /// the complete change as an immutable journal mutation.
+    /// Allocate one hole below a depth-one extent leaf and describe the
+    /// complete change as an immutable journal mutation.
     ///
     /// This is the transactional counterpart of the bounded depth-one support
     /// in `attach_data_block`: it updates the selected leaf, the inode root key
@@ -881,14 +1014,114 @@ impl<I: BlockImage> Ext4Pager<I> {
             ExtentNode::Index(_) => return Err(Ext4FormatError::Corrupt),
         };
 
-        let allocation = self.plan_block_allocations(1)?;
+        let goal = self.extent_allocation_goal(inode, logical_block)?;
+        let mut allocation = self.plan_block_allocations_near(1, goal)?;
         let physical_block = allocation.claims[0];
         coalesce_insert_extent(&mut extents, logical_block, physical_block);
         if extents.len() > usize::from(header.max) {
-            // Match the bounded capability of the former direct path: one
-            // depth-one leaf is supported; splitting a full leaf remains a
-            // separate, fail-closed extension.
-            return Err(Ext4FormatError::Unsupported);
+            let root_growth = indexes.len() >= usize::from(root_header.max);
+            let replanned = self.plan_block_allocations_near(
+                if root_growth { 4 } else { 2 },
+                Some(physical_block),
+            )?;
+            if replanned.claims[0] != physical_block {
+                return Err(Ext4FormatError::Corrupt);
+            }
+            allocation = replanned;
+
+            let right_home = allocation.claims[1];
+            let right_extents = extents.split_off(extents.len() / 2);
+            let mut leaf_after = before;
+            ExtentNode::encode_leaf(&extents, &mut leaf_after)?;
+            let mut right_before = [0u8; BLOCK_SIZE];
+            self.read_block(right_home, &mut right_before)?;
+            let mut right_after = right_before;
+            ExtentNode::encode_leaf(&right_extents, &mut right_after)?;
+
+            indexes[selected].logical_block = extents[0].logical_block;
+            indexes.insert(
+                selected + 1,
+                ExtentIdx {
+                    logical_block: right_extents[0].logical_block,
+                    child: right_home,
+                },
+            );
+            let mut inode_after = *inode;
+            let mut extent_metadata = vec![
+                MetadataBlock {
+                    home,
+                    role: MetaRole::ExtentNode,
+                    before_version: crc32c(0, &before) as u64,
+                    after: leaf_after,
+                    depends_on: Vec::new(),
+                },
+                MetadataBlock {
+                    home: right_home,
+                    role: MetaRole::ExtentNode,
+                    before_version: crc32c(0, &right_before) as u64,
+                    after: right_after,
+                    depends_on: Vec::new(),
+                },
+            ];
+            if root_growth {
+                let left_root_home = allocation.claims[2];
+                let right_root_home = allocation.claims[3];
+                let right_root_indexes = indexes.split_off(indexes.len() / 2);
+                let mut left_root_before = [0u8; BLOCK_SIZE];
+                self.read_block(left_root_home, &mut left_root_before)?;
+                let mut right_root_before = [0u8; BLOCK_SIZE];
+                self.read_block(right_root_home, &mut right_root_before)?;
+                let mut left_root_after = left_root_before;
+                let mut right_root_after = right_root_before;
+                ExtentNode::encode_index(1, &indexes, &mut left_root_after)?;
+                ExtentNode::encode_index(1, &right_root_indexes, &mut right_root_after)?;
+                inode_after.set_extent_index_root(
+                    &[
+                        ExtentIdx {
+                            logical_block: indexes[0].logical_block,
+                            child: left_root_home,
+                        },
+                        ExtentIdx {
+                            logical_block: right_root_indexes[0].logical_block,
+                            child: right_root_home,
+                        },
+                    ],
+                    root_header
+                        .depth
+                        .checked_add(1)
+                        .ok_or(Ext4FormatError::OutOfBounds)?,
+                )?;
+                extent_metadata.push(MetadataBlock {
+                    home: left_root_home,
+                    role: MetaRole::ExtentNode,
+                    before_version: crc32c(0, &left_root_before) as u64,
+                    after: left_root_after,
+                    depends_on: Vec::new(),
+                });
+                extent_metadata.push(MetadataBlock {
+                    home: right_root_home,
+                    role: MetaRole::ExtentNode,
+                    before_version: crc32c(0, &right_root_before) as u64,
+                    after: right_root_after,
+                    depends_on: Vec::new(),
+                });
+            } else {
+                inode_after.set_extent_index_root(&indexes, root_header.depth)?;
+            }
+            inode_after.blocks_512 = inode_after
+                .blocks_512
+                .checked_add(
+                    u64::try_from(allocation.claims.len())
+                        .map_err(|_| Ext4FormatError::OutOfBounds)?
+                        * (BLOCK_SIZE / 512) as u64,
+                )
+                .ok_or(Ext4FormatError::OutOfBounds)?;
+            return Ok(Some(IndexedUninitializedConversion {
+                physical_block,
+                extent_metadata,
+                allocation: Some(allocation),
+                inode_after: Some(inode_after),
+            }));
         }
         let mut after = before;
         ExtentNode::encode_leaf(&extents, &mut after)?;
@@ -901,7 +1134,10 @@ impl<I: BlockImage> Ext4Pager<I> {
         }
         inode_after.blocks_512 = inode_after
             .blocks_512
-            .checked_add((BLOCK_SIZE / 512) as u64)
+            .checked_add(
+                u64::try_from(allocation.claims.len()).map_err(|_| Ext4FormatError::OutOfBounds)?
+                    * (BLOCK_SIZE / 512) as u64,
+            )
             .ok_or(Ext4FormatError::OutOfBounds)?;
 
         Ok(Some(IndexedUninitializedConversion {
@@ -1068,6 +1304,266 @@ impl<I: BlockImage> Ext4Pager<I> {
             }],
             allocation: None,
             inode_after: None,
+        }))
+    }
+
+    /// Allocate one hole through a depth-two root -> parent -> leaf path.
+    /// Leaf and parent splits are carried upward in the same immutable plan;
+    /// a full inline root grows to depth three.
+    fn plan_depth_two_hole_allocation(
+        &mut self,
+        inode: &Inode,
+        logical_block: u32,
+    ) -> Result<Option<IndexedUninitializedConversion>> {
+        let root_header = ExtentHeader::parse(inode.extent_root_bytes())?;
+        if root_header.depth != 2 {
+            return Ok(None);
+        }
+        if !matches!(
+            self.resolve_inode_block(inode, logical_block)?,
+            BlockMapping::Hole
+        ) {
+            return Ok(None);
+        }
+        let mut root_indexes = match ExtentNode::parse(inode.extent_root_bytes())? {
+            ExtentNode::Index(indexes) if !indexes.is_empty() => indexes,
+            _ => return Err(Ext4FormatError::Corrupt),
+        };
+        let root_pos = root_indexes
+            .iter()
+            .rposition(|index| index.logical_block <= logical_block)
+            .unwrap_or(0);
+        let parent_home = root_indexes[root_pos].child;
+        let mut parent_before = [0u8; BLOCK_SIZE];
+        self.read_block(parent_home, &mut parent_before)?;
+        let parent_header = ExtentHeader::parse(&parent_before)?;
+        if parent_header.depth != 1 {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        let mut parent_indexes = match ExtentNode::parse(&parent_before)? {
+            ExtentNode::Index(indexes) if !indexes.is_empty() => indexes,
+            _ => return Err(Ext4FormatError::Corrupt),
+        };
+        let parent_pos = parent_indexes
+            .iter()
+            .rposition(|index| index.logical_block <= logical_block)
+            .unwrap_or(0);
+        let home = parent_indexes[parent_pos].child;
+        let mut before = [0u8; BLOCK_SIZE];
+        self.read_block(home, &mut before)?;
+        let header = ExtentHeader::parse(&before)?;
+        if header.depth != 0 {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        let mut extents = match ExtentNode::parse(&before)? {
+            ExtentNode::Leaf(extents) => extents,
+            ExtentNode::Index(_) => return Err(Ext4FormatError::Corrupt),
+        };
+
+        let goal = self.extent_allocation_goal(inode, logical_block)?;
+        let mut allocation = self.plan_block_allocations_near(1, goal)?;
+        let physical_block = allocation.claims[0];
+        coalesce_insert_extent(&mut extents, logical_block, physical_block);
+        let mut inode_after = *inode;
+        if extents.len() <= usize::from(header.max) {
+            let mut after = before;
+            ExtentNode::encode_leaf(&extents, &mut after)?;
+            let mut extent_metadata = vec![MetadataBlock {
+                home,
+                role: MetaRole::ExtentNode,
+                before_version: crc32c(0, &before) as u64,
+                after,
+                depends_on: Vec::new(),
+            }];
+            let new_leaf_low = extents[0].logical_block;
+            if parent_indexes[parent_pos].logical_block != new_leaf_low {
+                parent_indexes[parent_pos].logical_block = new_leaf_low;
+                let mut parent_after = parent_before;
+                ExtentNode::encode_index(parent_header.depth, &parent_indexes, &mut parent_after)?;
+                extent_metadata.push(MetadataBlock {
+                    home: parent_home,
+                    role: MetaRole::ExtentNode,
+                    before_version: crc32c(0, &parent_before) as u64,
+                    after: parent_after,
+                    depends_on: Vec::new(),
+                });
+                if parent_pos == 0
+                    && root_indexes[root_pos].logical_block != parent_indexes[0].logical_block
+                {
+                    root_indexes[root_pos].logical_block = parent_indexes[0].logical_block;
+                    inode_after.set_extent_index_root(&root_indexes, root_header.depth)?;
+                }
+            }
+            inode_after.blocks_512 = inode_after
+                .blocks_512
+                .checked_add((BLOCK_SIZE / 512) as u64)
+                .ok_or(Ext4FormatError::OutOfBounds)?;
+            return Ok(Some(IndexedUninitializedConversion {
+                physical_block,
+                extent_metadata,
+                allocation: Some(allocation),
+                inode_after: Some(inode_after),
+            }));
+        }
+
+        let parent_split = parent_indexes.len() >= usize::from(parent_header.max);
+        let root_growth = parent_split && root_indexes.len() >= usize::from(root_header.max);
+        let replanned = self.plan_block_allocations_near(
+            match (parent_split, root_growth) {
+                (false, false) => 2,
+                (true, false) => 3,
+                (true, true) => 5,
+                (false, true) => return Err(Ext4FormatError::Corrupt),
+            },
+            Some(physical_block),
+        )?;
+        if replanned.claims[0] != physical_block {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        allocation = replanned;
+
+        let right_home = allocation.claims[1];
+        let right_extents = extents.split_off(extents.len() / 2);
+        let mut leaf_after = before;
+        ExtentNode::encode_leaf(&extents, &mut leaf_after)?;
+        let mut right_before = [0u8; BLOCK_SIZE];
+        self.read_block(right_home, &mut right_before)?;
+        let mut right_after = right_before;
+        ExtentNode::encode_leaf(&right_extents, &mut right_after)?;
+        parent_indexes[parent_pos].logical_block = extents[0].logical_block;
+        parent_indexes.insert(
+            parent_pos + 1,
+            ExtentIdx {
+                logical_block: right_extents[0].logical_block,
+                child: right_home,
+            },
+        );
+        let mut parent_after = parent_before;
+        let mut extent_metadata = vec![
+            MetadataBlock {
+                home,
+                role: MetaRole::ExtentNode,
+                before_version: crc32c(0, &before) as u64,
+                after: leaf_after,
+                depends_on: Vec::new(),
+            },
+            MetadataBlock {
+                home: right_home,
+                role: MetaRole::ExtentNode,
+                before_version: crc32c(0, &right_before) as u64,
+                after: right_after,
+                depends_on: Vec::new(),
+            },
+        ];
+        if parent_split {
+            let right_parent_home = allocation.claims[2];
+            let right_parent_indexes = parent_indexes.split_off(parent_indexes.len() / 2);
+            let mut right_parent_before = [0u8; BLOCK_SIZE];
+            self.read_block(right_parent_home, &mut right_parent_before)?;
+            let mut right_parent_after = right_parent_before;
+            ExtentNode::encode_index(parent_header.depth, &parent_indexes, &mut parent_after)?;
+            ExtentNode::encode_index(
+                parent_header.depth,
+                &right_parent_indexes,
+                &mut right_parent_after,
+            )?;
+            root_indexes[root_pos].logical_block = parent_indexes[0].logical_block;
+            root_indexes.insert(
+                root_pos + 1,
+                ExtentIdx {
+                    logical_block: right_parent_indexes[0].logical_block,
+                    child: right_parent_home,
+                },
+            );
+            extent_metadata.push(MetadataBlock {
+                home: parent_home,
+                role: MetaRole::ExtentNode,
+                before_version: crc32c(0, &parent_before) as u64,
+                after: parent_after,
+                depends_on: Vec::new(),
+            });
+            extent_metadata.push(MetadataBlock {
+                home: right_parent_home,
+                role: MetaRole::ExtentNode,
+                before_version: crc32c(0, &right_parent_before) as u64,
+                after: right_parent_after,
+                depends_on: Vec::new(),
+            });
+            if root_growth {
+                let left_root_home = allocation.claims[3];
+                let right_root_home = allocation.claims[4];
+                let right_root_indexes = root_indexes.split_off(root_indexes.len() / 2);
+                let mut left_root_before = [0u8; BLOCK_SIZE];
+                self.read_block(left_root_home, &mut left_root_before)?;
+                let mut right_root_before = [0u8; BLOCK_SIZE];
+                self.read_block(right_root_home, &mut right_root_before)?;
+                let mut left_root_after = left_root_before;
+                let mut right_root_after = right_root_before;
+                ExtentNode::encode_index(root_header.depth, &root_indexes, &mut left_root_after)?;
+                ExtentNode::encode_index(
+                    root_header.depth,
+                    &right_root_indexes,
+                    &mut right_root_after,
+                )?;
+                inode_after.set_extent_index_root(
+                    &[
+                        ExtentIdx {
+                            logical_block: root_indexes[0].logical_block,
+                            child: left_root_home,
+                        },
+                        ExtentIdx {
+                            logical_block: right_root_indexes[0].logical_block,
+                            child: right_root_home,
+                        },
+                    ],
+                    root_header
+                        .depth
+                        .checked_add(1)
+                        .ok_or(Ext4FormatError::OutOfBounds)?,
+                )?;
+                extent_metadata.push(MetadataBlock {
+                    home: left_root_home,
+                    role: MetaRole::ExtentNode,
+                    before_version: crc32c(0, &left_root_before) as u64,
+                    after: left_root_after,
+                    depends_on: Vec::new(),
+                });
+                extent_metadata.push(MetadataBlock {
+                    home: right_root_home,
+                    role: MetaRole::ExtentNode,
+                    before_version: crc32c(0, &right_root_before) as u64,
+                    after: right_root_after,
+                    depends_on: Vec::new(),
+                });
+            } else {
+                inode_after.set_extent_index_root(&root_indexes, root_header.depth)?;
+            }
+        } else {
+            ExtentNode::encode_index(parent_header.depth, &parent_indexes, &mut parent_after)?;
+            extent_metadata.push(MetadataBlock {
+                home: parent_home,
+                role: MetaRole::ExtentNode,
+                before_version: crc32c(0, &parent_before) as u64,
+                after: parent_after,
+                depends_on: Vec::new(),
+            });
+            if root_indexes[root_pos].logical_block != parent_indexes[0].logical_block {
+                root_indexes[root_pos].logical_block = parent_indexes[0].logical_block;
+                inode_after.set_extent_index_root(&root_indexes, root_header.depth)?;
+            }
+        }
+        inode_after.blocks_512 = inode_after
+            .blocks_512
+            .checked_add(
+                u64::try_from(allocation.claims.len()).map_err(|_| Ext4FormatError::OutOfBounds)?
+                    * (BLOCK_SIZE / 512) as u64,
+            )
+            .ok_or(Ext4FormatError::OutOfBounds)?;
+        Ok(Some(IndexedUninitializedConversion {
+            physical_block,
+            extent_metadata,
+            allocation: Some(allocation),
+            inode_after: Some(inode_after),
         }))
     }
 
@@ -1571,10 +2067,12 @@ impl<I: BlockImage> Ext4Pager<I> {
         }))
     }
 
-    /// Build an immutable writeback plan for a contiguous run of already
-    /// mapped data pages. Extent growth/allocation stays on the single-page
-    /// path until the allocation claim and PageSlot transition are wired as
-    /// one vertical slice.
+    /// Build one immutable writeback transaction for a contiguous page run.
+    ///
+    /// Every single-page planner turn is evaluated against the preceding
+    /// turn's metadata after-images. The resulting chain is then collapsed to
+    /// one before/final-after pair per metadata home. This lets one L4 batch
+    /// allocate holes without publishing intermediate bitmap or extent states.
     pub fn plan_write_pages(
         &mut self,
         inode: InodeNo,
@@ -1582,42 +2080,71 @@ impl<I: BlockImage> Ext4Pager<I> {
         pages: &[Page4K],
         fsync_stamp: FsyncStamp,
     ) -> Result<Ext4MutationPlan> {
+        self.plan_write_pages_with_size(inode, start_file_page, pages, None, fsync_stamp)
+    }
+
+    /// [`Self::plan_write_pages`] with an optional byte-precise final inode
+    /// size. Buffered writeback uses this to fold close-visible EOF into the
+    /// same ordered transaction as data and allocation metadata.
+    pub fn plan_write_pages_with_size(
+        &mut self,
+        inode: InodeNo,
+        start_file_page: u64,
+        pages: &[Page4K],
+        exact_size: Option<u64>,
+        fsync_stamp: FsyncStamp,
+    ) -> Result<Ext4MutationPlan> {
         if pages.is_empty() {
             return Err(Ext4FormatError::Unsupported);
         }
-        let disk_inode = self.read_inode(inode)?;
-        let mut plan =
-            Ext4MutationPlan::new(MutationOrigin::FlushPage, inode.get() as u64, fsync_stamp);
-        let loc = self.inode_location(inode)?;
-        let mut inode_table_before = [0u8; BLOCK_SIZE];
-        self.read_block(loc.block, &mut inode_table_before)?;
-        plan.push_metadata(MetadataBlock {
-            home: loc.block,
-            role: MetaRole::InodeTable,
-            before_version: crc32c(0, &inode_table_before) as u64,
-            after: inode_table_before,
-            depends_on: Vec::new(),
-        })
-        .map_err(|_| Ext4FormatError::Corrupt)?;
+        let pending_before = self.pending_metadata.clone();
+        let planned = (|| {
+            let mut combined =
+                Ext4MutationPlan::new(MutationOrigin::FlushPage, inode.get() as u64, fsync_stamp);
+            for (offset, page) in pages.iter().enumerate() {
+                let file_page_index = start_file_page
+                    .checked_add(offset as u64)
+                    .ok_or(Ext4FormatError::OutOfBounds)?;
+                let part = self.plan_write_page(inode, file_page_index, page, fsync_stamp)?;
+                merge_chained_mutation(&mut combined, &part)?;
+                self.stage_mutation_after_images(&part);
+            }
+            if let Some(exact_size) = exact_size {
+                self.set_write_plan_inode_size(inode, exact_size, &mut combined)?;
+            }
+            Ok(combined)
+        })();
+        self.pending_metadata = pending_before;
+        planned
+    }
 
-        for (offset, page) in pages.iter().enumerate() {
-            let file_page_index = start_file_page
-                .checked_add(offset as u64)
-                .ok_or(Ext4FormatError::OutOfBounds)?;
-            let block =
-                match self.resolve_inode_block(&disk_inode, logical_block(file_page_index)?)? {
-                    BlockMapping::Data(block) => block,
-                    BlockMapping::Hole | BlockMapping::NeedNode(_) => {
-                        return Err(Ext4FormatError::Unsupported);
-                    }
-                };
-            plan.data.push(SealedDataWrite {
-                logical_page: file_page_index,
-                physical_block: block,
-                bytes: *page,
-            });
+    fn set_write_plan_inode_size(
+        &self,
+        inode: InodeNo,
+        exact_size: u64,
+        plan: &mut Ext4MutationPlan,
+    ) -> Result<()> {
+        if plan.data.iter().any(|write| {
+            write
+                .logical_page
+                .checked_mul(BLOCK_SIZE as u64)
+                .is_none_or(|start| start >= exact_size)
+        }) {
+            return Err(Ext4FormatError::Corrupt);
         }
-        Ok(plan)
+        let location = self.inode_location(inode)?;
+        let metadata = plan
+            .metadata
+            .iter_mut()
+            .find(|metadata| {
+                metadata.home == location.block && metadata.role == MetaRole::InodeTable
+            })
+            .ok_or(Ext4FormatError::Corrupt)?;
+        let inode_bytes = &mut metadata.after[location.offset..location.offset + location.len];
+        let mut disk_inode = Inode::parse(inode_bytes)?;
+        disk_inode.size = exact_size;
+        disk_inode.encode_preserving_unknown(inode_bytes)?;
+        self.refresh_inode_checksum(inode, &disk_inode, inode_bytes)
     }
 
     /// Build the complete inode-table after-image for a bounded metadata-only
@@ -2146,6 +2673,13 @@ impl<I: BlockImage> Ext4Pager<I> {
             return Err(Ext4FormatError::Corrupt);
         }
         BitmapMut::new(&mut inode_bitmap_after).clear(inode_bit)?;
+        // Make the just-released slot the next allocation candidate. The hint
+        // is deliberately non-authoritative: if this immutable destroy plan
+        // is abandoned, the still-set on-disk bitmap bit simply makes the
+        // allocator continue scanning. On commit, prompt reuse keeps inode
+        // numbers and inode-table cache lines local while the generation field
+        // still prevents stale dentries/page containers from aliasing it.
+        self.next_inode_hint = u64::from(inode_index);
 
         let mut deleted_inode = Inode::default();
         // The inode bitmap is cleared by this same plan. Retaining a file
@@ -2402,7 +2936,23 @@ impl<I: BlockImage> Ext4Pager<I> {
         }
     }
 
-    fn plan_block_allocation(&self) -> Result<(u64, usize, u64, Page4K, Page4K)> {
+    /// Prefer the physical successor/predecessor of an existing logical
+    /// neighbour so extending writes coalesce into the inode's current extent.
+    fn extent_allocation_goal(&mut self, inode: &Inode, logical: u32) -> Result<Option<u64>> {
+        if logical > 0 {
+            if let BlockMapping::Data(previous) = self.resolve_inode_block(inode, logical - 1)? {
+                return Ok(previous.checked_add(1));
+            }
+        }
+        if logical < u32::MAX {
+            if let BlockMapping::Data(next) = self.resolve_inode_block(inode, logical + 1)? {
+                return Ok(next.checked_sub(1));
+            }
+        }
+        Ok(None)
+    }
+
+    fn plan_block_allocation(&mut self) -> Result<(u64, usize, u64, Page4K, Page4K)> {
         let allocations = self.plan_block_allocations(1)?;
         let physical_block = allocations.claims[0];
         let group = allocations
@@ -2419,7 +2969,18 @@ impl<I: BlockImage> Ext4Pager<I> {
         ))
     }
 
-    fn plan_block_allocations(&self, amount: usize) -> Result<PlannedBlockAllocations> {
+    fn plan_block_allocations(&mut self, amount: usize) -> Result<PlannedBlockAllocations> {
+        self.plan_block_allocations_near(amount, None)
+    }
+
+    /// Plan `amount` free blocks beginning near an extent goal or the mount's
+    /// next-fit cursor. Every candidate is revalidated against the current
+    /// bitmap after-image, so the cursor never carries allocation authority.
+    fn plan_block_allocations_near(
+        &mut self,
+        amount: usize,
+        goal: Option<u64>,
+    ) -> Result<PlannedBlockAllocations> {
         if amount == 0 {
             return Err(Ext4FormatError::OutOfBounds);
         }
@@ -2429,13 +2990,31 @@ impl<I: BlockImage> Ext4Pager<I> {
         let blocks_per_group = self.superblock.blocks_per_group as u64;
         let first_data_block = self.superblock.first_data_block as u64;
         let total_blocks = core::cmp::min(self.superblock.blocks_count, self.image.total_blocks());
+        if self.groups.is_empty() || first_data_block >= total_blocks {
+            return Err(Ext4FormatError::OutOfBounds);
+        }
+
+        let scan_start = goal
+            .filter(|block| *block >= first_data_block && *block < total_blocks)
+            .or_else(|| {
+                (self.next_block_hint >= first_data_block && self.next_block_hint < total_blocks)
+                    .then_some(self.next_block_hint)
+            })
+            .unwrap_or(first_data_block);
+        let preferred_group = usize::try_from((scan_start - first_data_block) / blocks_per_group)
+            .map_err(|_| Ext4FormatError::OutOfBounds)?;
+        if preferred_group >= self.groups.len() {
+            return Err(Ext4FormatError::Corrupt);
+        }
 
         let mut claims = Vec::new();
         let mut groups = Vec::new();
-        for (group_index, group) in self.groups.iter().copied().enumerate() {
+        for group_offset in 0..self.groups.len() {
+            let group_index = (preferred_group + group_offset) % self.groups.len();
+            let group = self.groups[group_index];
             let group_start = first_data_block + group_index as u64 * blocks_per_group;
             if group_start >= total_blocks {
-                break;
+                continue;
             }
             let group_block_count = core::cmp::min(blocks_per_group, total_blocks - group_start);
             let bitmap_home = group.block_bitmap_block();
@@ -2453,9 +3032,16 @@ impl<I: BlockImage> Ext4Pager<I> {
             let mut bitmap_after = bitmap_before;
             let remaining = amount - claims.len();
             let mut free = Vec::new();
-            for bit in 0..group_block_count as usize {
+            let bit_count = group_block_count as usize;
+            let start_bit = if group_index == preferred_group {
+                usize::try_from(scan_start - group_start)
+                    .map_err(|_| Ext4FormatError::OutOfBounds)?
+            } else {
+                0
+            };
+            for bit in (start_bit..bit_count).chain(0..start_bit) {
                 if BitmapView::new(&bitmap_after).is_set(bit)
-                    || self.is_reserved_metadata_block(group_start + bit as u64)?
+                    || self.reserved_blocks.contains(&(group_start + bit as u64))
                 {
                     continue;
                 }
@@ -2480,45 +3066,21 @@ impl<I: BlockImage> Ext4Pager<I> {
                 count,
             });
             if claims.len() == amount {
+                let next = claims
+                    .last()
+                    .copied()
+                    .and_then(|block| block.checked_add(1))
+                    .unwrap_or(first_data_block);
+                self.next_block_hint = if next < total_blocks {
+                    next
+                } else {
+                    first_data_block
+                };
                 return Ok(PlannedBlockAllocations { claims, groups });
             }
         }
 
         Err(Ext4FormatError::OutOfBounds)
-    }
-
-    fn is_reserved_metadata_block(&self, block: u64) -> Result<bool> {
-        if block == 0 {
-            return Ok(true);
-        }
-        let gdt_start = if self.superblock.block_size() == 1024 {
-            2
-        } else {
-            1
-        };
-        let gdt_bytes = self
-            .groups
-            .len()
-            .checked_mul(self.superblock.group_desc_size())
-            .ok_or(Ext4FormatError::OutOfBounds)?;
-        let gdt_blocks = gdt_bytes.div_ceil(BLOCK_SIZE) as u64;
-        if block >= gdt_start && block < gdt_start + gdt_blocks {
-            return Ok(true);
-        }
-        let inode_table_bytes = u64::from(self.superblock.inodes_per_group)
-            .checked_mul(u64::from(self.superblock.inode_size))
-            .ok_or(Ext4FormatError::OutOfBounds)?;
-        let inode_table_blocks = inode_table_bytes.div_ceil(BLOCK_SIZE as u64);
-        for group in &self.groups {
-            if block == group.block_bitmap_block() || block == group.inode_bitmap_block() {
-                return Ok(true);
-            }
-            let inode_table_start = group.inode_table_block();
-            if block >= inode_table_start && block < inode_table_start + inode_table_blocks {
-                return Ok(true);
-            }
-        }
-        Ok(false)
     }
 
     fn group_desc_home(&self, group_index: usize) -> Result<u64> {
@@ -2533,17 +3095,30 @@ impl<I: BlockImage> Ext4Pager<I> {
         Ok(gdt_start + (byte_offset / BLOCK_SIZE) as u64)
     }
 
-    fn plan_inode_allocation(&self) -> Result<(InodeNo, usize, u64, Page4K, Page4K)> {
+    fn plan_inode_allocation(&mut self) -> Result<(InodeNo, usize, u64, Page4K, Page4K)> {
         if self.superblock.inodes_per_group == 0 {
             return Err(Ext4FormatError::Corrupt);
         }
         let inodes_per_group = self.superblock.inodes_per_group as u64;
         let total_inodes = self.superblock.inodes_count as u64;
+        if self.groups.is_empty() || total_inodes == 0 {
+            return Err(Ext4FormatError::OutOfBounds);
+        }
+        let scan_start = (self.next_inode_hint < total_inodes)
+            .then_some(self.next_inode_hint)
+            .unwrap_or(0);
+        let preferred_group = usize::try_from(scan_start / inodes_per_group)
+            .map_err(|_| Ext4FormatError::OutOfBounds)?;
+        if preferred_group >= self.groups.len() {
+            return Err(Ext4FormatError::Corrupt);
+        }
 
-        for (group_index, group) in self.groups.iter().copied().enumerate() {
+        for group_offset in 0..self.groups.len() {
+            let group_index = (preferred_group + group_offset) % self.groups.len();
+            let group = self.groups[group_index];
             let group_first_index = group_index as u64 * inodes_per_group;
             if group_first_index >= total_inodes {
-                break;
+                continue;
             }
             let group_inode_count =
                 core::cmp::min(inodes_per_group, total_inodes - group_first_index);
@@ -2552,7 +3127,17 @@ impl<I: BlockImage> Ext4Pager<I> {
             self.read_block(bitmap_home, &mut bitmap_before)?;
             let mut bitmap_after = bitmap_before;
             let view = BitmapView::new(&bitmap_after);
-            let Some(bit) = (0..group_inode_count as usize).find(|bit| !view.is_set(*bit)) else {
+            let bit_count = group_inode_count as usize;
+            let start_bit = if group_index == preferred_group {
+                usize::try_from(scan_start - group_first_index)
+                    .map_err(|_| Ext4FormatError::OutOfBounds)?
+            } else {
+                0
+            };
+            let Some(bit) = (start_bit..bit_count)
+                .chain(0..start_bit)
+                .find(|bit| !view.is_set(*bit))
+            else {
                 continue;
             };
             BitmapMut::new(&mut bitmap_after).set(bit)?;
@@ -2562,6 +3147,12 @@ impl<I: BlockImage> Ext4Pager<I> {
                 .ok_or(Ext4FormatError::OutOfBounds)?;
             let inode_number =
                 u32::try_from(inode_number).map_err(|_| Ext4FormatError::OutOfBounds)?;
+            let allocated_index = group_first_index + bit as u64;
+            self.next_inode_hint = if allocated_index + 1 < total_inodes {
+                allocated_index + 1
+            } else {
+                0
+            };
             return Ok((
                 InodeNo::new(inode_number),
                 group_index,
@@ -3566,20 +4157,33 @@ impl<I: BlockImage> Ext4Pager<I> {
     }
 
     pub fn lookup(&mut self, directory: InodeNo, name: &[u8]) -> Result<Option<InodeNo>> {
-        let mut entries = [DirEntryLite::empty(); 8];
-        let mut offset = 0u64;
-        loop {
-            let count = self.read_dir_entries_from(directory, offset, &mut entries)?;
-            if count == 0 {
-                return Ok(None);
+        // Walk the directory exactly once. The old implementation requested
+        // eight entries at a time through `read_dir_entries_from`, whose
+        // `skip_entries` contract restarted at byte zero for every batch.
+        // Looking up a late entry in a large Cargo `deps` directory therefore
+        // reread prefixes 0, 8, 16, ... and was quadratic even when all ext4
+        // blocks were already cached.
+        let disk_inode = self.read_inode(directory)?;
+        if !disk_inode.is_dir() {
+            return Err(Ext4FormatError::Unsupported);
+        }
+
+        let page_count = div_ceil_u64(disk_inode.size, BLOCK_SIZE as u64);
+        for page_index in 0..page_count {
+            let mut page = [0u8; BLOCK_SIZE];
+            match self.resolve_inode_block(&disk_inode, logical_block(page_index)?)? {
+                BlockMapping::Data(block) => self.read_block(block, &mut page)?,
+                BlockMapping::Hole => continue,
+                BlockMapping::NeedNode(_) => return Err(Ext4FormatError::Unsupported),
             }
-            for entry in entries.iter().take(count) {
-                if entry.name() == name {
-                    return Ok(Some(entry.inode));
+            for entry in DirEntryIter::new(&page) {
+                let entry = entry?;
+                if entry.name == name {
+                    return Ok(Some(InodeNo::new(entry.inode)));
                 }
             }
-            offset += count as u64;
         }
+        Ok(None)
     }
 
     pub fn read_dir_entries(
@@ -3796,10 +4400,16 @@ impl<I: BlockImage> Ext4Pager<I> {
         new_ino: InodeNo,
         file_type: u8,
     ) -> Result<()> {
-        let (phys, _before, after) =
-            self.plan_append_dir_entry_after_image(dir_ino, name, new_ino, file_type)?;
-        self.image.write_block(phys, &after)?;
-        Ok(())
+        let plan = self.plan_append_dir_entry_mutation(
+            dir_ino,
+            name,
+            new_ino,
+            file_type,
+            MutationOrigin::Create,
+            new_ino.get() as u64,
+            FsyncStamp::new(0),
+        )?;
+        self.apply_mutation_direct(&plan)
     }
 
     fn plan_append_dir_entry_after_image(
@@ -3878,9 +4488,86 @@ impl<I: BlockImage> Ext4Pager<I> {
         Err(Ext4FormatError::OutOfBounds)
     }
 
-    /// Build the bounded hard-link mutation for an existing regular file.
-    /// Directory hard links and allocation of new directory blocks stay
-    /// fail-closed until the complete namespace/orphan lifecycle exists.
+    /// Plan a directory entry publication, growing the parent directory when
+    /// every existing block is full.  The growth is expressed through the
+    /// normal write planner so the new extent, parent inode, allocation
+    /// bitmap, group descriptors, superblock counters, and directory block
+    /// become one immutable mutation.
+    fn plan_append_dir_entry_mutation(
+        &mut self,
+        dir_ino: InodeNo,
+        name: &[u8],
+        new_ino: InodeNo,
+        file_type: u8,
+        origin: MutationOrigin,
+        object: u64,
+        fsync_stamp: FsyncStamp,
+    ) -> Result<Ext4MutationPlan> {
+        match self.plan_append_dir_entry_after_image(dir_ino, name, new_ino, file_type) {
+            Ok((home, before, after)) => {
+                let mut plan = Ext4MutationPlan::new(origin, object, fsync_stamp);
+                plan.push_metadata(MetadataBlock {
+                    home,
+                    role: MetaRole::DirectoryBlock,
+                    before_version: crc32c(0, &before) as u64,
+                    after,
+                    depends_on: Vec::new(),
+                })
+                .map_err(|_| Ext4FormatError::Corrupt)?;
+                Ok(plan)
+            }
+            Err(Ext4FormatError::OutOfBounds) => {
+                if name.len() > 255 {
+                    return Err(Ext4FormatError::OutOfBounds);
+                }
+                let disk_inode = self.read_inode(dir_ino)?;
+                if !disk_inode.is_dir() || disk_inode.is_htree_indexed() {
+                    return Err(Ext4FormatError::Unsupported);
+                }
+                if disk_inode.size % BLOCK_SIZE as u64 != 0 {
+                    return Err(Ext4FormatError::Corrupt);
+                }
+                let page_index = div_ceil_u64(disk_inode.size, BLOCK_SIZE as u64);
+                let mut page = [0u8; BLOCK_SIZE];
+                encode_dir_entry(new_ino.get(), BLOCK_SIZE as u16, file_type, name, &mut page)?;
+                self.refresh_dirblock_checksum(dir_ino, &disk_inode, &mut page)?;
+
+                let mut plan = self.plan_write_page(dir_ino, page_index, &page, fsync_stamp)?;
+                if plan.data.len() != 1
+                    || plan.data[0].logical_page != page_index
+                    || plan.data[0].bytes != page
+                {
+                    return Err(Ext4FormatError::Corrupt);
+                }
+                let write = plan.data.pop().ok_or(Ext4FormatError::Corrupt)?;
+                if !plan
+                    .allocations
+                    .iter()
+                    .any(|claim| claim.physical_block == write.physical_block)
+                {
+                    return Err(Ext4FormatError::Corrupt);
+                }
+                let mut before = [0u8; BLOCK_SIZE];
+                self.read_block(write.physical_block, &mut before)?;
+                plan.push_metadata(MetadataBlock {
+                    home: write.physical_block,
+                    role: MetaRole::DirectoryBlock,
+                    before_version: crc32c(0, &before) as u64,
+                    after: write.bytes,
+                    depends_on: Vec::new(),
+                })
+                .map_err(|_| Ext4FormatError::Corrupt)?;
+                plan.origin = origin;
+                plan.object = object;
+                Ok(plan)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Build the hard-link mutation for an existing regular file, including
+    /// parent-directory growth when its current blocks have no dirent slack.
+    /// Directory hard links remain unsupported.
     pub fn plan_link_dir_entry(
         &mut self,
         dir_ino: InodeNo,
@@ -3888,8 +4575,29 @@ impl<I: BlockImage> Ext4Pager<I> {
         target_ino: InodeNo,
         fsync_stamp: FsyncStamp,
     ) -> Result<Ext4MutationPlan> {
-        let (dir_home, dir_before, dir_after) =
-            self.plan_append_dir_entry_after_image(dir_ino, name, target_ino, 1)?;
+        let pending_before = self.pending_metadata.clone();
+        let planned = self.plan_link_dir_entry_inner(dir_ino, name, target_ino, fsync_stamp);
+        self.pending_metadata = pending_before;
+        planned
+    }
+
+    fn plan_link_dir_entry_inner(
+        &mut self,
+        dir_ino: InodeNo,
+        name: &[u8],
+        target_ino: InodeNo,
+        fsync_stamp: FsyncStamp,
+    ) -> Result<Ext4MutationPlan> {
+        let mut plan = self.plan_append_dir_entry_mutation(
+            dir_ino,
+            name,
+            target_ino,
+            1,
+            MutationOrigin::Link,
+            target_ino.get() as u64,
+            fsync_stamp,
+        )?;
+        self.stage_mutation_after_images(&plan);
 
         let location = self.inode_location(target_ino)?;
         let mut inode_table_before = [0u8; BLOCK_SIZE];
@@ -3911,17 +4619,9 @@ impl<I: BlockImage> Ext4Pager<I> {
         disk_inode.encode_preserving_unknown(inode_bytes)?;
         self.refresh_inode_checksum(target_ino, &disk_inode, inode_bytes)?;
 
-        let mut plan =
+        let mut link =
             Ext4MutationPlan::new(MutationOrigin::Link, target_ino.get() as u64, fsync_stamp);
-        plan.push_metadata(MetadataBlock {
-            home: dir_home,
-            role: MetaRole::DirectoryBlock,
-            before_version: crc32c(0, &dir_before) as u64,
-            after: dir_after,
-            depends_on: Vec::new(),
-        })
-        .map_err(|_| Ext4FormatError::Corrupt)?;
-        plan.push_metadata(MetadataBlock {
+        link.push_metadata(MetadataBlock {
             home: location.block,
             role: MetaRole::InodeTable,
             before_version: crc32c(0, &inode_table_before) as u64,
@@ -3929,6 +4629,7 @@ impl<I: BlockImage> Ext4Pager<I> {
             depends_on: Vec::new(),
         })
         .map_err(|_| Ext4FormatError::Corrupt)?;
+        merge_chained_mutation(&mut plan, &link)?;
         Ok(plan)
     }
 
@@ -3948,83 +4649,72 @@ impl<I: BlockImage> Ext4Pager<I> {
         target_ino: InodeNo,
         fsync_stamp: FsyncStamp,
     ) -> Result<Ext4MutationPlan> {
-        if new_name.len() > 255 {
+        if old_name.is_empty() || new_name.is_empty() || new_name.len() > 255 {
             return Err(Ext4FormatError::OutOfBounds);
         }
-        let new_min = (8usize + new_name.len() + 3) & !3;
-        let disk_inode = self.read_inode(dir_ino)?;
-        if !disk_inode.is_dir() {
+        let target_inode = self.read_inode(target_ino)?;
+        let file_type = if target_inode.is_dir() {
+            2
+        } else if target_inode.is_file() {
+            1
+        } else {
             return Err(Ext4FormatError::Unsupported);
-        }
-        let page_count = div_ceil_u64(disk_inode.size, BLOCK_SIZE as u64);
+        };
 
-        for page_index in 0..page_count {
-            let phys = match self.resolve_inode_block(&disk_inode, logical_block(page_index)?)? {
-                BlockMapping::Data(b) => b,
-                BlockMapping::Hole => continue,
-                BlockMapping::NeedNode(_) => return Err(Ext4FormatError::Unsupported),
-            };
-            let mut before = [0u8; BLOCK_SIZE];
-            self.read_block(phys, &mut before)?;
-            let mut after = before;
-
-            let mut off = 0usize;
-            while off + 8 <= BLOCK_SIZE {
-                let rec_len = read_u16_le(&after, off + 4)? as usize;
-                if rec_len == 0 || off + rec_len > BLOCK_SIZE {
-                    break;
-                }
-                let ino_here = u32::from_le_bytes(after[off..off + 4].try_into().unwrap());
-                if ino_here != 0 {
-                    let name_len = after[off + 6] as usize;
-                    let name_end = off + 8 + name_len;
-                    if name_end <= BLOCK_SIZE
-                        && name_len == new_name.len()
-                        && &after[off + 8..name_end] == new_name
-                    {
-                        return Err(Ext4FormatError::Unsupported);
-                    }
-                    if name_end <= BLOCK_SIZE
-                        && name_len == old_name.len()
-                        && &after[off + 8..name_end] == old_name
-                    {
-                        let found_ino = InodeNo::new(ino_here);
-                        if found_ino != target_ino {
-                            return Err(Ext4FormatError::Corrupt);
-                        }
-                        let file_type = after[off + 7];
-                        if new_min > rec_len {
-                            return Err(Ext4FormatError::Unsupported);
-                        }
-                        encode_dir_entry(
-                            target_ino.get(),
-                            rec_len as u16,
-                            file_type,
-                            new_name,
-                            &mut after[off..off + rec_len],
-                        )?;
-                        self.refresh_dirblock_checksum(dir_ino, &disk_inode, &mut after)?;
-                        let mut plan = Ext4MutationPlan::new(
-                            MutationOrigin::Rename,
-                            target_ino.get() as u64,
-                            fsync_stamp,
-                        );
-                        plan.push_metadata(MetadataBlock {
-                            home: phys,
-                            role: MetaRole::DirectoryBlock,
-                            before_version: crc32c(0, &before) as u64,
-                            after,
-                            depends_on: Vec::new(),
-                        })
-                        .map_err(|_| Ext4FormatError::Corrupt)?;
-                        return Ok(plan);
-                    }
-                }
-                off += rec_len;
+        // Rename through a chained directory snapshot rather than requiring
+        // the destination name to fit inside the source record. Cargo and
+        // rustc routinely publish linker outputs by renaming a short random
+        // temporary name to a longer final artifact name. The removal creates
+        // slack first; append then observes that exact after-image through the
+        // pager's temporary metadata overlay. Home blocks remain untouched
+        // until the complete mutation is admitted.
+        let pending_before = self.pending_metadata.clone();
+        let planned = (|| {
+            let (found_ino, old_home, old_before, old_after) =
+                self.plan_remove_dir_entry_after_image(dir_ino, old_name)?;
+            if found_ino != target_ino {
+                return Err(Ext4FormatError::Corrupt);
             }
-        }
+            self.pending_metadata.insert(old_home, old_after);
+            let (new_home, new_before, new_after) =
+                self.plan_append_dir_entry_after_image(dir_ino, new_name, target_ino, file_type)?;
 
-        Err(Ext4FormatError::OutOfBounds)
+            let mut plan =
+                Ext4MutationPlan::new(MutationOrigin::Rename, target_ino.get() as u64, fsync_stamp);
+            if old_home == new_home {
+                if crc32c(0, &old_after) as u64 != crc32c(0, &new_before) as u64 {
+                    return Err(Ext4FormatError::Corrupt);
+                }
+                plan.push_metadata(MetadataBlock {
+                    home: old_home,
+                    role: MetaRole::DirectoryBlock,
+                    before_version: crc32c(0, &old_before) as u64,
+                    after: new_after,
+                    depends_on: Vec::new(),
+                })
+                .map_err(|_| Ext4FormatError::Corrupt)?;
+            } else {
+                plan.push_metadata(MetadataBlock {
+                    home: old_home,
+                    role: MetaRole::DirectoryBlock,
+                    before_version: crc32c(0, &old_before) as u64,
+                    after: old_after,
+                    depends_on: Vec::new(),
+                })
+                .map_err(|_| Ext4FormatError::Corrupt)?;
+                plan.push_metadata(MetadataBlock {
+                    home: new_home,
+                    role: MetaRole::DirectoryBlock,
+                    before_version: crc32c(0, &new_before) as u64,
+                    after: new_after,
+                    depends_on: Vec::new(),
+                })
+                .map_err(|_| Ext4FormatError::Corrupt)?;
+            }
+            Ok(plan)
+        })();
+        self.pending_metadata = pending_before;
+        planned
     }
 
     /// Build the bounded cross-directory regular-file rename mutation.
@@ -4050,19 +4740,13 @@ impl<I: BlockImage> Ext4Pager<I> {
             return Err(Ext4FormatError::Unsupported);
         }
 
+        let mut plan =
+            Ext4MutationPlan::new(MutationOrigin::Rename, target_ino.get() as u64, fsync_stamp);
         let (found_ino, old_home, old_before, old_after) =
             self.plan_remove_dir_entry_after_image(old_dir_ino, old_name)?;
         if found_ino != target_ino {
             return Err(Ext4FormatError::Corrupt);
         }
-        let (new_home, new_before, new_after) =
-            self.plan_append_dir_entry_after_image(new_dir_ino, new_name, target_ino, 1)?;
-        if old_home == new_home {
-            return Err(Ext4FormatError::Unsupported);
-        }
-
-        let mut plan =
-            Ext4MutationPlan::new(MutationOrigin::Rename, target_ino.get() as u64, fsync_stamp);
         plan.push_metadata(MetadataBlock {
             home: old_home,
             role: MetaRole::DirectoryBlock,
@@ -4071,14 +4755,25 @@ impl<I: BlockImage> Ext4Pager<I> {
             depends_on: Vec::new(),
         })
         .map_err(|_| Ext4FormatError::Corrupt)?;
-        plan.push_metadata(MetadataBlock {
-            home: new_home,
-            role: MetaRole::DirectoryBlock,
-            before_version: crc32c(0, &new_before) as u64,
-            after: new_after,
-            depends_on: Vec::new(),
-        })
-        .map_err(|_| Ext4FormatError::Corrupt)?;
+
+        // The destination of rustc's archive publication is the shared
+        // `target/*/deps` directory. It quickly exhausts the slack in its
+        // existing directory blocks, while the source `tmp.a` lives in a
+        // fresh temporary subdirectory. The bounded append helper alone can
+        // only use existing slack and incorrectly surfaced this ordinary
+        // growth case as `OutOfBounds`/ENOENT. Build the destination through
+        // the full append planner so a new directory block, its extent and
+        // allocation metadata are part of the same atomic rename mutation.
+        let append = self.plan_append_dir_entry_mutation(
+            new_dir_ino,
+            new_name,
+            target_ino,
+            1,
+            MutationOrigin::Rename,
+            target_ino.get() as u64,
+            fsync_stamp,
+        )?;
+        merge_chained_mutation(&mut plan, &append)?;
         Ok(plan)
     }
 
@@ -4097,13 +4792,33 @@ impl<I: BlockImage> Ext4Pager<I> {
         if old_ino == overwritten_ino {
             return Err(Ext4FormatError::Unsupported);
         }
-        let (dir_home, dir_before, dir_after) = self.plan_rename_overwrite_after_image(
-            dir_ino,
-            old_name,
-            new_name,
-            old_ino,
-            overwritten_ino,
-        )?;
+
+        // The source and destination names need not live in the same directory
+        // block.  Large Cargo incremental directories routinely keep the old
+        // final artifact in an early block and append the new `.part` file to
+        // the last block.  Build both edits through a temporary overlay so a
+        // same-block pair still collapses to one metadata after-image while a
+        // cross-block pair is committed atomically as two metadata homes.
+        let pending_before = self.pending_metadata.clone();
+        let planned_dir = (|| {
+            let (found_ino, old_home, old_before, old_after) =
+                self.plan_remove_dir_entry_after_image(dir_ino, old_name)?;
+            if found_ino != old_ino {
+                return Err(Ext4FormatError::Corrupt);
+            }
+            self.pending_metadata.insert(old_home, old_after);
+            let (new_home, new_before, new_after) = self.plan_replace_dir_entry_inode_after_image(
+                dir_ino,
+                new_name,
+                overwritten_ino,
+                old_ino,
+            )?;
+            Ok((
+                old_home, old_before, old_after, new_home, new_before, new_after,
+            ))
+        })();
+        self.pending_metadata = pending_before;
+        let (old_home, old_before, old_after, new_home, new_before, new_after) = planned_dir?;
 
         let old_inode = self.read_inode(old_ino)?;
         if !old_inode.is_file() {
@@ -4132,14 +4847,36 @@ impl<I: BlockImage> Ext4Pager<I> {
 
         let mut plan =
             Ext4MutationPlan::new(MutationOrigin::Rename, old_ino.get() as u64, fsync_stamp);
-        plan.push_metadata(MetadataBlock {
-            home: dir_home,
-            role: MetaRole::DirectoryBlock,
-            before_version: crc32c(0, &dir_before) as u64,
-            after: dir_after,
-            depends_on: Vec::new(),
-        })
-        .map_err(|_| Ext4FormatError::Corrupt)?;
+        if old_home == new_home {
+            if crc32c(0, &old_after) as u64 != crc32c(0, &new_before) as u64 {
+                return Err(Ext4FormatError::Corrupt);
+            }
+            plan.push_metadata(MetadataBlock {
+                home: old_home,
+                role: MetaRole::DirectoryBlock,
+                before_version: crc32c(0, &old_before) as u64,
+                after: new_after,
+                depends_on: Vec::new(),
+            })
+            .map_err(|_| Ext4FormatError::Corrupt)?;
+        } else {
+            plan.push_metadata(MetadataBlock {
+                home: old_home,
+                role: MetaRole::DirectoryBlock,
+                before_version: crc32c(0, &old_before) as u64,
+                after: old_after,
+                depends_on: Vec::new(),
+            })
+            .map_err(|_| Ext4FormatError::Corrupt)?;
+            plan.push_metadata(MetadataBlock {
+                home: new_home,
+                role: MetaRole::DirectoryBlock,
+                before_version: crc32c(0, &new_before) as u64,
+                after: new_after,
+                depends_on: Vec::new(),
+            })
+            .map_err(|_| Ext4FormatError::Corrupt)?;
+        }
         plan.push_metadata(MetadataBlock {
             home: location.block,
             role: MetaRole::InodeTable,
@@ -4151,13 +4888,12 @@ impl<I: BlockImage> Ext4Pager<I> {
         Ok(plan)
     }
 
-    fn plan_rename_overwrite_after_image(
+    fn plan_replace_dir_entry_inode_after_image(
         &mut self,
         dir_ino: InodeNo,
-        old_name: &[u8],
-        new_name: &[u8],
-        old_ino: InodeNo,
-        overwritten_ino: InodeNo,
+        name: &[u8],
+        expected_ino: InodeNo,
+        replacement_ino: InodeNo,
     ) -> Result<(u64, Page4K, Page4K)> {
         let disk_inode = self.read_inode(dir_ino)?;
         if !disk_inode.is_dir() || disk_inode.is_htree_indexed() {
@@ -4174,9 +4910,6 @@ impl<I: BlockImage> Ext4Pager<I> {
             let mut before = [0u8; BLOCK_SIZE];
             self.read_block(phys, &mut before)?;
             let mut after = before;
-            let mut prev_off: Option<usize> = None;
-            let mut old_entry: Option<(usize, Option<usize>)> = None;
-            let mut new_entry: Option<usize> = None;
 
             let mut off = 0usize;
             while off + 8 <= BLOCK_SIZE {
@@ -4191,41 +4924,20 @@ impl<I: BlockImage> Ext4Pager<I> {
                     if name_end > BLOCK_SIZE {
                         return Err(Ext4FormatError::Corrupt);
                     }
-                    if name_len == old_name.len() && &after[off + 8..name_end] == old_name {
-                        if InodeNo::new(ino_here) != old_ino {
+                    if name_len == name.len() && &after[off + 8..name_end] == name {
+                        if InodeNo::new(ino_here) != expected_ino {
                             return Err(Ext4FormatError::Corrupt);
                         }
                         if after[off + 7] == 2 {
                             return Err(Ext4FormatError::Unsupported);
                         }
-                        old_entry = Some((off, prev_off));
-                    } else if name_len == new_name.len() && &after[off + 8..name_end] == new_name {
-                        if InodeNo::new(ino_here) != overwritten_ino {
-                            return Err(Ext4FormatError::Corrupt);
-                        }
-                        if after[off + 7] == 2 {
-                            return Err(Ext4FormatError::Unsupported);
-                        }
-                        new_entry = Some(off);
+                        after[off..off + 4].copy_from_slice(&replacement_ino.get().to_le_bytes());
+                        self.refresh_dirblock_checksum(dir_ino, &disk_inode, &mut after)?;
+                        return Ok((phys, before, after));
                     }
                 }
-                prev_off = Some(off);
                 off += rec_len;
             }
-
-            let (Some((old_off, old_prev)), Some(new_off)) = (old_entry, new_entry) else {
-                continue;
-            };
-            after[new_off..new_off + 4].copy_from_slice(&old_ino.get().to_le_bytes());
-            if let Some(prev) = old_prev {
-                let prev_rec = read_u16_le(&after, prev + 4)? as usize;
-                let old_rec = read_u16_le(&after, old_off + 4)? as usize;
-                write_u16_le(&mut after, prev + 4, (prev_rec + old_rec) as u16)?;
-            } else {
-                after[old_off..old_off + 4].fill(0);
-            }
-            self.refresh_dirblock_checksum(dir_ino, &disk_inode, &mut after)?;
-            return Ok((phys, before, after));
         }
 
         Err(Ext4FormatError::OutOfBounds)
@@ -4519,14 +5231,42 @@ impl<I: BlockImage> Ext4Pager<I> {
         gid: u32,
         fsync_stamp: FsyncStamp,
     ) -> Result<(InodeNo, Ext4MutationPlan)> {
+        let pending_before = self.pending_metadata.clone();
+        let planned =
+            self.plan_create_regular_file_inner(parent_ino, name, mode, uid, gid, fsync_stamp);
+        self.pending_metadata = pending_before;
+        planned
+    }
+
+    fn plan_create_regular_file_inner(
+        &mut self,
+        parent_ino: InodeNo,
+        name: &[u8],
+        mode: u16,
+        uid: u32,
+        gid: u32,
+        fsync_stamp: FsyncStamp,
+    ) -> Result<(InodeNo, Ext4MutationPlan)> {
         let (new_ino, group_index, bitmap_home, bitmap_before, bitmap_after) =
             self.plan_inode_allocation()?;
+        let mut plan = self.plan_append_dir_entry_mutation(
+            parent_ino,
+            name,
+            new_ino,
+            1,
+            MutationOrigin::Create,
+            new_ino.get() as u64,
+            fsync_stamp,
+        )?;
+        self.stage_mutation_after_images(&plan);
         let (group_desc_home, group_desc_before, group_desc_after) =
             self.plan_group_free_inode_decrement(group_index, &bitmap_after)?;
         let (superblock_home, superblock_before, superblock_after) =
             self.plan_superblock_free_inode_decrement()?;
 
+        let generation = self.next_inode_generation(new_ino)?;
         let mut inode = Inode::default();
+        inode.generation = generation;
         inode.extra_isize = self.new_inode_extra_isize();
         inode.mode = Inode::S_IFREG | (mode & 0o7777);
         inode.uid = uid;
@@ -4549,51 +5289,45 @@ impl<I: BlockImage> Ext4Pager<I> {
         inode.encode(inode_bytes)?;
         self.refresh_inode_checksum(new_ino, &inode, inode_bytes)?;
 
-        let (dir_home, dir_before, dir_after) =
-            self.plan_append_dir_entry_after_image(parent_ino, name, new_ino, 1)?;
-
-        let mut plan =
+        let mut create =
             Ext4MutationPlan::new(MutationOrigin::Create, new_ino.get() as u64, fsync_stamp);
-        plan.push_metadata(MetadataBlock {
-            home: bitmap_home,
-            role: MetaRole::InodeBitmap,
-            before_version: crc32c(0, &bitmap_before) as u64,
-            after: bitmap_after,
-            depends_on: Vec::new(),
-        })
-        .map_err(|_| Ext4FormatError::Corrupt)?;
-        plan.push_metadata(MetadataBlock {
-            home: group_desc_home,
-            role: MetaRole::GroupDescriptor,
-            before_version: crc32c(0, &group_desc_before) as u64,
-            after: group_desc_after,
-            depends_on: Vec::new(),
-        })
-        .map_err(|_| Ext4FormatError::Corrupt)?;
-        plan.push_metadata(MetadataBlock {
-            home: superblock_home,
-            role: MetaRole::Superblock,
-            before_version: crc32c(0, &superblock_before) as u64,
-            after: superblock_after,
-            depends_on: Vec::new(),
-        })
-        .map_err(|_| Ext4FormatError::Corrupt)?;
-        plan.push_metadata(MetadataBlock {
-            home: location.block,
-            role: MetaRole::InodeTable,
-            before_version: crc32c(0, &inode_table_before) as u64,
-            after: inode_table_after,
-            depends_on: Vec::new(),
-        })
-        .map_err(|_| Ext4FormatError::Corrupt)?;
-        plan.push_metadata(MetadataBlock {
-            home: dir_home,
-            role: MetaRole::DirectoryBlock,
-            before_version: crc32c(0, &dir_before) as u64,
-            after: dir_after,
-            depends_on: Vec::new(),
-        })
-        .map_err(|_| Ext4FormatError::Corrupt)?;
+        create
+            .push_metadata(MetadataBlock {
+                home: bitmap_home,
+                role: MetaRole::InodeBitmap,
+                before_version: crc32c(0, &bitmap_before) as u64,
+                after: bitmap_after,
+                depends_on: Vec::new(),
+            })
+            .map_err(|_| Ext4FormatError::Corrupt)?;
+        create
+            .push_metadata(MetadataBlock {
+                home: group_desc_home,
+                role: MetaRole::GroupDescriptor,
+                before_version: crc32c(0, &group_desc_before) as u64,
+                after: group_desc_after,
+                depends_on: Vec::new(),
+            })
+            .map_err(|_| Ext4FormatError::Corrupt)?;
+        create
+            .push_metadata(MetadataBlock {
+                home: superblock_home,
+                role: MetaRole::Superblock,
+                before_version: crc32c(0, &superblock_before) as u64,
+                after: superblock_after,
+                depends_on: Vec::new(),
+            })
+            .map_err(|_| Ext4FormatError::Corrupt)?;
+        create
+            .push_metadata(MetadataBlock {
+                home: location.block,
+                role: MetaRole::InodeTable,
+                before_version: crc32c(0, &inode_table_before) as u64,
+                after: inode_table_after,
+                depends_on: Vec::new(),
+            })
+            .map_err(|_| Ext4FormatError::Corrupt)?;
+        merge_chained_mutation(&mut plan, &create)?;
         Ok((new_ino, plan))
     }
 
@@ -4613,8 +5347,34 @@ impl<I: BlockImage> Ext4Pager<I> {
         gid: u32,
         fsync_stamp: FsyncStamp,
     ) -> Result<(InodeNo, u64, Ext4MutationPlan)> {
+        let pending_before = self.pending_metadata.clone();
+        let planned =
+            self.plan_create_directory_inner(parent_ino, name, mode, uid, gid, fsync_stamp);
+        self.pending_metadata = pending_before;
+        planned
+    }
+
+    fn plan_create_directory_inner(
+        &mut self,
+        parent_ino: InodeNo,
+        name: &[u8],
+        mode: u16,
+        uid: u32,
+        gid: u32,
+        fsync_stamp: FsyncStamp,
+    ) -> Result<(InodeNo, u64, Ext4MutationPlan)> {
         let (new_ino, inode_group, inode_bitmap_home, inode_bitmap_before, inode_bitmap_after) =
             self.plan_inode_allocation()?;
+        let mut plan = self.plan_append_dir_entry_mutation(
+            parent_ino,
+            name,
+            new_ino,
+            2,
+            MutationOrigin::Create,
+            new_ino.get() as u64,
+            fsync_stamp,
+        )?;
+        self.stage_mutation_after_images(&plan);
         let (data_block, block_group, block_bitmap_home, block_bitmap_before, block_bitmap_after) =
             self.plan_block_allocation()?;
         let group_desc_updates = self.plan_group_mkdir_count_updates(
@@ -4638,7 +5398,9 @@ impl<I: BlockImage> Ext4Pager<I> {
             &mut child_dir_after[12..],
         )?;
 
+        let generation = self.next_inode_generation(new_ino)?;
         let mut inode = Inode::default();
+        inode.generation = generation;
         inode.extra_isize = self.new_inode_extra_isize();
         inode.mode = Inode::S_IFDIR | (mode & 0o7777);
         inode.uid = uid;
@@ -4703,82 +5465,79 @@ impl<I: BlockImage> Ext4Pager<I> {
             new_table_after = parent_table_after;
         }
 
-        let (parent_dir_home, parent_dir_before, parent_dir_after) =
-            self.plan_append_dir_entry_after_image(parent_ino, name, new_ino, 2)?;
-
-        let mut plan =
+        let mut create =
             Ext4MutationPlan::new(MutationOrigin::Create, new_ino.get() as u64, fsync_stamp);
-        plan.push_metadata(MetadataBlock {
-            home: block_bitmap_home,
-            role: MetaRole::BlockBitmap,
-            before_version: crc32c(0, &block_bitmap_before) as u64,
-            after: block_bitmap_after,
-            depends_on: Vec::new(),
-        })
-        .map_err(|_| Ext4FormatError::Corrupt)?;
-        plan.push_metadata(MetadataBlock {
-            home: inode_bitmap_home,
-            role: MetaRole::InodeBitmap,
-            before_version: crc32c(0, &inode_bitmap_before) as u64,
-            after: inode_bitmap_after,
-            depends_on: Vec::new(),
-        })
-        .map_err(|_| Ext4FormatError::Corrupt)?;
+        create
+            .push_metadata(MetadataBlock {
+                home: block_bitmap_home,
+                role: MetaRole::BlockBitmap,
+                before_version: crc32c(0, &block_bitmap_before) as u64,
+                after: block_bitmap_after,
+                depends_on: Vec::new(),
+            })
+            .map_err(|_| Ext4FormatError::Corrupt)?;
+        create
+            .push_metadata(MetadataBlock {
+                home: inode_bitmap_home,
+                role: MetaRole::InodeBitmap,
+                before_version: crc32c(0, &inode_bitmap_before) as u64,
+                after: inode_bitmap_after,
+                depends_on: Vec::new(),
+            })
+            .map_err(|_| Ext4FormatError::Corrupt)?;
         for (home, before, after) in group_desc_updates {
-            plan.push_metadata(MetadataBlock {
-                home,
-                role: MetaRole::GroupDescriptor,
-                before_version: crc32c(0, &before) as u64,
-                after,
+            create
+                .push_metadata(MetadataBlock {
+                    home,
+                    role: MetaRole::GroupDescriptor,
+                    before_version: crc32c(0, &before) as u64,
+                    after,
+                    depends_on: Vec::new(),
+                })
+                .map_err(|_| Ext4FormatError::Corrupt)?;
+        }
+        create
+            .push_metadata(MetadataBlock {
+                home: superblock_home,
+                role: MetaRole::Superblock,
+                before_version: crc32c(0, &superblock_before) as u64,
+                after: superblock_after,
                 depends_on: Vec::new(),
             })
             .map_err(|_| Ext4FormatError::Corrupt)?;
-        }
-        plan.push_metadata(MetadataBlock {
-            home: superblock_home,
-            role: MetaRole::Superblock,
-            before_version: crc32c(0, &superblock_before) as u64,
-            after: superblock_after,
-            depends_on: Vec::new(),
-        })
-        .map_err(|_| Ext4FormatError::Corrupt)?;
-        plan.push_metadata(MetadataBlock {
-            home: parent_location.block,
-            role: MetaRole::InodeTable,
-            before_version: crc32c(0, &parent_table_before) as u64,
-            after: parent_table_after,
-            depends_on: Vec::new(),
-        })
-        .map_err(|_| Ext4FormatError::Corrupt)?;
-        if new_location.block != parent_location.block {
-            plan.push_metadata(MetadataBlock {
-                home: new_location.block,
+        create
+            .push_metadata(MetadataBlock {
+                home: parent_location.block,
                 role: MetaRole::InodeTable,
-                before_version: crc32c(0, &new_table_before) as u64,
-                after: new_table_after,
+                before_version: crc32c(0, &parent_table_before) as u64,
+                after: parent_table_after,
                 depends_on: Vec::new(),
             })
             .map_err(|_| Ext4FormatError::Corrupt)?;
+        if new_location.block != parent_location.block {
+            create
+                .push_metadata(MetadataBlock {
+                    home: new_location.block,
+                    role: MetaRole::InodeTable,
+                    before_version: crc32c(0, &new_table_before) as u64,
+                    after: new_table_after,
+                    depends_on: Vec::new(),
+                })
+                .map_err(|_| Ext4FormatError::Corrupt)?;
         }
-        plan.push_metadata(MetadataBlock {
-            home: parent_dir_home,
-            role: MetaRole::DirectoryBlock,
-            before_version: crc32c(0, &parent_dir_before) as u64,
-            after: parent_dir_after,
-            depends_on: Vec::new(),
-        })
-        .map_err(|_| Ext4FormatError::Corrupt)?;
-        plan.push_metadata(MetadataBlock {
-            home: data_block,
-            role: MetaRole::DirectoryBlock,
-            before_version: crc32c(0, &child_dir_before) as u64,
-            after: child_dir_after,
-            depends_on: Vec::new(),
-        })
-        .map_err(|_| Ext4FormatError::Corrupt)?;
-        plan.allocations.push(BlockClaim {
+        create
+            .push_metadata(MetadataBlock {
+                home: data_block,
+                role: MetaRole::DirectoryBlock,
+                before_version: crc32c(0, &child_dir_before) as u64,
+                after: child_dir_after,
+                depends_on: Vec::new(),
+            })
+            .map_err(|_| Ext4FormatError::Corrupt)?;
+        create.allocations.push(BlockClaim {
             physical_block: data_block,
         });
+        merge_chained_mutation(&mut plan, &create)?;
         Ok((new_ino, data_block, plan))
     }
 
@@ -4795,14 +5554,48 @@ impl<I: BlockImage> Ext4Pager<I> {
         gid: u32,
         fsync_stamp: FsyncStamp,
     ) -> Result<(InodeNo, Ext4MutationPlan)> {
+        let pending_before = self.pending_metadata.clone();
+        let planned = self.plan_create_fast_symlink_inner(
+            parent_ino,
+            name,
+            link_target,
+            uid,
+            gid,
+            fsync_stamp,
+        );
+        self.pending_metadata = pending_before;
+        planned
+    }
+
+    fn plan_create_fast_symlink_inner(
+        &mut self,
+        parent_ino: InodeNo,
+        name: &[u8],
+        link_target: &[u8],
+        uid: u32,
+        gid: u32,
+        fsync_stamp: FsyncStamp,
+    ) -> Result<(InodeNo, Ext4MutationPlan)> {
         let (new_ino, group_index, bitmap_home, bitmap_before, bitmap_after) =
             self.plan_inode_allocation()?;
+        let mut plan = self.plan_append_dir_entry_mutation(
+            parent_ino,
+            name,
+            new_ino,
+            7,
+            MutationOrigin::Create,
+            new_ino.get() as u64,
+            fsync_stamp,
+        )?;
+        self.stage_mutation_after_images(&plan);
         let (group_desc_home, group_desc_before, group_desc_after) =
             self.plan_group_free_inode_decrement(group_index, &bitmap_after)?;
         let (superblock_home, superblock_before, superblock_after) =
             self.plan_superblock_free_inode_decrement()?;
 
+        let generation = self.next_inode_generation(new_ino)?;
         let mut inode = Inode::default();
+        inode.generation = generation;
         inode.extra_isize = self.new_inode_extra_isize();
         inode.mode = Inode::S_IFLNK | 0o777;
         inode.uid = uid;
@@ -4824,51 +5617,45 @@ impl<I: BlockImage> Ext4Pager<I> {
         inode.encode(inode_bytes)?;
         self.refresh_inode_checksum(new_ino, &inode, inode_bytes)?;
 
-        let (dir_home, dir_before, dir_after) =
-            self.plan_append_dir_entry_after_image(parent_ino, name, new_ino, 7)?;
-
-        let mut plan =
+        let mut create =
             Ext4MutationPlan::new(MutationOrigin::Create, new_ino.get() as u64, fsync_stamp);
-        plan.push_metadata(MetadataBlock {
-            home: bitmap_home,
-            role: MetaRole::InodeBitmap,
-            before_version: crc32c(0, &bitmap_before) as u64,
-            after: bitmap_after,
-            depends_on: Vec::new(),
-        })
-        .map_err(|_| Ext4FormatError::Corrupt)?;
-        plan.push_metadata(MetadataBlock {
-            home: group_desc_home,
-            role: MetaRole::GroupDescriptor,
-            before_version: crc32c(0, &group_desc_before) as u64,
-            after: group_desc_after,
-            depends_on: Vec::new(),
-        })
-        .map_err(|_| Ext4FormatError::Corrupt)?;
-        plan.push_metadata(MetadataBlock {
-            home: superblock_home,
-            role: MetaRole::Superblock,
-            before_version: crc32c(0, &superblock_before) as u64,
-            after: superblock_after,
-            depends_on: Vec::new(),
-        })
-        .map_err(|_| Ext4FormatError::Corrupt)?;
-        plan.push_metadata(MetadataBlock {
-            home: location.block,
-            role: MetaRole::InodeTable,
-            before_version: crc32c(0, &inode_table_before) as u64,
-            after: inode_table_after,
-            depends_on: Vec::new(),
-        })
-        .map_err(|_| Ext4FormatError::Corrupt)?;
-        plan.push_metadata(MetadataBlock {
-            home: dir_home,
-            role: MetaRole::DirectoryBlock,
-            before_version: crc32c(0, &dir_before) as u64,
-            after: dir_after,
-            depends_on: Vec::new(),
-        })
-        .map_err(|_| Ext4FormatError::Corrupt)?;
+        create
+            .push_metadata(MetadataBlock {
+                home: bitmap_home,
+                role: MetaRole::InodeBitmap,
+                before_version: crc32c(0, &bitmap_before) as u64,
+                after: bitmap_after,
+                depends_on: Vec::new(),
+            })
+            .map_err(|_| Ext4FormatError::Corrupt)?;
+        create
+            .push_metadata(MetadataBlock {
+                home: group_desc_home,
+                role: MetaRole::GroupDescriptor,
+                before_version: crc32c(0, &group_desc_before) as u64,
+                after: group_desc_after,
+                depends_on: Vec::new(),
+            })
+            .map_err(|_| Ext4FormatError::Corrupt)?;
+        create
+            .push_metadata(MetadataBlock {
+                home: superblock_home,
+                role: MetaRole::Superblock,
+                before_version: crc32c(0, &superblock_before) as u64,
+                after: superblock_after,
+                depends_on: Vec::new(),
+            })
+            .map_err(|_| Ext4FormatError::Corrupt)?;
+        create
+            .push_metadata(MetadataBlock {
+                home: location.block,
+                role: MetaRole::InodeTable,
+                before_version: crc32c(0, &inode_table_before) as u64,
+                after: inode_table_after,
+                depends_on: Vec::new(),
+            })
+            .map_err(|_| Ext4FormatError::Corrupt)?;
+        merge_chained_mutation(&mut plan, &create)?;
         Ok((new_ino, plan))
     }
 
@@ -4947,6 +5734,17 @@ impl<I: BlockImage> Ext4Pager<I> {
         self.write_inode(new_ino, &inode)?;
         self.append_dir_entry(parent_ino, name, new_ino, 2 /* EXT4_FT_DIR */)?;
         Ok(new_ino)
+    }
+
+    /// Return the next persistent incarnation for an inode bitmap slot.
+    ///
+    /// Unlink keeps the previous generation in the cleared inode so a later
+    /// allocation of the same numeric inode cannot inherit stale VFS, page
+    /// cache, or advisory-lock state from its former occupant.
+    fn next_inode_generation(&mut self, inode: InodeNo) -> Result<u32> {
+        let previous = self.read_inode(inode)?.generation;
+        let next = previous.wrapping_add(1);
+        Ok(if next == 0 { 1 } else { next })
     }
 
     fn read_inode(&mut self, inode: InodeNo) -> Result<Inode> {
@@ -5346,6 +6144,7 @@ fn read_group_descs<I: BlockImage>(image: &I, superblock: &Superblock) -> Result
 
 fn inode_to_meta(inode: Inode) -> InodeMetaLite {
     InodeMetaLite {
+        generation: inode.generation,
         mode: inode.mode,
         uid: inode.uid,
         gid: inode.gid,

@@ -47,6 +47,16 @@ impl TaskWakeState {
         self.wake_queue.lock().push_back(self.task);
     }
 
+    /// Preserve a mailbox wake that races with an already-owned poll.
+    ///
+    /// The polling hart still owns the future, so publishing another global
+    /// wake-queue entry would allow a second hart to race the poll handoff.
+    /// `finish_polled_pending` consumes this bit and performs the sole
+    /// Polling -> Runnable transition after the poll returns.
+    pub(crate) fn request_while_polling(&self) {
+        self.wake_requested.store(true, Ordering::Release);
+    }
+
     pub(crate) fn take_wake(&self) -> bool {
         self.wake_requested.swap(false, Ordering::AcqRel)
     }

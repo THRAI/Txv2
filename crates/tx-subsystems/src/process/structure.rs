@@ -233,6 +233,17 @@ impl ProcessIdentity {
         &self.payload
     }
 
+    /// Retain the live process payload for a bounded operation.
+    ///
+    /// Syscall contexts use this once at entry, then access the payload's
+    /// own fine-grained fd/cwd/resource locks directly. Re-locking the outer
+    /// identity slot for every individual lookup adds no lifetime safety:
+    /// the retained payload capability already keeps the exact live object
+    /// valid until the syscall frame is dropped.
+    pub fn payload_cap(&self) -> Option<PayloadCap<ProcessPayload>> {
+        self.payload.lock().as_ref().cloned()
+    }
+
     /// Snapshot the current process-group `Cap`. The returned `Cap` is a
     /// strong reference; it remains valid until dropped even if the
     /// target rebinds via `setpgid`.
@@ -1226,6 +1237,12 @@ pub struct ProcessPayload {
     /// Field shape mirrors the existing
     /// `aspace: AtomicSlot<Cap<AddressSpace>>` precedent above.
     pub(crate) cred: AtomicSlot<Cap<Cred>>,
+    /// Placeholder policy-restriction authority retained for the lifetime of
+    /// this process payload.  Until the real append-only restriction stack is
+    /// implemented, every syscall in the process observes the same immutable
+    /// unit-valued handle; retaining one cap avoids a zone allocation and EBR
+    /// retirement on every script-context construction.
+    pub(crate) restrictions: Cap<step_engine::RestrictionStackHandle>,
     /// Serializes credential writers and records an exec reservation without
     /// keeping a lock guard alive across exec's reversible phases.
     pub(crate) cred_mutation: ProcessSpinMutex<CredMutationState>,
@@ -1499,6 +1516,15 @@ impl ProcessPayload {
             .expect("ProcessPayload.cred slot is always populated")
     }
 
+    /// Clone the process-owned placeholder restriction authority.
+    ///
+    /// The placeholder is immutable, so sharing it across concurrent syscall
+    /// frames has the same semantics as minting an identical unit-valued cap
+    /// per call without the allocator/reclaimer traffic.
+    pub fn restrictions_cap(&self) -> Cap<step_engine::RestrictionStackHandle> {
+        self.restrictions.clone()
+    }
+
     pub(crate) fn reserve_exec_cred(&self) -> Option<(ExecCredReservationToken, Cred)> {
         let mut state = self.cred_mutation.lock();
         if state.exec_reservation.is_some() {
@@ -1689,6 +1715,56 @@ impl ProcessPayload {
         Some(fd)
     }
 
+    /// Publish the two ends of a newly-created pipe/socket pair as one fd-table
+    /// transaction.
+    ///
+    /// Linux makes both descriptor allocations visible atomically.  Publishing
+    /// one end, dropping the table lock, and then publishing the other leaves a
+    /// multithreaded process with an observable half-created pair and lets an
+    /// unrelated allocator consume the second slot.  It also makes rollback by
+    /// descriptor number unsafe once another thread can close and reuse the
+    /// first slot.  Keep the canonical `fds -> fd_cloexec` lock order and make
+    /// no table change unless two slots fit below RLIMIT_NOFILE.
+    pub fn install_new_fd_pair(
+        &self,
+        first_file: Cap<OpenFile>,
+        second_file: Cap<OpenFile>,
+        want_cloexec: bool,
+    ) -> Option<(u32, u32)> {
+        let mut files = self.fds.lock();
+        let limit = self.rlimit_nofile_cur.load(Ordering::Acquire);
+
+        let find_free = |start: u32| -> Option<u32> {
+            let mut fd = start;
+            for existing in files.range(start..).map(|(&fd, _)| fd) {
+                if existing == fd {
+                    fd = fd.checked_add(1)?;
+                } else if existing > fd {
+                    break;
+                }
+            }
+            (fd < limit).then_some(fd)
+        };
+        let first_fd = find_free(0)?;
+        // `first_fd` is not in `files`; starting at its successor makes the
+        // second search distinct without publishing a temporary first entry.
+        let second_fd = find_free(first_fd.checked_add(1)?)?;
+
+        let mut cloexec = self.fd_cloexec.lock();
+        debug_assert!(!files.contains_key(&first_fd));
+        debug_assert!(!files.contains_key(&second_fd));
+        files.insert(first_fd, first_file);
+        files.insert(second_fd, second_file);
+        if want_cloexec {
+            cloexec.insert(first_fd);
+            cloexec.insert(second_fd);
+        } else {
+            cloexec.remove(&first_fd);
+            cloexec.remove(&second_fd);
+        }
+        Some((first_fd, second_fd))
+    }
+
     pub fn install_fd_with_cloexec(
         &self,
         fd: u32,
@@ -1860,13 +1936,22 @@ impl ProcessPayload {
         Some(generation)
     }
 
-    /// Attach a freshly signed thread only while no process lifecycle episode
-    /// owns the shared lane. Holding `group_exit` across the idle check and
-    /// roster insertion prevents exec from snapshotting the old roster and a
-    /// concurrent `CLONE_THREAD` from attaching immediately afterwards.
+    /// Attach a freshly signed thread while no process-wide lifecycle episode
+    /// freezes the thread roster. A local `ThreadExit` only protects the
+    /// exiting thread's resumable userspace cleanup; a live sibling may still
+    /// create another thread while that cleanup is in flight. In contrast,
+    /// group exit and every exec phase must reject the attachment because they
+    /// own a fixed roster snapshot.
+    ///
+    /// Holding `group_exit` across the admission check and roster insertion
+    /// prevents exec/group-exit from fixing the old roster and a concurrent
+    /// `CLONE_THREAD` from attaching immediately afterwards.
     pub(crate) fn attach_thread_if_lifecycle_idle(&self, thread: Cap<ThreadIdentity>) -> bool {
         let episode = self.group_exit.lock();
-        if episode.is_some() {
+        if episode
+            .as_ref()
+            .is_some_and(|current| current.owner != GroupExitOwner::ThreadExit)
+        {
             return false;
         }
         self.threads.attach(thread);

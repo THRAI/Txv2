@@ -1,8 +1,13 @@
 use core::ptr::NonNull;
-
-use crate::{boot_static, user_access, Platform};
 #[cfg(target_arch = "riscv64")]
-use crate::{current_kernel_resume_ctx_ptr, trap_stack_top_for_cpu, KernelResumeCtx};
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+use crate::{boot_static, pmap::topology as pmap_topology, user_access, Platform};
+#[cfg(target_arch = "riscv64")]
+use crate::{
+    current_kernel_resume_ctx_ptr, kernel_resume_ctx_ptr_for_cpu, trap_stack_top_for_cpu,
+    KernelResumeCtx, MAX_BOOT_CPUS,
+};
 #[cfg(target_arch = "riscv64")]
 use tx_hal::SmpIf;
 use tx_hal::{
@@ -88,6 +93,9 @@ core::arch::global_asm!(
     .equ TX_RV64_TF_F30, TX_RV64_TF_F_BASE + 30*8
     .equ TX_RV64_TF_F31, TX_RV64_TF_F_BASE + 31*8
     .equ TX_RV64_TF_FCSR, TX_RV64_TF_F_BASE + 256
+    .equ TX_RV64_TF_FP_STATE_FLAGS, TX_RV64_TF_F_BASE + 260
+    .equ TX_RV64_TF_FP_CAPTURE_VALID, 1
+    .equ TX_RV64_TF_FP_RESTORE_REQUIRED, 2
     # Keep the frame 16-byte aligned at every Rust call boundary.  The
     # register payload occupies 552 bytes; the final 8 bytes are ABI padding.
     .equ TX_RV64_TF_SIZE, 560
@@ -100,8 +108,19 @@ core::arch::global_asm!(
     .equ TX_RV64_RCTX_RA, 8
     .equ TX_RV64_RCTX_S0, 16
     # s1..s11 follow at +8 each up to offset 104.
+    .equ TX_RV64_RCTX_CALLER_RA_SLOT, 112
+    .equ TX_RV64_RCTX_CALLER_RA_EXPECTED, 120
+    .equ TX_RV64_RCTX_LOADED_SP, 128
+    .equ TX_RV64_RCTX_LOADED_RA, 136
+    .equ TX_RV64_RCTX_ENTRY_GENERATION, 144
+    .equ TX_RV64_RCTX_RESUME_GENERATION, 152
+    # Release-build layout of `enter_userspace_with_context`: its 688-byte
+    # frame stores the caller return PC at sp+680. Keep this temporary fault-
+    # localisation constant in sync with the release disassembly.
+    .equ TX_RV64_ENTRY_CALLER_RA_OFFSET, 680
     # Rv64PerCpuArea::trap_stack_top, addressed through kernel tp.
     .equ TX_RV64_PERCPU_TRAP_STACK_TOP, 24
+    .equ TX_RV64_PERCPU_CPU_ID, 0
 
     .globl tx_rv64_qemu_minimal_trap_vector
 tx_rv64_qemu_minimal_trap_vector:
@@ -232,14 +251,18 @@ tx_rv64_qemu_minimal_trap_vector:
     sd t0, TX_RV64_TF_STVAL(sp)
     csrr t0, sstatus
     sd t0, TX_RV64_TF_SSTATUS(sp)
-    # t0 = sstatus; save FP regs only once user FP state is active
-    # (FS=Clean/Dirty). FS=Initial means the frame owns the zero state
-    # and no user FP instruction has dirtied it yet.
+    sw zero, TX_RV64_TF_FP_STATE_FLAGS(sp)
+    # t0 = sstatus; only Dirty state differs from the image retained by the
+    # ThreadPayload, so Clean may reuse that authoritative copy. Crucially, a
+    # direct-return trap must leave Dirty as Dirty: clearing it before the
+    # captured image has been published lets a later preemption reuse stale
+    # payload state. Context restore is the only path that may establish Clean.
+    # FS=Initial owns the zero state and also needs no capture.
     # Using t0 is safe: it was already saved to TX_RV64_TF_X5(sp) above.
     srli t0, t0, 13
     andi t0, t0, 3
-    li t1, 2
-    bltu t0, t1, 1f
+    li t1, 3
+    bne t0, t1, 1f
     fsd f0,  TX_RV64_TF_F0(sp)
     fsd f1,  TX_RV64_TF_F1(sp)
     fsd f2,  TX_RV64_TF_F2(sp)
@@ -274,6 +297,8 @@ tx_rv64_qemu_minimal_trap_vector:
     fsd f31, TX_RV64_TF_F31(sp)
     frcsr t0
     sw   t0, TX_RV64_TF_FCSR(sp)
+    li t0, TX_RV64_TF_FP_CAPTURE_VALID
+    sw t0, TX_RV64_TF_FP_STATE_FLAGS(sp)
 1:
 
     # From-user traps arrive with gp restored from the user frame.
@@ -296,6 +321,11 @@ tx_rv64_qemu_minimal_trap_vector:
     addi a0, sp, TX_RV64_TF_SIZE
     call tx_rv64_kernel_tls_from_trap_stack_top
     mv tp, a0
+    # Preserve the authoritative source-hart identity in the frame.  Rust
+    # trap handling must not derive it from tp a second time while selecting
+    # the suspended KernelResumeCtx.
+    ld t0, TX_RV64_PERCPU_CPU_ID(tp)
+    sd t0, TX_RV64_TF_TMP_SSCRATCH(sp)
     j .Ltx_rv64_kernel_tp_ready
 .Ltx_rv64_restore_kernel_tp:
     ld tp, TX_RV64_TF_X4(sp)
@@ -324,12 +354,11 @@ tx_rv64_qemu_minimal_trap_vector:
     csrw sepc, t0
     ld t0, TX_RV64_TF_SSTATUS(sp)
     csrw sstatus, t0
-    # t0 = outgoing sstatus; restore FP regs if FS != Off. Ordinary
-    # integer-only threads return with FS=Off and avoid this block;
-    # the lazy-FP illegal-instruction path uses FS=Initial once to
-    # publish the zero FP state before retrying the first FP insn.
-    srli t0, t0, 13
-    andi t0, t0, 3
+    # Hardware FP registers remain untouched while Rust handles a normal trap,
+    # so a captured Dirty image does not need to be reloaded on a direct return.
+    # Only an explicit context restore (rt_sigreturn/lazy first use) sets bit 1.
+    lw t0, TX_RV64_TF_FP_STATE_FLAGS(sp)
+    andi t0, t0, TX_RV64_TF_FP_RESTORE_REQUIRED
     beqz t0, 2f
     lw   t0, TX_RV64_TF_FCSR(sp)
     fscsr t0
@@ -455,6 +484,18 @@ tx_rv64_enter_userspace_save_resume:
     sd s10, (TX_RV64_RCTX_S0 +  80)(a0)
     sd s11, (TX_RV64_RCTX_S0 +  88)(a0)
 
+    # Snapshot the suspended Rust frame's saved caller return address. This
+    # does not repair it: the trap path compares the live slot with this value
+    # before dispatch, after dispatch, and again after switching back to the
+    # kernel root, and stops at the first discrepancy.
+    addi t0, sp, TX_RV64_ENTRY_CALLER_RA_OFFSET
+    sd t0, TX_RV64_RCTX_CALLER_RA_SLOT(a0)
+    ld t0, 0(t0)
+    sd t0, TX_RV64_RCTX_CALLER_RA_EXPECTED(a0)
+    ld t0, TX_RV64_RCTX_ENTRY_GENERATION(a0)
+    addi t0, t0, 1
+    sd t0, TX_RV64_RCTX_ENTRY_GENERATION(a0)
+
     # Re-prime sscratch with trap_stack_top so the next user trap
     # lands on the trap stack.
     csrw sscratch, a2
@@ -553,8 +594,14 @@ tx_rv64_resume_kernel_after_reschedule:
     .option norelax
     la gp, __global_pointer$
     .option pop
-    ld sp,   TX_RV64_RCTX_SP(a0)
-    ld ra,   TX_RV64_RCTX_RA(a0)
+    ld t0, TX_RV64_RCTX_SP(a0)
+    sd t0, TX_RV64_RCTX_LOADED_SP(a0)
+    mv sp, t0
+    ld t0, TX_RV64_RCTX_RA(a0)
+    sd t0, TX_RV64_RCTX_LOADED_RA(a0)
+    mv ra, t0
+    ld t0, TX_RV64_RCTX_ENTRY_GENERATION(a0)
+    sd t0, TX_RV64_RCTX_RESUME_GENERATION(a0)
     ld s0,  (TX_RV64_RCTX_S0 +   0)(a0)
     ld s1,  (TX_RV64_RCTX_S0 +   8)(a0)
     ld s2,  (TX_RV64_RCTX_S0 +  16)(a0)
@@ -581,7 +628,7 @@ const RV64_SSTATUS_SPIE: usize = 1 << 5;
 const RV64_SSTATUS_FS_MASK: usize = 3 << 13;
 const RV64_SSTATUS_FS_OFF: usize = 0 << 13;
 const RV64_SSTATUS_FS_INITIAL: usize = 1 << 13;
-const RV64_SSTATUS_FS_DIRTY: usize = 3 << 13;
+const RV64_SSTATUS_FS_CLEAN: usize = 2 << 13;
 const X_SP: usize = 2;
 const X_RA: usize = 1;
 const X_TP: usize = 4;
@@ -603,13 +650,67 @@ pub struct Rv64TrapFrame {
     pub sstatus: usize, // offset  280
     pub f: [u64; 32],   // offsets 288..543  (TX_RV64_TF_F_BASE)
     pub fcsr: u32,      // offset  544       (TX_RV64_TF_FCSR)
-    pub _pad_fp: u32,   // offset  548       (pad FP payload to 8 bytes)
-                        // payload = 552 bytes; repr(align(16)) rounds the
-                        // complete frame to 560 bytes (TX_RV64_TF_SIZE)
+    /// Bit 0 says assembly captured a Dirty hardware FP image. Bit 1 asks the
+    /// direct-return epilogue to install a context explicitly written by Rust.
+    pub _fp_state_flags: u32, // offset 548 (TX_RV64_TF_FP_STATE_FLAGS)
+    /// Assembly-only scratch slot at offset 552. Ordinary from-kernel traps
+    /// preserve their exact pre-trap `sscratch` value here before switching to
+    /// the per-hart trap stack.
+    pub _trap_tmp_sscratch: usize,
 }
 
 const _: [(); 560] = [(); core::mem::size_of::<Rv64TrapFrame>()];
 const _: [(); 16] = [(); core::mem::align_of::<Rv64TrapFrame>()];
+const _: () = assert!(core::mem::offset_of!(Rv64TrapFrame, _fp_state_flags) == 548);
+const _: () = assert!(core::mem::offset_of!(Rv64TrapFrame, _trap_tmp_sscratch) == 552);
+
+const RV64_FP_CAPTURE_VALID: u32 = 1 << 0;
+const RV64_FP_RESTORE_REQUIRED: u32 = 1 << 1;
+
+/// Last supervisor-mode trap that completed dispatch and was safe to return.
+///
+/// A fatal trap deliberately does not overwrite this record.  Therefore a
+/// secondary null-PC fault can still report the interrupt or fixup that
+/// immediately preceded it.  Every field is atomic only so a nested fatal
+/// diagnostic cannot observe a Rust data race; normal writers are per-hart and
+/// run with supervisor interrupts disabled.
+#[cfg(target_arch = "riscv64")]
+struct KernelTrapReturnTrace {
+    sequence: AtomicUsize,
+    scause: AtomicUsize,
+    stval: AtomicUsize,
+    marker: AtomicUsize,
+    incoming_sepc: AtomicUsize,
+    incoming_ra: AtomicUsize,
+    incoming_sp: AtomicUsize,
+    outgoing_sepc: AtomicUsize,
+    outgoing_ra: AtomicUsize,
+    action: AtomicUsize,
+    fixup_recovery: AtomicUsize,
+}
+
+#[cfg(target_arch = "riscv64")]
+impl KernelTrapReturnTrace {
+    const fn new() -> Self {
+        Self {
+            sequence: AtomicUsize::new(0),
+            scause: AtomicUsize::new(0),
+            stval: AtomicUsize::new(0),
+            marker: AtomicUsize::new(0),
+            incoming_sepc: AtomicUsize::new(0),
+            incoming_ra: AtomicUsize::new(0),
+            incoming_sp: AtomicUsize::new(0),
+            outgoing_sepc: AtomicUsize::new(0),
+            outgoing_ra: AtomicUsize::new(0),
+            action: AtomicUsize::new(0),
+            fixup_recovery: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+static KERNEL_TRAP_RETURN_TRACE: [KernelTrapReturnTrace; MAX_BOOT_CPUS] =
+    [const { KernelTrapReturnTrace::new() }; MAX_BOOT_CPUS];
 
 impl Rv64TrapFrame {
     pub const fn snapshot(&self) -> TrapFrameSnapshot {
@@ -714,16 +815,11 @@ impl Rv64TrapFrame {
     }
 
     fn capture_user_context(&self) -> UserTrapContext {
-        let fs = (self.sstatus >> 13) & 3;
-        let fp = if fs >= 2 {
-            let mut flags = UserFpContext::FLAG_VALID;
-            if fs == 3 {
-                flags |= UserFpContext::FLAG_DIRTY;
-            }
+        let fp = if self._fp_state_flags & RV64_FP_CAPTURE_VALID != 0 {
             UserFpContext {
                 regs: self.f,
                 fcsr: self.fcsr,
-                flags,
+                flags: UserFpContext::FLAG_VALID | UserFpContext::FLAG_DIRTY,
                 ..UserFpContext::empty()
             }
         } else {
@@ -745,9 +841,11 @@ impl Rv64TrapFrame {
         if context.fp.is_valid() {
             self.f = context.fp.regs;
             self.fcsr = context.fp.fcsr;
+            self._fp_state_flags = RV64_FP_RESTORE_REQUIRED;
         } else {
             self.f = [0u64; 32];
             self.fcsr = 0;
+            self._fp_state_flags = 0;
         }
         self.prepare_user_return_with_fp_state(context.fp.is_valid());
     }
@@ -771,7 +869,10 @@ impl Rv64TrapFrame {
         self.sstatus &= !RV64_SSTATUS_SPP;
         self.sstatus |= RV64_SSTATUS_SPIE;
         let fs = if fp_valid {
-            RV64_SSTATUS_FS_DIRTY
+            // The frame holds the authoritative saved image. Loading it before
+            // sret establishes a Clean hardware copy; user FP writes will make
+            // the architectural FS field Dirty again.
+            RV64_SSTATUS_FS_CLEAN
         } else {
             RV64_SSTATUS_FS_OFF
         };
@@ -781,6 +882,7 @@ impl Rv64TrapFrame {
     fn enable_initial_user_fp_state(&mut self) {
         self.f = [0u64; 32];
         self.fcsr = 0;
+        self._fp_state_flags = RV64_FP_RESTORE_REQUIRED;
         self.sstatus = (self.sstatus & !RV64_SSTATUS_FS_MASK) | RV64_SSTATUS_FS_INITIAL;
     }
 }
@@ -861,19 +963,6 @@ impl TrapIf for Platform {
 
     /// RV64 implementation of the portable userspace-entry hook.
     ///
-    /// Materialises a fresh `Rv64TrapFrame` from `ctx`, prepares it
-    /// for the user-mode `sret`, and hands it to the existing
-    /// `return_to_userspace` low-level primitive. This is the second
-    /// site of the two-site discipline pinned by
-    /// `txdoc:THREAD-5-4-THE-TWO-SITE-DISCIPLINE`
-    /// (`docs/design/02_execution/THREAD_RUNTIME_v1.md`): the
-    /// userspace-entry shim that produces the `UserTrapContext`
-    /// (in `tx_subsystems::thread_runtime::execution::
-    /// prepare_userspace_entry_payload`) merges any pending syscall
-    /// return into the context's `a0` slot before this call; the
-    /// platform's writeback is the `restore_user_context` shape
-    /// already used by `Rv64TrapFrame::restore_user_context`.
-    ///
     /// Materialises a fresh `Rv64TrapFrame` from `ctx`, stashes the
     /// kernel-side caller's `(sp, ra, callee-saved s-regs)` into
     /// the per-hart [`KernelResumeCtx`], re-primes `sscratch` with
@@ -896,7 +985,8 @@ impl TrapIf for Platform {
             sstatus: 0,
             f: [0u64; 32],
             fcsr: 0,
-            _pad_fp: 0,
+            _fp_state_flags: 0,
+            _trap_tmp_sscratch: 0,
         };
         frame.restore_user_context(ctx);
         // `restore_user_context` already calls `prepare_user_return`,
@@ -907,7 +997,13 @@ impl TrapIf for Platform {
         #[cfg(target_arch = "riscv64")]
         unsafe {
             let cpu = <Platform as SmpIf>::current_cpu_id();
-            let resume_ctx = current_kernel_resume_ctx_ptr();
+            let kernel_sp: usize;
+            core::arch::asm!("mv {sp}, sp", sp = out(reg) kernel_sp, options(nomem, nostack));
+            let stack_cpu = kernel_stack_owner_for_sp(kernel_sp);
+            if stack_cpu != Some(cpu) {
+                report_userspace_entry_cpu_mismatch(cpu, stack_cpu, kernel_sp);
+            }
+            let resume_ctx = kernel_resume_ctx_ptr_for_cpu(cpu);
             let stack_top = trap_stack_top_for_cpu(cpu);
             tx_rv64_enter_userspace_save_resume(resume_ctx, &frame, stack_top);
         }
@@ -1097,12 +1193,234 @@ extern "C" {
 #[cfg(target_arch = "riscv64")]
 #[no_mangle]
 extern "C" fn tx_rv64_qemu_kernel_trap_entry(frame: &mut Rv64TrapFrame) {
+    let previous_mode = frame.previous_mode();
+    let cpu = if previous_mode == TrapPreviousMode::User {
+        source_cpu_from_user_trap(frame)
+    } else {
+        <Platform as SmpIf>::current_cpu_id()
+    };
+    let incoming_sepc = frame.sepc;
+    let incoming_ra = frame.x[X_RA];
+    let incoming_sp = frame.x[X_SP];
+    #[cfg(feature = "trap-trace")]
+    if previous_mode == TrapPreviousMode::User {
+        validate_suspended_kernel_return(frame, b"before-dispatch", cpu);
+    }
     let action = unsafe { tx_kernel_riscv64_qemu_trap_dispatch(frame) };
-    apply_trap_action(frame, action);
+    #[cfg(feature = "trap-trace")]
+    if previous_mode == TrapPreviousMode::User {
+        validate_suspended_kernel_return(frame, b"after-dispatch", cpu);
+    } else if !matches!(action, TrapAction::Terminate) {
+        record_kernel_trap_return(frame, action, incoming_sepc, incoming_ra, incoming_sp);
+    }
+    apply_trap_action(frame, action, cpu);
 }
 
 #[cfg(target_arch = "riscv64")]
-fn apply_trap_action(frame: &Rv64TrapFrame, action: TrapAction) {
+fn source_cpu_from_user_trap(frame: &Rv64TrapFrame) -> tx_hal::CpuId {
+    let source = frame._trap_tmp_sscratch;
+    let tls_cpu = <Platform as SmpIf>::current_cpu_id();
+    if source >= MAX_BOOT_CPUS || source != tls_cpu.0 {
+        console_write_literal(b"txkernel:qemu-riscv64-virt:user-trap-cpu-mismatch\nsource=0x");
+        console_write_hex(source);
+        console_write_literal(b" tls-cpu=0x");
+        console_write_hex(tls_cpu.0);
+        console_write_literal(b" trap-sp=0x");
+        console_write_hex(frame as *const Rv64TrapFrame as usize);
+        console_write_literal(b"\n");
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+    tx_hal::CpuId(source)
+}
+
+#[cfg(target_arch = "riscv64")]
+fn record_kernel_trap_return(
+    frame: &Rv64TrapFrame,
+    action: TrapAction,
+    incoming_sepc: usize,
+    incoming_ra: usize,
+    incoming_sp: usize,
+) {
+    let fixup_recovery = match classify_rv64_trap(frame.scause) {
+        TrapClass::PageFault { .. } => user_access::fixup_lookup(incoming_sepc)
+            .filter(|recovery| *recovery == frame.sepc)
+            .unwrap_or(0),
+        _ => 0,
+    };
+
+    // Kernel interrupt handlers must not rewrite the interrupted stack or the
+    // control-flow pair.  In particular, the trap epilogue loads `sp` from
+    // `frame.x[X_SP]`; accepting a modified value silently moves this hart
+    // onto another hart's boot-stack slice and lets both CPUs overwrite each
+    // other's return frames.  The only supported PC rewrite is the explicit
+    // copy_{from,to}_user page-fault fixup, which redirects sepc to a
+    // linker-declared recovery stub.
+    if frame.x[X_SP] != incoming_sp
+        || frame.x[X_RA] != incoming_ra
+        || (frame.sepc != incoming_sepc && fixup_recovery == 0)
+    {
+        console_write_literal(b"txkernel:qemu-riscv64-virt:kernel-trap-return-corruption\n");
+        console_write_literal(b"scause=0x");
+        console_write_hex(frame.scause);
+        console_write_literal(b" stval=0x");
+        console_write_hex(frame.stval);
+        console_write_literal(b" in-sepc=0x");
+        console_write_hex(incoming_sepc);
+        console_write_literal(b" out-sepc=0x");
+        console_write_hex(frame.sepc);
+        console_write_literal(b" in-ra=0x");
+        console_write_hex(incoming_ra);
+        console_write_literal(b" out-ra=0x");
+        console_write_hex(frame.x[X_RA]);
+        console_write_literal(b" in-sp=0x");
+        console_write_hex(incoming_sp);
+        console_write_literal(b" out-sp=0x");
+        console_write_hex(frame.x[X_SP]);
+        console_write_literal(b"\n");
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+
+    let cpu = <Platform as SmpIf>::current_cpu_id();
+    let trace = &KERNEL_TRAP_RETURN_TRACE[cpu.0];
+    let next_sequence = trace.sequence.load(Ordering::Relaxed).wrapping_add(1);
+    trace.scause.store(frame.scause, Ordering::Relaxed);
+    trace.stval.store(frame.stval, Ordering::Relaxed);
+    trace.marker.store(frame.x[0], Ordering::Relaxed);
+    trace.incoming_sepc.store(incoming_sepc, Ordering::Relaxed);
+    trace.incoming_ra.store(incoming_ra, Ordering::Relaxed);
+    trace.incoming_sp.store(incoming_sp, Ordering::Relaxed);
+    trace.outgoing_sepc.store(frame.sepc, Ordering::Relaxed);
+    trace.outgoing_ra.store(frame.x[X_RA], Ordering::Relaxed);
+    trace.action.store(action as usize, Ordering::Relaxed);
+    trace
+        .fixup_recovery
+        .store(fixup_recovery, Ordering::Relaxed);
+    trace.sequence.store(next_sequence, Ordering::Release);
+}
+
+/// Verify the return address in the kernel stack frame that remains suspended
+/// while this hart executes userspace. The entry assembly snapshots both the
+/// slot address and its value immediately before `sret`; checking at trap
+/// boundaries distinguishes corruption in userspace/MMU state from corruption
+/// caused by the Rust trap dispatcher.
+#[cfg(target_arch = "riscv64")]
+fn validate_suspended_kernel_return(frame: &Rv64TrapFrame, stage: &[u8], cpu: tx_hal::CpuId) {
+    unsafe extern "C" {
+        static __text_start: u8;
+        static __text_end: u8;
+    }
+
+    let ctx_ptr = kernel_resume_ctx_ptr_for_cpu(cpu);
+    // SAFETY: entry assembly is the sole writer for this hart. Volatile reads
+    // are intentional because the writes happen outside Rust's memory model.
+    let (saved_sp, resume_pc, slot, expected) = unsafe {
+        (
+            core::ptr::read_volatile(core::ptr::addr_of!((*ctx_ptr).sp)),
+            core::ptr::read_volatile(core::ptr::addr_of!((*ctx_ptr).ra)),
+            core::ptr::read_volatile(core::ptr::addr_of!((*ctx_ptr).caller_ra_slot)),
+            core::ptr::read_volatile(core::ptr::addr_of!((*ctx_ptr).caller_ra_expected)),
+        )
+    };
+    let stack_top = kernel_stack_top_for_cpu(cpu);
+    const BOOT_STACK_STRIDE: usize = 512 * 1024;
+    let stack_bottom = stack_top.saturating_sub(BOOT_STACK_STRIDE);
+    let slot_valid = slot >= stack_bottom
+        && slot <= stack_top.saturating_sub(core::mem::size_of::<usize>())
+        && slot & (core::mem::align_of::<usize>() - 1) == 0;
+    let text_start = core::ptr::addr_of!(__text_start) as usize;
+    let text_end = core::ptr::addr_of!(__text_end) as usize;
+    let expected_valid = (text_start..text_end).contains(&expected);
+    let actual = if slot_valid {
+        // SAFETY: the range/alignment check above confines the address to this
+        // hart's linker-reserved 512 KiB kernel-stack slice.
+        unsafe { core::ptr::read_volatile(slot as *const usize) }
+    } else {
+        0
+    };
+
+    if slot_valid && expected_valid && actual == expected {
+        return;
+    }
+
+    console_write_literal(b"txkernel:qemu-riscv64-virt:suspended-return-corruption\n");
+    console_write_literal(b"stage=");
+    console_write_literal(stage);
+    console_write_literal(b" hart=0x");
+    console_write_hex(cpu.0);
+    console_write_literal(b" scause=0x");
+    console_write_hex(frame.scause);
+    console_write_literal(b" sepc=0x");
+    console_write_hex(frame.sepc);
+    console_write_literal(b" marker=0x");
+    console_write_hex(frame.x[0]);
+    console_write_literal(b"\nresume-sp=0x");
+    console_write_hex(saved_sp);
+    console_write_literal(b" resume-pc=0x");
+    console_write_hex(resume_pc);
+    console_write_literal(b" slot=0x");
+    console_write_hex(slot);
+    console_write_literal(b" expected=0x");
+    console_write_hex(expected);
+    console_write_literal(b" actual=0x");
+    console_write_hex(actual);
+    console_write_literal(b"\n");
+    console_write_sv39_walk(slot);
+
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Print the hardware page-table path for one virtual address without
+/// allocation. This tells a physical overwrite from an accidental remap: the
+/// expected stack leaf must resolve to the kernel image's same-offset physical
+/// page.
+#[cfg(target_arch = "riscv64")]
+fn console_write_sv39_walk(virt: usize) {
+    const SATP_PPN_MASK: usize = (1usize << 44) - 1;
+    const PTE_V: usize = 1 << 0;
+    const PTE_RWX: usize = (1 << 1) | (1 << 2) | (1 << 3);
+    const PTE_PPN_MASK: usize = (1usize << 44) - 1;
+    const PAGE_SIZE: usize = 4096;
+
+    let satp: usize;
+    unsafe {
+        core::arch::asm!("csrr {satp}, satp", satp = out(reg) satp, options(nomem, nostack));
+    }
+    let mut table_phys = (satp & SATP_PPN_MASK) * PAGE_SIZE;
+    console_write_literal(b"sv39: satp=0x");
+    console_write_hex(satp);
+    console_write_literal(b" root-phys=0x");
+    console_write_hex(table_phys);
+    console_write_literal(b"\n");
+
+    for level in (0..=2usize).rev() {
+        let shift = 12 + level * 9;
+        let index = (virt >> shift) & 0x1ff;
+        let pte_addr = pmap_topology::DIRECT_MAP_BASE + table_phys + index * 8;
+        // SAFETY: satp names the active, direct-mapped page-table root and
+        // every valid branch below it is a page-table page.
+        let pte = unsafe { core::ptr::read_volatile(pte_addr as *const usize) };
+        console_write_literal(b"  level=0x");
+        console_write_hex(level);
+        console_write_literal(b" index=0x");
+        console_write_hex(index);
+        console_write_literal(b" pte=0x");
+        console_write_hex(pte);
+        console_write_literal(b"\n");
+        if pte & PTE_V == 0 || pte & PTE_RWX != 0 {
+            break;
+        }
+        table_phys = ((pte >> 10) & PTE_PPN_MASK) * PAGE_SIZE;
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+fn apply_trap_action(frame: &Rv64TrapFrame, action: TrapAction, cpu: tx_hal::CpuId) {
     let from_user = frame.previous_mode() == TrapPreviousMode::User;
     match action {
         // Resume / DeliverSignal: fall through to the trap-vector
@@ -1137,12 +1455,13 @@ fn apply_trap_action(frame: &Rv64TrapFrame, action: TrapAction) {
         // the next reactor poll without a longjmp.
         TrapAction::Reschedule => {
             if from_user {
-                let cpu = <Platform as SmpIf>::current_cpu_id();
                 let stack_top = trap_stack_top_for_cpu(cpu);
                 crate::deactivate_current_user_pmap();
+                #[cfg(feature = "trap-trace")]
+                validate_suspended_kernel_return(frame, b"after-kernel-root-switch", cpu);
                 unsafe {
                     core::arch::asm!("csrw sscratch, {top}", top = in(reg) stack_top);
-                    let ctx = current_kernel_resume_ctx_ptr();
+                    let ctx = kernel_resume_ctx_ptr_for_cpu(cpu);
                     tx_rv64_resume_kernel_after_reschedule(ctx);
                 }
                 // Asm helper diverges; this path is unreachable.
@@ -1225,12 +1544,225 @@ pub unsafe fn return_to_userspace(_frame: &Rv64TrapFrame) -> ! {
 
 #[cfg(target_arch = "riscv64")]
 fn tx_rv64_qemu_trap_panic(frame: &Rv64TrapFrame) -> ! {
+    // Fatal traps can arrive on more than one hart before the first reporter
+    // has finished writing its context.  The SBI console has no record-level
+    // serialization, so two full dumps otherwise interleave byte-for-byte and
+    // destroy the register evidence needed to localise the original fault.
+    // Keep this diagnostic path allocation- and lock-free: the first hart owns
+    // the report and every later hart stops without touching the console.
+    static REPORTING_HART: AtomicUsize = AtomicUsize::new(usize::MAX);
+    let hart = <Platform as SmpIf>::current_cpu_id().0;
+    if REPORTING_HART
+        .compare_exchange(usize::MAX, hart, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+
     console_write_literal(b"txkernel:qemu-riscv64-virt:trap\nreason=trap-action-terminate\n");
     console_write_trap_summary(frame);
     console_write_trapframe(frame);
+    console_write_kernel_execution_state(frame);
     console_write_fp_chain(frame.x[8]);
     console_write_stack_dump(frame.x[2], 32);
+    console_write_kernel_stack_scan(frame.x[2]);
 
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+fn console_write_kernel_execution_state(frame: &Rv64TrapFrame) {
+    let cpu = <Platform as SmpIf>::current_cpu_id();
+    let ctx = current_kernel_resume_ctx_ptr();
+    // SAFETY: this is the statically allocated save area for the current hart.
+    // The trap path is its only reader/writer, and fatal-trap diagnostics never
+    // return to permit another userspace entry on this hart.
+    let (sp, ra, loaded_sp, loaded_ra, entry_generation, resume_generation) = unsafe {
+        (
+            core::ptr::read_volatile(core::ptr::addr_of!((*ctx).sp)),
+            core::ptr::read_volatile(core::ptr::addr_of!((*ctx).ra)),
+            core::ptr::read_volatile(core::ptr::addr_of!((*ctx).resume_loaded_sp)),
+            core::ptr::read_volatile(core::ptr::addr_of!((*ctx).resume_loaded_ra)),
+            core::ptr::read_volatile(core::ptr::addr_of!((*ctx).entry_generation)),
+            core::ptr::read_volatile(core::ptr::addr_of!((*ctx).resume_generation)),
+        )
+    };
+    let kernel_stack_top = kernel_stack_top_for_cpu(cpu);
+    let trap_stack_top = trap_stack_top_for_cpu(cpu);
+    let current_sscratch: usize;
+    let satp: usize;
+    unsafe {
+        core::arch::asm!(
+            "csrr {sscratch}, sscratch",
+            "csrr {satp}, satp",
+            sscratch = out(reg) current_sscratch,
+            satp = out(reg) satp,
+            options(nomem, nostack),
+        );
+    }
+    console_write_literal(b"kernel-resume: cpu=0x");
+    console_write_hex(cpu.0);
+    console_write_literal(b" ctx=0x");
+    console_write_hex(ctx as usize);
+    console_write_literal(b" sp=0x");
+    console_write_hex(sp);
+    console_write_literal(b" ra=0x");
+    console_write_hex(ra);
+    console_write_literal(b" loaded-sp=0x");
+    console_write_hex(loaded_sp);
+    console_write_literal(b" loaded-ra=0x");
+    console_write_hex(loaded_ra);
+    console_write_literal(b" entry-gen=0x");
+    console_write_hex(entry_generation);
+    console_write_literal(b" resume-gen=0x");
+    console_write_hex(resume_generation);
+    console_write_literal(b"\n");
+    console_write_literal(b"kernel-exec: stack-top=0x");
+    console_write_hex(kernel_stack_top);
+    console_write_literal(b" stack-used=0x");
+    console_write_hex(kernel_stack_top.saturating_sub(frame.x[2]));
+    console_write_literal(b" trap-stack-top=0x");
+    console_write_hex(trap_stack_top);
+    console_write_literal(b" saved-sscratch=0x");
+    // The assembly-only scratch slot shares the final ABI padding word of the
+    // Rust trap-frame layout. For an ordinary from-kernel trap it contains the
+    // exact pre-trap sscratch value.
+    console_write_hex(frame._trap_tmp_sscratch);
+    console_write_literal(b" current-sscratch=0x");
+    console_write_hex(current_sscratch);
+    console_write_literal(b" satp=0x");
+    console_write_hex(satp);
+    console_write_literal(b"\n");
+    console_write_last_kernel_trap_return(cpu);
+}
+
+#[cfg(target_arch = "riscv64")]
+fn console_write_last_kernel_trap_return(cpu: tx_hal::CpuId) {
+    let trace = &KERNEL_TRAP_RETURN_TRACE[cpu.0];
+    let sequence = trace.sequence.load(Ordering::Acquire);
+    console_write_literal(b"last-kernel-trap-return: seq=0x");
+    console_write_hex(sequence);
+    console_write_literal(b" scause=0x");
+    console_write_hex(trace.scause.load(Ordering::Relaxed));
+    console_write_literal(b" stval=0x");
+    console_write_hex(trace.stval.load(Ordering::Relaxed));
+    console_write_literal(b" marker=0x");
+    console_write_hex(trace.marker.load(Ordering::Relaxed));
+    console_write_literal(b" in-sepc=0x");
+    console_write_hex(trace.incoming_sepc.load(Ordering::Relaxed));
+    console_write_literal(b" out-sepc=0x");
+    console_write_hex(trace.outgoing_sepc.load(Ordering::Relaxed));
+    console_write_literal(b" in-ra=0x");
+    console_write_hex(trace.incoming_ra.load(Ordering::Relaxed));
+    console_write_literal(b" out-ra=0x");
+    console_write_hex(trace.outgoing_ra.load(Ordering::Relaxed));
+    console_write_literal(b" in-sp=0x");
+    console_write_hex(trace.incoming_sp.load(Ordering::Relaxed));
+    console_write_literal(b" action=0x");
+    console_write_hex(trace.action.load(Ordering::Relaxed));
+    console_write_literal(b" fixup=0x");
+    console_write_hex(trace.fixup_recovery.load(Ordering::Relaxed));
+    console_write_literal(b"\n");
+}
+
+/// Scan the live portion of the current hart's kernel stack for return-address
+/// candidates. A raw prefix is useful for inspecting arguments, while this
+/// bounded text-only scan retains the deeper call chain that led to a wild
+/// jump without dumping hundreds of unrelated stack words over serial.
+#[cfg(target_arch = "riscv64")]
+fn console_write_kernel_stack_scan(sp: usize) {
+    unsafe extern "C" {
+        static __kernel_start: u8;
+        static __text_end: u8;
+    }
+
+    const KERNEL_ADDR_MIN: usize = 0xffff_0000_0000_0000;
+    if sp < KERNEL_ADDR_MIN || sp & 7 != 0 {
+        return;
+    }
+
+    let cpu = <Platform as SmpIf>::current_cpu_id();
+    let stack_top = kernel_stack_top_for_cpu(cpu);
+    if stack_top <= sp {
+        return;
+    }
+    let text_lo = core::ptr::addr_of!(__kernel_start) as usize;
+    let text_hi = core::ptr::addr_of!(__text_end) as usize;
+    let words = ((stack_top - sp) / core::mem::size_of::<usize>()).min(2048);
+
+    console_write_literal(b"kstack-ra-candidates:\n");
+    let mut printed = 0usize;
+    for index in 0..words {
+        let word_addr = sp + index * core::mem::size_of::<usize>();
+        let word = unsafe { core::ptr::read_volatile(word_addr as *const usize) };
+        if (text_lo..text_hi).contains(&word) {
+            console_write_literal(b"  +0x");
+            console_write_hex(index * core::mem::size_of::<usize>());
+            console_write_literal(b": 0x");
+            console_write_hex(word);
+            console_write_literal(b"\n");
+            printed += 1;
+            if printed >= 96 {
+                break;
+            }
+        }
+    }
+}
+
+/// The boot trampoline assigns one 512 KiB kernel-stack slice per hart before
+/// Rust-side per-CPU state exists. Derive that same bound when the optional
+/// runtime record was never populated, so a fatal stack scan still covers the
+/// live boot/AP stack.
+#[cfg(target_arch = "riscv64")]
+fn kernel_stack_top_for_cpu(cpu: tx_hal::CpuId) -> usize {
+    unsafe extern "C" {
+        static __tx_boot_stack_top: u8;
+    }
+
+    const BOOT_STACK_STRIDE: usize = 512 * 1024;
+    let recorded = crate::RV64_PERCPU_AREAS[cpu.0].kernel_stack_top().0;
+    if recorded != 0 {
+        recorded
+    } else {
+        (core::ptr::addr_of!(__tx_boot_stack_top) as usize)
+            .saturating_sub(cpu.0.saturating_mul(BOOT_STACK_STRIDE))
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+fn kernel_stack_owner_for_sp(sp: usize) -> Option<tx_hal::CpuId> {
+    unsafe extern "C" {
+        static __tx_boot_stack_bottom: u8;
+        static __tx_boot_stack_top: u8;
+    }
+
+    const BOOT_STACK_STRIDE: usize = 512 * 1024;
+    let bottom = core::ptr::addr_of!(__tx_boot_stack_bottom) as usize;
+    let top = core::ptr::addr_of!(__tx_boot_stack_top) as usize;
+    if !(bottom..top).contains(&sp) {
+        return None;
+    }
+    let cpu = top.saturating_sub(1).saturating_sub(sp) / BOOT_STACK_STRIDE;
+    (cpu < MAX_BOOT_CPUS).then_some(tx_hal::CpuId(cpu))
+}
+
+#[cfg(target_arch = "riscv64")]
+fn report_userspace_entry_cpu_mismatch(
+    tls_cpu: tx_hal::CpuId,
+    stack_cpu: Option<tx_hal::CpuId>,
+    sp: usize,
+) -> ! {
+    console_write_literal(b"txkernel:qemu-riscv64-virt:userspace-entry-cpu-mismatch\ntls-cpu=0x");
+    console_write_hex(tls_cpu.0);
+    console_write_literal(b" stack-cpu=0x");
+    console_write_hex(stack_cpu.map_or(usize::MAX, |cpu| cpu.0));
+    console_write_literal(b" sp=0x");
+    console_write_hex(sp);
+    console_write_literal(b"\n");
     loop {
         core::hint::spin_loop();
     }

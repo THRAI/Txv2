@@ -9,3 +9,9 @@ repository.workspace = true
 path = "src/lib.rs"
 test = false
 doctest = false
+
+[features]
+default = []
+# LA64 keeps LSX/LASX state in the architecture-neutral user context.  Other
+# targets must not pay for that 1 KiB payload on every trap round-trip.
+extended-user-vector-context = []

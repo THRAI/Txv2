@@ -26,7 +26,10 @@ use crate::execution::WaitToken;
 
 #[derive(Clone)]
 enum RegisteredWaitSource {
-    WaitSource(Arc<tx_substrate::wake::WaitSource>),
+    WaitSource {
+        source: Arc<tx_substrate::wake::WaitSource>,
+        diagnostic_kind: &'static str,
+    },
     RawQueue(RawQueue),
     RawPort(RawPort),
 }
@@ -92,10 +95,24 @@ pub struct WaitSourceRegistrySummary {
 /// Register a mailbox-backed [`tx_substrate::wake::WaitSource`] under an
 /// explicit carrier id.
 pub fn register_wait_source_with_id(id: u64, source: Arc<tx_substrate::wake::WaitSource>) {
+    register_wait_source_with_diagnostic_kind(id, source, "unknown");
+}
+
+/// Register an object wait source together with a read-only semantic label.
+/// The label is consumed only by the explicit kernel stall diagnostic.
+pub fn register_wait_source_with_diagnostic_kind(
+    id: u64,
+    source: Arc<tx_substrate::wake::WaitSource>,
+    diagnostic_kind: &'static str,
+) {
     tx_substrate::wake::register_source(Arc::clone(&source));
-    REGISTRY
-        .lock()
-        .insert(id, RegisteredWaitSource::WaitSource(source));
+    REGISTRY.lock().insert(
+        id,
+        RegisteredWaitSource::WaitSource {
+            source,
+            diagnostic_kind,
+        },
+    );
 }
 
 /// Register a level-triggered readiness queue for wait-source resolution.
@@ -166,7 +183,7 @@ pub fn registry_summary() -> WaitSourceRegistrySummary {
     };
     for source in registry.values() {
         match source {
-            RegisteredWaitSource::WaitSource(_) => summary.wait_sources += 1,
+            RegisteredWaitSource::WaitSource { .. } => summary.wait_sources += 1,
             RegisteredWaitSource::RawQueue(_) => summary.raw_queues += 1,
             RegisteredWaitSource::RawPort(_) => summary.raw_ports += 1,
         }
@@ -193,8 +210,20 @@ pub fn lookup_wait_port(id: u64) -> Option<RawPort> {
 /// Return a clone of the mailbox-backed wait source registered under `id`.
 pub fn lookup_wait_source(id: u64) -> Option<Arc<tx_substrate::wake::WaitSource>> {
     match REGISTRY.lock().get(&id) {
-        Some(RegisteredWaitSource::WaitSource(source)) => Some(Arc::clone(source)),
+        Some(RegisteredWaitSource::WaitSource { source, .. }) => Some(Arc::clone(source)),
         _ => None,
+    }
+}
+
+/// Return the semantic owner label attached at source construction.
+pub fn registered_wait_source_diagnostic_kind(id: u64) -> Option<&'static str> {
+    match REGISTRY.lock().get(&id) {
+        Some(RegisteredWaitSource::WaitSource {
+            diagnostic_kind, ..
+        }) => Some(*diagnostic_kind),
+        Some(RegisteredWaitSource::RawQueue(_)) => Some("raw-queue"),
+        Some(RegisteredWaitSource::RawPort(_)) => Some("raw-port"),
+        None => None,
     }
 }
 
@@ -211,7 +240,7 @@ pub fn install_registered_mailbox_wait(
 ) -> Option<RegisteredMailboxWait> {
     let source = REGISTRY.lock().get(&source_id).cloned()?;
     match source {
-        RegisteredWaitSource::WaitSource(_) => None,
+        RegisteredWaitSource::WaitSource { .. } => None,
         RegisteredWaitSource::RawQueue(queue) => {
             if queue.peek() & interest != 0 {
                 return Some(RegisteredMailboxWait::Ready);
@@ -277,7 +306,7 @@ pub fn wait_on_registered_source_id(source_id: u64, interest: u64) -> Option<Reg
     let mask = Mask::from_bits(interest);
     let source = REGISTRY.lock().get(&source_id).cloned()?;
     match source {
-        RegisteredWaitSource::WaitSource(source) => Some(RegisteredWaitFuture::WaitSource(
+        RegisteredWaitSource::WaitSource { source, .. } => Some(RegisteredWaitFuture::WaitSource(
             Box::new(wait_source_future(source, mask.bits())),
         )),
         RegisteredWaitSource::RawQueue(queue) => Some(RegisteredWaitFuture::RawQueue(Box::new(

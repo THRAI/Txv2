@@ -6,6 +6,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use tx_hal::{UserPtr, UserTrapContext};
 
+use crate::thread_runtime::adapter::reactor_entry::UserspaceTrapInfo;
 use crate::thread_runtime::adapter::step_engine::{
     self, Cap, MailboxEvent, OneShotStepOp, OperationalCapExt, PayloadCap, SignalRouting,
     TaskMailbox,
@@ -211,6 +212,16 @@ where
     // last chance to observe state.
     let mut payload_guard = thread.payload.lock();
     if let Some(payload) = payload_guard.as_ref() {
+        // A running task future retains its own PayloadCap, so detaching the
+        // identity payload is not itself observable by that future. Publish a
+        // lock-free terminal latch and resolve an active userspace wait before
+        // exec/group-exit is allowed to replace the shared address space.
+        payload.mark_exit_intent();
+        if let Some(request) = payload.active_userspace_request() {
+            let _ = payload
+                .userspace_slot()
+                .complete_interesting_trap(request, UserspaceTrapInfo::TimerPreempt);
+        }
         // Lifecycle termination must wake the outer thread task even when a
         // nested futex/I/O wait has replaced or cleared the mailbox waker.
         payload.wake_lifecycle_task();
@@ -1463,6 +1474,52 @@ mod step_op_wraps {
         assert_eq!(sibling.exit_status(), Some(9));
         assert_eq!(proc_cap.live_thread_count(), 1);
         assert!(proc_cap.thread_by_tid(sibling.tid.0).is_none());
+    }
+
+    #[test]
+    fn local_thread_exit_cleanup_does_not_block_sibling_clone() {
+        let _g = setup();
+        let proc_cap = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
+        let exiting = crate::process::execution::step_clone_thread(
+            &proc_cap,
+            &tx_hal::UserTrapContext::empty(),
+            SignalMask::EMPTY,
+            0,
+            0,
+            0x8000_1800,
+        )
+        .expect("exiting sibling");
+
+        let mut exit_op = ThreadExitOp::new(exiting.clone(), 9);
+        let mut yield_cleanup = |_aspace: &AddressSpace, _cleanup: &mut ThreadExitUserCleanup| {
+            StepOutcome::yield_on_wait_source(step_engine::NoProgress, 0xface, 1)
+        };
+        assert!(matches!(
+            exit_op.step_exit_with_cleanup_for_test(&mut yield_cleanup),
+            StepOutcome::Yield { .. }
+        ));
+
+        let replacement = crate::process::execution::step_clone_thread(
+            &proc_cap,
+            &tx_hal::UserTrapContext::empty(),
+            SignalMask::EMPTY,
+            0,
+            0,
+            0,
+        )
+        .expect("a local sibling exit must not reject clone(CLONE_THREAD)");
+        assert_eq!(proc_cap.live_thread_count(), 3);
+        assert!(proc_cap.thread_by_tid(replacement.tid.0).is_some());
+
+        let mut finish_cleanup =
+            |_aspace: &AddressSpace, _cleanup: &mut ThreadExitUserCleanup| StepOutcome::Done(());
+        assert_eq!(
+            exit_op.step_exit_with_cleanup_for_test(&mut finish_cleanup),
+            StepOutcome::Done(())
+        );
+        assert_eq!(proc_cap.live_thread_count(), 2);
+        assert!(proc_cap.thread_by_tid(exiting.tid.0).is_none());
+        assert!(proc_cap.thread_by_tid(replacement.tid.0).is_some());
     }
 
     #[test]

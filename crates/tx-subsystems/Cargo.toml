@@ -19,6 +19,7 @@ vfs-read-test-support = []
 test-support = ["tx-services/test-support"]
 
 [dependencies]
+hashbrown = { version = "0.16.1", default-features = false, features = ["inline-more"] }
 smoltcp = { path = "../../external/smoltcp-asterinas", default-features = false, features = ["alloc", "log", "medium-ethernet", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp"] }
 tx-hal = { path = "../tx-hal" }
 tx-observe = { path = "../tx-observe" }

@@ -43,6 +43,21 @@ pub struct FilesystemStats {
 /// `StepOutcome<T, NoProgress>`. `fallocate`
 /// defaults to `Done(())` and `supports_reflink` defaults to `false`.
 pub trait FsPageBacking: Send + Sync + 'static {
+    /// Whether dirty pages are owned by the mount's asynchronous backend
+    /// planner.  A filesystem may install a planner only for parallel reads
+    /// while retaining synchronous compatibility writeback; planner presence
+    /// alone is therefore not a writeback capability test.
+    fn uses_async_writeback(&self) -> bool {
+        false
+    }
+
+    /// Maximum contiguous page count accepted atomically by `flush_pages`.
+    /// Backends inherit one-page progress semantics until they explicitly
+    /// implement a range transaction.
+    fn flush_batch_limit(&self) -> usize {
+        1
+    }
+
     fn filesystem_stats(&self, _guard: &Guard<'_>) -> StepOutcome<FilesystemStats, NoProgress> {
         StepOutcome::err(Errno::ENOSYS.into())
     }
@@ -61,6 +76,39 @@ pub trait FsPageBacking: Send + Sync + 'static {
         frame: &Frame,
         guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress>;
+
+    /// Flush one contiguous run of file pages.
+    ///
+    /// The compatibility implementation preserves existing backends by
+    /// replaying `flush_page`; its matching `flush_batch_limit` is one.
+    /// Filesystems with a range planner override both methods so allocation
+    /// and metadata publication are admitted once for the whole run.
+    fn flush_pages(
+        &self,
+        fs_object_id: FsObjectId,
+        first_offset: u64,
+        frames: &[Frame],
+        guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        let mut offset = first_offset;
+        for frame in frames {
+            match self.flush_page(fs_object_id, offset, frame, guard) {
+                StepOutcome::Done(()) => {}
+                StepOutcome::Continue { progress } => {
+                    return StepOutcome::Continue { progress };
+                }
+                StepOutcome::Yield { progress, shape } => {
+                    return StepOutcome::Yield { progress, shape };
+                }
+                StepOutcome::Err(errno) => return StepOutcome::Err(errno),
+            }
+            let Some(next) = offset.checked_add(crate::vm::USER_PAGE_SIZE as u64) else {
+                return StepOutcome::err(Errno::EINVAL.into());
+            };
+            offset = next;
+        }
+        StepOutcome::done(())
+    }
 
     fn truncate(
         &self,

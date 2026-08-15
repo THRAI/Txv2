@@ -1389,31 +1389,22 @@ fn step_flush_page_backed_open_file_without_retry(
         return StepOutcome::done(());
     };
 
-    // Main's IO-manager/JBD2 mount keeps data on the asynchronous L4/L6 path,
-    // but buffered-write allocation may have published a page-aligned
-    // provisional inode size.  Commit the PageContainer's byte-precise EOF
-    // before the dirty slots move to Writeback, then admit their data without
-    // turning close into an fsync durability barrier.
+    // Async mounts admit dirty data without turning close into an fsync
+    // barrier. The ext4 batch planner folds the PageContainer's byte-precise
+    // EOF into the same transaction as hole allocation and ordered data, so
+    // close must not serialize a separate truncate transaction first.
     if pc
         .file_backend_context()
-        .is_some_and(|context| context.payload().backend_planner().is_some())
+        .is_some_and(|context| context.payload().fs_page_backing.uses_async_writeback())
     {
-        let size_result = pc.publish_exact_size_for_close_visibility(guard);
         let _ = pc.queue_dirty_file_writeback_retained(pc.clone());
-        return match size_result {
-            StepOutcome::Done(()) => StepOutcome::done(()),
-            StepOutcome::Continue { .. } => StepOutcome::continue_with(NoProgress),
-            StepOutcome::Yield { shape, .. } => StepOutcome::Yield {
-                progress: NoProgress,
-                shape,
-            },
-            StepOutcome::Err(errno) => StepOutcome::Err(errno),
-        };
+        return StepOutcome::done(());
     }
 
     // Legacy mounts have no owned background backend. Preserve final-smp's
-    // close-to-reopen visibility and retry failed synchronous writeback.
-    let _ = pc.queue_dirty_file_writeback();
+    // close-to-reopen visibility by leaving slots Dirty for the synchronous
+    // fsync walker. Queuing them here would move them to Writeback even though
+    // this mount has no service task to consume that queue.
     match crate::page_backed::step_fsync(pc, guard) {
         StepOutcome::Done(()) => StepOutcome::done(()),
         StepOutcome::Continue { .. } => StepOutcome::continue_with(NoProgress),
@@ -1443,12 +1434,11 @@ fn retry_deferred_page_writebacks(guard: &step_engine::Guard<'_>, budget: usize)
     for pc in batch {
         if pc
             .file_backend_context()
-            .is_some_and(|context| context.payload().backend_planner().is_some())
+            .is_some_and(|context| context.payload().fs_page_backing.uses_async_writeback())
         {
             let _ = pc.queue_dirty_file_writeback_retained(pc.clone());
             continue;
         }
-        let _ = pc.queue_dirty_file_writeback();
         match crate::page_backed::step_fsync(&pc, guard) {
             StepOutcome::Done(()) => {}
             StepOutcome::Err(_) | StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
@@ -2059,6 +2049,7 @@ fn sign_process_payload(
     let cred_cap = crate::cred::sign_cred(cred)?;
     let cred_slot: AtomicSlot<Cap<crate::cred::Cred>> = AtomicSlot::empty();
     cred_slot.store(Some(cred_cap));
+    let restrictions = crate::cred::placeholder_restrictions_cap()?;
 
     // Namespace proxy slot — the caller provides the immutable
     // namespace bundle (init nsproxy for bootstrap, parent clone for
@@ -2084,6 +2075,7 @@ fn sign_process_payload(
         siginfo_slots: crate::signal::SigInfoSlots::new(),
         signal_port: RawPort::new(),
         cred: cred_slot,
+        restrictions,
         cred_mutation: process_spin_mutex(
             crate::process::structure::CredMutationState::new(),
             b"debug.lock.process.payload.cred_mutation",

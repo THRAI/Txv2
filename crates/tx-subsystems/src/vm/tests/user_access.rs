@@ -87,6 +87,44 @@ fn vm_copy_to_user_rejects_read_only_recipe() {
 }
 
 #[test]
+fn vm_resident_value_write_declines_cold_and_cross_page_ranges() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("vm user-access test lock");
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let user_addr = 0x18_000;
+    map_private(&aspace, user_addr, USER_PAGE_SIZE * 2, Prot::READ_WRITE);
+
+    assert_eq!(
+        aspace.write_user_resident(UserPtr::<u64>::new(user_addr), 0x1122_3344_5566_7788),
+        None,
+        "a recipe without a published PTE must fall back"
+    );
+
+    let guard = crate::vm::adapter::step_engine::guard();
+    assert_eq!(
+        aspace.copy_to_user(UserPtr::new(user_addr), &[0; 8], &guard),
+        StepOutcome::Done(8)
+    );
+    assert_eq!(
+        aspace.write_user_resident(UserPtr::<u64>::new(user_addr), 0x1122_3344_5566_7788),
+        Some(Ok(()))
+    );
+    assert_eq!(
+        aspace.read_user(UserPtr::<u64>::new(user_addr), &guard),
+        StepOutcome::Done(0x1122_3344_5566_7788)
+    );
+
+    assert_eq!(
+        aspace.write_user_resident(
+            UserPtr::<u64>::new(user_addr + USER_PAGE_SIZE - 4),
+            0xaabb_ccdd_eeff_0011,
+        ),
+        None,
+        "cross-page values must fall back before writing any byte"
+    );
+}
+
+#[test]
 fn vm_read_user_cstr_grows_past_initial_capacity() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("vm user-access test lock");
     setup_host_substrate();

@@ -427,6 +427,21 @@ impl CpuLocalEpochState {
         self.active_guards.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Replace the epoch published by an admitted reader without opening a
+    /// quiescent window.
+    ///
+    /// Guard admission uses this only before the first protected load.  The
+    /// reader is already pinned and accounted active, so changing the value
+    /// must not touch `active_guards` or transiently publish zero.
+    pub(crate) fn republish(&self, epoch: u64) {
+        debug_assert_ne!(
+            self.local_epoch.load(Ordering::Relaxed),
+            0,
+            "only an active reader epoch may be republished"
+        );
+        self.local_epoch.store(epoch, Ordering::SeqCst);
+    }
+
     pub(crate) fn leave(&self) {
         self.local_epoch.store(0, Ordering::Release);
         self.active_guards.fetch_sub(1, Ordering::Relaxed);

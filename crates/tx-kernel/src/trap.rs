@@ -2,13 +2,21 @@ use tx_hal::{
     CpuId, FaultInfo, IpiKind, IrqHandled, KernelTrapSink, PercpuIf, SmpIf, TrapAction,
     TrapFrameMut, TxPlatform, VirtAddr,
 };
-use tx_services::time::platform::HalDeadlineTimer;
-use tx_shims::linux_syscall::numbers::{NR_RT_SIGPROCMASK, NR_SET_TID_ADDRESS};
+use tx_services::time::{platform::HalDeadlineTimer, CurrentHartDeadlineTimer};
+use tx_shims::linux_syscall::numbers::{
+    NR_BRK, NR_FCNTL, NR_FSTAT, NR_LSEEK, NR_MMAP, NR_READ, NR_RT_SIGPROCMASK, NR_SET_TID_ADDRESS,
+    NR_WRITE,
+};
 use tx_shims::linux_syscall::SyscallResult;
 
 use crate::{adapter::boot_runtime, trap_handoff};
 
 pub struct KernelTrapDispatcher;
+
+/// Retry window for a scheduling deadline that fired in supervisor mode.
+/// The durable per-hart marker is the correctness mechanism; this short re-arm
+/// closes the final race between the entry-boundary check and `sret`.
+const DEFERRED_USER_PREEMPT_RETRY_NS: u64 = 1_000_000;
 
 impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
     fn on_page_fault(view: TrapFrameMut<'_>, fault: FaultInfo) -> TrapAction {
@@ -16,6 +24,7 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
         // policy; only user-mode faults can be handed off to a
         // userspace-run wait.
         if !fault.from_user {
+            log_kernel_fault_context::<P>(<P as PercpuIf>::current_cpu_id().0);
             return TrapAction::Terminate;
         }
 
@@ -25,6 +34,11 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
         // mutation happens here.
         let info = trap_handoff::translate_user_pf::<P>(&view.view(), &fault);
         let hart = <P as PercpuIf>::current_cpu_id().0;
+        if !matches!(P::ARCH, tx_hal::Arch::LoongArch64)
+            && try_direct_resident_file_page_fault(hart, info)
+        {
+            return TrapAction::Resume;
+        }
         let outcome = trap_handoff::hand_off_user_pf(hart, &view, info);
         let action = trap_handoff::outcome_to_trap_action(&outcome);
         if matches!(action, TrapAction::Terminate) {
@@ -41,7 +55,24 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
         // `set_syscall_return` / `set_syscall_error` into the
         // *fresh* trap frame before `enter_userspace`.
         let req = trap_handoff::translate_syscall::<P>(&view.view());
+        #[cfg(feature = "syscall-profile")]
+        let profile_start = <P as tx_hal::TimeIf>::read_ns();
+        #[cfg(feature = "syscall-profile")]
+        let profile_compiler = record_profiled_syscall::<P>(&req);
+        #[cfg(feature = "syscall-profile")]
+        if profile_compiler {
+            store_profiled_trap_start::<P>(req.nr, profile_start);
+        }
         if let Some(action) = try_direct_trap_syscall::<P>(&mut view, &req) {
+            #[cfg(feature = "syscall-profile")]
+            if profile_compiler {
+                record_profiled_syscall_duration::<P>(
+                    req.nr,
+                    <P as tx_hal::TimeIf>::read_ns().saturating_sub(profile_start),
+                    true,
+                );
+                clear_profiled_trap_start::<P>();
+            }
             return action;
         }
         emit_debug_counter(b"debug.trap.syscall", req.nr as i64);
@@ -53,6 +84,25 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
     fn on_timer_interrupt(cpu: CpuId, view: TrapFrameMut<'_>) -> TrapAction {
         HalDeadlineTimer::<P>::new().cancel_deadline();
         if view.view().previous_mode == tx_hal::TrapPreviousMode::User {
+            if matches!(P::ARCH, tx_hal::Arch::LoongArch64) {
+                let hart = <P as PercpuIf>::current_cpu_id().0;
+                let outcome = trap_handoff::hand_off_timer_preempt(hart, &view);
+                if matches!(outcome, trap_handoff::TimerPreemptOutcome::Preempted) {
+                    crate::init::mark_boot_reactor_userspace_preempt(cpu);
+                }
+                return trap_handoff::timer_preempt_outcome_to_trap_action(&outcome);
+            }
+            // A supervisor-mode expiry may have left a fallback bit just
+            // before this user trap. This trap is now the authoritative
+            // preemption, so avoid an extra empty yield on the next entry.
+            let deferred = crate::init::take_deferred_userspace_preempt(cpu);
+            // A lone compute-bound userspace task does not need to traverse
+            // the complete trap-handoff/reactor/requeue path on every tick.
+            // Preserve the normal handoff for a deferred expiry, runnable
+            // competition, pending wake, or an already-due reactor timer.
+            if !deferred && crate::init::try_extend_uncontended_userspace_slice::<P>(cpu) {
+                return TrapAction::Resume;
+            }
             emit_debug_counter(b"debug.trap.timer_user", view.view().pc.0 as i64);
             let hart = <P as PercpuIf>::current_cpu_id().0;
             let outcome = trap_handoff::hand_off_timer_preempt(hart, &view);
@@ -61,6 +111,26 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
             }
             return trap_handoff::timer_preempt_outcome_to_trap_action(&outcome);
         }
+
+        // LA64's interrupt-wait rollback protocol follows the mainline
+        // one-shot timer contract: a supervisor-mode expiry is consumed here
+        // and normal reactor work decides the next deadline.  Re-arming the
+        // RV64 fallback at this point can leave every LA64 hart asleep while
+        // mailbox work is waiting to be made runnable.
+        if matches!(P::ARCH, tx_hal::Arch::LoongArch64) {
+            return TrapAction::Resume;
+        }
+
+        // The userspace slice is armed before polling the thread Future.
+        // Under TCG, entry-side VM/signal work can outlive a short slice, so
+        // the interrupt may arrive in supervisor mode. Merely cancelling it
+        // here lets this poll later enter user mode without any preemption.
+        // Retain the expired slice and re-arm once to cover the final
+        // check-to-sret race.
+        crate::init::defer_userspace_preempt(cpu);
+        let retry_deadline =
+            <P as tx_hal::TimeIf>::read_ns().saturating_add(DEFERRED_USER_PREEMPT_RETRY_NS);
+        HalDeadlineTimer::<P>::new().set_current_hart_deadline_ns(retry_deadline);
 
         TrapAction::Resume
     }
@@ -137,6 +207,7 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
         // (the board maps this to a kernel panic, which is correct — a
         // kernel bug should stop the world).
         if !fault.from_user {
+            log_kernel_fault_context::<P>(<P as PercpuIf>::current_cpu_id().0);
             return TrapAction::Terminate;
         }
 
@@ -154,6 +225,290 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
             log_page_fault_handoff_failure::<P>(hart, &outcome);
         }
         action
+    }
+}
+
+/// Resolve the common warm executable/file-mapping fault without tearing down
+/// the current userspace run.  Only a resident, non-waiting VM operation may
+/// succeed here; every cold or contended case falls through to the canonical
+/// reactor-backed fault script.
+fn try_direct_resident_file_page_fault(hart: usize, info: trap_handoff::PageFaultInfo) -> bool {
+    let Some(payload) = tx_subsystems::thread_runtime::current_userspace_payload(hart) else {
+        return false;
+    };
+    if payload.active_userspace_request().is_none() {
+        return false;
+    }
+    let Some(thread) = tx_subsystems::thread_runtime::current_thread_identity(hart) else {
+        return false;
+    };
+    let Some(process) = thread.upgrade_owner_proc() else {
+        return false;
+    };
+    if payload.pending().snapshot() != 0
+        || process.group_pending_snapshot() != 0
+        || payload.interrupt_summary() != tx_subsystems::signal::InterruptSummary::EMPTY
+    {
+        return false;
+    }
+    let Some(aspace) = process.aspace_cap() else {
+        return false;
+    };
+    let access = match info.access {
+        trap_handoff::AccessKind::Read => tx_subsystems::vm::AccessMode::Read,
+        trap_handoff::AccessKind::Write => return false,
+        trap_handoff::AccessKind::Execute => tx_subsystems::vm::AccessMode::Execute,
+        trap_handoff::AccessKind::Unknown => return false,
+    };
+    aspace.try_resident_file_fault_oneshot(tx_subsystems::vm::VmFault::new(
+        tx_subsystems::vm::UserVirtAddr::new(info.addr.raw() as usize),
+        access,
+    ))
+}
+
+/// Temporary opt-in syscall mix profiler. Normal release builds do not carry
+/// the counters or the process-name lookup. Enable only with
+/// the `syscall-profile` feature for a diagnostic kernel.
+#[cfg(feature = "syscall-profile")]
+const PROFILE_NR_COUNT: usize = 512;
+#[cfg(feature = "syscall-profile")]
+static PROFILE_COUNTS: [core::sync::atomic::AtomicU64; PROFILE_NR_COUNT] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; PROFILE_NR_COUNT];
+#[cfg(feature = "syscall-profile")]
+static PROFILE_TOTAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "syscall-profile")]
+static PROFILE_NEXT_DUMP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1_000);
+#[cfg(feature = "syscall-profile")]
+static PROFILE_TIMED_COUNTS: [core::sync::atomic::AtomicU64; PROFILE_NR_COUNT] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; PROFILE_NR_COUNT];
+#[cfg(feature = "syscall-profile")]
+static PROFILE_TIMED_NS: [core::sync::atomic::AtomicU64; PROFILE_NR_COUNT] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; PROFILE_NR_COUNT];
+#[cfg(feature = "syscall-profile")]
+static PROFILE_TIMED_MAX_NS: [core::sync::atomic::AtomicU64; PROFILE_NR_COUNT] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; PROFILE_NR_COUNT];
+#[cfg(feature = "syscall-profile")]
+static PROFILE_DIRECT_COUNTS: [core::sync::atomic::AtomicU64; PROFILE_NR_COUNT] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; PROFILE_NR_COUNT];
+#[cfg(feature = "syscall-profile")]
+static PROFILE_DIRECT_NS: [core::sync::atomic::AtomicU64; PROFILE_NR_COUNT] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; PROFILE_NR_COUNT];
+#[cfg(feature = "syscall-profile")]
+static PROFILE_VM_PAGES: [core::sync::atomic::AtomicU64; PROFILE_NR_COUNT] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; PROFILE_NR_COUNT];
+#[cfg(feature = "syscall-profile")]
+static PROFILE_VM_MAX_PAGES: [core::sync::atomic::AtomicU64; PROFILE_NR_COUNT] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; PROFILE_NR_COUNT];
+#[cfg(feature = "syscall-profile")]
+static PROFILE_TIMED_TOTAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "syscall-profile")]
+static PROFILE_TIMED_NEXT_DUMP: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(1_000);
+#[cfg(feature = "syscall-profile")]
+const PROFILE_HART_COUNT: usize = 64;
+#[cfg(feature = "syscall-profile")]
+static PROFILE_TRAP_START_NS: [core::sync::atomic::AtomicU64; PROFILE_HART_COUNT] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; PROFILE_HART_COUNT];
+#[cfg(feature = "syscall-profile")]
+static PROFILE_TRAP_NR: [core::sync::atomic::AtomicU64; PROFILE_HART_COUNT] =
+    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; PROFILE_HART_COUNT];
+#[cfg(feature = "syscall-profile")]
+static PROFILE_HANDOFF_COUNTS: [core::sync::atomic::AtomicU64; PROFILE_NR_COUNT] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; PROFILE_NR_COUNT];
+#[cfg(feature = "syscall-profile")]
+static PROFILE_HANDOFF_NS: [core::sync::atomic::AtomicU64; PROFILE_NR_COUNT] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; PROFILE_NR_COUNT];
+#[cfg(feature = "syscall-profile")]
+static PROFILE_HANDOFF_MAX_NS: [core::sync::atomic::AtomicU64; PROFILE_NR_COUNT] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; PROFILE_NR_COUNT];
+
+#[cfg(feature = "syscall-profile")]
+fn record_profiled_syscall<P: TxPlatform>(req: &boot_runtime::userspace::SyscallRequest) -> bool {
+    use core::sync::atomic::Ordering;
+
+    let hart = <P as PercpuIf>::current_cpu_id().0;
+    let Some(thread) = tx_subsystems::thread_runtime::current_thread_identity(hart) else {
+        return false;
+    };
+    let Some(process) = thread.upgrade_owner_proc() else {
+        return false;
+    };
+    let comm = process.comm();
+    let comm_len = comm
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(comm.len());
+    let comm = &comm[..comm_len];
+    if comm != b"cargo" && comm != b"tg-xtask" && comm != b"rustc" && comm != b"axbuild" {
+        return false;
+    }
+
+    if let Some(counter) = PROFILE_COUNTS.get(req.nr as usize) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+    if matches!(req.nr, 215 | 222 | 226) {
+        let pages = (req.args[1] as u64).div_ceil(4096);
+        if let Some(total) = PROFILE_VM_PAGES.get(req.nr as usize) {
+            total.fetch_add(pages, Ordering::Relaxed);
+        }
+        if let Some(maximum) = PROFILE_VM_MAX_PAGES.get(req.nr as usize) {
+            maximum.fetch_max(pages, Ordering::Relaxed);
+        }
+    }
+    let total = PROFILE_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+    let threshold = PROFILE_NEXT_DUMP.load(Ordering::Relaxed);
+    if total != threshold {
+        return true;
+    }
+    let next = match threshold {
+        1_000 => 5_000,
+        5_000 => 20_000,
+        20_000 => 50_000,
+        _ => threshold.saturating_add(50_000),
+    };
+    if PROFILE_NEXT_DUMP
+        .compare_exchange(threshold, next, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
+        return true;
+    }
+
+    tx_hal::console_write_str::<P>("txkernel:syscall-profile:total=");
+    write_u64::<P>(total);
+    tx_hal::console_write_str::<P>("\n");
+    for (profile_nr, counter) in PROFILE_COUNTS.iter().enumerate() {
+        let count = counter.load(Ordering::Relaxed);
+        if count == 0 {
+            continue;
+        }
+        tx_hal::console_write_str::<P>("txkernel:syscall-profile:nr=");
+        write_usize::<P>(profile_nr);
+        tx_hal::console_write_str::<P>(":count=");
+        write_u64::<P>(count);
+        let pages = PROFILE_VM_PAGES[profile_nr].load(Ordering::Relaxed);
+        if pages != 0 {
+            tx_hal::console_write_str::<P>(":pages=");
+            write_u64::<P>(pages);
+            tx_hal::console_write_str::<P>(":max_pages=");
+            write_u64::<P>(PROFILE_VM_MAX_PAGES[profile_nr].load(Ordering::Relaxed));
+        }
+        tx_hal::console_write_str::<P>("\n");
+    }
+    true
+}
+
+#[cfg(feature = "syscall-profile")]
+fn store_profiled_trap_start<P: TxPlatform>(nr: u64, start_ns: u64) {
+    use core::sync::atomic::Ordering;
+
+    let hart = <P as PercpuIf>::current_cpu_id().0;
+    if hart >= PROFILE_HART_COUNT {
+        return;
+    }
+    PROFILE_TRAP_NR[hart].store(nr, Ordering::Relaxed);
+    PROFILE_TRAP_START_NS[hart].store(start_ns, Ordering::Release);
+}
+
+#[cfg(feature = "syscall-profile")]
+fn clear_profiled_trap_start<P: TxPlatform>() {
+    use core::sync::atomic::Ordering;
+
+    let hart = <P as PercpuIf>::current_cpu_id().0;
+    if hart < PROFILE_HART_COUNT {
+        PROFILE_TRAP_START_NS[hart].store(0, Ordering::Release);
+        PROFILE_TRAP_NR[hart].store(u64::MAX, Ordering::Relaxed);
+    }
+}
+
+#[cfg(feature = "syscall-profile")]
+pub(crate) fn take_profiled_trap_start<P: TxPlatform>(nr: u64) -> Option<u64> {
+    use core::sync::atomic::Ordering;
+
+    let hart = <P as PercpuIf>::current_cpu_id().0;
+    if hart >= PROFILE_HART_COUNT || PROFILE_TRAP_NR[hart].load(Ordering::Acquire) != nr {
+        return None;
+    }
+    let start = PROFILE_TRAP_START_NS[hart].swap(0, Ordering::AcqRel);
+    PROFILE_TRAP_NR[hart].store(u64::MAX, Ordering::Relaxed);
+    (start != 0).then_some(start)
+}
+
+#[cfg(feature = "syscall-profile")]
+pub(crate) fn record_profiled_syscall_handoff(nr: u64, elapsed_ns: u64) {
+    use core::sync::atomic::Ordering;
+
+    let Some(count) = PROFILE_HANDOFF_COUNTS.get(nr as usize) else {
+        return;
+    };
+    count.fetch_add(1, Ordering::Relaxed);
+    PROFILE_HANDOFF_NS[nr as usize].fetch_add(elapsed_ns, Ordering::Relaxed);
+    PROFILE_HANDOFF_MAX_NS[nr as usize].fetch_max(elapsed_ns, Ordering::Relaxed);
+}
+
+#[cfg(feature = "syscall-profile")]
+pub(crate) fn record_profiled_syscall_duration<P: TxPlatform>(
+    nr: u64,
+    elapsed_ns: u64,
+    direct: bool,
+) {
+    use core::sync::atomic::Ordering;
+
+    let Some(count) = PROFILE_TIMED_COUNTS.get(nr as usize) else {
+        return;
+    };
+    count.fetch_add(1, Ordering::Relaxed);
+    PROFILE_TIMED_NS[nr as usize].fetch_add(elapsed_ns, Ordering::Relaxed);
+    PROFILE_TIMED_MAX_NS[nr as usize].fetch_max(elapsed_ns, Ordering::Relaxed);
+    if direct {
+        PROFILE_DIRECT_COUNTS[nr as usize].fetch_add(1, Ordering::Relaxed);
+        PROFILE_DIRECT_NS[nr as usize].fetch_add(elapsed_ns, Ordering::Relaxed);
+    }
+
+    let total = PROFILE_TIMED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+    let threshold = PROFILE_TIMED_NEXT_DUMP.load(Ordering::Relaxed);
+    if total != threshold {
+        return;
+    }
+    let next = match threshold {
+        1_000 => 5_000,
+        5_000 => 20_000,
+        20_000 => 50_000,
+        _ => threshold.saturating_add(50_000),
+    };
+    if PROFILE_TIMED_NEXT_DUMP
+        .compare_exchange(threshold, next, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+
+    tx_hal::console_write_str::<P>("txkernel:syscall-latency:total=");
+    write_u64::<P>(total);
+    tx_hal::console_write_str::<P>("\n");
+    for profile_nr in 0..PROFILE_NR_COUNT {
+        let count = PROFILE_TIMED_COUNTS[profile_nr].load(Ordering::Relaxed);
+        if count == 0 {
+            continue;
+        }
+        tx_hal::console_write_str::<P>("txkernel:syscall-latency:nr=");
+        write_usize::<P>(profile_nr);
+        tx_hal::console_write_str::<P>(":count=");
+        write_u64::<P>(count);
+        tx_hal::console_write_str::<P>(":total_ns=");
+        write_u64::<P>(PROFILE_TIMED_NS[profile_nr].load(Ordering::Relaxed));
+        tx_hal::console_write_str::<P>(":max_ns=");
+        write_u64::<P>(PROFILE_TIMED_MAX_NS[profile_nr].load(Ordering::Relaxed));
+        tx_hal::console_write_str::<P>(":direct_count=");
+        write_u64::<P>(PROFILE_DIRECT_COUNTS[profile_nr].load(Ordering::Relaxed));
+        tx_hal::console_write_str::<P>(":direct_ns=");
+        write_u64::<P>(PROFILE_DIRECT_NS[profile_nr].load(Ordering::Relaxed));
+        tx_hal::console_write_str::<P>(":handoff_count=");
+        write_u64::<P>(PROFILE_HANDOFF_COUNTS[profile_nr].load(Ordering::Relaxed));
+        tx_hal::console_write_str::<P>(":handoff_ns=");
+        write_u64::<P>(PROFILE_HANDOFF_NS[profile_nr].load(Ordering::Relaxed));
+        tx_hal::console_write_str::<P>(":handoff_max_ns=");
+        write_u64::<P>(PROFILE_HANDOFF_MAX_NS[profile_nr].load(Ordering::Relaxed));
+        tx_hal::console_write_str::<P>("\n");
     }
 }
 
@@ -217,6 +572,32 @@ fn try_direct_trap_syscall<P: TxPlatform>(
     view: &mut TrapFrameMut<'_>,
     req: &trap_handoff::SyscallRequest,
 ) -> Option<TrapAction> {
+    // Reject unsupported calls before resolving the current payload, thread,
+    // process and address space. Previously every VFS/VM syscall paid all of
+    // that direct-lane setup only for the dispatcher to return `None` and run
+    // the ordinary async path anyway.
+    if !tx_shims::linux_syscall::is_direct_trap_syscall(req.nr) {
+        return None;
+    }
+    // The cache-hit VFS/VM fast lanes were introduced and validated on RV64.
+    // LA64 keeps mainline's shallow direct calls and hands deep operations to
+    // the reactor, where they do not execute on the architecture trap stack.
+    if matches!(P::ARCH, tx_hal::Arch::LoongArch64)
+        && matches!(
+            req.nr,
+            tx_shims::linux_syscall::numbers::NR_OPENAT
+                | NR_READ
+                | NR_WRITE
+                | NR_FCNTL
+                | NR_FSTAT
+                | NR_LSEEK
+                | NR_BRK
+                | NR_MMAP
+                | tx_shims::linux_syscall::numbers::NR_STATX
+        )
+    {
+        return None;
+    }
     let direct_total_start = direct_sigprocmask_detail_now(req.nr);
     let hart = <P as PercpuIf>::current_cpu_id().0;
     let payload_start = direct_sigprocmask_detail_now(req.nr);
@@ -404,8 +785,23 @@ fn direct_syscall_preconditions(
         // Direct query lane (getpid-class + clock reads): only bypass the
         // run_thread AST checkpoint when no signal work is pending, so
         // delivery timing is identical to the slow path.
-        NR_GETPID | NR_GETTID | NR_GETUID | NR_GETEUID | NR_GETGID | NR_GETEGID
-        | NR_CLOCK_GETTIME | NR_GETTIMEOFDAY => {
+        NR_GETPID
+        | NR_GETTID
+        | NR_GETUID
+        | NR_GETEUID
+        | NR_GETGID
+        | NR_GETEGID
+        | NR_CLOCK_GETTIME
+        | NR_GETTIMEOFDAY
+        | NR_READ
+        | NR_WRITE
+        | NR_FCNTL
+        | NR_FSTAT
+        | NR_LSEEK
+        | NR_BRK
+        | NR_MMAP
+        | tx_shims::linux_syscall::numbers::NR_OPENAT
+        | tx_shims::linux_syscall::numbers::NR_STATX => {
             payload.pending().snapshot() == 0
                 && process.group_pending_snapshot() == 0
                 && payload.interrupt_summary() == tx_subsystems::signal::InterruptSummary::EMPTY
@@ -523,11 +919,99 @@ fn log_page_fault_handoff_failure<P: TxPlatform>(
     tx_hal::console_write_str::<P>("\n");
 }
 
-fn write_usize<P: TxPlatform>(value: usize) {
+/// Snapshot the task/userspace ownership visible on a hart immediately before
+/// a fatal kernel trap is handed back to the board panic path. This is kept
+/// allocation-free so it remains useful when the suspected failure is an EBR,
+/// vmalloc, or trap-stack lifetime violation.
+fn log_kernel_fault_context<P: TxPlatform>(hart: usize) {
+    use tx_subsystems::thread_runtime::{
+        current_thread_identity, current_thread_payload, current_userspace_payload,
+        current_userspace_thread_identity,
+    };
+
+    let poll_thread = current_thread_identity(hart);
+    let userspace_thread = current_userspace_thread_identity(hart);
+    let payload = current_thread_payload(hart).or_else(|| current_userspace_payload(hart));
+
+    tx_hal::console_write_str::<P>("txkernel:");
+    tx_hal::console_write_str::<P>(P::BOARD);
+    tx_hal::console_write_str::<P>(":kernel-fault-context:hart=");
+    write_usize::<P>(hart);
+    tx_hal::console_write_str::<P>(":poll-thread=");
+    write_usize::<P>(usize::from(poll_thread.is_some()));
+    tx_hal::console_write_str::<P>(":userspace-thread=");
+    write_usize::<P>(usize::from(userspace_thread.is_some()));
+
+    if let Some(thread) = poll_thread.as_ref().or(userspace_thread.as_ref()) {
+        tx_hal::console_write_str::<P>(":tid=");
+        write_usize::<P>(thread.tid.0 as usize);
+        if let Some(process) = thread.upgrade_owner_proc() {
+            tx_hal::console_write_str::<P>(":pid=");
+            write_usize::<P>(process.pid.0 as usize);
+        }
+    }
+
+    if let Some(payload) = payload {
+        let (pc, ra, sp, tls, syscall, entry_hart) = payload.user_entry_diagnostic();
+        tx_hal::console_write_str::<P>(":active-request=");
+        write_usize::<P>(usize::from(payload.active_userspace_request().is_some()));
+        tx_hal::console_write_str::<P>(":entry-pc=0x");
+        write_hex_u64::<P>(pc);
+        tx_hal::console_write_str::<P>(":entry-ra=0x");
+        write_hex_u64::<P>(ra);
+        tx_hal::console_write_str::<P>(":entry-sp=0x");
+        write_hex_u64::<P>(sp);
+        tx_hal::console_write_str::<P>(":entry-tls=0x");
+        write_hex_u64::<P>(tls);
+        tx_hal::console_write_str::<P>(":entry-syscall=0x");
+        write_hex_u64::<P>(syscall);
+        tx_hal::console_write_str::<P>(":entry-hart=");
+        write_u64::<P>(entry_hart);
+        if let Some((nr, arg0, arg1)) = payload.active_syscall_diagnostic() {
+            tx_hal::console_write_str::<P>(":active-syscall=0x");
+            write_hex_u64::<P>(nr);
+            tx_hal::console_write_str::<P>(":arg0=0x");
+            write_hex_u64::<P>(arg0);
+            tx_hal::console_write_str::<P>(":arg1=0x");
+            write_hex_u64::<P>(arg1);
+        }
+    }
+    if let Some(trace) = tx_reactor::reactor_poll_trace(tx_reactor::HartId(hart)) {
+        tx_hal::console_write_str::<P>(":reactor-seq=");
+        write_u64::<P>(trace.sequence);
+        tx_hal::console_write_str::<P>(":reactor-phase=");
+        write_usize::<P>(trace.phase);
+        tx_hal::console_write_str::<P>(":reactor-task=");
+        write_usize::<P>(trace.task_id);
+        tx_hal::console_write_str::<P>(":reactor-generation=");
+        write_u64::<P>(trace.generation);
+        tx_hal::console_write_str::<P>(":future-data=0x");
+        write_hex_u64::<P>(trace.future_data as u64);
+        tx_hal::console_write_str::<P>(":future-vtable=0x");
+        write_hex_u64::<P>(trace.future_vtable as u64);
+    }
+    if let Some(trace) = tx_substrate::epoch::reclaim_trace(CpuId(hart)) {
+        tx_hal::console_write_str::<P>(":ebr-seq=");
+        write_u64::<P>(trace.sequence);
+        tx_hal::console_write_str::<P>(":ebr-active=");
+        write_usize::<P>(usize::from(trace.active));
+        tx_hal::console_write_str::<P>(":ebr-kind=");
+        write_usize::<P>(trace.kind);
+        tx_hal::console_write_str::<P>(":ebr-object=0x");
+        write_hex_u64::<P>(trace.object as u64);
+        tx_hal::console_write_str::<P>(":ebr-callback=0x");
+        write_hex_u64::<P>(trace.callback as u64);
+        tx_hal::console_write_str::<P>(":ebr-next=0x");
+        write_hex_u64::<P>(trace.next as u64);
+    }
+    tx_hal::console_write_str::<P>("\n");
+}
+
+pub(crate) fn write_usize<P: TxPlatform>(value: usize) {
     write_u64::<P>(value as u64);
 }
 
-fn write_u64<P: TxPlatform>(value: u64) {
+pub(crate) fn write_u64<P: TxPlatform>(value: u64) {
     if value == 0 {
         tx_hal::console_write_str::<P>("0");
         return;
@@ -543,4 +1027,15 @@ fn write_u64<P: TxPlatform>(value: u64) {
     }
     let s = core::str::from_utf8(&digits[idx..]).unwrap_or("");
     tx_hal::console_write_str::<P>(s);
+}
+
+fn write_hex_u64<P: TxPlatform>(value: u64) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut digits = [b'0'; 16];
+    for (index, digit) in digits.iter_mut().enumerate() {
+        let shift = (15 - index) * 4;
+        *digit = HEX[((value >> shift) & 0xf) as usize];
+    }
+    let text = core::str::from_utf8(&digits).unwrap_or("");
+    tx_hal::console_write_str::<P>(text);
 }

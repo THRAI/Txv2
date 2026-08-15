@@ -146,6 +146,32 @@ fn slab_reuses_small_objects_and_retains_one_empty_page() {
 }
 
 #[test]
+#[should_panic(expected = "slab object freed twice")]
+fn slab_rejects_duplicate_free_before_free_list_corruption() {
+    static mut PAGES: [TestPage; 2] = [TestPage {
+        _bytes: [0; PAGE_SIZE],
+    }; 2];
+    let metas = [FrameMeta::new(), FrameMeta::new()];
+    let bitmap = [AtomicU64::new(0)];
+    let allocator = test_allocator(&metas, &bitmap, 2);
+    let provider = TestProvider {
+        allocator: &allocator,
+        base: core::ptr::addr_of_mut!(PAGES) as usize,
+        arena_pages: 0,
+    };
+    let heap = SlabHeap::new(provider);
+    heap.init().expect("heap init");
+    let layout = Layout::from_size_align(256, 8).expect("valid layout");
+
+    let first = heap.try_alloc(layout).expect("first object");
+    let _second = heap.try_alloc(layout).expect("second object");
+    unsafe {
+        heap.dealloc(first.as_ptr(), layout);
+        heap.dealloc(first.as_ptr(), layout);
+    }
+}
+
+#[test]
 fn slab_returns_surplus_empty_pages_beyond_retained_page() {
     static mut PAGES: [TestPage; 3] = [TestPage {
         _bytes: [0; PAGE_SIZE],

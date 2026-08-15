@@ -6,7 +6,7 @@
 //! syscall contract is stable.
 
 use alloc::collections::BTreeMap;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use tx_services::time::{
     timekeeper_clock, ClockRead, DeadlineNs, DeadlineRegistrar, DeadlineRegistrarHandle,
@@ -46,10 +46,40 @@ struct PosixTimer {
 static NEXT_TIMER_ID: AtomicU32 = AtomicU32::new(1);
 static POSIX_TIMERS: SpinMutex<Option<BTreeMap<(u32, u32), PosixTimer>>> = SpinMutex::new(None);
 
+// Userspace entry checks timer expiry before every return to userspace, while
+// ordinary compiler processes never arm a POSIX timer.  Avoid serialising all
+// harts on `POSIX_TIMERS` in that overwhelmingly common case.  Writers update
+// the summary while holding the map lock; a stale `true` costs one harmless
+// lookup, while publishing `true` with Release makes an armed deadline visible
+// before a later entry-side Acquire check can skip the map.
+static ANY_POSIX_TIMER_ARMED: AtomicBool = AtomicBool::new(false);
+
+fn refresh_any_posix_timer_armed(timers: &BTreeMap<(u32, u32), PosixTimer>) {
+    ANY_POSIX_TIMER_ARMED.store(
+        timers.values().any(|timer| timer.deadline_ns != 0),
+        Ordering::Release,
+    );
+}
+
 fn with_timer_map<R>(f: impl FnOnce(&mut BTreeMap<(u32, u32), PosixTimer>) -> R) -> R {
     let mut guard = POSIX_TIMERS.lock();
     let map = guard.get_or_insert_with(BTreeMap::new);
-    f(map)
+    let result = f(map);
+    refresh_any_posix_timer_armed(map);
+    result
+}
+
+fn next_timer_deadline_for_pid(pid: u32) -> Option<u64> {
+    if !ANY_POSIX_TIMER_ARMED.load(Ordering::Acquire) {
+        return None;
+    }
+    let guard = POSIX_TIMERS.lock();
+    guard.as_ref().and_then(|timers| {
+        timers
+            .range((pid, 0)..=(pid, u32::MAX))
+            .filter_map(|(_, timer)| (timer.deadline_ns != 0).then_some(timer.deadline_ns))
+            .min()
+    })
 }
 
 fn valid_clock(clockid: u32) -> bool {
@@ -144,13 +174,17 @@ where
     F: FnMut(alloc::sync::Weak<tx_substrate::wake::TaskMailbox>, tx_substrate::wake::MailboxEvent),
 {
     let pid = process.pid.0;
+    let next_hint = next_timer_deadline_for_pid(pid)?;
     let now_ns = timekeeper_clock::<P>().monotonic_now_ns();
+    if next_hint > now_ns {
+        return Some(next_hint);
+    }
     let mut to_deliver = [None; 8];
     let mut deliver_len = 0usize;
     let next_deadline = with_timer_map(|timers| {
         let mut next_deadline: Option<u64> = None;
-        for ((timer_pid, _), timer) in timers.iter_mut() {
-            if *timer_pid != pid || timer.deadline_ns == 0 {
+        for (_, timer) in timers.range_mut((pid, 0)..=(pid, u32::MAX)) {
+            if timer.deadline_ns == 0 {
                 continue;
             }
 

@@ -24,9 +24,10 @@ use crate::vfs::structure::{
 use crate::vfs::FsOps;
 
 use super::{
-    step_open, step_open_in_mount_namespace, step_open_in_mount_namespace_with_mount,
-    step_open_in_mount_namespace_with_origin_mount, step_walk, step_walk_in_mount_namespace,
-    step_walk_in_mount_namespace_with_origin_mount, SYMLOOP_MAX,
+    step_open, step_open_cached_in_mount_namespace_with_origin_mount, step_open_in_mount_namespace,
+    step_open_in_mount_namespace_with_mount, step_open_in_mount_namespace_with_origin_mount,
+    step_walk, step_walk_in_mount_namespace, step_walk_in_mount_namespace_with_origin_mount,
+    SYMLOOP_MAX,
 };
 
 // === capturing char-device binding for the console TTY ================
@@ -873,6 +874,73 @@ fn namespace_aware_open_uses_each_namespaces_root_for_absolute_paths() {
     assert_eq!(file_b.open_file.rnode().fs_object_id(), b_id);
     assert_eq!(file_a.mount.key(), topo_a.root_mount.key());
     assert_eq!(file_b.mount.key(), topo_b.root_mount.key());
+}
+
+#[test]
+fn namespace_cached_open_never_calls_backend_and_reports_cold_component_as_eagain() {
+    let _serial = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_zones();
+    crate::mount::reset_mount_table_for_test();
+
+    let topo = build_rootfs();
+    topo.rootfs.add_dir(FsObjectId::new(2), b"cached");
+    let namespace =
+        crate::mount::MountNamespace::new_cap(topo.root_mount.clone()).expect("namespace");
+    let flags = OpenFileFlags {
+        read: true,
+        write: false,
+        append: false,
+        cloexec: false,
+        nonblocking: false,
+        packet: false,
+    };
+    let cred = Credential::root();
+    let guard = guard();
+
+    let primed = match step_open_in_mount_namespace_with_origin_mount(
+        topo.root_dentry.clone(),
+        &topo.root_mount,
+        b"/cached",
+        flags,
+        0,
+        &cred,
+        &namespace,
+        &guard,
+    ) {
+        V3::Done(opened) => opened,
+        other => panic!("priming open failed: {other:?}"),
+    };
+    let counts_after_prime = topo.rootfs.lookup_counts();
+
+    let cached = step_open_cached_in_mount_namespace_with_origin_mount(
+        topo.root_dentry.clone(),
+        &topo.root_mount,
+        b"/cached",
+        flags,
+        0,
+        &cred,
+        &namespace,
+        &guard,
+    );
+    assert!(matches!(cached, V3::Done(_)));
+    assert_eq!(topo.rootfs.lookup_counts(), counts_after_prime);
+
+    let cold = step_open_cached_in_mount_namespace_with_origin_mount(
+        topo.root_dentry.clone(),
+        &topo.root_mount,
+        b"/not-yet-cached",
+        flags,
+        0,
+        &cred,
+        &namespace,
+        &guard,
+    );
+    assert!(matches!(cold, V3::Err(V3Errno::EAGAIN)));
+    assert_eq!(topo.rootfs.lookup_counts(), counts_after_prime);
+
+    drop(primed);
 }
 
 #[test]

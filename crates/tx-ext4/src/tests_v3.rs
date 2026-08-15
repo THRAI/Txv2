@@ -533,6 +533,12 @@ fn build_image() -> MemImage {
     .encode(&mut image.block_mut(1)[..64])
     .unwrap();
 
+    // Keep allocation bitmaps consistent with the superblock/group counts.
+    // The fixture owns reserved inodes 1..=11 plus file inode 12, and its
+    // first 32 blocks contain filesystem metadata or preallocated data.
+    mark_inode_bitmap_used(&mut image, 12);
+    mark_block_bitmap_used(&mut image, 32);
+
     // root inode (ino 2): directory containing "hello" (ino 12).
     let mut root_inode = Inode::default();
     root_inode.mode = 0x4000 | 0o755;
@@ -833,6 +839,51 @@ fn build_tier1_rename_overwrite_image() -> MemImage {
     );
     *image.block_mut(21) = [0x21; BLOCK_SIZE];
     BitmapMut::new(image.block_mut(2)).set(21).unwrap();
+    image
+}
+
+fn build_tier1_cross_block_rename_overwrite_image() -> MemImage {
+    let mut image = build_tier1_rename_overwrite_image();
+
+    // Keep the established destination in the first directory block and put
+    // the newly-created source in a later block.  This is the layout produced
+    // by rustc incremental publication once a directory has grown beyond one
+    // block.
+    let mut root_inode = Inode::default();
+    root_inode.mode = 0x4000 | 0o755;
+    root_inode.size = 2 * BLOCK_SIZE as u64;
+    root_inode.blocks_512 = 16;
+    root_inode.links_count = 2;
+    root_inode.flags = Inode::EXTENTS_FL;
+    root_inode
+        .set_extent_root(&[
+            Extent {
+                logical_block: 0,
+                len: 1,
+                physical_start: 16,
+            },
+            Extent {
+                logical_block: 1,
+                len: 1,
+                physical_start: 22,
+            },
+        ])
+        .unwrap();
+    write_inode_at(&mut image, 2, &root_inode);
+
+    encode_dir(
+        image.block_mut(16),
+        &[
+            (2, 2, b".".as_slice()),
+            (2, 2, b"..".as_slice()),
+            (14, 1, b"dep-graph.bin".as_slice()),
+        ],
+    );
+    encode_dir(
+        image.block_mut(22),
+        &[(12, 1, b"dep-graph.part.bin".as_slice())],
+    );
+    BitmapMut::new(image.block_mut(2)).set(22).unwrap();
     image
 }
 
@@ -1478,6 +1529,27 @@ fn mounted_counting_rename_overwrite_fs(
         Arc::clone(&runtime),
     )
     .expect("mount Tier 1 rename-overwrite mutation ext4 image");
+    (mounted, runtime, writes)
+}
+
+fn mounted_counting_cross_block_rename_overwrite_fs(
+    sequence: u32,
+) -> (
+    crate::mount::MountedExt4<CountingImage>,
+    Arc<JournalMutationRuntime>,
+    Arc<AtomicUsize>,
+) {
+    let writes = Arc::new(AtomicUsize::new(0));
+    let runtime = mutation_runtime_for_test_with_metadata(sequence, 3, false);
+    let mounted = mount_ext4_read_write_with_mutation_journal_io_manager_planner(
+        CountingImage {
+            image: build_tier1_cross_block_rename_overwrite_image(),
+            writes: Arc::clone(&writes),
+        },
+        Ext4BlockGeometry::new(DeviceKey::new(7), 8),
+        Arc::clone(&runtime),
+    )
+    .expect("mount cross-block rename-overwrite ext4 image");
     (mounted, runtime, writes)
 }
 
@@ -2161,7 +2233,7 @@ fn ext4_mapped_write_mutation_requires_a_mutation_owner() {
 }
 
 #[test]
-fn ext4_prepare_write_range_requires_a_mutation_owner_before_dirty_publication() {
+fn ext4_prepare_write_range_accepts_legacy_direct_writeback() {
     let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     init_substrate();
     let fs = open_fs();
@@ -2175,7 +2247,7 @@ fn ext4_prepare_write_range_requires_a_mutation_owner_before_dirty_publication()
             BLOCK_SIZE,
             &guard,
         ),
-        V3::<(), NoProgress>::err(V3Errno::EOPNOTSUPP)
+        V3::<(), NoProgress>::done(())
     );
 }
 
@@ -2208,7 +2280,48 @@ fn ext4_metadata_admission_yields_and_wakes_instead_of_spinning() {
 }
 
 #[test]
-fn ext4_buffered_extending_write_preallocates_before_dirty_publication() {
+fn ext4_metadata_mutation_release_wakes_every_contender() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let fs = open_fs();
+    let permit = fs
+        .try_lock_metadata_mutation_admission()
+        .expect("first mutation owner");
+    let source = match fs.wait_for_metadata_mutation_admission::<()>() {
+        V3::Yield {
+            shape: tx_substrate::step::YieldShape::OnWaitSource { source, interests },
+            ..
+        } => {
+            assert_eq!(interests.raw(), 1);
+            source
+        }
+        other => panic!("contended mutation admission must yield: {other:?}"),
+    };
+    let endpoint = tx_substrate::wake::lookup_source(source).expect("registered ext4 wait source");
+    let first = Arc::new(tx_substrate::wake::TaskMailbox::new());
+    let second = Arc::new(tx_substrate::wake::TaskMailbox::new());
+    let first_generation = first.next_generation();
+    let second_generation = second.next_generation();
+    let _first_subscription = endpoint.register(
+        Arc::downgrade(&first),
+        first_generation,
+        tx_substrate::step::InterestMask::new(1),
+    );
+    let _second_subscription = endpoint.register(
+        Arc::downgrade(&second),
+        second_generation,
+        tx_substrate::step::InterestMask::new(1),
+    );
+
+    drop(permit);
+
+    assert!(first.poll().is_some(), "first contender was not woken");
+    assert!(second.poll().is_some(), "second contender was not woken");
+    assert!(fs.try_lock_metadata_mutation_admission().is_some());
+}
+
+#[test]
+fn ext4_buffered_extending_write_defers_allocation_until_writeback() {
     let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     init_substrate();
     let guard = epoch::guard();
@@ -2219,9 +2332,12 @@ fn ext4_buffered_extending_write_preallocates_before_dirty_publication() {
 
     assert_eq!(step_write(&pc, &of, 32, &guard), V3::done(32));
     assert_eq!(of.offset(), 4 * BLOCK_SIZE as u64 + 32);
-    assert_metadata_settled(&runtime, &writes);
+    assert_eq!(writes.load(Ordering::Acquire), 0);
+    assert_eq!(
+        runtime.snapshot_transaction_frontier(),
+        tx_subsystems::mount::MountTransactionFrontier::new(0)
+    );
     assert!(pc.page_marks(PageIndex::new(4)).expect("page 4").dirty);
-    let writes_after_preallocation = writes.load(Ordering::Acquire);
 
     let ppn = pc.lookup(PageIndex::new(4)).expect("dirty page 4 resident");
     let frame = Frame::new(ppn);
@@ -2234,15 +2350,15 @@ fn ext4_buffered_extending_write_preallocates_before_dirty_publication() {
         ),
         V3::<(), NoProgress>::done(())
     );
-    assert_eq!(writes.load(Ordering::Acquire), writes_after_preallocation);
+    assert_eq!(writes.load(Ordering::Acquire), 0);
     assert_eq!(
         runtime.snapshot_transaction_frontier(),
-        tx_subsystems::mount::MountTransactionFrontier::new(25)
+        tx_subsystems::mount::MountTransactionFrontier::new(24)
     );
 }
 
 #[test]
-fn ext4_preallocation_allows_multiple_extending_buffered_writes() {
+fn ext4_allows_multiple_extending_buffered_writes_before_writeback() {
     let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     init_substrate();
     let guard = epoch::guard();
@@ -2252,13 +2368,17 @@ fn ext4_preallocation_allows_multiple_extending_buffered_writes() {
 
     of.set_offset(4 * BLOCK_SIZE as u64);
     assert_eq!(step_write(&pc, &of, 32, &guard), V3::done(32));
-    assert_metadata_settled(&runtime, &writes);
 
     of.set_offset(5 * BLOCK_SIZE as u64);
     assert_eq!(
         step_write(&pc, &of, 32, &guard),
         V3::done(32),
-        "each growth allocation settles before the corresponding dirty page is published"
+        "dirty pages do not serialize on per-page allocation transactions"
+    );
+    assert_eq!(writes.load(Ordering::Acquire), 0);
+    assert_eq!(
+        runtime.snapshot_transaction_frontier(),
+        tx_subsystems::mount::MountTransactionFrontier::new(0)
     );
 
     assert_eq!(
@@ -2271,7 +2391,7 @@ fn ext4_preallocation_allows_multiple_extending_buffered_writes() {
 }
 
 #[test]
-fn ext4_truncate_after_preallocation_settles_cleanly() {
+fn ext4_truncate_with_deferred_dirty_growth_settles_cleanly() {
     let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     init_substrate();
     let guard = epoch::guard();
@@ -2281,7 +2401,7 @@ fn ext4_truncate_after_preallocation_settles_cleanly() {
 
     of.set_offset(4 * BLOCK_SIZE as u64);
     assert_eq!(step_write(&pc, &of, 32, &guard), V3::done(32));
-    assert_metadata_settled(&runtime, &writes);
+    assert_eq!(writes.load(Ordering::Acquire), 0);
 
     assert_eq!(
         mounted
@@ -2397,7 +2517,10 @@ fn ext4_destroy_clears_singleton_orphan_before_inode_reuse() {
             V3::Done(created) => created,
             other => panic!("create second file for orphan reuse test: {other:?}"),
         };
-    assert_eq!(second_id, first_id);
+    assert_eq!(second_id.inode_number(), first_id.inode_number());
+    assert_ne!(second_id, first_id);
+    assert_eq!(first_id.inode_generation(), 1);
+    assert_eq!(second_id.inode_generation(), 2);
     assert_eq!(
         fs_ops.unlink(FsObjectId::new(2), b"second", second_id, &guard,),
         V3::<(), NoProgress>::done(())
@@ -2445,8 +2568,13 @@ fn ext4_inode_reuse_does_not_reuse_live_unlinked_page_container() {
             other => panic!("create replacement inode: {other:?}"),
         };
     assert_eq!(
-        second_id, first_id,
+        second_id.inode_number(),
+        first_id.inode_number(),
         "fixture must exercise inode-number reuse"
+    );
+    assert_ne!(
+        second_id, first_id,
+        "reused inode number must have a new object identity"
     );
 
     let second_rnode = match fs_ops.materialise_rnode(second_id, second_meta, &payload, &guard) {
@@ -2542,7 +2670,7 @@ fn ext4_create_public_path_admits_regular_file_without_home_write() {
             .fs_ops()
             .create_inode(FsObjectId::new(2), b"created", 0o100640, &cred, &guard,),
         V3::<_, NoProgress>::done((
-            FsObjectId::new(14),
+            FsObjectId::from_inode_generation(14, 1),
             InodeMeta {
                 mode: 0o100640,
                 uid: 0,
@@ -2622,7 +2750,7 @@ fn ext4_chmod_public_path_admits_new_file_after_buffered_write_settlement() {
     );
     assert_eq!(
         runtime.snapshot_transaction_frontier(),
-        tx_subsystems::mount::MountTransactionFrontier::new(36)
+        tx_subsystems::mount::MountTransactionFrontier::new(35)
     );
 
     assert_eq!(
@@ -2733,7 +2861,7 @@ fn ext4_mkdir_public_path_admits_directory_without_home_write() {
             .fs_ops()
             .mkdir(FsObjectId::new(2), b"newdir", 0o755, &cred, &guard,),
         V3::<_, NoProgress>::done((
-            FsObjectId::new(14),
+            FsObjectId::from_inode_generation(14, 1),
             InodeMeta {
                 mode: 0o40755,
                 uid: 0,
@@ -2753,12 +2881,12 @@ fn ext4_mkdir_public_path_admits_directory_without_home_write() {
         mounted
             .fs_ops()
             .lookup(FsObjectId::new(2), b"newdir", &guard),
-        V3::<_, NoProgress>::done(FsObjectId::new(14))
+        V3::<_, NoProgress>::done(FsObjectId::from_inode_generation(14, 1))
     );
     assert_eq!(
         mounted
             .fs_ops()
-            .load_inode_meta(FsObjectId::new(14), &guard),
+            .load_inode_meta(FsObjectId::from_inode_generation(14, 1), &guard),
         V3::<_, NoProgress>::done(InodeMeta {
             mode: 0o40755,
             uid: 0,
@@ -2823,7 +2951,7 @@ fn ext4_symlink_public_path_admits_fast_symlink_without_home_write() {
             .fs_ops()
             .symlink(FsObjectId::new(2), b"alink", b"nested/child", &cred, &guard,),
         V3::<_, NoProgress>::done((
-            FsObjectId::new(14),
+            FsObjectId::from_inode_generation(14, 1),
             InodeMeta {
                 mode: 0o120777,
                 uid: 0,
@@ -2898,6 +3026,39 @@ fn ext4_rename_public_path_admits_same_dir_overwrite_without_home_write() {
 }
 
 #[test]
+fn ext4_rename_overwrite_across_directory_blocks_is_atomic() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let guard = epoch::guard();
+    let (mounted, runtime, writes) = mounted_counting_cross_block_rename_overwrite_fs(49);
+    let fs_ops = mounted.fs_ops();
+    let source = match fs_ops.lookup(FsObjectId::new(2), b"dep-graph.part.bin", &guard) {
+        V3::Done(object) => object,
+        other => panic!("lookup source before rename: {other:?}"),
+    };
+
+    assert_eq!(
+        fs_ops.rename(
+            FsObjectId::new(2),
+            b"dep-graph.part.bin",
+            FsObjectId::new(2),
+            b"dep-graph.bin",
+            &guard,
+        ),
+        V3::<(), NoProgress>::done(())
+    );
+    assert_metadata_settled(&runtime, &writes);
+    assert_eq!(
+        fs_ops.lookup(FsObjectId::new(2), b"dep-graph.part.bin", &guard),
+        V3::<FsObjectId, NoProgress>::err(V3Errno::ENOENT),
+    );
+    assert_eq!(
+        fs_ops.lookup(FsObjectId::new(2), b"dep-graph.bin", &guard),
+        V3::<_, NoProgress>::done(source),
+    );
+}
+
+#[test]
 fn ext4_rename_public_path_admits_cross_dir_regular_file_without_home_write() {
     let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     init_substrate();
@@ -2915,6 +3076,54 @@ fn ext4_rename_public_path_admits_cross_dir_regular_file_without_home_write() {
         V3::<(), NoProgress>::done(())
     );
     assert_metadata_settled(&runtime, &writes);
+}
+
+#[test]
+fn ext4_new_file_moves_out_of_new_directory_after_create_settlement() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let guard = epoch::guard();
+    let cred = tx_subsystems::vfs::Credential::root();
+    let (mounted, runtime, writes) = mounted_counting_mkdir_fs_with_ring(36);
+    let fs_ops = mounted.fs_ops();
+
+    let (temp_dir, _) = match fs_ops.mkdir(
+        FsObjectId::new(2),
+        b".tmp-test.temp-archive",
+        0o755,
+        &cred,
+        &guard,
+    ) {
+        V3::Done(created) => created,
+        other => panic!("create temporary archive directory: {other:?}"),
+    };
+    assert_metadata_settled(&runtime, &writes);
+
+    let (archive, _) = match fs_ops.create_inode(temp_dir, b"tmp.a", 0o644, &cred, &guard) {
+        V3::Done(created) => created,
+        other => panic!("create temporary archive: {other:?}"),
+    };
+    assert_metadata_settled(&runtime, &writes);
+    assert_eq!(
+        fs_ops.lookup(temp_dir, b"tmp.a", &guard),
+        V3::<_, NoProgress>::done(archive),
+    );
+
+    assert_eq!(
+        fs_ops.rename(
+            temp_dir,
+            b"tmp.a",
+            FsObjectId::new(2),
+            b"lib-test.rlib",
+            &guard,
+        ),
+        V3::<(), NoProgress>::done(()),
+    );
+    assert_metadata_settled(&runtime, &writes);
+    assert_eq!(
+        fs_ops.lookup(FsObjectId::new(2), b"lib-test.rlib", &guard),
+        V3::<_, NoProgress>::done(archive),
+    );
 }
 
 #[test]
@@ -3202,7 +3411,7 @@ fn ext4_shutdown_settles_mount_caches_and_releases_mount_pin() {
 }
 
 #[test]
-fn ext4_v3_mutation_methods_require_a_mutation_owner() {
+fn ext4_v3_mutation_methods_use_direct_executor_without_a_journal_owner() {
     let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     init_substrate();
     let fs = open_fs();
@@ -3217,11 +3426,13 @@ fn ext4_v3_mutation_methods_require_a_mutation_owner() {
         &cred,
         &guard,
     );
+    let V3::Done((file_id, _)) = result else {
+        panic!("direct create failed: {result:?}");
+    };
     assert_eq!(
-        result,
-        V3::<(FsObjectId, InodeMeta), NoProgress>::err(V3Errno::EOPNOTSUPP)
+        <Ext4FsInstance<MemImage> as FsOps>::lookup(&*fs, FsObjectId::new(2), b"new", &guard,),
+        V3::<_, NoProgress>::done(file_id)
     );
-
     let result = <Ext4FsInstance<MemImage> as FsOps>::mkdir(
         &*fs,
         FsObjectId::new(2),
@@ -3230,19 +3441,14 @@ fn ext4_v3_mutation_methods_require_a_mutation_owner() {
         &cred,
         &guard,
     );
-    assert_eq!(
-        result,
-        V3::<(FsObjectId, InodeMeta), NoProgress>::err(V3Errno::EOPNOTSUPP)
-    );
-
-    assert_eq!(
-        <Ext4FsInstance<MemImage> as FsOps>::destroy_inode(&*fs, FsObjectId::new(12), &guard),
-        V3::<(), NoProgress>::err(V3Errno::EOPNOTSUPP)
+    assert!(
+        matches!(result, V3::Done(_)),
+        "direct mkdir failed: {result:?}"
     );
 }
 
 #[test]
-fn ext4_materialise_new_regular_file_requires_a_mutation_owner() {
+fn ext4_loads_directly_created_regular_file_without_a_journal_owner() {
     let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     init_substrate();
     let fs = open_fs();
@@ -3257,10 +3463,13 @@ fn ext4_materialise_new_regular_file_requires_a_mutation_owner() {
         &cred,
         &guard,
     );
-    assert_eq!(
-        result,
-        V3::<(FsObjectId, InodeMeta), NoProgress>::err(V3Errno::EOPNOTSUPP)
-    );
+    let V3::Done((file_id, _)) = result else {
+        panic!("direct create failed: {result:?}");
+    };
+    assert!(matches!(
+        <Ext4FsInstance<MemImage> as FsOps>::load_inode_meta(&*fs, file_id, &guard),
+        V3::Done(_)
+    ));
 }
 
 #[test]
@@ -3323,13 +3532,16 @@ fn ext4_v3_mutation_methods_rejected_on_read_only_mount_with_erofs() {
 }
 
 #[test]
-fn production_namespace_without_mutation_owner_writes_nothing() {
+fn compatibility_namespace_without_journal_owner_writes_home_blocks_directly() {
     let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     init_substrate();
     let writes = Arc::new(AtomicUsize::new(0));
+    let mut image = build_image();
+    mark_inode_bitmap_used(&mut image, 12);
+    mark_block_bitmap_used(&mut image, 32);
     let fs = Ext4FsInstance::open(
         CountingImage {
-            image: build_image(),
+            image,
             writes: Arc::clone(&writes),
         },
         false,
@@ -3350,58 +3562,79 @@ fn production_namespace_without_mutation_owner_writes_nothing() {
         ),
         V3::<(), NoProgress>::err(V3Errno::EOPNOTSUPP),
     );
+    let new_file = match <Ext4FsInstance<CountingImage> as FsOps>::create_inode(
+        &*fs,
+        FsObjectId::new(2),
+        b"new",
+        0o100644,
+        &cred,
+        &guard,
+    ) {
+        V3::Done((id, _)) => id,
+        other => panic!("direct create failed: {other:?}"),
+    };
     assert_eq!(
-        <Ext4FsInstance<CountingImage> as FsOps>::create_inode(
-            &*fs,
-            FsObjectId::new(2),
-            b"new",
-            0o100644,
-            &cred,
-            &guard,
-        ),
-        V3::<_, NoProgress>::err(V3Errno::EOPNOTSUPP),
+        <Ext4FsInstance<CountingImage> as FsOps>::lookup(&*fs, FsObjectId::new(2), b"new", &guard,),
+        V3::<_, NoProgress>::done(new_file),
     );
     assert_eq!(
-        <Ext4FsInstance<CountingImage> as FsOps>::mkdir(
+        <Ext4FsInstance<CountingImage> as FsPageBacking>::flush_page(
             &*fs,
-            FsObjectId::new(2),
-            b"newdir",
-            0o755,
-            &cred,
+            new_file,
+            4 * BLOCK_SIZE as u64,
+            &frame,
             &guard,
         ),
-        V3::<_, NoProgress>::err(V3Errno::EOPNOTSUPP),
+        V3::<(), NoProgress>::done(()),
+        "compatibility writeback must allocate a sparse hole through the full planner",
     );
+    let grown =
+        match <Ext4FsInstance<CountingImage> as FsOps>::load_inode_meta(&*fs, new_file, &guard) {
+            V3::Done(meta) => meta,
+            other => panic!("load sparse file after compatibility writeback: {other:?}"),
+        };
+    assert_eq!(grown.size, 5 * BLOCK_SIZE as u64);
+    assert_eq!(grown.blocks, 8);
+    let new_dir = match <Ext4FsInstance<CountingImage> as FsOps>::mkdir(
+        &*fs,
+        FsObjectId::new(2),
+        b"newdir",
+        0o755,
+        &cred,
+        &guard,
+    ) {
+        V3::Done((id, _)) => id,
+        other => panic!("direct mkdir failed: {other:?}"),
+    };
     assert_eq!(
-        <Ext4FsInstance<CountingImage> as FsOps>::unlink(
-            &*fs,
-            FsObjectId::new(2),
-            b"hello",
-            FsObjectId::new(12),
-            &guard,
-        ),
-        V3::<(), NoProgress>::err(V3Errno::EOPNOTSUPP),
+        <Ext4FsInstance<CountingImage> as FsOps>::lookup(&*fs, FsObjectId::new(2), b"new", &guard,),
+        V3::<_, NoProgress>::done(new_file),
     );
+    assert!(writes.load(Ordering::Acquire) > 0);
     assert_eq!(
         <Ext4FsInstance<CountingImage> as FsOps>::rename(
             &*fs,
             FsObjectId::new(2),
-            b"hello",
+            b"new",
             FsObjectId::new(2),
-            b"renamed",
+            b"ren",
             &guard,
         ),
-        V3::<(), NoProgress>::err(V3Errno::EOPNOTSUPP),
+        V3::<(), NoProgress>::done(()),
+    );
+    assert_eq!(
+        <Ext4FsInstance<CountingImage> as FsOps>::lookup(&*fs, FsObjectId::new(2), b"ren", &guard,),
+        V3::<_, NoProgress>::done(new_file),
     );
     assert_eq!(
         <Ext4FsInstance<CountingImage> as FsOps>::rmdir(
             &*fs,
             FsObjectId::new(2),
-            b"empty",
-            FsObjectId::new(13),
+            b"newdir",
+            new_dir,
             &guard,
         ),
-        V3::<(), NoProgress>::err(V3Errno::EOPNOTSUPP),
+        V3::<(), NoProgress>::done(()),
     );
     assert_eq!(
         <Ext4FsInstance<CountingImage> as FsPageBacking>::flush_page(
@@ -3411,7 +3644,7 @@ fn production_namespace_without_mutation_owner_writes_nothing() {
             &frame,
             &guard,
         ),
-        V3::<(), NoProgress>::err(V3Errno::EOPNOTSUPP),
+        V3::<(), NoProgress>::done(()),
     );
     assert_eq!(
         <Ext4FsInstance<CountingImage> as FsPageBacking>::truncate(
@@ -3420,9 +3653,9 @@ fn production_namespace_without_mutation_owner_writes_nothing() {
             0,
             &guard,
         ),
-        V3::<(), NoProgress>::err(V3Errno::EOPNOTSUPP),
+        V3::<(), NoProgress>::done(()),
     );
-    assert_eq!(writes.load(Ordering::Acquire), 0);
+    assert!(writes.load(Ordering::Acquire) > 0);
 }
 
 #[test]
@@ -3438,7 +3671,7 @@ fn ext4_mkdir_public_path_admits_directory_with_ring_runtime_without_home_write(
             .fs_ops()
             .mkdir(FsObjectId::new(2), b"newdir", 0o755, &cred, &guard,),
         V3::<_, NoProgress>::done((
-            FsObjectId::new(14),
+            FsObjectId::from_inode_generation(14, 1),
             InodeMeta {
                 mode: 0o40755,
                 uid: 0,
@@ -3458,12 +3691,12 @@ fn ext4_mkdir_public_path_admits_directory_with_ring_runtime_without_home_write(
         mounted
             .fs_ops()
             .lookup(FsObjectId::new(2), b"newdir", &guard),
-        V3::<_, NoProgress>::done(FsObjectId::new(14))
+        V3::<_, NoProgress>::done(FsObjectId::from_inode_generation(14, 1))
     );
     assert_eq!(
         mounted
             .fs_ops()
-            .load_inode_meta(FsObjectId::new(14), &guard),
+            .load_inode_meta(FsObjectId::from_inode_generation(14, 1), &guard),
         V3::<_, NoProgress>::done(InodeMeta {
             mode: 0o40755,
             uid: 0,
@@ -3478,11 +3711,15 @@ fn ext4_mkdir_public_path_admits_directory_with_ring_runtime_without_home_write(
         })
     );
     assert_eq!(
-        mounted
-            .fs_ops()
-            .create_inode(FsObjectId::new(14), b"file", 0o100640, &cred, &guard,),
+        mounted.fs_ops().create_inode(
+            FsObjectId::from_inode_generation(14, 1),
+            b"file",
+            0o100640,
+            &cred,
+            &guard,
+        ),
         V3::<_, NoProgress>::done((
-            FsObjectId::new(15),
+            FsObjectId::from_inode_generation(15, 1),
             InodeMeta {
                 mode: 0o100640,
                 uid: 0,
@@ -3516,14 +3753,14 @@ fn ext4_mkdir_public_path_settles_cross_group_inode_and_data_with_ring_runtime()
             V3::Done(created) => created,
             other => panic!("cross-group mkdir through public path: {other:?}"),
         };
-    assert_eq!(created, FsObjectId::new(129));
+    assert_eq!(created, FsObjectId::from_inode_generation(129, 1));
     assert_eq!(meta.mode, 0o40755);
     assert_metadata_settled(&runtime, &writes);
     assert_eq!(
         mounted
             .fs_ops()
             .lookup(FsObjectId::new(2), b"cross-group", &guard),
-        V3::<_, NoProgress>::done(FsObjectId::new(129))
+        V3::<_, NoProgress>::done(FsObjectId::from_inode_generation(129, 1))
     );
     assert_eq!(
         mounted.fs_ops().load_inode_meta(created, &guard),
@@ -3652,7 +3889,7 @@ fn ext4_v3_filesystem_stats_reads_allocation_bitmaps() {
 }
 
 #[test]
-fn ext4_v3_truncate_requires_a_mutation_owner_while_clean_fsync_succeeds() {
+fn ext4_v3_truncate_uses_direct_executor_while_clean_fsync_succeeds() {
     let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     init_substrate();
     let fs = open_fs();
@@ -3660,7 +3897,7 @@ fn ext4_v3_truncate_requires_a_mutation_owner_while_clean_fsync_succeeds() {
 
     assert_eq!(
         <Ext4FsInstance<MemImage> as FsPageBacking>::truncate(&*fs, FsObjectId::new(12), 0, &guard,),
-        V3::<(), NoProgress>::err(V3Errno::EOPNOTSUPP)
+        V3::<(), NoProgress>::done(())
     );
     assert_eq!(
         <Ext4FsInstance<MemImage> as FsPageBacking>::fsync_file(&*fs, FsObjectId::new(12), &guard),

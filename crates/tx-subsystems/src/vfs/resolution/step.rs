@@ -25,7 +25,7 @@ use crate::vfs::FsOps;
 
 use super::state::{
     try_clone_io_request, try_copy_path, try_join_path, FinalSymlinkPolicy, IORequest, KernelStep,
-    PathResolution, ResumeToken, WalkCause, WalkMode, WalkState, WalkingState,
+    PathResolution, RemainingPath, ResumeToken, WalkCause, WalkMode, WalkState, WalkingState,
 };
 use super::terminal;
 
@@ -57,6 +57,56 @@ pub fn kernel_step(
     rules: TerminalRules,
     guard: &Guard<'_>,
 ) -> KernelStep {
+    kernel_step_with_lookup_policy(
+        walking,
+        fs_ops,
+        mount_payload,
+        mount_namespace,
+        cred,
+        rules,
+        false,
+        guard,
+    )
+}
+
+/// Advance a walker without consulting filesystem metadata backends.
+///
+/// This is the VFS half of the trap-local path lookup lane. It accepts only
+/// parent-local dentries whose backend generation still matches; a missing or
+/// stale component is reported as `EAGAIN` so the syscall can fall back to the
+/// ordinary wait-capable walker. No negative result from this function is
+/// exposed directly to userspace.
+pub fn kernel_step_cached(
+    walking: WalkingState,
+    fs_ops: Arc<dyn FsOps>,
+    mount_payload: Option<Cap<MountPayload>>,
+    mount_namespace: Option<&Cap<MountNamespace>>,
+    cred: &Credential,
+    rules: TerminalRules,
+    guard: &Guard<'_>,
+) -> KernelStep {
+    kernel_step_with_lookup_policy(
+        walking,
+        fs_ops,
+        mount_payload,
+        mount_namespace,
+        cred,
+        rules,
+        true,
+        guard,
+    )
+}
+
+fn kernel_step_with_lookup_policy(
+    walking: WalkingState,
+    fs_ops: Arc<dyn FsOps>,
+    mount_payload: Option<Cap<MountPayload>>,
+    mount_namespace: Option<&Cap<MountNamespace>>,
+    cred: &Credential,
+    rules: TerminalRules,
+    cache_only: bool,
+    guard: &Guard<'_>,
+) -> KernelStep {
     let WalkingState {
         mut current,
         remaining,
@@ -68,9 +118,9 @@ pub fn kernel_step(
     } = walking;
 
     // --- extract next component / end of input ---
-    let (component, remaining) = match take_next_component(remaining) {
-        Ok(Some(next)) => next,
-        Ok(None) => {
+    let ((component_start, component_end), remaining) = match take_next_component(remaining) {
+        Some(next) => next,
+        None => {
             if must_be_directory && current.rnode().meta().kind() != InodeKind::Directory {
                 return KernelStep::Error(WalkCause::NotADirectory);
             }
@@ -89,8 +139,8 @@ pub fn kernel_step(
             }
             return KernelStep::Error(WalkCause::ComponentNotFound);
         }
-        Err(errno) => return KernelStep::Error(WalkCause::FsOpsRejected(errno)),
     };
+    let component = remaining.absolute_slice(component_start, component_end);
 
     // --- `.` and `..` ---
     if component == b"." {
@@ -150,38 +200,49 @@ pub fn kernel_step(
         ));
     }
 
-    let child_inline = match InlineName::new(&component) {
-        Ok(n) => n,
-        Err(_) => return KernelStep::Error(WalkCause::ComponentNotFound),
-    };
+    if component.is_empty() || component.len() > crate::vfs::structure::VFS_NAME_MAX {
+        return KernelStep::Error(WalkCause::ComponentNotFound);
+    }
 
     // --- lookup / materialise, with parent-local dentry cache ---
     //
-    // Resolution authority is the `FsOps::lookup` tier: its per-parent
-    // caches are invalidated on rename/unlink/create keyed by the parent's
-    // fs_object_id, globally. The parent-local dentry child cache is NOT
-    // reliable for (name → ino) resolution — the same directory can have
-    // several live `DEntry` instances (weak child links die and chains get
-    // rebuilt per walk), so a mutation's `remove_cached_child` may purge a
-    // different instance than the one a later walk hits. Trusting a cached
-    // child blindly served pre-rename files: git's second config rewrite
-    // read the pre-first-rewrite content and `remote add` lost the url.
-    // The cached child is used only to PRESERVE the existing DEntry/RNode
-    // (and its PageContainer) identity when the FS agrees on the ino.
+    // Ext4 can have several live DEntry instances for one directory, so
+    // purging one parent-local map on rename is insufficient. Its FsOps
+    // supplies a mount-global directory version: a matching token makes this
+    // positive dentry authoritative without another backend lookup, while a
+    // mutation invalidates every instance at once. Backends without a token
+    // retain the traditional contract that their mutation path purges the
+    // relevant parent-local cache synchronously.
     let parent_fs_object_id = current.rnode().fs_object_id();
-    let cached_child = current.cached_child(child_inline);
-    let (child_dentry, child_rnode_cap, child_fs_object_id, child_meta) = {
-        let child_fs_object_id = match fs_ops.lookup(parent_fs_object_id, &component, guard) {
+    let lookup_version_before = fs_ops.lookup_cache_version(parent_fs_object_id);
+    let cached_child = current.cached_child_with_version_by_name(component);
+    let cached_is_authoritative = cached_child.as_ref().is_some_and(|(_, version)| {
+        lookup_version_before.is_none() || *version == lookup_version_before
+    });
+    let (child_dentry, child_rnode_cap, child_fs_object_id, child_meta) = if cached_is_authoritative
+    {
+        let cached = cached_child.expect("authoritative cached child exists");
+        let rnode = cached.0.rnode().clone();
+        let fs_object_id = rnode.fs_object_id();
+        let meta = rnode.meta();
+        (cached.0, rnode, fs_object_id, meta)
+    } else {
+        if cache_only {
+            return KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::EAGAIN));
+        }
+        let child_fs_object_id = match fs_ops.lookup(parent_fs_object_id, component, guard) {
             StepOutcome::Done(id) => id,
             StepOutcome::Yield { .. } => {
-                let retry_remaining = match remaining_with_component(&component, &remaining) {
-                    Ok(remaining) => remaining,
-                    Err(errno) => return KernelStep::Error(WalkCause::FsOpsRejected(errno)),
-                };
                 let request = IORequest::DirLookup {
                     fs_object_id: parent_fs_object_id,
-                    name: component,
+                    name: match try_copy_path(component) {
+                        Ok(name) => name,
+                        Err(errno) => {
+                            return KernelStep::Error(WalkCause::FsOpsRejected(errno));
+                        }
+                    },
                 };
+                let retry_remaining = remaining.rewind_to(component_start);
                 let resume_request = match try_clone_io_request(&request) {
                     Ok(request) => request,
                     Err(errno) => return KernelStep::Error(WalkCause::FsOpsRejected(errno)),
@@ -208,10 +269,7 @@ pub fn kernel_step(
                 )));
             }
             StepOutcome::Continue { .. } => {
-                let retry_remaining = match remaining_with_component(&component, &remaining) {
-                    Ok(remaining) => remaining,
-                    Err(errno) => return KernelStep::Error(WalkCause::FsOpsRejected(errno)),
-                };
+                let retry_remaining = remaining.rewind_to(component_start);
                 // Re-enter lookup (v3 continue without yield).
                 return KernelStep::Continue(WalkState::Walking(WalkingState {
                     current,
@@ -224,26 +282,31 @@ pub fn kernel_step(
                 }));
             }
         };
+        let lookup_version_after = fs_ops.lookup_cache_version(parent_fs_object_id);
+        let confirmed_lookup_version = if lookup_version_before == lookup_version_after {
+            lookup_version_after
+        } else {
+            None
+        };
 
-        if let Some(cached) =
-            cached_child.filter(|c| c.rnode().fs_object_id() == child_fs_object_id)
+        if let Some(cached) = cached_child
+            .map(|(child, _)| child)
+            .filter(|c| c.rnode().fs_object_id() == child_fs_object_id)
         {
             // FS agrees with the cached instance: keep the existing DEntry so
             // its RNode/PageContainer identity survives the walk.
+            let cached = current.cache_child_with_version(cached, confirmed_lookup_version);
             let rnode = cached.rnode().clone();
             let meta = rnode.meta();
             (cached, rnode, child_fs_object_id, meta)
         } else {
             // Stale or absent cached instance: drop it and materialise fresh.
-            current.remove_cached_child(child_inline);
+            current.remove_cached_child_by_name(component);
 
             let child_meta = match fs_ops.load_inode_meta(child_fs_object_id, guard) {
                 StepOutcome::Done(m) => m,
                 StepOutcome::Yield { .. } => {
-                    let retry_remaining = match remaining_with_component(&component, &remaining) {
-                        Ok(remaining) => remaining,
-                        Err(errno) => return KernelStep::Error(WalkCause::FsOpsRejected(errno)),
-                    };
+                    let retry_remaining = remaining.rewind_to(component_start);
                     let request = IORequest::LoadInodeMeta {
                         fs_object_id: child_fs_object_id,
                     };
@@ -273,10 +336,7 @@ pub fn kernel_step(
                     ));
                 }
                 StepOutcome::Continue { .. } => {
-                    let retry_remaining = match remaining_with_component(&component, &remaining) {
-                        Ok(remaining) => remaining,
-                        Err(errno) => return KernelStep::Error(WalkCause::FsOpsRejected(errno)),
-                    };
+                    let retry_remaining = remaining.rewind_to(component_start);
                     return KernelStep::Continue(WalkState::Walking(WalkingState {
                         current,
                         remaining: retry_remaining,
@@ -296,10 +356,7 @@ pub fn kernel_step(
                 mount_payload.as_ref(),
                 &WalkingState {
                     current: current.clone(),
-                    remaining: match remaining_with_component(&component, &remaining) {
-                        Ok(remaining) => remaining,
-                        Err(errno) => return KernelStep::Error(WalkCause::FsOpsRejected(errno)),
-                    },
+                    remaining: remaining.rewound_to(component_start),
                     hop_count,
                     mount_root: mount_root.clone(),
                     current_mount: current_mount.clone(),
@@ -318,6 +375,10 @@ pub fn kernel_step(
                 }
             };
 
+            let child_inline = match InlineName::new(component) {
+                Ok(name) => name,
+                Err(_) => return KernelStep::Error(WalkCause::ComponentNotFound),
+            };
             let mut child_dentry_raw = DEntry::new(child_inline, child_rnode_cap.clone());
             child_dentry_raw.set_parent_hint(&current);
             let child_dentry = match step_engine::sign(child_dentry_raw) {
@@ -328,7 +389,11 @@ pub fn kernel_step(
                     ));
                 }
             };
-            let child_dentry = current.cache_child(child_dentry);
+            let child_dentry =
+                current.cache_child_with_version(child_dentry, confirmed_lookup_version);
+            if let Some(mount) = current_mount.as_ref() {
+                mount.retain_dentry(child_dentry.clone());
+            }
             let child_rnode_cap = child_dentry.rnode().clone();
             let child_fs_object_id = child_rnode_cap.fs_object_id();
             let child_meta = child_rnode_cap.meta();
@@ -366,9 +431,13 @@ pub fn kernel_step(
             };
             return KernelStep::Continue(WalkState::Terminal(resolved));
         }
-        let protected_parent_meta = match fs_ops.load_inode_meta(parent_fs_object_id, guard) {
-            StepOutcome::Done(meta) => meta,
-            _ => parent_meta,
+        let protected_parent_meta = if cache_only {
+            parent_meta
+        } else {
+            match fs_ops.load_inode_meta(parent_fs_object_id, guard) {
+                StepOutcome::Done(meta) => meta,
+                _ => parent_meta,
+            }
         };
         if protected_symlink_follow_denied(cred, &protected_parent_meta, &child_meta) {
             return KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::EACCES));
@@ -386,7 +455,7 @@ pub fn kernel_step(
             };
             return KernelStep::Continue(WalkState::Walking(WalkingState {
                 current: mount_root.clone(),
-                remaining: new_remaining,
+                remaining: new_remaining.into(),
                 hop_count,
                 mount_root,
                 current_mount: mount_root_mount.clone(),
@@ -401,7 +470,7 @@ pub fn kernel_step(
             };
             return KernelStep::Continue(WalkState::Walking(WalkingState {
                 current,
-                remaining: new_remaining,
+                remaining: new_remaining.into(),
                 hop_count,
                 mount_root,
                 current_mount,
@@ -469,6 +538,12 @@ fn crossing_mount_for(
     guard: &Guard<'_>,
 ) -> Option<Cap<MountIdentity>> {
     if let Some(namespace) = mount_namespace {
+        // Ordinary compiler paths contain no mount boundary. Reject them
+        // before taking the namespace mount-table lock; the conservative
+        // filter cannot produce false negatives for completed registrations.
+        if !namespace.may_contain_mountpoint_object(child_fs_object_id) {
+            return None;
+        }
         if let Some(mount) = namespace.mount_for(child_dentry) {
             return Some(mount);
         }
@@ -672,7 +747,7 @@ struct PendingComponent {
     current: Cap<DEntry>,
     component: Vec<u8>,
     child_inline: InlineName,
-    remaining: Vec<u8>,
+    remaining: RemainingPath,
     hop_count: u32,
     mount_root: Cap<DEntry>,
     current_mount: Option<Cap<MountIdentity>>,
@@ -695,11 +770,12 @@ fn pending_component(
         must_be_directory,
     } = walking;
 
-    let (component, remaining) = take_next_component(remaining)
-        .map_err(|errno| KernelStep::Error(WalkCause::FsOpsRejected(errno)))?
-        .ok_or_else(|| {
+    let ((component_start, component_end), remaining) =
+        take_next_component(remaining).ok_or_else(|| {
             KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::EINVAL))
         })?;
+    let component = try_copy_path(remaining.absolute_slice(component_start, component_end))
+        .map_err(|errno| KernelStep::Error(WalkCause::FsOpsRejected(errno)))?;
 
     if current.rnode().meta().kind() != InodeKind::Directory {
         return Err(KernelStep::Error(WalkCause::NotADirectory));
@@ -809,6 +885,9 @@ fn continue_after_child_rnode(
         }
     };
     let child_dentry = current.cache_child(child_dentry);
+    if let Some(mount) = current_mount.as_ref() {
+        mount.retain_dentry(child_dentry.clone());
+    }
     let child_rnode_cap = child_dentry.rnode().clone();
     let child_fs_object_id = child_rnode_cap.fs_object_id();
     let child_meta = child_rnode_cap.meta();
@@ -850,7 +929,7 @@ fn continue_after_child_rnode(
             };
             return KernelStep::Continue(WalkState::Walking(WalkingState {
                 current: mount_root.clone(),
-                remaining: new_remaining,
+                remaining: new_remaining.into(),
                 hop_count,
                 mount_root,
                 current_mount: mount_root_mount.clone(),
@@ -864,7 +943,7 @@ fn continue_after_child_rnode(
         };
         return KernelStep::Continue(WalkState::Walking(WalkingState {
             current,
-            remaining: new_remaining,
+            remaining: new_remaining.into(),
             hop_count,
             mount_root,
             current_mount,
@@ -909,58 +988,34 @@ fn continue_after_child_rnode(
 
 fn remaining_with_component(
     component: &[u8],
-    remaining: &[u8],
-) -> Result<Vec<u8>, crate::execution::Errno> {
+    remaining: &RemainingPath,
+) -> Result<RemainingPath, crate::execution::Errno> {
     if remaining.is_empty() {
-        return try_copy_path(component);
+        return try_copy_path(component).map(Into::into);
     }
-    try_join_path(component, remaining)
+    try_join_path(component, remaining).map(Into::into)
 }
 
-fn take_next_component(
-    remaining: Vec<u8>,
-) -> Result<Option<(Vec<u8>, Vec<u8>)>, crate::execution::Errno> {
-    let Some(component_start) = remaining.iter().position(|byte| *byte != b'/') else {
-        return Ok(None);
-    };
-    let after_leading = &remaining[component_start..];
-    let component_len = after_leading
-        .iter()
-        .position(|byte| *byte == b'/')
-        .unwrap_or(after_leading.len());
-    let component_end = component_start + component_len;
-
-    let mut next_start = component_end;
-    while remaining.get(next_start) == Some(&b'/') {
-        next_start += 1;
-    }
-    let mut next_end = remaining.len();
-    while next_end > next_start && remaining[next_end - 1] == b'/' {
-        next_end -= 1;
-    }
-
-    let next = try_copy_path(&remaining[next_start..next_end])?;
-    let component = try_copy_path(&remaining[component_start..component_end])?;
-    Ok(Some((component, next)))
+fn take_next_component(mut remaining: RemainingPath) -> Option<((usize, usize), RemainingPath)> {
+    let component = remaining.take_next_component()?;
+    Some((component, remaining))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::take_next_component;
+    use super::{take_next_component, RemainingPath};
 
     #[test]
     fn take_next_component_collapses_separator_runs_without_front_removal() {
-        let (component, remaining) = take_next_component(b"////alpha///beta//".to_vec())
-            .expect("allocation")
-            .expect("component");
+        let ((start, end), remaining) =
+            take_next_component(RemainingPath::from_vec(b"////alpha///beta//".to_vec()))
+                .expect("component");
 
-        assert_eq!(component, b"alpha");
-        assert_eq!(remaining, b"beta");
+        assert_eq!(remaining.absolute_slice(start, end), b"alpha");
+        assert_eq!(&*remaining, b"beta");
 
-        let (component, remaining) = take_next_component(remaining)
-            .expect("allocation")
-            .expect("second component");
-        assert_eq!(component, b"beta");
+        let ((start, end), remaining) = take_next_component(remaining).expect("second component");
+        assert_eq!(remaining.absolute_slice(start, end), b"beta");
         assert!(remaining.is_empty());
     }
 }

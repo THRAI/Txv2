@@ -12,10 +12,9 @@ use crate::net::protocol::{
 use crate::net::structure::registry;
 use crate::net::structure::table::{SocketTable, SOCKET_TABLE};
 use crate::net::structure::{
-    AddressFamily, ConnectionKey, IpEndpoint, Ipv4Address, RecvWireSet, SendWireSet,
-    SocketIdentity, SocketKind, SocketProtocol, TcpBacklogEntry, TcpConnectAttempt,
-    TcpConnectDisposition, TcpState, TcpStateGeneration, UdpInner,
-    TCP_BACKLOG_TIMEOUT_STAGING_MILLIS,
+    AddressFamily, ConnectionKey, IpEndpoint, Ipv4Address, SendWireSet, SocketIdentity, SocketKind,
+    SocketProtocol, TcpBacklogEntry, TcpConnectAttempt, TcpConnectDisposition, TcpState,
+    TcpStateGeneration, UdpInner, TCP_BACKLOG_TIMEOUT_STAGING_MILLIS,
 };
 
 use super::SmoltcpTcpSegment;
@@ -577,9 +576,14 @@ impl PollContext {
         }
 
         let publish = NetworkPublish {
-            recv_has_data: protocol_publish.recv_readable
-                || target.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() == 0
-                    && recv_available > 0,
+            // Keep the mirror publication level-derived as well.  The raw
+            // readiness bit can still be set from an earlier receive while an
+            // epoll waiter has already consumed the mirrored WaitSource edge.
+            // Suppressing this publication from the raw bit alone then leaves
+            // the waiter asleep even though the authoritative TCP ring now has
+            // data.  Re-notifying the mirror is idempotent; readers still use
+            // clear-then-recheck to keep the raw level consistent.
+            recv_has_data: protocol_publish.recv_readable || recv_available > 0,
             send_has_space: !protocol_publish.connected && protocol_publish.send_writable,
             recv_broken: protocol_publish.broken || protocol_publish.recv_closed,
             send_broken: protocol_publish.broken || protocol_publish.send_closed,

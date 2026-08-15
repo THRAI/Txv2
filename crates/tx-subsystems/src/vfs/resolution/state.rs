@@ -7,6 +7,7 @@
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::ops::Deref;
 
 use crate::mount::{MountIdentity, MountNamespace};
 use crate::vfs::adapter::step_engine::Cap;
@@ -68,6 +69,83 @@ pub enum WalkState {
     Terminal(PathResolution),
 }
 
+/// Owned path storage plus the active byte range still to be walked.
+///
+/// The backing allocation is stable for an ordinary walk. Advancing one
+/// component only changes `start`/`end`; it does not allocate a component
+/// vector or shift the remaining suffix to the front of the buffer.
+#[derive(Clone, Debug)]
+pub struct RemainingPath {
+    bytes: Vec<u8>,
+    start: usize,
+    end: usize,
+}
+
+impl RemainingPath {
+    pub(super) fn from_vec(bytes: Vec<u8>) -> Self {
+        let end = bytes.len();
+        Self {
+            bytes,
+            start: 0,
+            end,
+        }
+    }
+
+    pub(super) fn take_next_component(&mut self) -> Option<(usize, usize)> {
+        while self.start < self.end && self.bytes[self.start] == b'/' {
+            self.start += 1;
+        }
+        if self.start == self.end {
+            return None;
+        }
+
+        let component_start = self.start;
+        let mut component_end = component_start;
+        while component_end < self.end && self.bytes[component_end] != b'/' {
+            component_end += 1;
+        }
+
+        let mut next_start = component_end;
+        while next_start < self.end && self.bytes[next_start] == b'/' {
+            next_start += 1;
+        }
+        while self.end > next_start && self.bytes[self.end - 1] == b'/' {
+            self.end -= 1;
+        }
+        self.start = next_start;
+        Some((component_start, component_end))
+    }
+
+    pub(super) fn absolute_slice(&self, start: usize, end: usize) -> &[u8] {
+        debug_assert!(start <= end && end <= self.bytes.len());
+        &self.bytes[start..end]
+    }
+
+    pub(super) fn rewind_to(mut self, start: usize) -> Self {
+        debug_assert!(start <= self.start && start <= self.end);
+        self.start = start;
+        self
+    }
+
+    pub(super) fn rewound_to(&self, start: usize) -> Self {
+        self.clone().rewind_to(start)
+    }
+}
+
+impl Deref for RemainingPath {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.bytes[self.start..self.end]
+    }
+}
+
+impl From<Vec<u8>> for RemainingPath {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::from_vec(bytes)
+    }
+}
+
 /// Full mutable walker frame — all state threaded through the
 /// component loop in the synchronous `walk_inner_v3`.
 #[derive(Clone, Debug)]
@@ -75,7 +153,7 @@ pub struct WalkingState {
     /// Current DEntry (parent directory for next lookup, or terminal).
     pub current: Cap<DEntry>,
     /// Remaining path bytes.
-    pub remaining: Vec<u8>,
+    pub remaining: RemainingPath,
     /// Symlink hop counter.
     pub hop_count: u32,
     /// Namespace root dentry (for absolute symlinks and `..` bound).

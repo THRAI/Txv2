@@ -838,6 +838,52 @@ fn fork_aspace_demotes_parent_pmap_for_private_entries_only() {
 }
 
 #[test]
+fn fork_batches_private_pte_demotion_into_one_shootdown() {
+    let _counting = COUNTING_PMAP_TEST_LOCK
+        .lock()
+        .expect("counting pmap test lock");
+    setup_host_substrate();
+    reset_counting_pmap();
+    let parent =
+        AddressSpace::new_for_platform::<CountingPmap>().expect("counting parent address space");
+    let private_range = range(0x28000, 2);
+    map_reserved(parent.reserve_map(
+        VmEntry::new(
+            private_range,
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("two-page private map");
+
+    for fault_addr in [0x28000_usize, 0x29000] {
+        let outcome = parent
+            .resolve_fault(VmFault::new(UserVirtAddr(fault_addr), AccessMode::Write))
+            .expect("private fault resolves");
+        let materialized = outcome.materialize_pagebacked().expect("private page");
+        parent
+            .publish_fault_materialization(outcome, materialized)
+            .expect("publish private page");
+    }
+
+    let child = AddressSpace::fork_aspace::<CountingPmap>(&parent).expect("batched fork");
+    assert_eq!(child.pmap().stats().mapped_pages, 2);
+    let counters = counting_pmap_counters();
+    assert_eq!(counters.shoots, 2, "both parent PTEs need invalidation");
+    assert_eq!(
+        counters.shoot_invalidations, 2,
+        "the shootdown must cover both demoted pages"
+    );
+    assert_eq!(
+        counters.shoot_batches, 1,
+        "fork must use one cross-hart shootdown for the complete private range"
+    );
+}
+
+#[test]
 fn fork_aspace_preserves_pmap_only_private_page_when_child_copy_to_user_cows() {
     setup_host_substrate();
     let parent = AddressSpace::new();

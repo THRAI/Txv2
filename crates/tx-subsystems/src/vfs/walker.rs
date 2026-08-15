@@ -365,6 +365,47 @@ pub fn step_open_in_mount_namespace_with_origin_mount<'g>(
     }
 }
 
+/// Namespace-aware open that succeeds only from authoritative positive
+/// dentry-cache entries. A cold or invalidated component returns `EAGAIN` and
+/// never invokes `FsOps::lookup`, `load_inode_meta`, or materialisation.
+pub fn step_open_cached_in_mount_namespace_with_origin_mount<'g>(
+    rooted_at: Cap<DEntry>,
+    origin_mount: &Cap<MountIdentity>,
+    path: &[u8],
+    flags: OpenFileFlags,
+    mode: u16,
+    cred: &Credential,
+    mount_namespace: &Cap<MountNamespace>,
+    guard: &Guard<'g>,
+) -> StepOutcome<OpenFileWithMount, NoProgress> {
+    use StepOutcome as V3;
+
+    let _ = mode;
+    let resolved = match crate::vfs::resolution::driver::walk_cached_to_completion_with_mount_namespace_and_origin(
+        rooted_at,
+        path,
+        crate::vfs::resolution::state::WalkMode::Entity,
+        crate::vfs::resolution::state::FinalSymlinkPolicy::Follow,
+        cred,
+        Some(mount_namespace),
+        Some(origin_mount),
+        guard,
+    ) {
+        Ok(resolved) => resolved,
+        Err(errno) => return V3::err(errno.into()),
+    };
+    let mount = match resolved.mount {
+        Some(mount) => mount,
+        None => return V3::err(step_engine::Errno::ENODEV),
+    };
+    match open_resolved_dentry(resolved.dentry, flags, cred, guard) {
+        V3::Done(open_file) => V3::done(OpenFileWithMount { open_file, mount }),
+        V3::Continue { progress } => V3::Continue { progress },
+        V3::Yield { progress, shape } => V3::Yield { progress, shape },
+        V3::Err(errno) => V3::err(errno),
+    }
+}
+
 fn open_after_walk<'g>(
     walk: StepOutcome<Cap<DEntry>, NoProgress>,
     flags: OpenFileFlags,

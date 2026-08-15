@@ -837,6 +837,26 @@ pub(super) fn validate_user_range<'a>(
     }
 }
 
+/// Wait-capable runtime validation for syscall buffers.  On SMP a valid user
+/// page can temporarily be owned by another range materializer; synchronous
+/// validation reports that state as `Yield`, which must not escape as `EIO`.
+pub(super) async fn validate_user_range_wait<'a>(
+    ctx: &SyscallCtx<'a>,
+    uaddr: u64,
+    len: usize,
+    access: UserAccessKind,
+) -> Result<(), Errno> {
+    #[cfg(not(target_os = "none"))]
+    {
+        validate_user_range(ctx, uaddr, len, access)
+    }
+
+    #[cfg(target_os = "none")]
+    {
+        validate_user_range_yield_retry(&ctx.aspace, uaddr, len, access).await
+    }
+}
+
 pub(super) fn write_mmsghdr_len<'a>(
     ctx: &SyscallCtx<'a>,
     mmsghdr_ptr: u64,

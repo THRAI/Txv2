@@ -489,12 +489,16 @@ fn raw_port_coalesces_fires_until_subscription_observes_ready() {
 
     assert_eq!(port.fire(0x1), 1);
     assert_eq!(port.fire(0x1), 0);
-    assert_eq!(wakes.load(Ordering::SeqCst), 1);
+    // The second fire is coalesced into the existing mailbox entry, but it
+    // must still invoke a newly registered/changed consumer waker.  The real
+    // reactor waker coalesces the runnable transition in TaskWakeState, so
+    // this does not create a second scheduler queue entry.
+    assert_eq!(wakes.load(Ordering::SeqCst), 2);
     assert!(mailbox.poll().is_some());
     assert!(mailbox.poll().is_none());
 
     assert_eq!(port.fire(0x1), 1);
-    assert_eq!(wakes.load(Ordering::SeqCst), 2);
+    assert_eq!(wakes.load(Ordering::SeqCst), 3);
     drop(sub);
     assert_eq!(port.fire(0x1), 0);
 }

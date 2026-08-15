@@ -11,7 +11,7 @@
 
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 pub struct SpinMutex<T, M = LockMetricsOff> {
     locked: AtomicBool,
@@ -223,6 +223,116 @@ impl<T, M: LockMetricsMode> Drop for SpinMutexGuard<'_, T, M> {
     }
 }
 
+/// A compact reader-writer spin lock for short, read-mostly kernel data.
+///
+/// The high bit of `state` denotes an active writer; the remaining bits count
+/// readers. Readers therefore share one cache line and do not serialize their
+/// protected work. Writers are intentionally rare users of this primitive and
+/// acquire the lock only when the reader count reaches zero.
+pub struct RwSpinLock<T> {
+    state: AtomicUsize,
+    value: UnsafeCell<T>,
+}
+
+const RW_WRITE_LOCKED: usize = 1usize << (usize::BITS - 1);
+const RW_READER_MASK: usize = RW_WRITE_LOCKED - 1;
+
+unsafe impl<T: Send + Sync> Sync for RwSpinLock<T> {}
+
+impl<T> RwSpinLock<T> {
+    pub const fn new(value: T) -> Self {
+        Self {
+            state: AtomicUsize::new(0),
+            value: UnsafeCell::new(value),
+        }
+    }
+
+    #[inline]
+    pub fn read(&self) -> RwSpinReadGuard<'_, T> {
+        loop {
+            let state = self.state.load(Ordering::Relaxed);
+            if state & RW_WRITE_LOCKED != 0 {
+                core::hint::spin_loop();
+                continue;
+            }
+            debug_assert!(state & RW_READER_MASK != RW_READER_MASK);
+            if self
+                .state
+                .compare_exchange_weak(state, state + 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                return RwSpinReadGuard { lock: self };
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    #[inline]
+    pub fn write(&self) -> RwSpinWriteGuard<'_, T> {
+        loop {
+            if self
+                .state
+                .compare_exchange_weak(0, RW_WRITE_LOCKED, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                return RwSpinWriteGuard { lock: self };
+            }
+            core::hint::spin_loop();
+        }
+    }
+}
+
+impl<T: core::fmt::Debug> core::fmt::Debug for RwSpinLock<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("RwSpinLock").field(&*self.read()).finish()
+    }
+}
+
+pub struct RwSpinReadGuard<'a, T> {
+    lock: &'a RwSpinLock<T>,
+}
+
+impl<T> core::ops::Deref for RwSpinReadGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.lock.value.get() }
+    }
+}
+
+impl<T> Drop for RwSpinReadGuard<'_, T> {
+    fn drop(&mut self) {
+        let previous = self.lock.state.fetch_sub(1, Ordering::Release);
+        debug_assert!(previous & RW_READER_MASK != 0);
+        debug_assert!(previous & RW_WRITE_LOCKED == 0);
+    }
+}
+
+pub struct RwSpinWriteGuard<'a, T> {
+    lock: &'a RwSpinLock<T>,
+}
+
+impl<T> core::ops::Deref for RwSpinWriteGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.lock.value.get() }
+    }
+}
+
+impl<T> core::ops::DerefMut for RwSpinWriteGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *self.lock.value.get() }
+    }
+}
+
+impl<T> Drop for RwSpinWriteGuard<'_, T> {
+    fn drop(&mut self) {
+        debug_assert_eq!(self.lock.state.load(Ordering::Relaxed), RW_WRITE_LOCKED);
+        self.lock.state.store(0, Ordering::Release);
+    }
+}
+
 #[doc(hidden)]
 pub trait LockTimingOps<M: LockMetricsMode>: Sized {
     fn start(metrics: &M) -> Self;
@@ -312,7 +422,10 @@ impl LockTimingOps<LockMetricsOn> for LockTimingOn {
 
 #[cfg(test)]
 mod tests {
-    use super::SpinMutex;
+    extern crate std;
+
+    use super::{RwSpinLock, SpinMutex};
+    use alloc::sync::Arc;
 
     #[test]
     fn try_lock_reports_contention_without_spinning() {
@@ -321,5 +434,24 @@ mod tests {
         assert!(mutex.try_lock().is_none());
         drop(guard);
         assert_eq!(*mutex.try_lock().expect("try_lock after release"), 7);
+    }
+
+    #[test]
+    fn rw_spin_lock_allows_parallel_readers_and_excludes_writer() {
+        let lock = Arc::new(RwSpinLock::new(0usize));
+        let first = lock.read();
+        let peer_lock = Arc::clone(&lock);
+        let peer = std::thread::spawn(move || {
+            let second = peer_lock.read();
+            assert_eq!(*second, 0);
+        });
+        peer.join().expect("parallel reader");
+        drop(first);
+
+        {
+            let mut writer = lock.write();
+            *writer = 7;
+        }
+        assert_eq!(*lock.read(), 7);
     }
 }

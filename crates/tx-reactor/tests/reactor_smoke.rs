@@ -2531,6 +2531,61 @@ fn concurrent_hart_loop_returns_at_poll_budget_boundary() {
 }
 
 #[test]
+fn cooperative_poll_preserves_existing_domain_deadline() {
+    let shared = SharedReactor::empty();
+    assert!(shared.init());
+    let domain_deadline_ns = 1_000_000;
+    let _domain_deadline = shared
+        .with(|reactor| {
+            reactor
+                .deadline_registrar_handle()
+                .register_deadline(
+                    DeadlineNs::new(domain_deadline_ns),
+                    TimerRole::DelegateTimeout,
+                    TimerTarget::DelegateToken(DelegateTokenId::new(1)),
+                )
+                .expect("domain deadline registration")
+        })
+        .expect("initialized reactor");
+    let deadlines = Arc::new(Mutex::new(Vec::new()));
+    let mut clock = ScriptedSliceClock::new(vec![1_000, 1_001], Arc::clone(&deadlines));
+
+    shared
+        .with(|reactor| reactor.program_current_hart_deadline(&mut clock))
+        .expect("initialized reactor");
+    shared
+        .with(|reactor| {
+            reactor
+                .submit_task_with_meta(async {}, InitialSchedMeta::kernel().with_affinity(0b0001))
+        })
+        .expect("initialized reactor");
+
+    let mut signal = RecordingRescheduleSignal::default();
+    let step = shared
+        .run_hart_loop_concurrent_with_slice_clock_and_poll_budget(
+            HartId(0),
+            1_000,
+            &mut signal,
+            &mut clock,
+            HartPollBudget::up_to(1),
+        )
+        .expect("initialized reactor");
+
+    assert_eq!(
+        step.stats,
+        RunStats {
+            polled: 1,
+            completed: 1,
+        }
+    );
+    assert_eq!(
+        deadlines.lock().expect("deadline log poisoned").as_slice(),
+        &[Some(domain_deadline_ns)],
+        "a cooperative poll must neither replace nor cancel the domain deadline",
+    );
+}
+
+#[test]
 fn slice_clock_restores_unchanged_domain_deadline_before_polling_idle() {
     let shared = SharedReactor::empty();
     assert!(shared.init());
@@ -2983,6 +3038,80 @@ fn shared_concurrent_poll_path_sets_per_hart_runtime_context() {
 }
 
 #[test]
+fn shared_concurrent_idle_hart_steals_only_preempted_movable_work() {
+    let shared = SharedReactor::empty();
+    assert!(shared.init());
+    let movable_polls = Arc::new(AtomicUsize::new(0));
+    let pinned_polls = Arc::new(AtomicUsize::new(0));
+    let new_polls = Arc::new(AtomicUsize::new(0));
+
+    shared
+        .with(|reactor| {
+            reactor.submit_task_with_meta(
+                CountPolls {
+                    polls: Arc::clone(&movable_polls),
+                },
+                InitialSchedMeta::fair()
+                    .with_affinity(0b0011)
+                    .movable()
+                    .preempted_on_submit(),
+            );
+            reactor.submit_task_with_meta(
+                CountPolls {
+                    polls: Arc::clone(&pinned_polls),
+                },
+                InitialSchedMeta::fair()
+                    .with_affinity(0b0011)
+                    .pinned()
+                    .preempted_on_submit(),
+            );
+        })
+        .expect("shared reactor initialized");
+
+    let mut signal = RecordingRescheduleSignal::default();
+    let step = shared
+        .run_hart_loop_concurrent(HartId(1), 0, &mut signal)
+        .expect("shared reactor initialized");
+    assert_eq!(step.stats.polled, 1);
+    assert_eq!(step.stats.completed, 1);
+    assert_eq!(movable_polls.load(Ordering::SeqCst), 1);
+    assert_eq!(pinned_polls.load(Ordering::SeqCst), 0);
+
+    let step = shared
+        .run_hart_loop_concurrent(HartId(0), 0, &mut signal)
+        .expect("shared reactor initialized");
+    assert_eq!(step.stats.polled, 1);
+    assert_eq!(step.stats.completed, 1);
+    assert_eq!(pinned_polls.load(Ordering::SeqCst), 1);
+
+    shared
+        .with(|reactor| {
+            reactor.submit_task_with_meta(
+                CountPolls {
+                    polls: Arc::clone(&new_polls),
+                },
+                InitialSchedMeta::fair().with_affinity(0b0011).movable(),
+            );
+        })
+        .expect("shared reactor initialized");
+
+    // A never-polled task remains in New on its initial owner.  The idle peer
+    // must not pull it before that first per-hart context installation.
+    let step = shared
+        .run_hart_loop_concurrent(HartId(1), 0, &mut signal)
+        .expect("shared reactor initialized");
+    assert_eq!(step.stats.polled, 0);
+    assert_eq!(new_polls.load(Ordering::SeqCst), 0);
+
+    let step = shared
+        .run_hart_loop_concurrent(HartId(0), 0, &mut signal)
+        .expect("shared reactor initialized");
+    assert_eq!(step.stats.polled, 1);
+    assert_eq!(step.stats.completed, 1);
+    assert_eq!(new_polls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn observability_accumulates_per_hart_poll_counts() {
     let reactor = Reactor::new();
     reactor.submit_task_with_meta(async {}, InitialSchedMeta::kernel().with_affinity(0b0001));
@@ -3206,8 +3335,9 @@ fn phase1_scheduler_prioritizes_kernel_then_new_then_preempted() {
         TaskHandle::new(fair_preempted),
         InitialSchedMeta::fair(),
     );
+    let first = scheduler.pick_next(HartId(0));
     assert_eq!(
-        scheduler.pick_next(HartId(0)),
+        first,
         Some((
             TaskHandle::new(fair_preempted),
             SliceConfig::Preemptive {
@@ -3215,6 +3345,7 @@ fn phase1_scheduler_prioritizes_kernel_then_new_then_preempted() {
             }
         ))
     );
+    assert!(scheduler.mark_dispatching_polling(fair_preempted, HartId(0)));
     scheduler.task_stopped(
         fair_preempted,
         StopReason::SliceExpired,
@@ -3259,12 +3390,14 @@ fn phase1_scheduler_preserves_remaining_budget_after_blocked_wake() {
     let task = TaskId(7);
 
     scheduler.task_submitted(task, TaskHandle::new(task), InitialSchedMeta::fair());
+    let first = scheduler.pick_next(HartId(0));
     assert_eq!(
-        scheduler.pick_next(HartId(0)).map(|(_, slice)| slice),
+        first.map(|(_, slice)| slice),
         Some(SliceConfig::Preemptive {
             slice_ns: Phase1Scheduler::NEW_QUEUE_SLICE_NS,
         })
     );
+    assert!(scheduler.mark_dispatching_polling(task, HartId(0)));
 
     scheduler.task_stopped(task, StopReason::Blocked, 250_000, HartId(0));
     scheduler.task_runnable(task, WakeHint::Normal);

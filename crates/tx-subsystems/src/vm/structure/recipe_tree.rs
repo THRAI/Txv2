@@ -199,43 +199,12 @@ impl RecipeTreeWith<TreapRecipeIndex> {
         existing: &VmEntry,
         replacements: Vec<VmEntry>,
     ) -> (Self, Option<VmEntry>, usize) {
-        let mut replacement_tree = TreapRecipeIndex { root: None };
-        let mut touched = 0usize;
-        let replacement_count = replacements.len();
-        let replacement_vm_size: usize = replacements.iter().map(|entry| entry.range.len()).sum();
-        for replacement in replacements {
-            let (next, replacement_touched) =
-                RecipeBackend::insert_entry(&replacement_tree, replacement);
-            replacement_tree = next;
-            touched += replacement_touched;
-        }
-
-        let mut removed = None;
-        let root = replace_node_with_subtree(
-            self.inner.root.clone(),
-            existing.range.start(),
-            replacement_tree.root,
-            &mut removed,
-            &mut touched,
+        let (rewritten, mut removed, touched) = self.replace_range(existing.range, replacements);
+        debug_assert!(
+            removed.len() <= 1,
+            "an exact recipe replacement must remove at most one entry"
         );
-        let len = if removed.is_some() {
-            self.len - 1 + replacement_count
-        } else {
-            self.len
-        };
-        let vm_size = match removed.as_ref() {
-            Some(removed) => self.vm_size - removed.range.len() + replacement_vm_size,
-            None => self.vm_size,
-        };
-        (
-            Self {
-                inner: TreapRecipeIndex { root },
-                len,
-                vm_size,
-            },
-            removed,
-            touched,
-        )
+        (rewritten, removed.pop(), touched)
     }
 
     pub(in crate::vm) fn replace_entry_with_entries_summary(
@@ -251,44 +220,10 @@ impl RecipeTreeWith<TreapRecipeIndex> {
         existing_start: UserVirtAddr,
         replacements: Vec<VmEntry>,
     ) -> (Self, RemovedRecipeSummary, usize) {
-        let mut replacement_tree = TreapRecipeIndex { root: None };
-        let mut touched = 0usize;
-        let replacement_count = replacements.len();
-        let replacement_vm_size: usize = replacements.iter().map(|entry| entry.range.len()).sum();
-        for replacement in replacements {
-            let (next, replacement_touched) =
-                RecipeBackend::insert_entry(&replacement_tree, replacement);
-            replacement_tree = next;
-            touched += replacement_touched;
-        }
-
-        let mut removed = RemovedRecipeSummary::default();
-        let root = replace_node_with_subtree_summary(
-            self.inner.root.clone(),
-            existing_start,
-            replacement_tree.root,
-            &mut removed,
-            &mut touched,
-        );
-        let len = if removed.count > 0 {
-            self.len - 1 + replacement_count
-        } else {
-            self.len
+        let Some(existing) = self.inner.lookup_ref(existing_start) else {
+            return (self.clone(), RemovedRecipeSummary::default(), 0);
         };
-        let vm_size = if removed.count > 0 {
-            self.vm_size - removed.vm_size + replacement_vm_size
-        } else {
-            self.vm_size
-        };
-        (
-            Self {
-                inner: TreapRecipeIndex { root },
-                len,
-                vm_size,
-            },
-            removed,
-            touched,
-        )
+        self.replace_range_summary(existing.range, replacements)
     }
 
     pub(in crate::vm) fn replace_entry_at_with_rewrite_summary(
@@ -991,85 +926,6 @@ fn remove_node(
     }
     *removed = Some(node.entry.clone());
     merge_nodes(node.left.clone(), node.right.clone(), touched)
-}
-
-#[allow(dead_code)]
-fn replace_node_with_subtree(
-    root: Option<Arc<RecipeNode>>,
-    key: UserVirtAddr,
-    replacement: Option<Arc<RecipeNode>>,
-    replaced: &mut Option<VmEntry>,
-    touched: &mut usize,
-) -> Option<Arc<RecipeNode>> {
-    let node = root?;
-    *touched += 1;
-    if key.as_usize() < node.key.as_usize() {
-        return Some(build_node(
-            node.key,
-            node.priority,
-            node.entry.clone(),
-            replace_node_with_subtree(node.left.clone(), key, replacement, replaced, touched),
-            node.right.clone(),
-        ));
-    }
-    if key.as_usize() > node.key.as_usize() {
-        return Some(build_node(
-            node.key,
-            node.priority,
-            node.entry.clone(),
-            node.left.clone(),
-            replace_node_with_subtree(node.right.clone(), key, replacement, replaced, touched),
-        ));
-    }
-
-    *replaced = Some(node.entry.clone());
-    let root = merge_nodes(node.left.clone(), replacement, touched);
-    merge_nodes(root, node.right.clone(), touched)
-}
-
-fn replace_node_with_subtree_summary(
-    root: Option<Arc<RecipeNode>>,
-    key: UserVirtAddr,
-    replacement: Option<Arc<RecipeNode>>,
-    replaced: &mut RemovedRecipeSummary,
-    touched: &mut usize,
-) -> Option<Arc<RecipeNode>> {
-    let node = root?;
-    *touched += 1;
-    if key.as_usize() < node.key.as_usize() {
-        return Some(build_node(
-            node.key,
-            node.priority,
-            node.entry.clone(),
-            replace_node_with_subtree_summary(
-                node.left.clone(),
-                key,
-                replacement,
-                replaced,
-                touched,
-            ),
-            node.right.clone(),
-        ));
-    }
-    if key.as_usize() > node.key.as_usize() {
-        return Some(build_node(
-            node.key,
-            node.priority,
-            node.entry.clone(),
-            node.left.clone(),
-            replace_node_with_subtree_summary(
-                node.right.clone(),
-                key,
-                replacement,
-                replaced,
-                touched,
-            ),
-        ));
-    }
-
-    replaced.observe(&node.entry);
-    let root = merge_nodes(node.left.clone(), replacement, touched);
-    merge_nodes(root, node.right.clone(), touched)
 }
 
 fn split_root_before(
@@ -3023,6 +2879,48 @@ mod tests {
         assert_eq!(counted.values_vec(), collecting.values_vec());
         assert_eq!(counted.len(), collecting.len());
         assert_eq!(counted.vm_size(), collecting.vm_size());
+    }
+
+    #[test]
+    fn treap_repeated_partial_protect_rewrites_stay_balanced() {
+        const PAGE_COUNT: usize = 1024;
+        const BASE: usize = 0x1000_0000;
+
+        let (mut tree, _) = RecipeTreeWith::<TreapRecipeIndex>::new().insert_entry(VmEntry::new(
+            range(BASE, PAGE_COUNT),
+            Prot::READ,
+            VmEntryFlags::SHARED,
+            VmBacking::None,
+        ));
+
+        for page in 0..PAGE_COUNT {
+            let target = range(BASE + page * super::super::USER_PAGE_SIZE, 1);
+            let existing_start = tree
+                .lookup(target.start())
+                .expect("the page must remain mapped")
+                .range
+                .start();
+            let rewrite = VmEntryProtectRewrite::new(
+                target,
+                if page % 2 == 0 {
+                    Prot::READ_WRITE
+                } else {
+                    Prot::READ
+                },
+            );
+            let (next, removed, _) = tree
+                .replace_entry_at_with_protect_summary(existing_start, rewrite)
+                .expect("partial protect rewrite");
+            assert_eq!(removed.count, 1);
+            tree = next;
+        }
+
+        let shape = tree.reclaim_stats();
+        assert_eq!(shape.entries, PAGE_COUNT);
+        assert!(
+            shape.tree_depth < 128,
+            "partial protect rewrites must preserve treap balance; shape={shape:?}"
+        );
     }
 
     #[test]

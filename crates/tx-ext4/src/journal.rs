@@ -98,6 +98,10 @@ impl Drop for JournalMetadataMutationPermit {
             return;
         };
         admission.busy.store(false, Ordering::Release);
+        // This is a condition-variable style readiness edge, not a transferable
+        // semaphore token. Waking only one subscriber can strand every other
+        // waiter if the selected task is cancelled before it retries. All
+        // contenders must recheck `busy`; compare-exchange still admits one.
         wait_routing::notify_all(&admission.ready, METADATA_MUTATION_READY);
     }
 }

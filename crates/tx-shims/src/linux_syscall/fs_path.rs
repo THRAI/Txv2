@@ -240,17 +240,26 @@ pub(super) async fn sys_fchmodat<P: PmapIf>(
     }
     let new_mode = chmod_mode_after_linux_fsetid_clear(requested_mode, &target_meta, ctx);
 
-    let result = {
-        let mut script_ctx = build_subject_script_ctx(ctx);
-        let mut op = ChmodOp {
+    use tx_scripts::drive;
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    let result = drive(
+        ChmodOp {
             rooted_at: &rooted_at,
             path: &path,
             mode: new_mode,
             cred: &walker_cred,
             target: Some(target_dentry),
-        };
-        step_engine::drive_oneshot(&mut op, &mut script_ctx)
-    };
+        },
+        &mut script_ctx,
+        step_engine::DriveMode::Waiting,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
+        timer_registrar_handle.as_ref(),
+    )
+    .await;
     match result {
         Ok(()) => SyscallResult::Return(0),
         Err(v3errno) => SyscallResult::Error(fs_change_errno_magnitude(Errno::from(v3errno))),
@@ -262,7 +271,7 @@ pub(super) async fn sys_fchmodat<P: PmapIf>(
 /// Resolves the fd's rnode and applies the same authorization and
 /// `FsOps::step_chmod` mutation path as `fchmodat`, without adding
 /// any path or symlink policy.
-pub(super) fn sys_fchmod(fd: u32, mode: u32, ctx: &SyscallCtx<'_>) -> SyscallResult {
+pub(super) async fn sys_fchmod(fd: u32, mode: u32, ctx: &SyscallCtx<'_>) -> SyscallResult {
     let open_file = match ctx.process.fd(fd) {
         Some(file) => file,
         None => return SyscallResult::Error(EBADF_VALUE),
@@ -282,13 +291,30 @@ pub(super) fn sys_fchmod(fd: u32, mode: u32, ctx: &SyscallCtx<'_>) -> SyscallRes
         Some(fs_ops) => fs_ops,
         None => return SyscallResult::Error(ENOSYS_VALUE),
     };
-    let guard = step_engine::guard();
-    match fs_ops.chmod_inode(rnode.fs_object_id(), new_mode, &ctx.walker_cred(), &guard) {
-        StepOutcome::Done(()) => SyscallResult::Return(0),
-        StepOutcome::Err(errno) => {
-            SyscallResult::Error(fs_change_errno_magnitude(Errno::from(errno)))
-        }
-        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => SyscallResult::Error(EIO_VALUE),
+    let walker_cred = ctx.walker_cred();
+    use tx_scripts::drive;
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    let op = tx_subsystems::vfs::ChmodInodeOp {
+        fs_ops: &fs_ops,
+        target: rnode.fs_object_id(),
+        mode: new_mode,
+        cred: &walker_cred,
+    };
+    match drive(
+        op,
+        &mut script_ctx,
+        step_engine::DriveMode::Waiting,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
+        timer_registrar_handle.as_ref(),
+    )
+    .await
+    {
+        Ok(()) => SyscallResult::Return(0),
+        Err(errno) => SyscallResult::Error(fs_change_errno_magnitude(Errno::from(errno))),
     }
 }
 
@@ -347,18 +373,27 @@ pub(super) async fn sys_fchownat<P: PmapIf>(
         return SyscallResult::error_from(e);
     }
 
-    let result = {
-        let mut script_ctx = build_subject_script_ctx(ctx);
-        let mut op = ChownOp {
+    use tx_scripts::drive;
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    let result = drive(
+        ChownOp {
             rooted_at: &rooted_at,
             path: &path,
             uid,
             gid,
             cred: &walker_cred,
             target: Some(target_dentry),
-        };
-        step_engine::drive_oneshot(&mut op, &mut script_ctx)
-    };
+        },
+        &mut script_ctx,
+        step_engine::DriveMode::Waiting,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
+        timer_registrar_handle.as_ref(),
+    )
+    .await;
     match result {
         Ok(()) => SyscallResult::Return(0),
         Err(v3errno) => SyscallResult::Error(fs_change_errno_magnitude(Errno::from(v3errno))),
@@ -370,7 +405,7 @@ pub(super) async fn sys_fchownat<P: PmapIf>(
 /// Resolves the fd's rnode and applies the same authorization,
 /// `(u32)-1` sentinel decoding, and `FsOps::step_chown` mutation path
 /// as `fchownat`.
-pub(super) fn sys_fchown(
+pub(super) async fn sys_fchown(
     fd: u32,
     uid_arg: u32,
     gid_arg: u32,
@@ -394,13 +429,31 @@ pub(super) fn sys_fchown(
         Some(fs_ops) => fs_ops,
         None => return SyscallResult::Error(ENOSYS_VALUE),
     };
-    let guard = step_engine::guard();
-    match fs_ops.chown_inode(rnode.fs_object_id(), uid, gid, &ctx.walker_cred(), &guard) {
-        StepOutcome::Done(()) => SyscallResult::Return(0),
-        StepOutcome::Err(errno) => {
-            SyscallResult::Error(fs_change_errno_magnitude(Errno::from(errno)))
-        }
-        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => SyscallResult::Error(EIO_VALUE),
+    let walker_cred = ctx.walker_cred();
+    use tx_scripts::drive;
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    let op = tx_subsystems::vfs::ChownInodeOp {
+        fs_ops: &fs_ops,
+        target: rnode.fs_object_id(),
+        uid,
+        gid,
+        cred: &walker_cred,
+    };
+    match drive(
+        op,
+        &mut script_ctx,
+        step_engine::DriveMode::Waiting,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
+        timer_registrar_handle.as_ref(),
+    )
+    .await
+    {
+        Ok(()) => SyscallResult::Return(0),
+        Err(errno) => SyscallResult::Error(fs_change_errno_magnitude(Errno::from(errno))),
     }
 }
 

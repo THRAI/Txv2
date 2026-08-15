@@ -11,13 +11,16 @@ mod domain;
 mod guard;
 mod local;
 
-pub use domain::{
-    cpu_summary, drain_requested_with_budget, init_on_ap, init_on_bsp, offline_cpu,
-    service_local_drain_request, summary, try_drain, try_reserve_local_retire, CpuEpochSummary,
-    DrainStats, EpochError, EpochSummary, LocalRetireReservation, ReservedRetireInvariant,
-    LOCAL_RETIRE_RESERVATION_CAPACITY,
+pub(crate) use domain::{
+    begin_reclaim_trace, finish_reclaim_trace, local_head_bag_summary, LocalRetireGuard,
+    MAX_EPOCH_CPUS, RECLAIM_KIND_DEFERRED_PUBLICATION,
 };
-pub(crate) use domain::{local_head_bag_summary, LocalRetireGuard, MAX_EPOCH_CPUS};
+pub use domain::{
+    cpu_summary, drain_requested_with_budget, init_on_ap, init_on_bsp, offline_cpu, reclaim_trace,
+    service_local_drain_request, summary, try_drain, try_reserve_local_retire, CpuEpochSummary,
+    DrainStats, EpochError, EpochSummary, LocalRetireReservation, ReclaimTrace,
+    ReservedRetireInvariant, LOCAL_RETIRE_RESERVATION_CAPACITY,
+};
 pub use guard::Guard;
 
 #[repr(C)]
@@ -146,6 +149,12 @@ pub mod testing {
         P: tx_hal::PercpuIf + tx_hal::SmpIf + tx_hal::IrqIf,
     {
         super::domain::init_on_bsp_with_admission_hook_for_test::<P>(admission_hook)
+    }
+
+    pub fn guard_with_admission_hook_for_test(
+        admission_hook: impl FnOnce(),
+    ) -> super::Guard<'static> {
+        super::domain::guard_with_admission_hook_for_test(admission_hook)
     }
 
     pub unsafe fn retire_intrusive_for_test(

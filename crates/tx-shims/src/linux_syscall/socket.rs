@@ -182,7 +182,7 @@ fn socket_requires_net_raw(kind: SocketKind, valid: ValidSocketType) -> bool {
             ))
 }
 
-pub(super) fn sys_socketpair<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_socketpair<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let domain = args[0] as i32;
     let type_ = args[1] as i32;
     let protocol = args[2] as i32;
@@ -201,10 +201,9 @@ pub(super) fn sys_socketpair<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
     if !matches!(kind, SocketKind::UnixDatagram | SocketKind::UnixStream) {
         return SyscallResult::Error(errno_to_i32(Errno::EOPNOTSUPP));
     }
-    if let Err(errno) = validate_user_range(ctx, sv, 8, UserAccessKind::Write) {
+    if let Err(errno) = validate_user_range_wait(ctx, sv, 8, UserAccessKind::Write).await {
         return SyscallResult::Error(errno_to_i32(errno));
     }
-
     let Some(net_namespace) = ctx.process.net_namespace() else {
         return SyscallResult::Error(ESRCH_VALUE);
     };
@@ -251,9 +250,16 @@ pub(super) fn sys_socketpair<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
     let second_fd = ctx.process.allocate_fd();
     let _ = ctx.process.set_fd(second_fd, Some(second.file));
     ctx.process.set_fd_cloexec(second_fd, second.cloexec);
-    match bootstrap_write_user::<[i32; 2]>(&ctx.aspace, sv, [first_fd as i32, second_fd as i32]) {
+    let mut fd_bytes = [0u8; 8];
+    fd_bytes[..4].copy_from_slice(&(first_fd as i32).to_le_bytes());
+    fd_bytes[4..].copy_from_slice(&(second_fd as i32).to_le_bytes());
+    match bootstrap_copy_to_user_wait(&ctx.aspace, sv, &fd_bytes).await {
         Ok(()) => SyscallResult::Return(0),
-        Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+        Err(errno) => {
+            let _ = ctx.process.set_fd(first_fd, None);
+            let _ = ctx.process.set_fd(second_fd, None);
+            SyscallResult::Error(errno_to_i32(errno))
+        }
     }
 }
 
@@ -1052,8 +1058,12 @@ where
             };
             let copied = core::cmp::min(len.min(NETLINK_RECVMSG_MAX), response.len());
             if copied > 0 {
-                if let Err(errno) =
-                    bootstrap_copy_to_user(&ctx.aspace, args[1], &response.as_slice()[..copied])
+                if let Err(errno) = bootstrap_copy_to_user_wait(
+                    &ctx.aspace,
+                    args[1],
+                    &response.as_slice()[..copied],
+                )
+                .await
                 {
                     return SyscallResult::Error(errno_to_i32(errno));
                 }
@@ -1081,7 +1091,9 @@ where
         };
         let copied = core::cmp::min(recv, staging.len());
         if copied > 0 {
-            if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, args[1], &staging[..copied]) {
+            if let Err(errno) =
+                bootstrap_copy_to_user_wait(&ctx.aspace, args[1], &staging[..copied]).await
+            {
                 return SyscallResult::Error(errno_to_i32(errno));
             }
         }
@@ -1159,7 +1171,7 @@ where
         // queued message (a later recv must still see it).
         if staging_len > 0 && !flags.contains(SendRecvFlags::MSG_PEEK) {
             if let Err(errno) =
-                validate_user_range(ctx, args[1], staging_len, UserAccessKind::Write)
+                validate_user_range_wait(ctx, args[1], staging_len, UserAccessKind::Write).await
             {
                 return SyscallResult::Error(errno_to_i32(errno));
             }
@@ -1173,7 +1185,8 @@ where
             StepOutcome::Done(recv) => {
                 if recv.bytes > 0 {
                     if let Err(errno) =
-                        bootstrap_copy_to_user(&ctx.aspace, args[1], &staging[..recv.bytes])
+                        bootstrap_copy_to_user_wait(&ctx.aspace, args[1], &staging[..recv.bytes])
+                            .await
                     {
                         return SyscallResult::Error(errno_to_i32(errno));
                     }

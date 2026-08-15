@@ -95,9 +95,9 @@ use tx_subsystems::vfs::structure::{
     OpenFileFlags, RNodeBacking, StructPayload, S_ISGID,
 };
 use tx_subsystems::vfs::{
-    step_open, step_walk, DEntry, FileFsyncOp, FlockOp, OpenFile, OpenFileGetFlOp, OpenFileSetFlOp,
-    OpenInMountNamespaceOp, OpenOp, ResolveOpenTargetInMountNamespaceOp, ResolveOpenTargetOp,
-    TruncateFsObjectOp,
+    step_open, step_open_cached_in_mount_namespace_with_origin_mount, step_walk, DEntry,
+    FileFsyncOp, FlockOp, OpenFile, OpenFileGetFlOp, OpenFileSetFlOp, OpenInMountNamespaceOp,
+    OpenOp, ResolveOpenTargetInMountNamespaceOp, ResolveOpenTargetOp, TruncateFsObjectOp,
 };
 use tx_subsystems::vm::{
     AddressSpace, MadviseAdvice, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking,
@@ -228,10 +228,10 @@ pub use numbers::{
     NR_PERF_EVENT_OPEN, NR_PERSONALITY, NR_PIDFD_OPEN, NR_PIDFD_SEND_SIGNAL, NR_PIPE2, NR_PPOLL,
     NR_PRCTL, NR_PREAD64, NR_PREADV, NR_PREADV2, NR_PRLIMIT64, NR_PSELECT6, NR_PSELECT6_TIME64,
     NR_PWRITE64, NR_PWRITEV, NR_PWRITEV2, NR_READ, NR_READAHEAD, NR_READLINKAT, NR_READV,
-    NR_RECVFROM, NR_RECVMMSG, NR_RECVMSG, NR_RENAMEAT2, NR_RESTART_SYSCALL, NR_RT_SIGACTION,
-    NR_RT_SIGPENDING, NR_RT_SIGPROCMASK, NR_RT_SIGQUEUEINFO, NR_RT_SIGRETURN, NR_RT_SIGSUSPEND,
-    NR_RT_SIGTIMEDWAIT, NR_SCHED_GETAFFINITY, NR_SCHED_GETATTR, NR_SCHED_GETPARAM,
-    NR_SCHED_GETSCHEDULER, NR_SCHED_GET_PRIORITY_MAX, NR_SCHED_GET_PRIORITY_MIN,
+    NR_RECVFROM, NR_RECVMMSG, NR_RECVMSG, NR_RENAMEAT, NR_RENAMEAT2, NR_RESTART_SYSCALL,
+    NR_RT_SIGACTION, NR_RT_SIGPENDING, NR_RT_SIGPROCMASK, NR_RT_SIGQUEUEINFO, NR_RT_SIGRETURN,
+    NR_RT_SIGSUSPEND, NR_RT_SIGTIMEDWAIT, NR_SCHED_GETAFFINITY, NR_SCHED_GETATTR,
+    NR_SCHED_GETPARAM, NR_SCHED_GETSCHEDULER, NR_SCHED_GET_PRIORITY_MAX, NR_SCHED_GET_PRIORITY_MIN,
     NR_SCHED_RR_GET_INTERVAL, NR_SCHED_SETAFFINITY, NR_SCHED_SETATTR, NR_SCHED_SETPARAM,
     NR_SCHED_SETSCHEDULER, NR_SCHED_YIELD, NR_SEMCTL, NR_SEMGET, NR_SEMOP, NR_SEMTIMEDOP,
     NR_SENDMMSG, NR_SENDMSG, NR_SENDTO, NR_SETGID, NR_SETITIMER, NR_SETNS, NR_SETPGID,
@@ -577,6 +577,18 @@ fn syscall_publishes_net_clock(nr: u64) -> bool {
 /// stays so Phase 2b's additions (`read`, `brk`) can return
 /// `SyscallResult::Return` after one or more `.await` points without
 /// changing the surface.
+#[inline]
+fn install_observation_parent(span: SpanId) -> Option<SpanId> {
+    (span != SpanId::NONE).then(|| tx_observe::set_current_parent_span(span))
+}
+
+#[inline]
+fn restore_observation_parent(previous: Option<SpanId>) {
+    if let Some(previous) = previous {
+        tx_observe::set_current_parent_span(previous);
+    }
+}
+
 pub async fn dispatch<
     'a,
     P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + CacheIf + tx_hal::ConsoleIf,
@@ -603,7 +615,7 @@ where
     // signature stays free of `ConsoleIf + PowerIf` bounds that would
     // ripple into every test-stub platform.
     let l0_span = emit_syscall_enter(&req);
-    let prev = tx_observe::set_current_parent_span(l0_span);
+    let prev = install_observation_parent(l0_span);
     // Deliver an expired ITIMER_REAL on the generic syscall boundary (Linux
     // delivers a fired alarm on the next return-to-userspace from any syscall).
     // Without this, alarm-armed tight loops that never reach a socket wait
@@ -611,14 +623,20 @@ where
     time::poll_itimer_real_on_syscall_boundary::<P>(ctx);
 
     let result = dispatch_inner::<P>(req, ctx).await;
-    syshist_record(
-        req.nr,
-        syshist_ret_of(&result),
-        ctx.process.pid.0 as u64,
-        req.args[0],
-        req.args[2],
-    );
-    tx_observe::set_current_parent_span(prev);
+    // The history ring is a crash-diagnostic companion to observation, not
+    // part of the production syscall fast path. In an observation-free
+    // benchmark run `emit_syscall_enter` already returned NONE; avoid the
+    // globally contended fetch_add and three cache-line writes in that case.
+    if l0_span != SpanId::NONE {
+        syshist_record(
+            req.nr,
+            syshist_ret_of(&result),
+            ctx.process.pid.0 as u64,
+            req.args[0],
+            req.args[2],
+        );
+    }
+    restore_observation_parent(prev);
     emit_syscall_exit(l0_span, &result);
     result
 }
@@ -640,14 +658,14 @@ pub fn dispatch_pthread_hot_oneshot(
     }
 
     let l0_span = emit_syscall_enter(&req);
-    let prev = tx_observe::set_current_parent_span(l0_span);
+    let prev = install_observation_parent(l0_span);
     let result = match req.nr {
         NR_FUTEX => sys_futex_oneshot(req.args, ctx)?,
         NR_RT_SIGPROCMASK => sys_rt_sigprocmask(req.args, ctx),
         NR_SET_TID_ADDRESS => sys_set_tid_address(req.args, ctx),
         _ => unreachable!("pthread hot dispatch prefilter covers all arms"),
     };
-    tx_observe::set_current_parent_span(prev);
+    restore_observation_parent(prev);
     emit_syscall_exit(l0_span, &result);
     Some(result)
 }
@@ -678,11 +696,11 @@ pub fn dispatch_clone_oneshot<P: PmapIf>(
     }
 
     let l0_span = emit_syscall_enter(req);
-    let prev = tx_observe::set_current_parent_span(l0_span);
+    let prev = install_observation_parent(l0_span);
     let ctx = SyscallCtx::new(process.clone(), thread.clone(), aspace.clone());
     let result = sys_clone_oneshot::<P>(req.args, &ctx)
         .expect("dispatch_clone_oneshot prefilters process-fork async clone");
-    tx_observe::set_current_parent_span(prev);
+    restore_observation_parent(prev);
     emit_syscall_exit(l0_span, &result);
     Some(result)
 }
@@ -786,9 +804,9 @@ pub fn dispatch_thread_aspace_oneshot(
         return None;
     }
     let l0_span = emit_syscall_enter(req);
-    let prev = tx_observe::set_current_parent_span(l0_span);
+    let prev = install_observation_parent(l0_span);
     let result = sys_rt_sigprocmask_thread_aspace(req.args, thread, aspace);
-    tx_observe::set_current_parent_span(prev);
+    restore_observation_parent(prev);
     emit_syscall_exit(l0_span, &result);
     Some(result)
 }
@@ -806,9 +824,9 @@ pub fn dispatch_thread_payload_aspace_oneshot(
         return None;
     }
     let l0_span = emit_syscall_enter(req);
-    let prev = tx_observe::set_current_parent_span(l0_span);
+    let prev = install_observation_parent(l0_span);
     let result = sys_rt_sigprocmask_thread_payload_aspace(req.args, thread, payload, aspace);
-    tx_observe::set_current_parent_span(prev);
+    restore_observation_parent(prev);
     emit_syscall_exit(l0_span, &result);
     Some(result)
 }
@@ -834,6 +852,63 @@ pub fn dispatch_vm_try_oneshot(
 /// the userspace-run wait. The caller is responsible for proving any
 /// syscall-specific safety preconditions, such as signal quiescence for
 /// `rt_sigprocmask`.
+pub const fn is_direct_trap_syscall(nr: u64) -> bool {
+    matches!(
+        nr,
+        NR_OPENAT
+            | NR_READ
+            | NR_WRITE
+            | NR_FCNTL
+            | NR_FSTAT
+            | NR_LSEEK
+            | NR_BRK
+            | NR_MMAP
+            | NR_GETPPID
+            | NR_GETPID
+            | NR_GETTID
+            | NR_GETUID
+            | NR_GETEUID
+            | NR_GETGID
+            | NR_GETEGID
+            | NR_CLOCK_GETTIME
+            | NR_GETTIMEOFDAY
+            | NR_STATX
+            | NR_FUTEX
+            | NR_RT_SIGPROCMASK
+            | NR_SET_TID_ADDRESS
+    )
+}
+
+/// Trap-local fast path for operations that are already proven synchronous.
+///
+/// Regular-file I/O only succeeds here when both user memory and the file
+/// page are resident; a zero-progress miss returns `None` and the caller
+/// performs the ordinary reactor handoff.  Restrict `fcntl` to commands whose
+/// implementation cannot wait or publish a cross-task wake.
+fn dispatch_direct_cached_io_or_fd(
+    req: &SyscallRequest,
+    ctx: &SyscallCtx<'_>,
+) -> Option<SyscallResult> {
+    if tx_observe::current().is_some() {
+        return None;
+    }
+    match req.nr {
+        NR_READ | NR_WRITE => dispatch_pagebacked_io_oneshot(req, ctx),
+        NR_BRK => sys_brk_try_oneshot(req.args, ctx),
+        NR_FSTAT => sys_fstat_cached_oneshot(req.args, ctx),
+        NR_LSEEK => Some(sys_lseek(
+            req.args[0] as u32,
+            req.args[1] as i64,
+            req.args[2] as u32,
+            ctx,
+        )),
+        NR_FCNTL if matches!(req.args[1] as i32, F_GETFD | F_SETFD | F_GETFL | F_GETLEASE) => {
+            Some(sys_fcntl(req.args, ctx))
+        }
+        _ => None,
+    }
+}
+
 pub fn dispatch_direct_trap_oneshot<P: tx_hal::TimeIf>(
     req: &SyscallRequest,
     process: &Cap<ProcessIdentity>,
@@ -844,6 +919,15 @@ where
     TimekeeperClock<P>: ClockRead,
 {
     match req.nr {
+        NR_OPENAT | NR_READ | NR_WRITE | NR_FCNTL | NR_FSTAT | NR_LSEEK | NR_BRK => {
+            let ctx = SyscallCtx::new(process.clone(), thread.clone(), aspace.clone());
+            if req.nr == NR_OPENAT {
+                sys_openat_cached_oneshot(req.args, &ctx)
+            } else {
+                dispatch_direct_cached_io_or_fd(req, &ctx)
+            }
+        }
+        NR_MMAP => dispatch_vm_try_oneshot(req, aspace),
         NR_GETPPID => dispatch_cap_only_immediate(req, process),
         // Pure queries / clock reads: never yield, never touch
         // VFS/VM/reactor state. They reuse the same Lane-1 immediate
@@ -873,24 +957,28 @@ where
         }
         NR_FUTEX => {
             let l0_span = emit_syscall_enter(req);
-            let prev = tx_observe::set_current_parent_span(l0_span);
+            let prev = install_observation_parent(l0_span);
             let ctx = SyscallCtx::new(process.clone(), thread.clone(), aspace.clone());
             let result = sys_futex_oneshot_with_wake_hint(
                 req.args,
                 &ctx,
                 tx_substrate::wake::MailboxSchedulerHint::WakeHandoff,
             )?;
-            tx_observe::set_current_parent_span(prev);
+            restore_observation_parent(prev);
             emit_syscall_exit(l0_span, &result);
             Some(result)
+        }
+        NR_STATX => {
+            let ctx = SyscallCtx::new(process.clone(), thread.clone(), aspace.clone());
+            sys_statx_cached_oneshot(req.args, &ctx)
         }
         NR_RT_SIGPROCMASK => dispatch_thread_aspace_oneshot(req, thread, aspace),
         NR_SET_TID_ADDRESS => {
             let l0_span = emit_syscall_enter(req);
-            let prev = tx_observe::set_current_parent_span(l0_span);
+            let prev = install_observation_parent(l0_span);
             let ctx = SyscallCtx::new(process.clone(), thread.clone(), aspace.clone());
             let result = sys_set_tid_address(req.args, &ctx);
-            tx_observe::set_current_parent_span(prev);
+            restore_observation_parent(prev);
             emit_syscall_exit(l0_span, &result);
             Some(result)
         }
@@ -930,14 +1018,14 @@ pub async fn dispatch_vm_hot(req: SyscallRequest, ctx: &SyscallCtx<'_>) -> Optio
     }
 
     let l0_span = emit_syscall_enter(&req);
-    let prev = tx_observe::set_current_parent_span(l0_span);
+    let prev = install_observation_parent(l0_span);
     let result = match req.nr {
         NR_MMAP => sys_mmap(req.args, ctx).await,
         NR_MUNMAP => sys_munmap(req.args, ctx).await,
         NR_MPROTECT => sys_mprotect(req.args, ctx).await,
         _ => unreachable!("VM hot dispatch prefilter covers all arms"),
     };
-    tx_observe::set_current_parent_span(prev);
+    restore_observation_parent(prev);
     emit_syscall_exit(l0_span, &result);
     Some(result)
 }
@@ -960,11 +1048,11 @@ pub async fn dispatch_writev_hot(
     emit_writev_hot_trace(b"debug.writev.hot.before_enter", req.nr as i64);
     let l0_span = emit_syscall_enter(&req);
     emit_writev_hot_trace(b"debug.writev.hot.after_enter", req.nr as i64);
-    let prev = tx_observe::set_current_parent_span(l0_span);
+    let prev = install_observation_parent(l0_span);
     emit_writev_hot_trace(b"debug.writev.hot.after_parent", req.nr as i64);
     let result = sys_writev(req.args, ctx).await;
     emit_writev_hot_trace(b"debug.writev.hot.after_body", req.nr as i64);
-    tx_observe::set_current_parent_span(prev);
+    restore_observation_parent(prev);
     emit_syscall_exit(l0_span, &result);
     emit_writev_hot_trace(b"debug.writev.hot.after_exit", req.nr as i64);
     Some(result)
@@ -994,14 +1082,205 @@ pub fn dispatch_writev_pagebacked_oneshot(
     }
 
     let l0_span = emit_syscall_enter(req);
-    let prev = tx_observe::set_current_parent_span(l0_span);
+    let prev = install_observation_parent(l0_span);
     emit_writev_hot_trace(b"debug.writev.pagebacked_dispatch.enter", req.nr as i64);
     let result =
         sys_writev_pagebacked_oneshot(req.args, ctx).unwrap_or(SyscallResult::Error(EAGAIN_VALUE));
     emit_writev_hot_trace(b"debug.writev.pagebacked_dispatch.after", req.nr as i64);
-    tx_observe::set_current_parent_span(prev);
+    restore_observation_parent(prev);
     emit_syscall_exit(l0_span, &result);
     Some(result)
+}
+
+/// Observation-free regular-file read/write lane used by the production
+/// thread dispatcher. Cached PageBacked I/O completes synchronously and avoids
+/// allocating the broad wait-capable syscall future. When either user memory
+/// or file data must wait, the helper returns `None` without progress and the
+/// canonical async dispatcher remains authoritative.
+pub fn dispatch_pagebacked_io_oneshot(
+    req: &SyscallRequest,
+    ctx: &SyscallCtx<'_>,
+) -> Option<SyscallResult> {
+    if tx_observe::current().is_some() {
+        return None;
+    }
+    match req.nr {
+        NR_READ => sys_read_pagebacked_oneshot(req.args, ctx),
+        NR_WRITE => sys_write_pagebacked_oneshot(req.args, ctx),
+        _ => None,
+    }
+}
+
+/// Compact synchronous lane for common descriptor and metadata operations.
+/// These arms contain no await point in the canonical dispatcher; selecting
+/// them before the broad async match avoids one heap allocation per call while
+/// keeping observation runs on the fully instrumented path.
+pub fn dispatch_fs_hot_oneshot<P: tx_hal::ConsoleIf>(
+    req: &SyscallRequest,
+    ctx: &SyscallCtx<'_>,
+) -> Option<SyscallResult> {
+    if tx_observe::current().is_some() {
+        return None;
+    }
+    if req.nr == NR_STATX {
+        return sys_statx_post_handoff_oneshot(req.args, ctx);
+    }
+    let result = match req.nr {
+        NR_FSTAT => sys_fstat::<P>(req.args, ctx),
+        NR_FCNTL => sys_fcntl(req.args, ctx),
+        NR_LSEEK => sys_lseek(
+            req.args[0] as u32,
+            req.args[1] as i64,
+            req.args[2] as u32,
+            ctx,
+        ),
+        NR_DUP => sys_dup(req.args[0] as u32, ctx),
+        NR_DUP3 => sys_dup3(
+            req.args[0] as u32,
+            req.args[1] as u32,
+            req.args[2] as u32,
+            ctx,
+        ),
+        NR_GETCWD => sys_getcwd(req.args, ctx),
+        NR_IOCTL => sys_ioctl(req.args, ctx),
+        NR_FADVISE64_64 => sys_fadvise64(req.args, ctx),
+        NR_READAHEAD => sys_readahead(req.args, ctx),
+        NR_SYNC_FILE_RANGE => sys_sync_file_range(req.args, ctx),
+        _ => return None,
+    };
+    Some(result)
+}
+
+#[inline]
+fn finish_observed_hot_syscall(
+    req: &SyscallRequest,
+    ctx: &SyscallCtx<'_>,
+    span: SpanId,
+    previous_parent: Option<SpanId>,
+    result: SyscallResult,
+) -> SyscallResult {
+    if span != SpanId::NONE {
+        syshist_record(
+            req.nr,
+            syshist_ret_of(&result),
+            ctx.process.pid.0 as u64,
+            req.args[0],
+            req.args[2],
+        );
+    }
+    restore_observation_parent(previous_parent);
+    emit_syscall_exit(span, &result);
+    result
+}
+
+/// Dedicated future for the compiler's dominant pathname operation. Keeping
+/// `openat` out of the broad dispatcher prevents one allocation sized for the
+/// union of every wait-capable Linux syscall on each file probe.
+pub async fn dispatch_openat_hot<P>(
+    req: SyscallRequest,
+    ctx: &SyscallCtx<'_>,
+) -> Option<SyscallResult>
+where
+    P: PmapIf + TimeIf + tx_hal::ConsoleIf,
+    TimekeeperClock<P>: ClockRead,
+{
+    if req.nr != NR_OPENAT {
+        return None;
+    }
+    let span = emit_syscall_enter(&req);
+    let previous_parent = install_observation_parent(span);
+    time::poll_itimer_real_on_syscall_boundary::<P>(ctx);
+    let result = sys_openat::<P>(
+        req.args[0] as i32,
+        req.args[1],
+        req.args[2] as u32,
+        req.args[3] as u32,
+        ctx,
+    )
+    .await;
+    Some(finish_observed_hot_syscall(
+        &req,
+        ctx,
+        span,
+        previous_parent,
+        result,
+    ))
+}
+
+/// Dedicated future for read-mostly pathname metadata operations used by
+/// Cargo and rustc. These operations may still wait on a cold user page or
+/// ext4 metadata admission, but no longer allocate the much larger generic
+/// syscall state machine.
+pub async fn dispatch_fs_lookup_hot<P>(
+    req: SyscallRequest,
+    ctx: &SyscallCtx<'_>,
+) -> Option<SyscallResult>
+where
+    P: PmapIf + TimeIf + tx_hal::ConsoleIf,
+    TimekeeperClock<P>: ClockRead,
+{
+    match req.nr {
+        NR_FACCESSAT | NR_FACCESSAT2 | NR_NEWFSTATAT | NR_GETDENTS64 | NR_STATX | NR_READLINKAT => {
+        }
+        _ => return None,
+    }
+    let span = emit_syscall_enter(&req);
+    let previous_parent = install_observation_parent(span);
+    time::poll_itimer_real_on_syscall_boundary::<P>(ctx);
+    let result = match req.nr {
+        NR_FACCESSAT => {
+            sys_faccessat::<P>(req.args[0] as i32, req.args[1], req.args[2] as i32, ctx).await
+        }
+        NR_FACCESSAT2 => {
+            sys_faccessat2::<P>(
+                req.args[0] as i32,
+                req.args[1],
+                req.args[2] as i32,
+                req.args[3] as i32,
+                ctx,
+            )
+            .await
+        }
+        NR_NEWFSTATAT => sys_newfstatat::<P>(req.args, ctx).await,
+        NR_GETDENTS64 => sys_getdents64(req.args, ctx).await,
+        NR_STATX => sys_statx::<P>(req.args, ctx).await,
+        NR_READLINKAT => sys_readlinkat(req.args, ctx).await,
+        _ => unreachable!("filesystem lookup hot prefilter covers all arms"),
+    };
+    Some(finish_observed_hot_syscall(
+        &req,
+        ctx,
+        span,
+        previous_parent,
+        result,
+    ))
+}
+
+/// `close` can wait while the detached file completes final writeback. Give
+/// it its own compact future rather than coupling every close to open/path and
+/// unrelated network/process syscall state.
+pub async fn dispatch_close_hot<P>(
+    req: SyscallRequest,
+    ctx: &SyscallCtx<'_>,
+) -> Option<SyscallResult>
+where
+    P: TimeIf,
+    TimekeeperClock<P>: ClockRead,
+{
+    if req.nr != NR_CLOSE {
+        return None;
+    }
+    let span = emit_syscall_enter(&req);
+    let previous_parent = install_observation_parent(span);
+    time::poll_itimer_real_on_syscall_boundary::<P>(ctx);
+    let result = sys_close(req.args[0] as u32, ctx).await;
+    Some(finish_observed_hot_syscall(
+        &req,
+        ctx,
+        span,
+        previous_parent,
+        result,
+    ))
 }
 
 async fn dispatch_inner<
@@ -1125,7 +1404,7 @@ where
         nr if nr == NR_SPLICE => sys_splice::<P>(req.args, ctx).await,
         nr if nr == NR_TEE => sys_tee(req.args, ctx),
         nr if nr == NR_SOCKET => sys_socket(req.args, ctx),
-        nr if nr == NR_SOCKETPAIR => sys_socketpair(req.args, ctx),
+        nr if nr == NR_SOCKETPAIR => sys_socketpair(req.args, ctx).await,
         nr if nr == NR_BIND => sys_bind(req.args, ctx),
         nr if nr == NR_GETSOCKNAME => sys_getsockname(req.args, ctx),
         nr if nr == NR_SETSOCKOPT => sys_setsockopt(req.args, ctx),
@@ -1195,7 +1474,7 @@ where
         // arms. Each wraps the FsOps surface Wave 3 Part 2 landed
         // (`step_chmod` / `step_chown`) plus a walker-side `access(2)`
         // predicate over the inode meta.
-        nr if nr == NR_FCHMOD => sys_fchmod(req.args[0] as u32, req.args[1] as u32, ctx),
+        nr if nr == NR_FCHMOD => sys_fchmod(req.args[0] as u32, req.args[1] as u32, ctx).await,
         nr if nr == NR_FCHMODAT => {
             sys_fchmodat::<P>(
                 req.args[0] as i32,
@@ -1216,12 +1495,15 @@ where
             )
             .await
         }
-        nr if nr == NR_FCHOWN => sys_fchown(
-            req.args[0] as u32,
-            req.args[1] as u32,
-            req.args[2] as u32,
-            ctx,
-        ),
+        nr if nr == NR_FCHOWN => {
+            sys_fchown(
+                req.args[0] as u32,
+                req.args[1] as u32,
+                req.args[2] as u32,
+                ctx,
+            )
+            .await
+        }
         nr if nr == NR_FCHOWNAT => {
             sys_fchownat::<P>(
                 req.args[0] as i32,
@@ -1378,6 +1660,11 @@ where
         nr if nr == NR_FTRUNCATE => sys_ftruncate(req.args, ctx).await,
         nr if nr == NR_FALLOCATE => sys_fallocate(req.args, ctx).await,
         nr if nr == NR_READLINKAT => sys_readlinkat(req.args, ctx).await,
+        nr if nr == NR_RENAMEAT => {
+            let mut args = req.args;
+            args[4] = 0;
+            sys_renameat2(args, ctx).await
+        }
         nr if nr == NR_RENAMEAT2 => sys_renameat2(req.args, ctx).await,
         // syslog(2) / klogctl — kernel ring-buffer read/control.
         // Stubbed: type 2 (READ) returns 0 bytes so `dmesg(1)` exits 0.

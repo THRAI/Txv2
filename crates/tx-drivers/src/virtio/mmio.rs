@@ -158,6 +158,17 @@ impl<P: TxPlatform> BlockDeviceOps for VirtioMmioBlock<P> {
     ) -> StepOutcome<(), NoProgress> {
         let _gate = self.io_gate.lock();
         self.quiesce_async();
+        // Keep every data frame live until virtio-drivers has completed the
+        // request and copied a bounce buffer back into the original direct-map
+        // address.  A naked `Frame` does not itself carry that lifetime.
+        let _dma_pins = match target
+            .iter()
+            .map(|frame| page_allocator::acquire_dma_pin(frame.ppn()))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(pins) => pins,
+            Err(_) => return StepOutcome::Err(Errno::EIO.into()),
+        };
         let mut inner = self.inner.lock();
         let Some(blk) = inner.as_mut() else {
             return StepOutcome::Err(Errno::ENODEV.into());
@@ -195,6 +206,14 @@ impl<P: TxPlatform> BlockDeviceOps for VirtioMmioBlock<P> {
     ) -> StepOutcome<(), NoProgress> {
         let _gate = self.io_gate.lock();
         self.quiesce_async();
+        let _dma_pins = match source
+            .iter()
+            .map(|frame| page_allocator::acquire_dma_pin(frame.ppn()))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(pins) => pins,
+            Err(_) => return StepOutcome::Err(Errno::EIO.into()),
+        };
         let mut inner = self.inner.lock();
         let Some(blk) = inner.as_mut() else {
             return StepOutcome::Err(Errno::ENODEV.into());
@@ -245,7 +264,12 @@ impl<P: TxPlatform> BlockDeviceOps for VirtioMmioBlock<P> {
     }
 
     fn supports_async_blocks(&self) -> bool {
-        true
+        // Keep the page/block service graph asynchronous, but complete each
+        // MMIO request through the proven synchronous virtio-drivers path.
+        // The merged non-blocking path retains raw frame destinations across
+        // scheduler turns and is not enabled until that lifetime contract is
+        // independently pinned and stress-verified.
+        false
     }
 
     fn submit_read_blocks_async(

@@ -159,8 +159,7 @@ impl<'a> BitmapPageAllocator<'a> {
             return Err(err);
         }
 
-        meta.mark_reserved();
-        meta.mark_direct_mapped();
+        meta.mark_permanent();
         Ok(PermanentFrame::new(self, ppn))
     }
 
@@ -658,7 +657,24 @@ impl PageAllocator for BitmapPageAllocator<'_> {
     }
 
     fn acquire_dma_pin(&self, ppn: Ppn) -> Result<(), AllocError> {
-        self.meta(ppn).increment_pin_count()
+        let meta = self.meta(ppn);
+        // DMA copy-back may write the whole frame. Never allow a raw/forged
+        // frame handle to turn kernel image, boot-stack, or page-table storage
+        // into a device destination merely because that frame is live.
+        if meta.is_reserved() {
+            return Err(AllocError::ReservedFrame);
+        }
+        meta.increment_pin_count()?;
+        // Contain a concurrent owner-role transition. OwnedFrame tokens are
+        // normally non-Send, but the global raw-PPN API must defend itself.
+        if meta.is_reserved() {
+            let state_after = meta
+                .decrement_pin_count()
+                .expect("DMA pin rollback must match its acquisition");
+            self.release_when_zero(ppn, state_after);
+            return Err(AllocError::ReservedFrame);
+        }
+        Ok(())
     }
 
     fn release_dma_pin(&self, ppn: Ppn) {
@@ -700,15 +716,18 @@ impl PageAllocator for BitmapPageAllocator<'_> {
     fn adopt_permanent_frame(&self, ppn: Ppn) {
         // Permanent anchors keep their refcount for the kernel lifetime and
         // cannot be returned by the normal allocator path.
-        let meta = self.meta(ppn);
-        meta.mark_reserved();
-        meta.mark_direct_mapped();
+        self.meta(ppn).mark_permanent();
     }
 
     fn release_page_table_frame(&self, ppn: Ppn) {
         // Pmap teardown clears the reserved flags first so releasing the owned
         // refcount can return the frame if no other role counters remain.
         let meta = self.meta(ppn);
+        assert!(
+            !meta.is_permanent(),
+            "pmap teardown attempted to release permanent frame PPN {:#x}",
+            ppn.0
+        );
         meta.clear_reserved();
         meta.clear_direct_mapped();
         self.release_owned(ppn);

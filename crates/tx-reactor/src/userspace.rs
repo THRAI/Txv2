@@ -373,6 +373,51 @@ impl UserspaceRunSlot {
         Ok(status)
     }
 
+    /// Resolve a trap produced by an already-dispatched userspace run.
+    ///
+    /// A pending request has not crossed the platform userspace-entry boundary,
+    /// so accepting a syscall, page fault, or fatal trap for it would attach a
+    /// stale hart-local context to the next run. A real trap may still replace
+    /// a timer-preemption placeholder recorded for the same running request.
+    pub fn complete_running_trap(
+        &self,
+        request: UserspaceRunRequest,
+        trap: UserspaceTrapInfo,
+    ) -> Result<UserspaceRunStatus, UserspaceRunError> {
+        let (status, waker) = {
+            let mut state = self.state.lock();
+            let active = state
+                .active
+                .as_mut()
+                .ok_or(UserspaceRunError::NoActiveRequest)?;
+            if active.request != request {
+                return Err(UserspaceRunError::StaleRequest {
+                    attempted: request,
+                    active: active.request,
+                });
+            }
+            match active.phase {
+                ActivePhase::Pending => return Err(UserspaceRunError::NotRunning(request)),
+                ActivePhase::Running => {
+                    active.phase = ActivePhase::Resolved(trap);
+                    (active.status(), active.waker.take())
+                }
+                ActivePhase::Resolved(_) => {
+                    if !active.phase.replace_timer_preempt_with(trap) {
+                        return Err(UserspaceRunError::AlreadyResolved(request));
+                    }
+                    (active.status(), active.waker.take())
+                }
+            }
+        };
+
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+
+        Ok(status)
+    }
+
     pub fn cancel(&self, request: UserspaceRunRequest) -> Result<(), UserspaceRunError> {
         let mut state = self.state.lock();
         let active = state

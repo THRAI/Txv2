@@ -40,7 +40,7 @@ use crate::io_manager::page::{
     PageIoOp, PageIoPriority, PageIoRange, PageIoRequest, PageIoRequestId, PageIoResult,
 };
 use crate::io_manager::runtime::{IoServiceKind, ServiceBudget, ServiceKick, ServiceWakeSource};
-use crate::mount::{MountPayloadBackendContext, MountPayloadPin};
+use crate::mount::{FsObjectPin, MountPayloadBackendContext, MountPayloadPin};
 use crate::sync::SpinMutex;
 use crate::vfs::{FsObjectId, OpenFile};
 use tx_hal::{Ppn, UserPtr};
@@ -82,7 +82,7 @@ pub use range::{
     RangeReservationTable,
 };
 pub use reflink::{cow_replace_into_private, install_shared_page};
-use resident::{ResidentBindingPin, ResidentCell, ResidentHit, ResidentRoot};
+use resident::{ResidentCell, ResidentHit, ResidentRoot};
 pub use slot::{
     PageSlot, PageSlotCompletionError, PageSlotFetch, PageSlotFsyncStatus, PageSlotSnapshot,
     PageSlotState,
@@ -100,26 +100,86 @@ use crate::test_support::EPOCH_TEST_LOCK;
 use core::sync::atomic::AtomicBool;
 
 static PAGE_CONTAINER_ZONE: Zone<PageContainer> = Zone::const_new();
-static PAGE_CONTAINER_RECLAIM_REGISTRY: SpinMutex<alloc::vec::Vec<Weak<PageContainer>>> =
-    SpinMutex::new(alloc::vec::Vec::new());
-static FILE_PAGE_CONTAINER_IDENTITIES: SpinMutex<alloc::vec::Vec<FilePageContainerIdentity>> =
-    SpinMutex::new(alloc::vec::Vec::new());
+static PAGE_CONTAINER_RECLAIM_REGISTRY: SpinMutex<PageContainerReclaimRegistry> =
+    SpinMutex::new(PageContainerReclaimRegistry::new());
+/// Mount-scoped canonical file page-cache identities.
+///
+/// Cargo discovers thousands of distinct source and artifact inodes during a
+/// BuildStorm run.  Keeping these identities in a `Vec` made every first
+/// materialisation retain-scan and search every previously seen file, turning
+/// the workload into an O(N^2) metadata path.  The mount trace id and object
+/// id already form a stable ordered key, so use a logarithmic index and remove
+/// a dead weak row only when that exact key is revisited.
+static FILE_PAGE_CONTAINER_IDENTITIES: SpinMutex<BTreeMap<(u64, FsObjectId), Weak<PageContainer>>> =
+    SpinMutex::new(BTreeMap::new());
 
-const PAGE_CACHE_RECLAIM_BATCH: usize = 256;
-const PAGE_CACHE_RECLAIM_LOW_WATERMARK: usize = 1024;
+const PAGE_CACHE_RECLAIM_MIN_BATCH: usize = 256;
+const PAGE_CACHE_RECLAIM_MAX_BATCH: usize = 4096;
+const PAGE_CACHE_RECLAIM_MIN_WATERMARK: usize = 1024;
+const PAGE_CACHE_RECLAIM_MAX_WATERMARK: usize = 128 * 1024;
 const MAX_FILE_WRITEBACK_BATCH_PAGES: usize = 64;
 const RESIDENT_ROOT_RETIRE_MAINTENANCE_BUDGET: usize = 64;
 const RESIDENT_ROOT_RETIRE_MAINTENANCE_ATTEMPTS: usize = 4;
 
+/// Weak, round-robin index of file page caches eligible for clean-page
+/// reclaim.
+///
+/// Reclaim used to retain this registry's global lock while entering every
+/// `PageContainer` state domain. Apart from creating a lock-order edge, that
+/// made one large file-cache scan stop registration and reclaim on every
+/// other hart. The cursor hands out one retained candidate at a time; the
+/// global lock is released before the candidate's page-cache locks are
+/// acquired.
+struct PageContainerReclaimRegistry {
+    entries: Vec<Weak<PageContainer>>,
+    cursor: usize,
+}
+
+impl PageContainerReclaimRegistry {
+    const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            cursor: 0,
+        }
+    }
+
+    fn register(&mut self, container: Weak<PageContainer>) {
+        self.entries.push(container);
+    }
+
+    fn scan_limit(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Return the next live candidate and eagerly discard dead weak entries.
+    /// The returned `Cap` keeps the object stable after the registry lock is
+    /// released.
+    fn next_live(&mut self, guard: &Guard<'_>) -> Option<Cap<PageContainer>> {
+        while !self.entries.is_empty() {
+            if self.cursor >= self.entries.len() {
+                self.cursor = 0;
+            }
+            let index = self.cursor;
+            if let Some(container) = self.entries[index].upgrade(guard) {
+                self.cursor = (index + 1) % self.entries.len();
+                return Some(container);
+            }
+
+            self.entries.swap_remove(index);
+            if self.entries.is_empty() {
+                self.cursor = 0;
+                return None;
+            }
+            if self.cursor >= self.entries.len() {
+                self.cursor = 0;
+            }
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 static FORCE_RESIDENT_ROOT_RETIRE_BACKPRESSURE_FOR_TEST: AtomicBool = AtomicBool::new(false);
-
-#[derive(Clone, Copy)]
-struct FilePageContainerIdentity {
-    mount_trace_id: u64,
-    fs_object_id: FsObjectId,
-    container: Weak<PageContainer>,
-}
 
 unsafe impl ZoneAllocated for PageContainer {
     fn zone() -> &'static Zone<Self> {
@@ -407,7 +467,11 @@ impl PageCacheIndex {
         Ok(Some(current))
     }
 
-    fn clean_pages(&self, budget: usize) -> Vec<(PageIndex, Ppn)> {
+    fn clean_pages(
+        &self,
+        page_slots: &BTreeMap<PageIndex, Arc<PageSlot>>,
+        budget: usize,
+    ) -> Vec<(PageIndex, Ppn)> {
         if budget == 0 {
             return Vec::new();
         }
@@ -415,7 +479,15 @@ impl PageCacheIndex {
         self.pages
             .iter()
             .filter_map(|(page, entry)| {
-                let reclaimable = !entry.get_mark(PageCacheMark::NoReclaim);
+                // Dirty/writeback state moved from PageCacheEntry to PageSlot
+                // during the resident-root split.  Candidate selection must
+                // follow that state instead of merely relying on the later
+                // withdrawal revalidation; otherwise a dirty prefix consumes
+                // the whole scan budget and hides clean pages behind it.
+                let clean = page_slots.get(page).is_some_and(|slot| {
+                    slot.snapshot().state == PageSlotState::Resident { ppn: entry.ppn() }
+                });
+                let reclaimable = clean && !entry.get_mark(PageCacheMark::NoReclaim);
                 reclaimable.then_some((*page, entry.ppn()))
             })
             .take(budget)
@@ -733,6 +805,24 @@ pub enum MaterializedPagePin {
     Device(DeviceFrame),
 }
 
+impl MaterializedPagePin {
+    /// Retain independent liveness evidence for a synchronous consumer of an
+    /// already-materialized frame.
+    ///
+    /// A pmap entry owns one pin, but callers must not borrow that ownership
+    /// after dropping the pmap lock: another hart may remove the entry and
+    /// release its pin before the caller finishes using the direct-map
+    /// pointer.  Acquiring a second pin while the entry is still locked makes
+    /// the pointer lifetime explicit.  Device frames are permanent and their
+    /// typed evidence is copyable.
+    pub(crate) fn retain(&self, ppn: Ppn) -> Result<Self, PageCacheError> {
+        match self {
+            Self::Allocated(_) => Ok(Self::Allocated(acquire_map_pin_for_materialization(ppn)?)),
+            Self::Device(device) => Ok(Self::Device(*device)),
+        }
+    }
+}
+
 struct MaterializedPageSnapshot {
     ppn: Ppn,
     pin: MaterializedPageSnapshotPin,
@@ -767,6 +857,10 @@ impl MaterializedPageSnapshot {
 
 pub struct PageContainer {
     kind: PageContainerKind,
+    /// Shared persistent-object lifetime evidence.  File-backed containers
+    /// must keep the inode alive even after its final dentry/open-file RNode
+    /// disappears: mmap and asynchronous writeback may still address it.
+    _object_pin: Option<FsObjectPin>,
     page_count: u64,
     size_bytes: AtomicU64,
     /// Logical EOF has its own persistence generation because synchronous
@@ -779,6 +873,96 @@ pub struct PageContainer {
     page_submission: PageIoSubmissionHandle,
     block_submission: BlockSubmissionHandle,
     state: PageContainerStateCell,
+}
+
+/// Point-in-time counters for one file-backed I/O pipeline.
+///
+/// The stall path takes each manager lock independently, so this is not a
+/// transactionally consistent state view. It is sufficient to distinguish a
+/// page-frontier wait from an L4, L6, device-tag, or wake-registration stall.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PageContainerFileIoDiagnosticSnapshot {
+    pub fs_object_id: u64,
+    pub resident_pages: usize,
+    pub slots_empty: usize,
+    pub slots_resident: usize,
+    pub slots_fetching: usize,
+    pub slots_dirty: usize,
+    pub slots_writeback: usize,
+    pub slots_error: usize,
+    pub file_fetches: usize,
+    pub fsync_queued: usize,
+    pub fsync_complete: usize,
+    pub l4_submissions: usize,
+    pub l4_completions: usize,
+    pub l4_backend_resumes: usize,
+    pub l4_metadata: usize,
+    pub l4_graphs: usize,
+    pub l4_pending_l6: usize,
+    pub l4_partial_l6: usize,
+    pub l4_l6_receipt_errors: usize,
+    pub l4_waiter_requests: usize,
+    pub l4_waiters: usize,
+    pub admitted_file_requests: usize,
+    pub background_graphs: usize,
+    pub wake_source_id: u64,
+    pub wake_pending_mask: u64,
+    pub wake_subscribers: usize,
+    pub l6_queued: usize,
+    pub l6_dispatch_blocked: usize,
+    pub l6_front_dispatch_blocked: bool,
+    pub l6_page_routes: usize,
+    pub l6_direct_routes: usize,
+    pub l6_depth_limit: usize,
+    pub l6_depth_in_flight: usize,
+    pub l6_tags_in_flight: usize,
+}
+
+/// One page-scoped completion source captured by the opt-in stall dump.
+///
+/// A retained wait without an in-flight owner is the important distinction
+/// here: retention itself is intentional so a waiter can register after the
+/// completion edge, but that source must then carry a pending notification.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FilePageWaitDiagnosticSnapshot {
+    pub fs_object_id: u64,
+    pub page: u64,
+    pub source_id: u64,
+    pub source_pending_mask: u64,
+    pub source_subscribers: usize,
+    pub resident: bool,
+    pub slot_state: u8,
+    pub slot_generation: u64,
+    pub fetch_present: bool,
+    pub fetch_id: u64,
+    pub fetch_generation: u64,
+    pub request_id: u64,
+    pub joined: bool,
+    pub compatibility_only: bool,
+}
+
+/// Snapshot every live file page completion source, including small-file
+/// compatibility containers that do not own a long-lived file-I/O reactor.
+/// This is used only by the explicit kernel stall report.
+pub fn all_file_page_wait_diagnostic_snapshots(
+    guard: &Guard<'_>,
+) -> Vec<FilePageWaitDiagnosticSnapshot> {
+    let containers = PAGE_CONTAINER_RECLAIM_REGISTRY.lock().entries.clone();
+    containers
+        .into_iter()
+        .filter_map(|container| container.upgrade(guard))
+        .flat_map(|container| container.file_page_wait_diagnostic_snapshots())
+        .collect()
+}
+
+impl Drop for PageContainer {
+    fn drop(&mut self) {
+        // A file-I/O task owns only weak PageContainer liveness plus cloned
+        // manager handles. Wake it on the final strong-reference drop so its
+        // next turn observes the dead weak endpoint and retires the runtime
+        // registration instead of sleeping forever.
+        self.page_submission.kick(IoServiceKind::Page);
+    }
 }
 
 /// Serializes derivation of immutable resident roots without entering the
@@ -915,7 +1099,7 @@ struct FilePageFetchId(u64);
 // shared libraries otherwise pay one reactor/device round trip per 4 KiB
 // fault. The demand page plus these following pages can be lowered into one
 // merged BIO when ext4 reports a contiguous extent.
-const FILE_READAHEAD_TRIGGER_PAGES: u64 = 64;
+pub const FILE_READAHEAD_TRIGGER_PAGES: u64 = 64;
 const FILE_READAHEAD_WINDOW_PAGES: u64 = 16;
 
 #[derive(Debug)]
@@ -1246,9 +1430,17 @@ fn record_map_pin_for_test() {
 impl PageContainer {
     pub fn new(kind: PageContainerKind, page_count: u64) -> Self {
         let capacity = page_count.saturating_mul(crate::vm::USER_PAGE_SIZE as u64);
+        let object_pin = match &kind {
+            PageContainerKind::File {
+                mount,
+                fs_object_id,
+            } => Some(FsObjectPin::from_mount_pin(mount.clone(), *fs_object_id)),
+            PageContainerKind::Anon { .. } | PageContainerKind::Device { .. } => None,
+        };
         let page_submission = PageIoSubmissionHandle::new(1024);
         Self {
             kind,
+            _object_pin: object_pin,
             page_count,
             size_bytes: AtomicU64::new(capacity),
             size_generation: AtomicU64::new(0),
@@ -1279,7 +1471,14 @@ impl PageContainer {
         kind: PageContainerKind,
         page_count: u64,
     ) -> Result<Cap<PageContainer>, ZoneError> {
-        step_engine::sign(Self::new(kind, page_count))
+        let reclaimable_file = matches!(&kind, PageContainerKind::File { .. });
+        let container = step_engine::sign(Self::new(kind, page_count))?;
+        if reclaimable_file {
+            PAGE_CONTAINER_RECLAIM_REGISTRY
+                .lock()
+                .register(container.downgrade());
+        }
+        Ok(container)
     }
 
     pub fn new_file_cap(
@@ -1310,9 +1509,6 @@ impl PageContainer {
             page_count,
         )?;
         container.set_size_bytes_persisted(size_bytes);
-        PAGE_CONTAINER_RECLAIM_REGISTRY
-            .lock()
-            .push(container.downgrade());
         Ok(container)
     }
 
@@ -1327,17 +1523,13 @@ impl PageContainer {
         guard: &Guard<'_>,
     ) -> Result<(Cap<PageContainer>, bool), ZoneError> {
         let mount_trace_id = mount.payload().trace_id();
+        let identity = (mount_trace_id, fs_object_id);
         let mut identities = FILE_PAGE_CONTAINER_IDENTITIES.lock();
-        identities.retain(|entry| entry.container.upgrade(guard).is_some());
-
-        if let Some(existing) = identities
-            .iter()
-            .find(|entry| {
-                entry.mount_trace_id == mount_trace_id && entry.fs_object_id == fs_object_id
-            })
-            .and_then(|entry| entry.container.upgrade(guard))
-        {
-            return Ok((existing, false));
+        if let Some(existing) = identities.get(&identity).copied() {
+            if let Some(existing) = existing.upgrade(guard) {
+                return Ok((existing, false));
+            }
+            identities.remove(&identity);
         }
 
         let page_size = crate::vm::USER_PAGE_SIZE as u64;
@@ -1349,11 +1541,7 @@ impl PageContainer {
         .max(minimum_page_count);
         let container =
             Self::new_file_cap_with_page_count(mount, fs_object_id, size_bytes, page_count)?;
-        identities.push(FilePageContainerIdentity {
-            mount_trace_id,
-            fs_object_id,
-            container: container.downgrade(),
-        });
+        identities.insert(identity, container.downgrade());
         Ok((container, true))
     }
 
@@ -1367,21 +1555,19 @@ impl PageContainer {
         guard: &Guard<'_>,
     ) -> bool {
         let mount_trace_id = mount.payload().trace_id();
+        let identity = (mount_trace_id, fs_object_id);
         let mut identities = FILE_PAGE_CONTAINER_IDENTITIES.lock();
-        let Some(index) = identities.iter().position(|entry| {
-            entry.mount_trace_id == mount_trace_id && entry.fs_object_id == fs_object_id
-        }) else {
+        let Some(entry) = identities.get(&identity).copied() else {
             return false;
         };
-        let entry = identities[index];
-        match entry.container.upgrade(guard) {
+        match entry.upgrade(guard) {
             Some(current) if current.key() == container.key() => {
-                identities.remove(index);
+                identities.remove(&identity);
                 true
             }
             Some(_) => false,
             None => {
-                identities.remove(index);
+                identities.remove(&identity);
                 false
             }
         }
@@ -1401,6 +1587,112 @@ impl PageContainer {
 
     pub fn resident_pages(&self) -> usize {
         self.state.lock().pages.len()
+    }
+
+    /// Snapshot the complete file-I/O pipeline for a one-shot kernel stall
+    /// report. This is deliberately outside every hot path.
+    pub fn file_io_diagnostic_snapshot(&self) -> PageContainerFileIoDiagnosticSnapshot {
+        let mut snapshot = PageContainerFileIoDiagnosticSnapshot {
+            fs_object_id: match self.kind {
+                PageContainerKind::File { fs_object_id, .. } => fs_object_id.as_u64(),
+                PageContainerKind::Anon { .. } | PageContainerKind::Device { .. } => 0,
+            },
+            ..PageContainerFileIoDiagnosticSnapshot::default()
+        };
+        {
+            let state = self.state.lock();
+            snapshot.resident_pages = state.pages.len();
+            snapshot.file_fetches = state.in_flight_file_pages.len();
+            for slot in state.page_slots.values() {
+                match slot.snapshot().state {
+                    PageSlotState::Empty => snapshot.slots_empty += 1,
+                    PageSlotState::Resident { .. } => snapshot.slots_resident += 1,
+                    PageSlotState::Fetching => snapshot.slots_fetching += 1,
+                    PageSlotState::Dirty { .. } => snapshot.slots_dirty += 1,
+                    PageSlotState::Writeback { .. } => snapshot.slots_writeback += 1,
+                    PageSlotState::Error { .. } => snapshot.slots_error += 1,
+                }
+            }
+            for fsync in state.fsync_submissions.values() {
+                match fsync.state() {
+                    FsyncSubmissionState::Queued => snapshot.fsync_queued += 1,
+                    FsyncSubmissionState::Complete(_) => snapshot.fsync_complete += 1,
+                    FsyncSubmissionState::Consumed => {}
+                }
+            }
+        }
+
+        let page = self.page_submission.diagnostic_snapshot();
+        snapshot.l4_submissions = page.service.submissions;
+        snapshot.l4_completions = page.service.completions;
+        snapshot.l4_backend_resumes = page.service.backend_resumes;
+        snapshot.l4_metadata = page.service.metadata;
+        snapshot.l4_graphs = page.service.graphs;
+        snapshot.l4_pending_l6 = page.service.pending_l6;
+        snapshot.l4_partial_l6 = page.service.partial_l6;
+        snapshot.l4_l6_receipt_errors = page.service.l6_receipt_errors;
+        snapshot.l4_waiter_requests = page.service.waiter_requests;
+        snapshot.l4_waiters = page.service.waiters;
+        snapshot.admitted_file_requests = page.admitted_file_requests;
+        snapshot.background_graphs = page.background_graphs;
+        snapshot.wake_source_id = page.wake_source_id;
+        snapshot.wake_pending_mask = page.wake_pending_mask;
+        snapshot.wake_subscribers = page.wake_subscribers;
+
+        let block = self.block_submission.diagnostic_snapshot();
+        snapshot.l6_queued = block.queued;
+        snapshot.l6_dispatch_blocked = block.dispatch_blocked;
+        snapshot.l6_front_dispatch_blocked = block.front_dispatch_blocked;
+        snapshot.l6_page_routes = block.page_routes;
+        snapshot.l6_direct_routes = block.direct_routes;
+        snapshot.l6_depth_limit = block.depth_limit;
+        snapshot.l6_depth_in_flight = block.depth_in_flight;
+        snapshot.l6_tags_in_flight = block.tags_in_flight;
+        snapshot
+    }
+
+    /// Snapshot every retained page-ready source for a one-shot stall report.
+    /// This allocates only when the explicit diagnostic path calls it.
+    pub fn file_page_wait_diagnostic_snapshots(&self) -> Vec<FilePageWaitDiagnosticSnapshot> {
+        let fs_object_id = match self.kind {
+            PageContainerKind::File { fs_object_id, .. } => fs_object_id.as_u64(),
+            PageContainerKind::Anon { .. } | PageContainerKind::Device { .. } => 0,
+        };
+        let state = self.state.lock();
+        state
+            .file_page_waits
+            .iter()
+            .map(|(page, wait)| {
+                let endpoint = notification::page_ready_endpoint(wait);
+                let slot = state.page_slots.get(page).map(|slot| slot.snapshot());
+                let fetch = state.in_flight_file_pages.get(page);
+                FilePageWaitDiagnosticSnapshot {
+                    fs_object_id,
+                    page: page.as_u64(),
+                    source_id: notification::page_ready_source_id(wait),
+                    source_pending_mask: endpoint.pending_mask_snapshot(),
+                    source_subscribers: endpoint.subscriber_count(),
+                    resident: state.pages.lookup(*page).is_some(),
+                    slot_state: slot.map_or(0xff, |slot| match slot.state {
+                        PageSlotState::Empty => 0,
+                        PageSlotState::Resident { .. } => 1,
+                        PageSlotState::Fetching => 2,
+                        PageSlotState::Dirty { .. } => 3,
+                        PageSlotState::Writeback { .. } => 4,
+                        PageSlotState::Error { .. } => 5,
+                    }),
+                    slot_generation: slot.map_or(0, |slot| slot.generation.raw()),
+                    fetch_present: fetch.is_some(),
+                    fetch_id: fetch.map_or(0, |fetch| fetch.id.0),
+                    fetch_generation: fetch.map_or(0, |fetch| fetch.generation.raw()),
+                    request_id: fetch
+                        .and_then(|fetch| fetch.request_id)
+                        .map_or(0, |id| id.raw()),
+                    joined: fetch.is_some_and(|fetch| fetch.joined),
+                    compatibility_only: fetch.is_some_and(|fetch| fetch.compatibility_only),
+                }
+            })
+            .collect()
     }
 
     #[cfg(tx_vm_pmap_boot_diag)]
@@ -2205,6 +2497,12 @@ impl PageContainer {
             .fsync_submissions
             .insert(id, fsync_submission::FsyncSubmission::new(id));
         debug_assert!(previous.is_none(), "L4 request identifiers are unique");
+        drop(state);
+        // This durability request is a second, independent L4 admission after
+        // the data-page frontier has completed. The writeback kick cannot be
+        // reused: the service may have consumed it and parked before the
+        // filesystem fallback submits this barrier request.
+        self.kick_file_io_service(IoServiceKind::Page);
         Some(id)
     }
 
@@ -2275,6 +2573,13 @@ impl PageContainer {
             start = end;
         }
         if submitted != 0 {
+            // Fsync can be the first producer after this container's service
+            // task has parked. Publishing the L4 request is not itself a
+            // scheduler edge: without an explicit Page kick the request can
+            // remain queued forever until unrelated I/O happens to wake the
+            // service. Background writeback already performs the same kick
+            // after admission; the fsync frontier must preserve that rule.
+            self.kick_file_io_service(IoServiceKind::Page);
             FileFsyncFrontierAdvance::Submitted { pages: submitted }
         } else if waiting {
             FileFsyncFrontierAdvance::Waiting
@@ -2364,6 +2669,8 @@ impl PageContainer {
             .page_submission
             .with_service(|service| service.drive_turn(budget));
         let mut work = Vec::new();
+        let mut backend_wait = None;
+        let mut block_work_queued = false;
 
         if let PageServiceTurn::Work(items) = step.turn {
             for item in items {
@@ -2438,7 +2745,8 @@ impl PageContainer {
                                     work.push(PageServiceDrivenWork::BackendSubmission(outcome));
                                 }
                             }
-                            Ok(outcome @ PageServiceBackendSubmitOutcome::Yield(_)) => {
+                            Ok(outcome @ PageServiceBackendSubmitOutcome::Yield(wait)) => {
+                                backend_wait.get_or_insert(wait);
                                 if self
                                     .page_submission
                                     .with_service(|service| {
@@ -2456,6 +2764,8 @@ impl PageContainer {
                                 }
                             }
                             Ok(outcome) => {
+                                block_work_queued |=
+                                    backend_submit_outcome_has_block_work(&outcome);
                                 if capture_work {
                                     work.push(PageServiceDrivenWork::BackendSubmission(outcome));
                                 }
@@ -2523,7 +2833,8 @@ impl PageContainer {
                                     work.push(PageServiceDrivenWork::BackendSubmission(outcome));
                                 }
                             }
-                            Ok(outcome @ PageServiceBackendSubmitOutcome::Yield(_)) => {
+                            Ok(outcome @ PageServiceBackendSubmitOutcome::Yield(wait)) => {
+                                backend_wait.get_or_insert(wait);
                                 if self
                                     .page_submission
                                     .with_service(|service| {
@@ -2541,6 +2852,8 @@ impl PageContainer {
                                 }
                             }
                             Ok(outcome) => {
+                                block_work_queued |=
+                                    backend_submit_outcome_has_block_work(&outcome);
                                 if capture_work {
                                     work.push(PageServiceDrivenWork::BackendSubmission(outcome));
                                 }
@@ -2563,13 +2876,23 @@ impl PageContainer {
         let next = self
             .page_submission
             .with_service(|service| service.drive_turn(ServiceBudget::new(0)).next);
-        let kicks = if next == PageServiceNext::Runnable {
-            usize::from(kick(ServiceKick::new(IoServiceKind::Page)))
-        } else {
-            0
-        };
+        // A page turn can run after the block phase of the surrounding
+        // page/block/page service cycle.  In that case an accepted L6 action
+        // cannot rely on the current cycle to observe the newly non-empty
+        // block queue.  Publish an explicit block edge; ServiceWakeSource
+        // latches it when the service task has not parked yet.
+        let mut kicks =
+            usize::from(block_work_queued && kick(ServiceKick::new(IoServiceKind::Block)));
+        if next == PageServiceNext::Runnable && backend_wait.is_none() {
+            kicks += usize::from(kick(ServiceKick::new(IoServiceKind::Page)));
+        }
 
-        Some(PageServiceBackendDriven { work, next, kicks })
+        Some(PageServiceBackendDriven {
+            work,
+            next,
+            kicks,
+            backend_wait,
+        })
     }
 
     pub fn drive_file_block_io_service_once<E, R, F>(
@@ -2596,7 +2919,6 @@ impl PageContainer {
         let mut device_completions = 0usize;
         let mut page_completions = 0usize;
         let mut kicks = driven.kicks;
-        let mut next = driven.next;
         while let Some(completion) = executor.poll_completion() {
             device_completions += 1;
             let receipt = self.block_submission.complete_receipt(completion)?;
@@ -2658,13 +2980,14 @@ impl PageContainer {
             if outcome.wake.is_some() {
                 kicks += usize::from(kick(ServiceKick::new(IoServiceKind::Page)));
             }
-            if outcome.block_submitted != 0 {
-                next = BlockServiceNext::Runnable;
-                kicks += usize::from(kick(ServiceKick::new(IoServiceKind::Block)));
-            }
         }
 
-        if pending_direct_completion {
+        // `driven.next` was computed before the concrete device completions
+        // above returned their tags.  Re-observe the manager now: synchronous
+        // VirtIO can reopen all queue depth in this same turn, so retaining a
+        // pre-poll `WaitingForCompletion` would strand the remaining BIOs.
+        let mut next = self.block_submission.service_next();
+        if pending_direct_completion || next == BlockServiceNext::Runnable {
             next = BlockServiceNext::Runnable;
             kicks += usize::from(kick(ServiceKick::new(IoServiceKind::Block)));
         }
@@ -2784,8 +3107,12 @@ impl PageContainer {
                     request.clone(),
                 ) {
                     Ok(PageServiceBackendSubmitOutcome::Err { errno, .. }) => Err(errno),
-                    Ok(_) => {
+                    Ok(outcome) => {
+                        let block_work_queued = backend_submit_outcome_has_block_work(&outcome);
                         self.page_submission.mark_background_graph(request.id);
+                        if block_work_queued {
+                            self.kick_file_io_service(IoServiceKind::Block);
+                        }
                         Ok(())
                     }
                     Err(_) => Err(Errno::EIO),
@@ -3366,6 +3693,19 @@ impl PageContainer {
         self.state.lock().pages.lookup(page)
     }
 
+    /// Materialize an already-published page without admitting I/O.
+    ///
+    /// VM file-fault prefault uses this after the demand read's bounded
+    /// readahead has completed. A miss must remain a miss: speculative PTE
+    /// publication is not allowed to turn into another device request.
+    pub fn materialize_resident_read(
+        &self,
+        page: PageIndex,
+        guard: &Guard<'_>,
+    ) -> Option<Result<MaterializedPage, PageCacheError>> {
+        self.materialize_published_read(page, guard)
+    }
+
     /// Borrow one resident binding from the immutable root under the caller's
     /// epoch guard. This never takes the PageContainer or I/O-manager lock.
     fn lookup_resident_with_guard<'g>(
@@ -3461,12 +3801,24 @@ impl PageContainer {
         Ok(())
     }
 
-    fn service_resident_root_retire_maintenance(&self) {
-        // A successful root replacement has consumed a CPU-local retire
-        // credit. Service one bounded drain after releasing PageContainerState
-        // so consecutive fault/install turns advance epochs and replenish the
-        // pool without making an admitted publication fallible.
-        let _ = tx_substrate::epoch::drain_with_budget(RESIDENT_ROOT_RETIRE_MAINTENANCE_BUDGET);
+    fn service_resident_root_retire_if_full(&self) {
+        // Retire reservations are CPU-local. A successful publication usually
+        // needs no maintenance; probing and immediately dropping one spare
+        // credit is enough to distinguish that case without an epoch scan.
+        // When the pool is full, advance two bounded turns so an exec that
+        // installs many pages in one reactor poll cannot park on publication
+        // backpressure before the outer scheduler boundary gets a chance to
+        // run maintenance.
+        match tx_substrate::epoch::try_reserve_local_retire() {
+            Ok(probe) => drop(probe),
+            Err(tx_substrate::epoch::EpochError::LocalRetireExhausted) => {
+                let _ =
+                    tx_substrate::epoch::drain_with_budget(RESIDENT_ROOT_RETIRE_MAINTENANCE_BUDGET);
+                let _ =
+                    tx_substrate::epoch::drain_with_budget(RESIDENT_ROOT_RETIRE_MAINTENANCE_BUDGET);
+            }
+            Err(_) => {}
+        }
     }
 
     fn install_resident_if_absent_published(
@@ -3492,8 +3844,13 @@ impl PageContainer {
             state.resident_slot(page)
         };
         let cell = Arc::new(ResidentCell::from_cached_frame(frame, slot));
-        let prepared = self
-            .prepare_resident_root_mutation(|root| Ok(root.with_cell(page, Arc::clone(&cell))))?;
+        let prepared = match self
+            .prepare_resident_root_mutation(|root| Ok(root.with_cell(page, Arc::clone(&cell))))
+        {
+            Ok(prepared) => Some(prepared),
+            Err(PageCacheError::Backend(Errno::EAGAIN)) => None,
+            Err(error) => return Err(error),
+        };
 
         let mut state = self.state.lock();
         if state.pages.lookup(page).is_some() {
@@ -3505,8 +3862,11 @@ impl PageContainer {
         let slot = state
             .page_slots
             .get(&page)
-            .expect("published resident page retains its PageSlot");
+            .expect("resident page retains its PageSlot");
         before_publish(slot)?;
+        if prepared.is_some() {
+            cell.mark_published();
+        }
         state.pages.insert(
             page,
             PageCacheEntry {
@@ -3517,9 +3877,14 @@ impl PageContainer {
                 },
             },
         )?;
-        prepared.commit(&self.resident);
+        let published = prepared.is_some();
+        if let Some(prepared) = prepared {
+            prepared.commit(&self.resident);
+        }
         drop(state);
-        self.service_resident_root_retire_maintenance();
+        if published {
+            self.service_resident_root_retire_if_full();
+        }
         Ok(true)
     }
 
@@ -3548,9 +3913,28 @@ impl PageContainer {
             (Arc::clone(&current.cell), slot, current.marks)
         };
         let replacement = Arc::new(ResidentCell::from_cached_frame(frame, Arc::clone(&slot)));
-        let prepared = self.prepare_resident_root_mutation(|root| {
-            Ok(root.with_cell(page, Arc::clone(&replacement)))
-        })?;
+        let was_published = expected_cell.is_published();
+        let state_only_claim = if was_published {
+            None
+        } else {
+            Some(
+                ResidentMutationClaim::try_acquire(&self.resident_sequence)
+                    .ok_or(PageCacheError::Backend(Errno::EAGAIN))?,
+            )
+        };
+        let prepared = if was_published {
+            Some(self.prepare_resident_root_mutation(|root| {
+                let root_cell = root.lookup(page).ok_or(PageCacheError::MissingPage)?;
+                if !core::ptr::eq(root_cell, Arc::as_ptr(&expected_cell)) {
+                    return Err(PageCacheError::MismatchedFrame {
+                        current: root_cell.ppn(),
+                    });
+                }
+                Ok(root.with_cell(page, Arc::clone(&replacement)))
+            })?)
+        } else {
+            None
+        };
 
         let mut state = self.state.lock();
         let current = state.pages.load(page).ok_or(PageCacheError::MissingPage)?;
@@ -3562,6 +3946,9 @@ impl PageContainer {
         slot.replace_if_matches(expected_generation, expected_ppn, replacement_ppn)
             .map_err(page_slot_completion_error_to_page_cache_error)?;
         current.cell.mark_withdrawn();
+        if prepared.is_some() {
+            replacement.mark_published();
+        }
         state
             .pages
             .compare_replace(
@@ -3573,9 +3960,14 @@ impl PageContainer {
                 }),
             )
             .expect("validated resident replacement invariant");
-        prepared.commit(&self.resident);
+        if let Some(prepared) = prepared {
+            prepared.commit(&self.resident);
+        }
         drop(state);
-        self.service_resident_root_retire_maintenance();
+        drop(state_only_claim);
+        if was_published {
+            self.service_resident_root_retire_if_full();
+        }
         Ok(replacement_ppn)
     }
 
@@ -3624,20 +4016,40 @@ impl PageContainer {
             return Ok(0);
         }
 
-        let prepared = self.prepare_resident_root_mutation(|mut root| {
-            for withdrawal in &expected {
-                let Some(root_cell) = root.lookup(withdrawal.page) else {
-                    return Err(PageCacheError::MissingPage);
-                };
-                if !core::ptr::eq(root_cell, Arc::as_ptr(&withdrawal.cell)) {
-                    return Err(PageCacheError::MismatchedFrame {
-                        current: root_cell.ppn(),
-                    });
+        let has_published = expected.iter().any(|item| item.cell.is_published());
+        let state_only_claim = if has_published {
+            None
+        } else {
+            Some(
+                ResidentMutationClaim::try_acquire(&self.resident_sequence)
+                    .ok_or(PageCacheError::Backend(Errno::EAGAIN))?,
+            )
+        };
+        let prepared = if has_published {
+            Some(self.prepare_resident_root_mutation(|mut root| {
+                for withdrawal in &expected {
+                    match root.lookup(withdrawal.page) {
+                        Some(root_cell)
+                            if core::ptr::eq(root_cell, Arc::as_ptr(&withdrawal.cell)) =>
+                        {
+                            root = root.without_cell(withdrawal.page);
+                        }
+                        Some(root_cell) => {
+                            return Err(PageCacheError::MismatchedFrame {
+                                current: root_cell.ppn(),
+                            });
+                        }
+                        None if withdrawal.cell.is_published() => {
+                            return Err(PageCacheError::MissingPage);
+                        }
+                        None => {}
+                    }
                 }
-                root = root.without_cell(withdrawal.page);
-            }
-            Ok(root)
-        })?;
+                Ok(root)
+            })?)
+        } else {
+            None
+        };
 
         let mut state = self.state.lock();
         for withdrawal in &expected {
@@ -3678,7 +4090,9 @@ impl PageContainer {
         for withdrawal in &expected {
             withdrawal.cell.mark_withdrawn();
         }
-        prepared.commit(&self.resident);
+        if let Some(prepared) = prepared {
+            prepared.commit(&self.resident);
+        }
         for withdrawal in &expected {
             state
                 .pages
@@ -3690,7 +4104,10 @@ impl PageContainer {
                 .expect("published batch withdrawal invariant");
         }
         drop(state);
-        self.service_resident_root_retire_maintenance();
+        drop(state_only_claim);
+        if has_published {
+            self.service_resident_root_retire_if_full();
+        }
         Ok(expected.len())
     }
 
@@ -3732,22 +4149,35 @@ impl PageContainer {
             (Arc::clone(&entry.cell), slot, snapshot.generation)
         };
 
-        let prepared = match self.prepare_resident_root_mutation(|root| {
-            let Some(root_cell) = root.lookup(page) else {
-                return Err(PageCacheError::MissingPage);
-            };
-            if !core::ptr::eq(root_cell, Arc::as_ptr(&expected_cell)) {
-                return Err(PageCacheError::MismatchedFrame {
-                    current: root_cell.ppn(),
-                });
+        let was_published = expected_cell.is_published();
+        let state_only_claim = if was_published {
+            None
+        } else {
+            Some(
+                ResidentMutationClaim::try_acquire(&self.resident_sequence)
+                    .ok_or(PageCacheError::Backend(Errno::EAGAIN))?,
+            )
+        };
+        let prepared = if was_published {
+            match self.prepare_resident_root_mutation(|root| {
+                let Some(root_cell) = root.lookup(page) else {
+                    return Err(PageCacheError::MissingPage);
+                };
+                if !core::ptr::eq(root_cell, Arc::as_ptr(&expected_cell)) {
+                    return Err(PageCacheError::MismatchedFrame {
+                        current: root_cell.ppn(),
+                    });
+                }
+                Ok(root.without_cell(page))
+            }) {
+                Ok(prepared) => Some(prepared),
+                Err(PageCacheError::MissingPage | PageCacheError::MismatchedFrame { .. }) => {
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
             }
-            Ok(root.without_cell(page))
-        }) {
-            Ok(prepared) => prepared,
-            Err(PageCacheError::MissingPage | PageCacheError::MismatchedFrame { .. }) => {
-                return Ok(false);
-            }
-            Err(error) => return Err(error),
+        } else {
+            None
         };
 
         let mut state = self.state.lock();
@@ -3775,13 +4205,18 @@ impl PageContainer {
         slot.withdraw_if_matches(expected_generation, expected_ppn)
             .map_err(page_slot_completion_error_to_page_cache_error)?;
         expected_cell.mark_withdrawn();
-        prepared.commit(&self.resident);
+        if let Some(prepared) = prepared {
+            prepared.commit(&self.resident);
+        }
         state
             .pages
             .compare_replace(page, |entry| Arc::ptr_eq(&entry.cell, &expected_cell), None)
             .expect("published resident withdrawal invariant");
         drop(state);
-        self.service_resident_root_retire_maintenance();
+        drop(state_only_claim);
+        if was_published {
+            self.service_resident_root_retire_if_full();
+        }
         Ok(true)
     }
 
@@ -3800,8 +4235,21 @@ impl PageContainer {
             state.resident_slot(page)
         };
         let cell = Arc::new(ResidentCell::from_cached_frame(frame, slot));
-        let prepared = self
-            .prepare_resident_root_mutation(|root| Ok(root.with_cell(page, Arc::clone(&cell))))?;
+        // The immutable resident root is an acceleration index, not the
+        // authority for a completed file read. A syscall can hold an outer
+        // epoch guard while fetching many pages; once that CPU's retire
+        // credits are full, publishing another root can transiently return
+        // EAGAIN even though the backend read itself succeeded. Preserve the
+        // fetched page in the lock-backed table in that case. Subsequent
+        // lookups miss the RCU fast path and fall through to `state.pages`
+        // instead of exposing EBR pressure as a file I/O failure.
+        let prepared = match self
+            .prepare_resident_root_mutation(|root| Ok(root.with_cell(page, Arc::clone(&cell))))
+        {
+            Ok(prepared) => Some(prepared),
+            Err(PageCacheError::Backend(Errno::EAGAIN)) => None,
+            Err(error) => return Err(error),
+        };
 
         let mut state = self.state.lock();
         if state.pages.lookup(page).is_some() {
@@ -3813,6 +4261,9 @@ impl PageContainer {
             .expect("fetched resident page has a PageSlot")
             .complete_fetch(generation, Ok(ppn))
             .map_err(page_slot_completion_error_to_page_cache_error)?;
+        if prepared.is_some() {
+            cell.mark_published();
+        }
         state.pages.insert(
             page,
             PageCacheEntry {
@@ -3823,9 +4274,14 @@ impl PageContainer {
                 },
             },
         )?;
-        prepared.commit(&self.resident);
+        let published = prepared.is_some();
+        if let Some(prepared) = prepared {
+            prepared.commit(&self.resident);
+        }
         drop(state);
-        self.service_resident_root_retire_maintenance();
+        if published {
+            self.service_resident_root_retire_if_full();
+        }
         Ok(true)
     }
 
@@ -3872,6 +4328,7 @@ impl PageContainer {
         state
             .ensure_resident_page_slot(page, ppn)
             .map_err(page_slot_completion_error_to_page_cache_error)?;
+        cell.mark_published();
         state.pages.insert(
             page,
             PageCacheEntry {
@@ -3884,7 +4341,7 @@ impl PageContainer {
         )?;
         prepared.commit(&self.resident);
         drop(state);
-        self.service_resident_root_retire_maintenance();
+        self.service_resident_root_retire_if_full();
         Ok(())
     }
 
@@ -3928,6 +4385,7 @@ impl PageContainer {
         slot.replace_if_matches(expected_generation, expected_ppn, replacement_ppn)
             .map_err(page_slot_completion_error_to_page_cache_error)?;
         current.cell.mark_withdrawn();
+        replacement.mark_published();
         state.pages.compare_replace(
             page,
             |entry| entry.ppn() == expected_ppn,
@@ -3938,7 +4396,7 @@ impl PageContainer {
         )?;
         prepared.commit(&self.resident);
         drop(state);
-        self.service_resident_root_retire_maintenance();
+        self.service_resident_root_retire_if_full();
         Ok(())
     }
 
@@ -4063,6 +4521,9 @@ impl PageContainer {
         if state.pages.len() != 0 {
             return Err(PageCacheError::Backend(Errno::EBUSY));
         }
+        for (_, cell) in &cells {
+            cell.mark_published();
+        }
         for (page, cell) in cells {
             state
                 .ensure_resident_page_slot(page, cell.ppn())
@@ -4080,7 +4541,7 @@ impl PageContainer {
         }
         prepared.commit(&self.resident);
         drop(state);
-        self.service_resident_root_retire_maintenance();
+        self.service_resident_root_retire_if_full();
         Ok(())
     }
 
@@ -4316,7 +4777,11 @@ impl PageContainer {
                 guard,
             ) {
                 StepOutcome::Done(()) => {}
-                StepOutcome::Continue { .. } => return StepOutcome::Err(V3Errno::EAGAIN),
+                StepOutcome::Continue { .. } => {
+                    return StepOutcome::Continue {
+                        progress: NoProgress,
+                    };
+                }
                 StepOutcome::Yield { shape, .. } => {
                     if let Some((carrier, interests)) = notification::wait_source_parts(&shape) {
                         return notification::yield_on_wait_source(NoProgress, carrier, interests);
@@ -4326,65 +4791,78 @@ impl PageContainer {
                 StepOutcome::Err(errno) => return StepOutcome::Err(errno),
             }
         }
-        let mut fetch_id =
-            match self.begin_file_page_fetch(page, access, false, admit_fault_readahead) {
-                FilePageFetchStart::Cached(materialized) => {
-                    return match materialized {
-                        Ok(page) => StepOutcome::Done(page),
-                        Err(error) => StepOutcome::Err(page_cache_error_to_errno(error).into()),
-                    };
-                }
-                FilePageFetchStart::Joined(endpoint) => {
-                    return notification::yield_on_page_ready_source(NoProgress, &endpoint);
-                }
-                FilePageFetchStart::Owner(fetch_id) => fetch_id,
-                FilePageFetchStart::Retry => {
-                    return StepOutcome::Continue {
-                        progress: NoProgress,
-                    };
-                }
-            };
+        // Large-file read planners own a service wake endpoint. Small files
+        // deliberately omit that per-inode runtime and retain the synchronous
+        // pager path; mount-wide planner presence is not enough to park a
+        // fault on an executor that does not exist.
+        let planner_runtime_ready = self.file_planner_runtime_ready();
+        let mut fetch_id = match self.begin_file_page_fetch(
+            page,
+            access,
+            !planner_runtime_ready,
+            admit_fault_readahead,
+        ) {
+            FilePageFetchStart::Cached(materialized) => {
+                return match materialized {
+                    Ok(page) => StepOutcome::Done(page),
+                    Err(error) => StepOutcome::Err(page_cache_error_to_errno(error).into()),
+                };
+            }
+            FilePageFetchStart::Joined(endpoint) => {
+                return notification::yield_on_page_ready_source(NoProgress, &endpoint);
+            }
+            FilePageFetchStart::Owner(fetch_id) => fetch_id,
+            FilePageFetchStart::Retry => {
+                return StepOutcome::Continue {
+                    progress: NoProgress,
+                };
+            }
+        };
 
         reclaim_clean_file_pages_if_low();
 
-        if let Some(planned) =
-            self.try_materialize_file_page_from_backend_plan(page, access, fetch_id)
-        {
-            match planned {
-                // ENOSYS is the planner's capability-miss result. In ext4 it
-                // also occurs after journal settlement invalidates the
-                // mount-wide derived extent table while an existing RNode
-                // still owns its PageContainer. Re-enter the fetch protocol
-                // without an L4 planner request and use FsPageBacking's
-                // authoritative pager path for this page.
-                StepOutcome::Err(errno) if errno == V3Errno::ENOSYS => {
-                    // The planner turn may have terminalized its L4 request
-                    // without installing a page. Retire that exact fetch
-                    // before starting the compatibility fetch; otherwise the
-                    // second begin can join a dead planner request and park
-                    // forever on its wait source.
-                    self.finish_file_page_fetch_without_install(page, fetch_id);
-                    fetch_id = match self.begin_file_page_fetch(page, access, true, false) {
-                        FilePageFetchStart::Cached(materialized) => {
-                            return match materialized {
-                                Ok(page) => StepOutcome::Done(page),
-                                Err(error) => {
-                                    StepOutcome::Err(page_cache_error_to_errno(error).into())
-                                }
-                            };
-                        }
-                        FilePageFetchStart::Joined(endpoint) => {
-                            return notification::yield_on_page_ready_source(NoProgress, &endpoint);
-                        }
-                        FilePageFetchStart::Owner(fetch_id) => fetch_id,
-                        FilePageFetchStart::Retry => {
-                            return StepOutcome::Continue {
-                                progress: NoProgress,
-                            };
-                        }
-                    };
+        if planner_runtime_ready {
+            if let Some(planned) =
+                self.try_materialize_file_page_from_backend_plan(page, access, fetch_id)
+            {
+                match planned {
+                    // ENOSYS is the planner's capability-miss result. In ext4 it
+                    // also occurs after journal settlement invalidates the
+                    // mount-wide derived extent table while an existing RNode
+                    // still owns its PageContainer. Re-enter the fetch protocol
+                    // without an L4 planner request and use FsPageBacking's
+                    // authoritative pager path for this page.
+                    StepOutcome::Err(errno) if errno == V3Errno::ENOSYS => {
+                        // The planner turn may have terminalized its L4 request
+                        // without installing a page. Retire that exact fetch
+                        // before starting the compatibility fetch; otherwise the
+                        // second begin can join a dead planner request and park
+                        // forever on its wait source.
+                        self.finish_file_page_fetch_without_install(page, fetch_id);
+                        fetch_id = match self.begin_file_page_fetch(page, access, true, false) {
+                            FilePageFetchStart::Cached(materialized) => {
+                                return match materialized {
+                                    Ok(page) => StepOutcome::Done(page),
+                                    Err(error) => {
+                                        StepOutcome::Err(page_cache_error_to_errno(error).into())
+                                    }
+                                };
+                            }
+                            FilePageFetchStart::Joined(endpoint) => {
+                                return notification::yield_on_page_ready_source(
+                                    NoProgress, &endpoint,
+                                );
+                            }
+                            FilePageFetchStart::Owner(fetch_id) => fetch_id,
+                            FilePageFetchStart::Retry => {
+                                return StepOutcome::Continue {
+                                    progress: NoProgress,
+                                };
+                            }
+                        };
+                    }
+                    planned => return planned,
                 }
-                planned => return planned,
             }
         }
 
@@ -4393,9 +4871,9 @@ impl PageContainer {
             return StepOutcome::Err(V3Errno::EINVAL);
         };
         // Routes through `FsPageBacking::fetch_page`. v3 outcome:
-        // Done→install + Done; Continue→ no frame, surface EAGAIN as
-        // a conservative choice; Yield{OnWaitSource{c,i}}→pass through
-        // with `NoProgress`; Yield{OnAgent}→Err(EIO); Err→Err.
+        // Done→install + Done; Continue→release this fetch ownership and
+        // retry through the outer driver; Yield{OnWaitSource{c,i}}→pass
+        // through with `NoProgress`; Yield{OnAgent}→Err(EIO); Err→Err.
         match mount
             .payload()
             .fs_page_backing
@@ -4405,12 +4883,13 @@ impl PageContainer {
                 self.install_fetched_file_page_from_owner(page, access, frame, fetch_id)
             }
             StepOutcome::Continue { progress: _ } => {
-                // `Continue` with `NoProgress` means "fs is asking us
-                // to retry"; there is no frame to install. Conservative
-                // choice: surface `Err(EAGAIN)` so callers that expect
-                // a frame don't observe a stale value.
+                // `Continue` is internal coordination, not a Linux errno.
+                // Relinquish this exact owner before retrying so the next
+                // turn can either become owner or join a new wait source.
                 self.finish_file_page_fetch_without_install(page, fetch_id);
-                StepOutcome::Err(V3Errno::EAGAIN)
+                StepOutcome::Continue {
+                    progress: NoProgress,
+                }
             }
             StepOutcome::Yield { progress: _, shape } => {
                 self.finish_file_page_fetch_without_install(page, fetch_id);
@@ -4442,6 +4921,23 @@ impl PageContainer {
             .conflicts(PageRange::new(page, 1), kind)
     }
 
+    fn file_planner_runtime_ready(&self) -> bool {
+        // Unit tests drive the planner service explicitly and intentionally do
+        // not install a reactor wake source.  Production faults must require
+        // that source: otherwise a planner request can yield to an executor
+        // that was never registered for this inode.
+        #[cfg(test)]
+        let service_ready = true;
+        #[cfg(not(test))]
+        let service_ready = self.page_submission.has_wake_source();
+        matches!(
+            &self.kind,
+            PageContainerKind::File { mount, .. }
+                if mount.payload().backend_planner().is_some()
+                    && service_ready
+        )
+    }
+
     fn try_materialize_file_page_from_backend_plan(
         &self,
         page: PageIndex,
@@ -4451,7 +4947,7 @@ impl PageContainer {
         let PageContainerKind::File { mount, .. } = &self.kind else {
             return None;
         };
-        if mount.payload().backend_planner().is_none() {
+        if !self.file_planner_runtime_ready() {
             return None;
         }
 
@@ -4579,12 +5075,7 @@ impl PageContainer {
         // A planner-owned L4 read must retain its destination before admission.
         // Allocate it outside `state`: PageContainer's lock never covers frame
         // allocation, and a direct-pager fetch has no L4 payload to retain.
-        let planner_present = !compatibility_only
-            && matches!(
-                &self.kind,
-                PageContainerKind::File { mount, .. }
-                    if mount.payload().backend_planner().is_some()
-            );
+        let planner_present = !compatibility_only && self.file_planner_runtime_ready();
         let planned_target_count = if planner_present && admit_fault_readahead {
             self.fault_read_window_pages(page)
         } else {
@@ -4693,7 +5184,17 @@ impl PageContainer {
 
             let fetch_id = state.allocate_file_fetch_id();
             let generation = match state.page_slots.entry(page).or_default().begin_fetch() {
-                PageSlotFetch::Owner { generation } => generation,
+                PageSlotFetch::Owner { generation } => {
+                    // `file_page_waits` intentionally survives completion so
+                    // tasks that install their wait after the completion edge
+                    // still observe level readiness.  Clear that readiness
+                    // only after this new fetch generation has become the
+                    // authoritative owner under the same state lock.
+                    if let Some(wait) = state.file_page_waits.get(&page) {
+                        notification::reset_page_ready(wait);
+                    }
+                    generation
+                }
                 // Resident-root publication is prepared outside `state`.  A
                 // direct-pager owner can therefore have retired its fetch row
                 // while the matching PageSlot is still Fetching.  That window
@@ -4781,10 +5282,10 @@ impl PageContainer {
         demand_page: PageIndex,
         targets: impl Iterator<Item = CachedFrame>,
     ) {
-        let PageContainerKind::File { mount, .. } = &self.kind else {
+        let PageContainerKind::File { mount: _, .. } = &self.kind else {
             return;
         };
-        if mount.payload().backend_planner().is_none() {
+        if !self.file_planner_runtime_ready() {
             return;
         }
 
@@ -5005,8 +5506,6 @@ impl PageContainer {
         frame: Frame,
         fetch_id: FilePageFetchId,
     ) -> StepOutcome<MaterializedPage, NoProgress> {
-        use adapter::step_engine::Errno as V3Errno;
-
         let frame = match cached_frame_from_frame(frame) {
             Ok(frame) => frame,
             Err(error) => {
@@ -5025,10 +5524,14 @@ impl PageContainer {
         let (fetch_generation, notify_ready) = {
             let mut state = self.state.lock();
             let Some(fetch) = state.in_flight_file_pages.get(&page) else {
-                return StepOutcome::Err(V3Errno::EAGAIN);
+                return StepOutcome::Continue {
+                    progress: NoProgress,
+                };
             };
             if fetch.id != fetch_id {
-                return StepOutcome::Err(V3Errno::EAGAIN);
+                return StepOutcome::Continue {
+                    progress: NoProgress,
+                };
             }
             let fetch = state
                 .in_flight_file_pages
@@ -5226,6 +5729,13 @@ impl PageContainer {
     }
 
     fn check_bounds(&self, page: PageIndex) -> Result<(), PageCacheError> {
+        // A regular file's logical size is tracked independently by
+        // `size_bytes`; `page_count` is only its initial sparse-cache/service
+        // window.  Treating that window as a hard capacity regressed main by
+        // rejecting compiler and linker outputs once they grew past it.
+        if matches!(self.kind, PageContainerKind::File { .. }) {
+            return Ok(());
+        }
         if page.as_u64() >= self.page_count {
             return Err(PageCacheError::OutOfBounds);
         }
@@ -5233,6 +5743,9 @@ impl PageContainer {
     }
 
     fn byte_capacity(&self) -> Option<u64> {
+        if matches!(self.kind, PageContainerKind::File { .. }) {
+            return Some(u64::MAX);
+        }
         self.page_count
             .checked_mul(crate::vm::USER_PAGE_SIZE as u64)
     }
@@ -5549,7 +6062,7 @@ pub fn reserve_frame_with_reclaim(
     match page_allocator::reserve_frame(policy) {
         Ok(frame) => Ok(frame),
         Err(AllocError::Exhausted) => {
-            reclaim_clean_file_pages(PAGE_CACHE_RECLAIM_BATCH);
+            reclaim_clean_file_pages(PAGE_CACHE_RECLAIM_MAX_BATCH);
             page_allocator::reserve_frame(policy)
         }
         Err(error) => Err(error),
@@ -5557,12 +6070,21 @@ pub fn reserve_frame_with_reclaim(
 }
 
 pub fn reclaim_clean_file_pages_if_low() -> usize {
-    match page_allocator::free_count() {
-        Ok(free) if free <= PAGE_CACHE_RECLAIM_LOW_WATERMARK => {
-            reclaim_clean_file_pages(PAGE_CACHE_RECLAIM_BATCH)
-        }
-        _ => 0,
+    let (Ok(free), Ok(total)) = (page_allocator::free_count(), page_allocator::total_count())
+    else {
+        return 0;
+    };
+    let watermark = (total / 8).clamp(
+        PAGE_CACHE_RECLAIM_MIN_WATERMARK,
+        PAGE_CACHE_RECLAIM_MAX_WATERMARK,
+    );
+    if free > watermark {
+        return 0;
     }
+    let deficit = watermark.saturating_sub(free).saturating_add(1);
+    reclaim_clean_file_pages(
+        deficit.clamp(PAGE_CACHE_RECLAIM_MIN_BATCH, PAGE_CACHE_RECLAIM_MAX_BATCH),
+    )
 }
 
 pub fn reclaim_clean_file_pages(budget: usize) -> usize {
@@ -5572,16 +6094,19 @@ pub fn reclaim_clean_file_pages(budget: usize) -> usize {
 
     let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
     let mut reclaimed = 0usize;
-    let mut registry = PAGE_CONTAINER_RECLAIM_REGISTRY.lock();
-    registry.retain(|weak| {
-        let Some(pc) = weak.upgrade(&guard) else {
-            return false;
-        };
-        if reclaimed < budget {
-            reclaimed += pc.reclaim_clean_file_pages(budget - reclaimed);
+    let scan_limit = PAGE_CONTAINER_RECLAIM_REGISTRY.lock().scan_limit();
+    for _ in 0..scan_limit {
+        if reclaimed >= budget {
+            break;
         }
-        true
-    });
+        let candidate = PAGE_CONTAINER_RECLAIM_REGISTRY.lock().next_live(&guard);
+        let Some(pc) = candidate else {
+            break;
+        };
+        // Never enter a PageContainer state or resident-publication domain
+        // while retaining the mount-independent registry lock.
+        reclaimed += pc.reclaim_clean_file_pages(budget - reclaimed);
+    }
     reclaimed
 }
 
@@ -5591,7 +6116,10 @@ impl PageContainer {
             return 0;
         }
         let mut reclaimed = 0usize;
-        let candidates = self.state.lock().pages.clean_pages(budget);
+        let candidates = {
+            let state = self.state.lock();
+            state.pages.clean_pages(&state.page_slots, budget)
+        };
         for (page, ppn) in candidates {
             let reservation = {
                 let mut state = self.state.lock();
@@ -5653,15 +6181,10 @@ fn materialized_snapshot_from_state(
     if slot_ppn != entry.ppn() {
         return Err(PageCacheError::Backend(Errno::ESTALE));
     }
-    let pin = match entry.cell.binding() {
-        ResidentBindingPin::Allocated(cache_pin) => {
-            debug_assert_eq!(cache_pin.ppn(), entry.ppn());
-            let cache_pin =
-                page_allocator::acquire_cache_pin(entry.ppn()).map_err(PageCacheError::Alloc)?;
-            MaterializedPageSnapshotPin::Allocated(cache_pin)
-        }
-        ResidentBindingPin::Device(device) => MaterializedPageSnapshotPin::Device(*device),
-    };
+    let pin = entry
+        .cell
+        .try_snapshot_pin()?
+        .ok_or(PageCacheError::Backend(Errno::ESTALE))?;
     Ok(MaterializedPageSnapshot {
         ppn: entry.ppn(),
         pin,
@@ -5728,6 +6251,19 @@ fn record_file_service_block_submissions(
         PageServiceBackendSubmitOutcome::QueuedPageCompletions { .. }
         | PageServiceBackendSubmitOutcome::Yield(_)
         | PageServiceBackendSubmitOutcome::Err { .. } => {}
+    }
+}
+
+fn backend_submit_outcome_has_block_work(outcome: &PageServiceBackendSubmitOutcome) -> bool {
+    match outcome {
+        PageServiceBackendSubmitOutcome::BlockBiosQueued { submitted, .. }
+        | PageServiceBackendSubmitOutcome::BlockGraphQueued { submitted, .. }
+        | PageServiceBackendSubmitOutcome::MetadataFirstQueued { submitted, .. } => {
+            !submitted.is_empty()
+        }
+        PageServiceBackendSubmitOutcome::QueuedPageCompletions { .. }
+        | PageServiceBackendSubmitOutcome::Yield(_)
+        | PageServiceBackendSubmitOutcome::Err { .. } => false,
     }
 }
 

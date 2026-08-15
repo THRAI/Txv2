@@ -168,8 +168,10 @@ fn step_range_with_user_buffer(
 
         // `materialize_page` is now v3
         // `StepOutcome<MaterializedPage, NoProgress>`. Map per variant:
-        // - `Done` / `Continue { .. }` → run the user-side copy, then
-        //   either continue the loop (on success) or terminate.
+        // - `Done` → run the user-side copy, then either continue the loop
+        //   (on success) or terminate.
+        // - `Continue { .. }` → preserve the internal page-cache retry and
+        //   any bytes already copied; it must not become userspace EAGAIN.
         // - `Yield { OnWaitSource .. }` with `advanced == 0` → v3 `Yield`
         //   with `ByteProgress::EMPTY`. Otherwise propagate the yield
         //   carrying the accumulated bytes.
@@ -227,16 +229,16 @@ fn step_range_with_user_buffer(
                 }
             }
             StepOutcome::Continue { .. } => {
-                // NoProgress wait source: no materialized frame; treat as
-                // EAGAIN-like and surface partial progress (or EIO if
-                // none) — page allocation rarely emits this.
+                // A concurrent fetch owner or resident-root publisher may
+                // leave a short retry window with no wait source to join yet.
+                // Preserve that internal retry as `Continue`: the waiting
+                // syscall driver inserts a scheduler boundary for empty
+                // progress and re-enters with a fresh guard.  Returning
+                // EAGAIN here leaks page-cache coordination to a blocking
+                // read(2), which is observable under parallel compiler I/O.
                 emit_pagebacked_trace(b"debug.pagebacked.user_range.err", 2);
-                if advanced == 0 {
-                    return V3::err(step_engine::Errno::EAGAIN);
-                }
                 emit_pagebacked_trace(b"debug.pagebacked.user_range.phase", 4);
-                of.set_offset(offset);
-                return V3::done(advanced);
+                return continue_after_materialize_retry(of, offset, advanced);
             }
             StepOutcome::Yield { shape, .. } => {
                 emit_pagebacked_trace(b"debug.pagebacked.user_range.err", 3);
@@ -280,6 +282,22 @@ fn step_range_with_user_buffer(
     emit_pagebacked_trace(b"debug.pagebacked.user_range.phase", 5);
     of.set_offset(offset);
     V3::done(advanced)
+}
+
+/// Preserve a page-cache retry inside the step engine instead of exposing it
+/// as a Linux `EAGAIN`.  When earlier chunks completed, their file-position
+/// advance must be committed exactly once before the driver re-enters.
+pub(super) fn continue_after_materialize_retry(
+    of: &OpenFile,
+    offset: u64,
+    advanced: usize,
+) -> StepOutcome<usize, ByteProgress> {
+    if advanced != 0 {
+        of.set_offset(offset);
+    }
+    StepOutcome::Continue {
+        progress: ByteProgress::new(advanced),
+    }
 }
 
 fn copy_chunk_user(
@@ -542,11 +560,9 @@ fn step_range_with_kernel_buffer(
                 }
             }
             V3::Continue { .. } => {
-                if advanced == 0 {
-                    return V3::err(step_engine::Errno::EAGAIN);
-                }
-                of.set_offset(offset);
-                return V3::done(advanced);
+                // Match the direct user-buffer lane: this is an internal
+                // page-cache retry, not a Linux-visible nonblocking result.
+                return continue_after_materialize_retry(of, offset, advanced);
             }
             V3::Yield { shape, .. } => {
                 let Some((carrier, interests)) =

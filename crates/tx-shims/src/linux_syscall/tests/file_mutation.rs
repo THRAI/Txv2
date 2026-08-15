@@ -28,9 +28,9 @@ use tx_subsystems::vm::{
 
 use crate::linux_syscall::{
     AT_FDCWD, AT_REMOVEDIR, NR_FSTAT, NR_FTRUNCATE, NR_LINKAT, NR_LSEEK, NR_MKDIRAT, NR_MOUNT,
-    NR_NEWFSTATAT, NR_OPENAT, NR_READLINKAT, NR_RENAMEAT2, NR_SYMLINKAT, NR_TRUNCATE, NR_UNLINKAT,
-    NR_UTIMENSAT, NR_WRITE, O_RDWR, O_TMPFILE, RENAME_EXCHANGE, RENAME_NOREPLACE, SEEK_SET,
-    UTIME_NOW,
+    NR_NEWFSTATAT, NR_OPENAT, NR_READLINKAT, NR_RENAMEAT, NR_RENAMEAT2, NR_SYMLINKAT, NR_TRUNCATE,
+    NR_UNLINKAT, NR_UTIMENSAT, NR_WRITE, O_RDWR, O_TMPFILE, RENAME_EXCHANGE, RENAME_NOREPLACE,
+    SEEK_SET, UTIME_NOW,
 };
 
 /// errno magnitudes (positive Linux RV64 generic ABI values).
@@ -970,6 +970,53 @@ fn dispatch_readlinkat_regular_file_returns_neg_einval() {
     drop(path);
 }
 
+/// A parent-local positive dentry is authoritative for backends whose
+/// namespace mutation path purges that cache synchronously. readlinkat must
+/// use the materialised inode kind instead of repeating lookup + metadata I/O.
+#[test]
+fn dispatch_readlinkat_uses_authoritative_cached_regular_dentry() {
+    let _setup = fm_setup();
+    let (root_dentry, _tmpfs) = build_tmpfs_root();
+
+    // Deliberately use an object id absent from tmpfs. Falling through to the
+    // backend would therefore return ENOENT; EINVAL proves the cached inode
+    // kind was consumed directly.
+    let cached_rnode = RNode::new_cap(
+        FsObjectId::new(u64::MAX - 17),
+        InodeMeta::new(InodeKind::Regular, 0o100644),
+        RNodeBacking::Directory,
+    )
+    .expect("cached regular rnode");
+    let mut cached_dentry_raw = DEntry::new(
+        InlineName::new(b"cached-regular").expect("cached name"),
+        cached_rnode,
+    );
+    cached_dentry_raw.set_parent_hint(&root_dentry);
+    let cached_dentry = step_engine::sign(cached_dentry_raw).expect("cached dentry");
+    let _retained_cached_dentry = root_dentry.cache_child(cached_dentry);
+
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap, thread);
+    let path = nul_terminate(b"/cached-regular");
+    let mut buf = vec![0u8; 64];
+    let req = SyscallRequest::new(
+        NR_READLINKAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            0,
+            0,
+        ],
+    );
+
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(req, &ctx)),
+        SyscallResult::Error(E_INVAL)
+    );
+}
+
 /// `readlinkat` against a missing entry surfaces the lookup's
 /// `-ENOENT`.
 #[test]
@@ -1000,6 +1047,35 @@ fn dispatch_readlinkat_missing_returns_neg_enoent() {
 // -----------------------------------------------------------------
 // renameat2
 // -----------------------------------------------------------------
+
+/// A journal-backed namespace operation may transiently yield while another
+/// task owns ext4's metadata-mutation permit.  The syscall driver must retry
+/// that scheduling outcome instead of exposing it as userspace `EIO`.
+#[test]
+fn namespace_mutation_driver_retries_transient_yield() {
+    use core::cell::Cell;
+    use tx_substrate::step::{NoProgress, YieldShape};
+
+    let _setup = fm_setup();
+    let attempts = Cell::new(0usize);
+    let result = block_on(super::super::fs_mut::drive_namespace_mutation_yield_retry(
+        |_guard| {
+            let attempt = attempts.get();
+            attempts.set(attempt + 1);
+            if attempt == 0 {
+                StepOutcome::Yield {
+                    progress: NoProgress,
+                    shape: YieldShape::on_wait_source(1, 1),
+                }
+            } else {
+                StepOutcome::Done(())
+            }
+        },
+    ));
+
+    assert_eq!(result, Ok(()));
+    assert_eq!(attempts.get(), 2);
+}
 
 /// `renameat2` from a non-privileged caller whose parents lack the
 /// write bit returns `-EACCES`. Locks in the `require_rename` wiring:
@@ -1079,10 +1155,38 @@ fn dispatch_renameat2_same_directory_succeeds() {
     drop(newpath);
 }
 
-/// Rename-over at the syscall layer must complete the VFS lifetime
-/// protocol by destroying the displaced inode after tmpfs drops its
-/// last link. Otherwise repeated temp-file replacement keeps old
-/// PageContainers resident until the whole tmpfs mount is torn down.
+/// libc's ordinary `rename(2)` wrapper uses asm-generic `renameat` (38), not
+/// `renameat2` (276). Keep both ABI entry points on the same VFS operation.
+#[test]
+fn dispatch_renameat_same_directory_succeeds() {
+    let _setup = fm_setup();
+    let (root_dentry, tmpfs) = build_tmpfs_root();
+    create_regular(&tmpfs, b"a");
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let oldpath = nul_terminate(b"/a");
+    let newpath = nul_terminate(b"/b");
+    let req = SyscallRequest::new(
+        NR_RENAMEAT,
+        [
+            AT_FDCWD as i64 as u64,
+            oldpath.as_ptr() as u64,
+            AT_FDCWD as i64 as u64,
+            newpath.as_ptr() as u64,
+            u64::MAX,
+            0,
+        ],
+    );
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Return(0));
+    assert!(!lookup_exists(&tmpfs, b"a"), "/a should be gone");
+    assert!(lookup_exists(&tmpfs, b"b"), "/b should exist");
+}
+
+/// Rename-over performs best-effort post-commit reclamation. Tmpfs can destroy
+/// its zero-link inode immediately; a backend cleanup limitation must not
+/// retroactively turn the already committed rename into a userspace failure.
 #[test]
 fn dispatch_renameat2_over_existing_destroys_displaced_inode() {
     let _setup = fm_setup();

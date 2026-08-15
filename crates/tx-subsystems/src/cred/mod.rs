@@ -283,14 +283,10 @@ pub fn step_set_capability_sets(
 /// seccomp / landlock surfaces; until then `SubjectAuthority` just
 /// needs *some* cap to satisfy the type signature. The
 /// `RestrictionStackHandle` placeholder is a unit-typed
-/// `ZoneAllocated` struct in `adapter::step_engine`, so each call
-/// reserves a fresh slot in the placeholder zone and signs the
-/// unit-typed value into it. The resulting cap is short-lived (the
-/// syscall arm drops it at script-frame exit; EBR retires the slab).
-///
-/// Cost is one zone reservation per syscall entry — acceptable for
-/// the placeholder; PR-K replaces with the proper slot-style append-
-/// only stack.
+/// `ZoneAllocated` struct in `adapter::step_engine`. Process creation
+/// reserves one slot and retains the resulting cap in `ProcessPayload`;
+/// syscall script contexts clone that immutable authority until PR-K
+/// replaces it with the proper append-only restriction stack.
 pub fn placeholder_restrictions_cap() -> Result<Cap<RestrictionStackHandle>, ZoneError> {
     step_engine::sign(RestrictionStackHandle::placeholder())
 }

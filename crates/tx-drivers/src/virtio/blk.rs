@@ -86,6 +86,19 @@ impl<P: TxPlatform> VirtioPciBlock<P> {
     ) -> StepOutcome<(), NoProgress> {
         let _gate = self.io_gate.lock();
         self.quiesce_async();
+        // `Frame` is only an address carrier.  Retain every destination for
+        // the complete virtio request so a page-cache/VM teardown cannot turn
+        // the later bounce-buffer copy-back into a write through a stale PPN.
+        // This also rejects forged/reserved PPNs before they reach the HAL's
+        // direct-map conversion.
+        let _dma_pins = match target
+            .iter()
+            .map(|frame| page_allocator::acquire_dma_pin(frame.ppn()))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(pins) => pins,
+            Err(_) => return StepOutcome::Err(Errno::EIO.into()),
+        };
         let mut inner = self.inner.lock();
         let Some(blk) = inner.as_mut() else {
             return StepOutcome::Err(Errno::ENODEV.into());
@@ -122,6 +135,14 @@ impl<P: TxPlatform> VirtioPciBlock<P> {
     ) -> StepOutcome<(), NoProgress> {
         let _gate = self.io_gate.lock();
         self.quiesce_async();
+        let _dma_pins = match source
+            .iter()
+            .map(|frame| page_allocator::acquire_dma_pin(frame.ppn()))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(pins) => pins,
+            Err(_) => return StepOutcome::Err(Errno::EIO.into()),
+        };
         let mut inner = self.inner.lock();
         let Some(blk) = inner.as_mut() else {
             return StepOutcome::Err(Errno::ENODEV.into());
@@ -197,7 +218,10 @@ impl<P: TxPlatform> BlockDeviceOps for VirtioPciBlock<P> {
     }
 
     fn supports_async_blocks(&self) -> bool {
-        true
+        // See the MMIO implementation: the upper I/O graph remains async,
+        // while device descriptors currently complete synchronously so raw
+        // frame destinations cannot outlive their submission turn.
+        false
     }
 
     fn submit_read_blocks_async(

@@ -28,12 +28,12 @@ mod tests;
 pub use crate::cred::CapabilitySet;
 pub use checks::{DirectoryAtPath, EntityAtPath, ParentAndName, ResolveCtx, RootCtx};
 pub use execution::{
-    CreateInParentOp, CreateThenWalkInMountNamespaceOp, CreateThenWalkOp, FileFsyncOp, FlockOp,
-    FsOps, InodeStatOp, LinkInParentOp, LoadInodeMetaOp, LookupInParentOp, MkdirOp, MountOutput,
-    OpenFileGetFlOp, OpenFileIoctlOp, OpenFileLseekOp, OpenFileSetFlOp, OpenInMountNamespaceOp,
-    OpenNoFollowInMountNamespaceOp, OpenNoFollowOp, OpenOp, PathWalkOp, ReadLinkByIdOp,
-    ResolveOpenTargetInMountNamespaceOp, ResolveOpenTargetOp, SymlinkOp, TruncateFsObjectOp,
-    UnlinkFromParentOp, WalkInMountNamespaceWithOriginOp,
+    ChmodInodeOp, ChownInodeOp, CreateInParentOp, CreateThenWalkInMountNamespaceOp,
+    CreateThenWalkOp, FileFsyncOp, FlockOp, FsOps, InodeStatOp, LinkInParentOp, LoadInodeMetaOp,
+    LookupInParentOp, MkdirOp, MountOutput, OpenFileGetFlOp, OpenFileIoctlOp, OpenFileLseekOp,
+    OpenFileSetFlOp, OpenInMountNamespaceOp, OpenNoFollowInMountNamespaceOp, OpenNoFollowOp,
+    OpenOp, PathWalkOp, ReadLinkByIdOp, ResolveOpenTargetInMountNamespaceOp, ResolveOpenTargetOp,
+    SymlinkOp, TruncateFsObjectOp, UnlinkFromParentOp, WalkInMountNamespaceWithOriginOp,
 };
 pub use fd_ready::{query_fd_ready, FdReadyMask, FdReadyQuery, FdReadyReport, FdWait};
 pub use notification::{VFS_READABLE, VFS_WRITABLE};
@@ -45,8 +45,9 @@ pub use structure::{
     S_IFMT, S_IFREG, S_IFSOCK, S_ISGID, S_ISUID, S_ISVTX, VFS_NAME_MAX,
 };
 pub use walker::{
-    step_open, step_open_in_mount_namespace, step_open_in_mount_namespace_with_mount,
-    step_open_in_mount_namespace_with_origin_mount, step_open_nofollow, step_walk,
-    step_walk_in_mount_namespace, step_walk_in_mount_namespace_with_origin_mount,
-    OpenFileWithMount, ResolvedDEntryWithMount, SYMLOOP_MAX,
+    step_open, step_open_cached_in_mount_namespace_with_origin_mount, step_open_in_mount_namespace,
+    step_open_in_mount_namespace_with_mount, step_open_in_mount_namespace_with_origin_mount,
+    step_open_nofollow, step_walk, step_walk_in_mount_namespace,
+    step_walk_in_mount_namespace_with_origin_mount, OpenFileWithMount, ResolvedDEntryWithMount,
+    SYMLOOP_MAX,
 };

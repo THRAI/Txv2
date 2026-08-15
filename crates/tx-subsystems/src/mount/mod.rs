@@ -36,6 +36,55 @@ static MOUNT_API_FILE_ZONE: Zone<MountApiFile> = Zone::const_new();
 static BACKGROUND_MOUNT_SETTLEMENT_QUEUE: SpinMutex<Vec<MountSettlementOp>> =
     SpinMutex::new(Vec::new());
 
+// The parent-local VFS dcache intentionally stores weak child references so
+// removed subtrees cannot form parent/child retention cycles.  Without a
+// separate bounded owner, though, closing the last fd also destroys the
+// DEntry/RNode/PageContainer identity and a later open/stat of the same path
+// has to materialise the whole stack again.  Keep the most recently
+// materialised path objects alive at the mount identity, which is outside the
+// DEntry parent chain and therefore cannot create that cycle.
+//
+// This is deliberately bounded: retaining every build output would turn the
+// page cache into an unbounded 4 GiB-memory consumer during BuildStorm.  The
+// bound must nevertheless cover a metadata scan's reuse distance: the
+// official image currently has more than 1,600 entries in target/debug/deps
+// alone, so the old 256-entry FIFO produced almost no second-pass hits.  Match
+// the ext4 lookup-cache working-set window while keeping a fixed upper bound.
+const MOUNT_DENTRY_RETENTION_CAPACITY: usize = 4096;
+
+#[derive(Debug)]
+struct DentryRetentionCache {
+    entries: Vec<Cap<DEntry>>,
+    next_victim: usize,
+}
+
+impl DentryRetentionCache {
+    const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            next_victim: 0,
+        }
+    }
+
+    fn retain(&mut self, dentry: Cap<DEntry>) {
+        if self.entries.len() < MOUNT_DENTRY_RETENTION_CAPACITY {
+            self.entries.push(dentry);
+            return;
+        }
+
+        self.entries[self.next_victim] = dentry;
+        self.next_victim += 1;
+        if self.next_victim == MOUNT_DENTRY_RETENTION_CAPACITY {
+            self.next_victim = 0;
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 unsafe impl ZoneAllocated for MountIdentity {
     fn zone() -> &'static Zone<Self> {
         &MOUNT_IDENTITY_ZONE
@@ -776,6 +825,10 @@ pub struct MountIdentity {
     /// sharing a non-zero `peer_group` are peers and propagate to each
     /// other. Allocated by `allocate_peer_group_id`.
     peer_group: AtomicU64,
+    /// Bounded strong owner for recently materialised path identities.  The
+    /// parent DEntry maps remain weak and keep their mutation semantics; this
+    /// cache only controls lifetime and is never consulted for correctness.
+    retained_dentries: SpinMutex<DentryRetentionCache>,
 }
 
 impl MountIdentity {
@@ -796,6 +849,7 @@ impl MountIdentity {
             flags: AtomicU64::new(flags.bits()),
             propagation: AtomicU64::new(Propagation::Private.to_bits()),
             peer_group: AtomicU64::new(0),
+            retained_dentries: SpinMutex::new(DentryRetentionCache::new()),
         }
     }
 
@@ -848,6 +902,21 @@ impl MountIdentity {
 
     pub fn root_dentry(&self) -> &Cap<DEntry> {
         &self.root_dentry
+    }
+
+    /// Retain a newly materialised path object in this mount's bounded cache.
+    ///
+    /// The caller has already published the child in its parent-local weak
+    /// dcache.  Mutations continue to invalidate that lookup entry normally;
+    /// an invalidated object may remain alive here until FIFO replacement, but
+    /// cannot be reached by a subsequent path walk.
+    pub fn retain_dentry(&self, dentry: Cap<DEntry>) {
+        self.retained_dentries.lock().retain(dentry);
+    }
+
+    #[cfg(test)]
+    fn retained_dentry_count(&self) -> usize {
+        self.retained_dentries.lock().len()
     }
 
     pub fn parent(&self) -> Option<&Cap<MountIdentity>> {
@@ -904,12 +973,25 @@ impl Entity for MountIdentity {
 pub struct MountNamespace {
     root: Cap<MountIdentity>,
     mounts: SpinMutex<Vec<NamespaceMountEntry>>,
+    // Conservative inode filter for the path-walk hot path. Most components
+    // are not mountpoints; rejecting them here avoids locking and scanning the
+    // namespace table twice per component. Bits are never cleared, so hash
+    // collisions and unmounts can only cause a slow-path false positive.
+    mountpoint_object_filter: AtomicU64,
 }
 
 #[derive(Debug)]
 struct NamespaceMountEntry {
     mountpoint_key: SlotKey,
     mount: IdentitySlot<MountIdentity>,
+}
+
+#[inline]
+fn mountpoint_filter_bit(fs_object_id: FsObjectId) -> u64 {
+    // Fibonacci hashing spreads sequential ext4 inode numbers across all
+    // bits. The generation is already folded into FsObjectId::as_u64().
+    let hash = fs_object_id.as_u64().wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    1u64 << (hash >> 58)
 }
 
 struct CloneIdentitySnapshot {
@@ -941,6 +1023,7 @@ impl MountNamespace {
         Self {
             root,
             mounts: SpinMutex::new(Vec::new()),
+            mountpoint_object_filter: AtomicU64::new(0),
         }
     }
 
@@ -967,10 +1050,25 @@ impl MountNamespace {
             Some(mountpoint.key()),
             "namespace mountpoint key must match MountIdentity.mountpoint"
         );
+        let fs_object_id = mountpoint.rnode().fs_object_id();
         self.mounts.lock().push(NamespaceMountEntry {
             mountpoint_key: mountpoint.key(),
             mount: IdentitySlot::from_cap(mount),
         });
+        // Publish after the exact table row. A reader that observes this bit
+        // with Acquire is guaranteed to observe the completed registration.
+        self.mountpoint_object_filter
+            .fetch_or(mountpoint_filter_bit(fs_object_id), Ordering::Release);
+    }
+
+    /// Cheap conservative test used before exact mountpoint lookup.
+    ///
+    /// `false` is authoritative; `true` only means the namespace table may
+    /// contain a row for this filesystem object.
+    #[inline]
+    pub fn may_contain_mountpoint_object(&self, fs_object_id: FsObjectId) -> bool {
+        self.mountpoint_object_filter.load(Ordering::Acquire) & mountpoint_filter_bit(fs_object_id)
+            != 0
     }
 
     pub fn mount_for(&self, mountpoint: &Cap<DEntry>) -> Option<Cap<MountIdentity>> {
@@ -1228,6 +1326,12 @@ impl MountNamespace {
         runtime::sign(Self {
             root: cloned_root,
             mounts: SpinMutex::new(cloned),
+            // The clone contains a snapshot subset of the source rows. Copying
+            // the monotonic filter can add false positives only; every cloned
+            // row's bit was published before its source registration returned.
+            mountpoint_object_filter: AtomicU64::new(
+                self.mountpoint_object_filter.load(Ordering::Acquire),
+            ),
         })
     }
 
@@ -1492,6 +1596,10 @@ pub fn bind_mount_in_namespace(
         mountpoint_key: target_key,
         mount: IdentitySlot::from_cap(mount_cap.clone()),
     });
+    namespace.mountpoint_object_filter.fetch_or(
+        mountpoint_filter_bit(target_fs_object_id),
+        Ordering::Release,
+    );
 
     Ok(BindMountOutput { mount: mount_cap })
 }
@@ -1572,6 +1680,10 @@ pub fn move_mount_in_namespace(
         global.push(global_row);
     }
     namespaced.push(namespace_row);
+    namespace.mountpoint_object_filter.fetch_or(
+        mountpoint_filter_bit(target_fs_object_id),
+        Ordering::Release,
+    );
     Ok(())
 }
 
@@ -2497,6 +2609,67 @@ mod tests {
     }
 
     #[test]
+    fn mount_retention_keeps_a_weak_cached_child_materialised() {
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        crate::zones::register_all().expect("kernel zones");
+
+        let fs = Arc::new(MockFs);
+        let payload = MountPayload::new_cap(
+            fs.clone() as Arc<dyn FsOps>,
+            fs as Arc<dyn FsPageBacking>,
+            None,
+            DevId::new(32),
+            MountOptions::default(),
+            "mockfs",
+            SourceLabel::Static("retained-dentry"),
+        )
+        .expect("mount payload");
+        let root_rnode = RNode::new_cap_in_mount(
+            FsObjectId::ROOT,
+            InodeMeta::new(InodeKind::Directory, 0o040755),
+            RNodeBacking::Directory,
+            &payload,
+        )
+        .expect("root rnode");
+        let mount = MountIdentity::new_cap(
+            MountId::new(32),
+            None,
+            root_rnode,
+            None,
+            payload.clone(),
+            MountFlags::empty(),
+        )
+        .expect("mount identity");
+        let child_rnode = RNode::new_cap_in_mount(
+            FsObjectId::new(2),
+            InodeMeta::new(InodeKind::Regular, 0o100644),
+            RNodeBacking::Directory,
+            &payload,
+        )
+        .expect("child rnode");
+        let child = DEntry::new_cap(InlineName::new(b"cached").expect("name"), child_rnode)
+            .expect("child dentry");
+
+        let published = mount.root_dentry().cache_child(child);
+        let expected_key = published.key();
+        mount.retain_dentry(published);
+        tx_test_support::drain_to_quiescence();
+
+        assert_eq!(mount.retained_dentry_count(), 1);
+        assert_eq!(
+            mount
+                .root_dentry()
+                .cached_child_by_name(b"cached")
+                .expect("retained weak child upgrades")
+                .key(),
+            expected_key
+        );
+    }
+
+    #[test]
     fn snapshot_payload_pins_captures_root_and_visible_mount_payloads() {
         tx_test_support::init_host();
         let _lock = crate::test_support::EPOCH_TEST_LOCK
@@ -3058,8 +3231,11 @@ mod tests {
         let lower = make_child(33);
         let upper = make_child(34);
 
+        assert!(!namespace.may_contain_mountpoint_object(FsObjectId::new(99)));
+        assert!(!namespace.may_contain_mountpoint_object(FsObjectId::new(100)));
         namespace.register_mount(&mountpoint, lower.clone());
         namespace.register_mount(&mountpoint, upper.clone());
+        assert!(namespace.may_contain_mountpoint_object(FsObjectId::new(99)));
         assert_eq!(
             namespace.mount_for(&mountpoint).expect("upper").id(),
             upper.id()
@@ -3075,6 +3251,10 @@ mod tests {
             .umount(lower.root_dentry())
             .expect("pop lower by mounted root");
         assert!(namespace.mount_for(&mountpoint).is_none());
+        assert!(
+            namespace.may_contain_mountpoint_object(FsObjectId::new(99)),
+            "the conservative filter stays set after unmount"
+        );
     }
 
     #[test]

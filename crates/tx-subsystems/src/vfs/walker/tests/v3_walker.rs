@@ -216,8 +216,7 @@ fn run_walker_preserves_lookup_yield_as_defer() {
                 FsObjectId::new(2)
             );
             assert_eq!(
-                resume.walking.remaining,
-                b"slow".to_vec(),
+                &*resume.walking.remaining, b"slow",
                 "resume token must restart at the deferred lookup component"
             );
             resume

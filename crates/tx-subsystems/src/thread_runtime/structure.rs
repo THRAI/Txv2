@@ -256,6 +256,14 @@ pub struct ThreadPayload {
     /// awaiting syscall dispatch; blocking syscall futures should
     /// appear as sleeping to procfs observers.
     pub(crate) proc_sleeping: AtomicBool,
+    /// Lock-free lifecycle latch set when this thread submits `exit(2)` or is
+    /// terminated by exec/group-exit collapse.
+    ///
+    /// The bit is never cleared: a retained task future must not return to
+    /// userspace after the identity payload has been detached. Keeping this
+    /// separate from `active_syscall_nr` also avoids restoring the old
+    /// per-round payload-slot lock on the syscall hot path.
+    exit_intent: core::sync::atomic::AtomicBool,
     active_syscall_nr: AtomicU64,
     active_syscall_arg0: AtomicU64,
     active_syscall_arg1: AtomicU64,
@@ -299,6 +307,7 @@ impl ThreadPayload {
             stopped: core::sync::atomic::AtomicBool::new(false),
             alt_stack: SpinMutex::new(None),
             proc_sleeping: AtomicBool::new(false),
+            exit_intent: core::sync::atomic::AtomicBool::new(false),
             active_syscall_nr: AtomicU64::new(u64::MAX),
             active_syscall_arg0: AtomicU64::new(0),
             active_syscall_arg1: AtomicU64::new(0),
@@ -340,11 +349,21 @@ impl ThreadPayload {
         *self.lifecycle_waker.lock() = Some(waker);
     }
 
-    pub(crate) fn wake_lifecycle_task(&self) {
+    /// Request another poll through the stable task waker installed by the
+    /// reactor wrapper.
+    ///
+    /// Architecture userspace-entry shims may return through a non-local trap
+    /// handoff, so callers at that boundary must not retain or dereference the
+    /// pre-entry stack-local `Context`.
+    pub fn request_task_repoll(&self) {
         let waker = self.lifecycle_waker.lock().clone();
         if let Some(waker) = waker {
             waker.wake_by_ref();
         }
+    }
+
+    pub(crate) fn wake_lifecycle_task(&self) {
+        self.request_task_repoll();
     }
 
     /// Snapshot the reactor task handle, if one has been bound. Always
@@ -361,6 +380,14 @@ impl ThreadPayload {
     /// Update the procfs sleep-state hint for syscall dispatch.
     pub fn set_proc_sleeping(&self, sleeping: bool) {
         self.proc_sleeping.store(sleeping, Ordering::Release);
+    }
+
+    pub fn mark_exit_intent(&self) {
+        self.exit_intent.store(true, Ordering::Release);
+    }
+
+    pub fn exit_intent(&self) -> bool {
+        self.exit_intent.load(Ordering::Acquire)
     }
 
     pub fn begin_syscall_diagnostic(&self, nr: u64, arg0: u64, arg1: u64) {
@@ -443,6 +470,25 @@ impl ThreadPayload {
     /// discipline.
     pub fn store_saved_user_context(&self, ctx: Option<UserTrapContext>) {
         *self.saved_user_context.lock() = ctx;
+    }
+
+    /// Store a trap capture while retaining an unchanged lazy FP/vector image.
+    ///
+    /// Architectures may report an invalid FP payload when hardware says the
+    /// register file is Clean: the previously saved image is still
+    /// authoritative and copying it out of the trap frame would be redundant.
+    /// Exec/clone use `store_saved_user_context` directly when they intend to
+    /// replace the complete context.
+    pub fn store_captured_user_context(&self, mut ctx: UserTrapContext) {
+        let mut saved = self.saved_user_context.lock();
+        if !ctx.fp.is_valid() {
+            if let Some(previous) = saved.as_ref() {
+                if previous.fp.is_valid() {
+                    ctx.fp = previous.fp;
+                }
+            }
+        }
+        *saved = Some(ctx);
     }
 
     /// Publish the pre-`rt_sigsuspend` mask for the next handler frame.
@@ -696,10 +742,37 @@ impl ThreadIdentitySlots {
 
 static CURRENT_THREAD_IDENTITY: ThreadIdentitySlots = ThreadIdentitySlots::new();
 static CURRENT_USERSPACE_THREAD_IDENTITY: ThreadIdentitySlots = ThreadIdentitySlots::new();
+// These counters are post-mortem breadcrumbs, not part of the userspace-entry
+// protocol.  Keeping them live in an optimized kernel makes every hart update
+// the same cache lines twice per syscall/trap round trip.  Preserve the probe
+// for debug kernels while compiling the contended writes out of benchmark and
+// submission builds.
 static LAST_USERSPACE_SET_HART: AtomicU64 = AtomicU64::new(u64::MAX);
 static LAST_USERSPACE_CLEAR_HART: AtomicU64 = AtomicU64::new(u64::MAX);
 static USERSPACE_SET_COUNT: AtomicU64 = AtomicU64::new(0);
 static USERSPACE_CLEAR_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[inline(always)]
+fn trace_userspace_payload_set(hart: usize) {
+    #[cfg(debug_assertions)]
+    {
+        LAST_USERSPACE_SET_HART.store(hart as u64, Ordering::Relaxed);
+        USERSPACE_SET_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = hart;
+}
+
+#[inline(always)]
+fn trace_userspace_payload_clear(hart: usize) {
+    #[cfg(debug_assertions)]
+    {
+        LAST_USERSPACE_CLEAR_HART.store(hart as u64, Ordering::Relaxed);
+        USERSPACE_CLEAR_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = hart;
+}
 
 /// Return the `PayloadCap<ThreadPayload>` registered for `hart`, or
 /// `None` if no thread future is currently driving on that hart.
@@ -813,8 +886,7 @@ pub fn set_current_userspace_payload(
     let mut slot = CURRENT_USERSPACE_PAYLOAD.slots[hart].lock();
     let prev = slot.clone();
     *slot = Some(payload);
-    LAST_USERSPACE_SET_HART.store(hart as u64, Ordering::Relaxed);
-    USERSPACE_SET_COUNT.fetch_add(1, Ordering::Relaxed);
+    trace_userspace_payload_set(hart);
     prev
 }
 
@@ -838,8 +910,7 @@ pub fn clear_current_userspace_payload(hart: usize) -> Option<PayloadCap<ThreadP
         return None;
     }
     let cleared = CURRENT_USERSPACE_PAYLOAD.slots[hart].lock().take();
-    LAST_USERSPACE_CLEAR_HART.store(hart as u64, Ordering::Relaxed);
-    USERSPACE_CLEAR_COUNT.fetch_add(1, Ordering::Relaxed);
+    trace_userspace_payload_clear(hart);
     cleared
 }
 
@@ -862,8 +933,7 @@ pub(crate) fn clear_thread_slots_for(
         clear_payload_slot_if_matches(&CURRENT_THREAD_PAYLOAD, hart, payload_key);
         clear_identity_slot_if_matches(&CURRENT_THREAD_IDENTITY, hart, thread_key);
         if clear_payload_slot_if_matches(&CURRENT_USERSPACE_PAYLOAD, hart, payload_key) {
-            LAST_USERSPACE_CLEAR_HART.store(hart as u64, Ordering::Relaxed);
-            USERSPACE_CLEAR_COUNT.fetch_add(1, Ordering::Relaxed);
+            trace_userspace_payload_clear(hart);
         }
         clear_identity_slot_if_matches(&CURRENT_USERSPACE_THREAD_IDENTITY, hart, thread_key);
         hart += 1;

@@ -104,6 +104,47 @@ fn rnode_backing_uses_page_container_cap_without_backend_live_nodes() {
 }
 
 #[test]
+fn positive_dentry_cache_survives_external_child_close_until_invalidation() {
+    let _g = setup_process_world();
+
+    let root_rnode = RNode::new_cap(
+        FsObjectId::new(90),
+        InodeMeta::new(InodeKind::Directory, 0o040755),
+        RNodeBacking::Directory,
+    )
+    .expect("root rnode");
+    let root = DEntry::new_cap(InlineName::ROOT, root_rnode).expect("root dentry");
+    let name = InlineName::new(b"cached").expect("child name");
+    let child_rnode = RNode::new_cap(
+        FsObjectId::new(91),
+        InodeMeta::new(InodeKind::Regular, 0o100644),
+        RNodeBacking::Directory,
+    )
+    .expect("child rnode");
+    let mut child_raw = DEntry::new(name, child_rnode);
+    child_raw.set_parent_hint(&root);
+    let child = sign_for(
+        reserve_for::<DEntry>().expect("child dentry reservation"),
+        child_raw,
+    );
+    let weak_child = child.downgrade();
+    root.cache_child(child.clone());
+    drop(child);
+    tx_test_support::drain_to_quiescence();
+
+    assert!(root.cached_child(name).is_some());
+    {
+        let guard = guard();
+        assert!(weak_child.upgrade(&guard).is_some());
+    }
+
+    root.remove_cached_child(name);
+    tx_test_support::drain_to_quiescence();
+    let guard = guard();
+    assert!(weak_child.upgrade(&guard).is_none());
+}
+
+#[test]
 fn cached_removed_directory_subtree_does_not_retain_parent_cycle() {
     let _g = setup_process_world();
 

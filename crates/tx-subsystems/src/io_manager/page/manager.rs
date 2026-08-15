@@ -25,8 +25,8 @@ use super::service::PageWaitError;
 use super::service::PageWaiter;
 use super::service::{
     PageService, PageServiceBackendOutcome, PageServiceBackendPrepared,
-    PageServiceBackendSubmitError, PageServiceBlockCompletionPrepared, PageServiceL6Applied,
-    PageServiceTaggedBlockCompletionError,
+    PageServiceBackendSubmitError, PageServiceBlockCompletionPrepared,
+    PageServiceDiagnosticSnapshot, PageServiceL6Applied, PageServiceTaggedBlockCompletionError,
 };
 use super::{
     PageContainerKey, PageGeneration, PageIoFlags, PageIoOp, PageIoPriority, PageIoRange,
@@ -86,7 +86,24 @@ unsafe impl Send for AdmittedFileRequest {}
 #[derive(Clone, Debug)]
 pub(crate) struct PageIoSubmissionHandle(Arc<PageIoSubmissionManager>);
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PageIoSubmissionDiagnosticSnapshot {
+    pub(crate) service: PageServiceDiagnosticSnapshot,
+    pub(crate) admitted_file_requests: usize,
+    pub(crate) background_graphs: usize,
+    pub(crate) wake_source_id: u64,
+    pub(crate) wake_pending_mask: u64,
+    pub(crate) wake_subscribers: usize,
+}
+
 impl PageIoSubmissionHandle {
+    pub(crate) fn has_immediate_work(&self, include_submissions: bool) -> bool {
+        self.0
+            .lock_state()
+            .service
+            .has_immediate_work(include_submissions)
+    }
+
     pub(crate) fn new(max_pending: usize) -> Self {
         Self(Arc::new(PageIoSubmissionManager {
             state: SpinMutex::new(PageIoSubmissionState {
@@ -100,6 +117,30 @@ impl PageIoSubmissionHandle {
 
     pub(crate) fn with_service<R>(&self, f: impl FnOnce(&mut PageService) -> R) -> R {
         f(&mut self.0.lock_state().service)
+    }
+
+    pub(crate) fn diagnostic_snapshot(&self) -> PageIoSubmissionDiagnosticSnapshot {
+        let state = self.0.lock_state();
+        let (wake_source_id, wake_pending_mask, wake_subscribers) = state
+            .wake_source
+            .as_ref()
+            .map(|source| {
+                let endpoint = source.wake_endpoint();
+                (
+                    source.source_id(),
+                    endpoint.pending_mask_snapshot(),
+                    endpoint.subscriber_count(),
+                )
+            })
+            .unwrap_or((0, 0, 0));
+        PageIoSubmissionDiagnosticSnapshot {
+            service: state.service.diagnostic_snapshot(),
+            admitted_file_requests: state.admitted_file_requests.len(),
+            background_graphs: state.background_graphs.len(),
+            wake_source_id,
+            wake_pending_mask,
+            wake_subscribers,
+        }
     }
 
     /// Publish a queued L4 request and its retained data owner together.

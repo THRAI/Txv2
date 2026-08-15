@@ -5,6 +5,7 @@
 //! future lock-policy swaps behind one local API surface.
 
 pub(crate) type SpinMutex<T> = tx_substrate::SpinMutex<T>;
+pub(crate) type RwSpinLock<T> = tx_substrate::RwSpinLock<T>;
 
 #[cfg(any(tx_lock_metrics_vm, tx_lock_metrics_process))]
 pub(crate) type ObservedSpinMutex<T> = tx_substrate::SpinMutex<T, tx_substrate::LockMetricsOn>;

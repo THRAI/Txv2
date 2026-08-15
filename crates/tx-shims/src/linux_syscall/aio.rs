@@ -394,8 +394,7 @@ fn run_write(file: &Cap<OpenFile>, bytes: &[u8]) -> Result<usize, i64> {
 /// scope can outlive the syscall arm).
 fn build_owner_subject(ctx: &SyscallCtx<'_>) -> crate::KernelSubjectContext {
     let cred_cap = ctx.cred_cap();
-    let restrictions_cap = tx_subsystems::cred::placeholder_restrictions_cap()
-        .expect("placeholder restrictions zone has capacity per syscall entry");
+    let restrictions_cap = ctx.restrictions_cap();
     let authority = crate::KernelSubjectAuthority::new(cred_cap, restrictions_cap);
     crate::KernelSubjectContext::from_thread(ctx.process.clone(), ctx.thread.clone(), authority)
 }

@@ -192,15 +192,26 @@ unsafe impl<P: TxPlatform> virtio_drivers::Hal for TxVirtioHal<P> {
             .iter()
             .position(|entry| entry.allocation.dma_addr::<P>() == paddr)
         else {
-            return;
+            panic!("virtio DMA unshare for unknown address {paddr:#x}");
         };
         let entry = shared.swap_remove(index);
-        let dir = entry.direction;
-        let len = entry.len.min(buffer.as_ref().len());
+        let buffer_len = buffer.as_ref().len();
+        let original_ptr = entry.original.as_ptr() as *mut u8;
+        let buffer_ptr = buffer.as_ptr() as *mut u8;
+        if original_ptr != buffer_ptr
+            || entry.len != buffer_len
+            || core::mem::discriminant(&entry.direction) != core::mem::discriminant(&direction)
+        {
+            panic!(
+                "virtio DMA unshare mismatch: paddr={paddr:#x} original={original_ptr:p}/{:#x} buffer={buffer_ptr:p}/{buffer_len:#x}",
+                entry.len,
+            );
+        }
+        let len = entry.len;
         <P as DmaIf>::sync_for_cpu(entry.allocation.paddr, len, virtio_direction(direction));
-        match dir {
+        match entry.direction {
             BufferDirection::DeviceToDriver | BufferDirection::Both => {
-                copy_from_dma(entry.allocation.vaddr, entry.original, len);
+                copy_from_dma(entry.allocation.vaddr, buffer, len);
             }
             BufferDirection::DriverToDevice => {}
         }

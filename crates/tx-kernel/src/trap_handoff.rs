@@ -8,7 +8,7 @@
 //! shell does **not** mutate the trap frame on syscall return. It
 //! snapshots `view.capture_user_context()` into the active
 //! `ThreadPayload`, resolves the userspace-run wait via
-//! `complete_interesting_trap`, and returns
+//! `complete_running_trap`, and returns
 //! `TrapAction::Reschedule`. The userspace-entry shim (a separate
 //! lane) drains `pending_syscall_return` and writes it into the
 //! fresh trap frame before `enter_userspace`.
@@ -157,7 +157,7 @@ pub enum HandoffOutcome {
     /// same as `NoActivePayload` (terminate). A future lane may
     /// want a richer policy.
     NoActiveRequest,
-    /// `complete_interesting_trap` rejected the hand-off (e.g. the
+    /// `complete_running_trap` rejected the hand-off (e.g. the
     /// active request was already resolved or stale). Phase 1
     /// terminates; later lanes may want richer policy.
     SlotError(UserspaceRunError),
@@ -194,7 +194,7 @@ pub fn current_payload_for_hart(hart: usize) -> Option<PayloadCap<ThreadPayload>
 /// 2. Snapshots `view.capture_user_context()` into the payload's
 ///    `saved_user_context` slot (Plan B writeback discipline).
 /// 3. Resolves the in-flight userspace-run wait by calling
-///    `slot.complete_interesting_trap(req, UserspaceTrapInfo::Syscall(req))`
+///    `slot.complete_running_trap(req, UserspaceTrapInfo::Syscall(req))`
 ///    on the payload's `userspace_slot`.
 ///
 /// Returns a [`HandoffOutcome`] so the caller (`KernelTrapDispatcher`)
@@ -228,11 +228,11 @@ pub fn hand_off_syscall(
     emit_syscall_roundtrip_marker(req.nr, b"debug.trap.handoff.capture");
     const RV64_ECALL_INSN_BYTES: usize = 4;
     ctx.pc = ctx.pc.wrapping_add(RV64_ECALL_INSN_BYTES);
-    payload.store_saved_user_context(Some(ctx));
+    payload.store_captured_user_context(ctx);
     emit_syscall_roundtrip_marker(req.nr, b"debug.trap.handoff.store");
 
     let slot: UserspaceRunSlot = payload.userspace_slot().clone();
-    match slot.complete_interesting_trap(active, UserspaceTrapInfo::Syscall(req)) {
+    match slot.complete_running_trap(active, UserspaceTrapInfo::Syscall(req)) {
         Ok(_status) => {
             emit_syscall_roundtrip_marker(req.nr, b"debug.trap.handoff.complete");
             HandoffOutcome::Resolved
@@ -291,7 +291,7 @@ pub fn hand_off_user_pf(
         return HandoffOutcome::NoActiveRequest;
     };
 
-    payload.store_saved_user_context(Some(view.capture_user_context()));
+    payload.store_captured_user_context(view.capture_user_context());
 
     let slot: UserspaceRunSlot = payload.userspace_slot().clone();
     // TODO(phase-2): The thread future, woken by this resolution,
@@ -299,8 +299,7 @@ pub fn hand_off_user_pf(
     // `txdoc:VM-5-1-FAULT-HANDLER`. The trap shell hands off
     // raw fault info; downstream policy (SIGSEGV on Err, retry on
     // Ok) lives in the future, not here.
-    match slot.complete_interesting_trap(active, UserspaceTrapInfo::PageFault(info.into_reactor()))
-    {
+    match slot.complete_running_trap(active, UserspaceTrapInfo::PageFault(info.into_reactor())) {
         Ok(_status) => HandoffOutcome::Resolved,
         Err(err) => HandoffOutcome::SlotError(err),
     }
@@ -333,10 +332,10 @@ pub fn hand_off_user_fatal(
         return HandoffOutcome::NoActiveRequest;
     };
 
-    payload.store_saved_user_context(Some(view.capture_user_context()));
+    payload.store_captured_user_context(view.capture_user_context());
 
     let slot: UserspaceRunSlot = payload.userspace_slot().clone();
-    match slot.complete_interesting_trap(
+    match slot.complete_running_trap(
         active,
         UserspaceTrapInfo::Fatal(FatalTrapInfo::new(cause, value)),
     ) {
@@ -361,7 +360,7 @@ pub fn hand_off_timer_preempt(hart: usize, view: &TrapFrameMut<'_>) -> TimerPree
         return TimerPreemptOutcome::NoActiveRequest;
     };
 
-    payload.store_saved_user_context(Some(view.capture_user_context()));
+    payload.store_captured_user_context(view.capture_user_context());
 
     let slot: UserspaceRunSlot = payload.userspace_slot().clone();
     match slot.record_timer_preemption(active) {

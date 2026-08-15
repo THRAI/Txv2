@@ -329,6 +329,7 @@ fn permanent_frame_anchor_never_returns_to_free_pool() {
     assert_eq!(metas[0].refcount_for_test(), 1);
     assert!(metas[0].is_reserved());
     assert!(metas[0].is_direct_mapped());
+    assert!(metas[0].is_permanent());
 
     drop(permanent);
 
@@ -353,6 +354,7 @@ fn reserved_boot_frame_can_become_permanent_anchor() {
     assert_eq!(metas[0].refcount_for_test(), 1);
     assert!(metas[0].is_reserved());
     assert!(metas[0].is_direct_mapped());
+    assert!(metas[0].is_permanent());
     assert!(!allocator.is_free_for_test(Ppn(0)));
 }
 
@@ -374,12 +376,48 @@ fn owned_frame_can_become_permanent_anchor() {
     assert_eq!(metas[0].refcount_for_test(), 1);
     assert!(metas[0].is_reserved());
     assert!(metas[0].is_direct_mapped());
+    assert!(metas[0].is_permanent());
 
     drop(permanent);
 
     assert_eq!(metas[0].refcount_for_test(), 1);
     assert_eq!(allocator.free_count(), 0);
     assert!(!allocator.is_free_for_test(Ppn(0)));
+}
+
+#[test]
+fn dma_pin_rejects_reserved_permanent_frame() {
+    let metas = [FrameMeta::new()];
+    let bitmap = [AtomicU64::new(0)];
+    let allocator = BitmapPageAllocator::new_for_test(&metas, &bitmap, 1);
+    allocator.mark_free_for_test(Ppn(0));
+
+    let _permanent = allocator
+        .claim_permanent_frame(Ppn(0))
+        .expect("permanent anchor");
+
+    assert_eq!(
+        PageAllocator::acquire_dma_pin(&allocator, Ppn(0)),
+        Err(AllocError::ReservedFrame)
+    );
+    assert_eq!(metas[0].pin_count_for_test(), 0);
+    assert_eq!(metas[0].refcount_for_test(), 1);
+    assert!(!allocator.is_free_for_test(Ppn(0)));
+}
+
+#[test]
+#[should_panic(expected = "pmap teardown attempted to release permanent frame")]
+fn pmap_teardown_cannot_release_permanent_frame() {
+    let metas = [FrameMeta::new()];
+    let bitmap = [AtomicU64::new(0)];
+    let allocator = BitmapPageAllocator::new_for_test(&metas, &bitmap, 1);
+    allocator.mark_free_for_test(Ppn(0));
+
+    let _permanent = allocator
+        .claim_permanent_frame(Ppn(0))
+        .expect("permanent anchor");
+
+    PageAllocator::release_page_table_frame(&allocator, Ppn(0));
 }
 
 #[test]

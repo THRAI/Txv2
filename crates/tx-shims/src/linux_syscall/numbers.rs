@@ -1586,8 +1586,8 @@ pub const GRND_INSECURE: u32 = 0x4;
 
 // ---------------------------------------------------------------------
 // Slice 8 — file-mutation syscalls. NR_MKDIRAT, NR_UNLINKAT,
-// NR_SYMLINKAT, NR_LINKAT, NR_TRUNCATE, NR_FTRUNCATE, NR_READLINKAT,
-// NR_UTIMENSAT, NR_RENAMEAT2 plus the `AT_REMOVEDIR`, `RENAME_*`,
+// NR_SYMLINKAT, NR_LINKAT, NR_RENAMEAT, NR_TRUNCATE, NR_FTRUNCATE,
+// NR_READLINKAT, NR_UTIMENSAT, NR_RENAMEAT2 plus the `AT_REMOVEDIR`, `RENAME_*`,
 // `UTIME_NOW` / `UTIME_OMIT` flag constants. Each arm wraps the
 // in-tree `FsOps::*` step bodies (`unlink` / `rename` / `link` /
 // `mkdir` / `rmdir` / `symlink` / `read_link`) plus the
@@ -1604,6 +1604,10 @@ pub const NR_UNLINKAT: u64 = 35;
 pub const NR_SYMLINKAT: u64 = 36;
 /// `NR_LINKAT = 37` — Linux RV64 generic ABI `__NR_linkat`.
 pub const NR_LINKAT: u64 = 37;
+/// `NR_RENAMEAT = 38` — Linux RV64 generic ABI `__NR_renameat`.
+/// This is the syscall used by libc's ordinary `rename(2)` wrapper; it shares
+/// the `renameat2` implementation with an implicit flags value of zero.
+pub const NR_RENAMEAT: u64 = 38;
 /// `NR_TRUNCATE = 45` — Linux RV64 generic ABI `__NR_truncate`. Slice 8
 /// wires the path-named form against `step_truncate` for PageBacked
 /// regular files.

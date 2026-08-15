@@ -8,7 +8,7 @@ use alloc::{
 use core::{
     future::Future,
     ptr,
-    sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering},
     task::{Context, Poll},
 };
 
@@ -34,8 +34,8 @@ use crate::{
     },
     spin_lock::SpinLock,
     task::{
-        PendingPollCommit, TakeRunnableError, TaskDrainRecord, TaskGeneration, TaskId, TaskKey,
-        TaskLifecycleError, TaskStatus, TaskTable,
+        PendingPollCommit, TakeRunnableError, TaskDrainRecord, TaskFuture, TaskGeneration, TaskId,
+        TaskKey, TaskLifecycleError, TaskStatus, TaskTable,
     },
     userspace::{
         UserspaceEntryCheckpoint, UserspaceEntryDecision, UserspaceEntryOutcome,
@@ -190,9 +190,17 @@ impl PollTiming {
 
     fn finish<C: SliceClock>(self, clock: &mut C) -> PollAccounting {
         let end_ns = clock.now_ns();
-        clock.cancel_current_hart_deadline();
-        let consumed_ns = end_ns.saturating_sub(self.start_ns);
         let cancelled_slice_deadline = matches!(self.slice, SliceConfig::Preemptive { .. });
+        // Only a preemptive poll installed a per-hart slice deadline in
+        // `start`.  A cooperative kernel task runs while the existing
+        // deadline-domain arm remains authoritative.  Cancelling it here used
+        // to silently lose timeout/futex wakes: the caller quite correctly
+        // skipped `restore_current_hart_deadline_after_slice` for a
+        // cooperative task, leaving the hart with no timer programmed.
+        if cancelled_slice_deadline {
+            clock.cancel_current_hart_deadline();
+        }
+        let consumed_ns = end_ns.saturating_sub(self.start_ns);
         let slice_expired = matches!(
             self.slice,
             SliceConfig::Preemptive { slice_ns } if consumed_ns >= slice_ns
@@ -302,6 +310,107 @@ pub struct ReactorShared {
 
 const MAX_REACTOR_HARTS: usize = 64;
 
+/// Allocation-free snapshot of the last task poll on one reactor hart.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReactorPollTrace {
+    pub sequence: u64,
+    /// 0 = outside poll, 1 = prepared, 2 = inside `Future::poll`,
+    /// 3 = poll returned, 4 = committing the returned future.
+    pub phase: usize,
+    pub task_id: usize,
+    pub generation: u64,
+    pub future_data: usize,
+    pub future_vtable: usize,
+}
+
+#[repr(align(64))]
+struct ReactorPollTraceCell {
+    sequence: AtomicU64,
+    phase: AtomicUsize,
+    task_id: AtomicUsize,
+    generation: AtomicU64,
+    future_data: AtomicUsize,
+    future_vtable: AtomicUsize,
+}
+
+impl ReactorPollTraceCell {
+    const fn new() -> Self {
+        Self {
+            sequence: AtomicU64::new(0),
+            phase: AtomicUsize::new(0),
+            task_id: AtomicUsize::new(0),
+            generation: AtomicU64::new(0),
+            future_data: AtomicUsize::new(0),
+            future_vtable: AtomicUsize::new(0),
+        }
+    }
+}
+
+static REACTOR_POLL_TRACE: [ReactorPollTraceCell; MAX_REACTOR_HARTS] =
+    [const { ReactorPollTraceCell::new() }; MAX_REACTOR_HARTS];
+
+fn task_future_raw_parts(future: &TaskFuture) -> (usize, usize) {
+    let raw: *const (dyn Future<Output = ()> + Send + 'static) = future.as_ref().get_ref();
+    let [data, vtable] = unsafe {
+        core::mem::transmute::<*const (dyn Future<Output = ()> + Send + 'static), [usize; 2]>(raw)
+    };
+    (data, vtable)
+}
+
+#[inline(always)]
+fn begin_poll_trace(hart: HartId, key: TaskKey, future: &TaskFuture) -> u64 {
+    // Poll tracing is crash-localisation instrumentation, not scheduler state.
+    // A production BuildStorm run can execute this path millions of times, so
+    // compile all of its per-poll atomic stores out with the existing metrics
+    // gate unless tracing was requested explicitly.
+    if !cfg!(tx_reactor_poll_metrics) {
+        return 0;
+    }
+    let Some(trace) = REACTOR_POLL_TRACE.get(hart.0) else {
+        return 0;
+    };
+    let sequence = trace.sequence.load(Ordering::Relaxed).wrapping_add(1);
+    let (future_data, future_vtable) = task_future_raw_parts(future);
+    trace.task_id.store(key.id().0, Ordering::Relaxed);
+    trace
+        .generation
+        .store(key.generation().value(), Ordering::Relaxed);
+    trace.future_data.store(future_data, Ordering::Relaxed);
+    trace.future_vtable.store(future_vtable, Ordering::Relaxed);
+    trace.sequence.store(sequence, Ordering::Relaxed);
+    trace.phase.store(1, Ordering::Release);
+    sequence
+}
+
+#[inline(always)]
+fn set_poll_trace_phase(hart: HartId, sequence: u64, phase: usize) {
+    if !cfg!(tx_reactor_poll_metrics) {
+        return;
+    }
+    let Some(trace) = REACTOR_POLL_TRACE.get(hart.0) else {
+        return;
+    };
+    if trace.sequence.load(Ordering::Relaxed) == sequence {
+        trace.phase.store(phase, Ordering::Release);
+    }
+}
+
+pub fn reactor_poll_trace(hart: HartId) -> Option<ReactorPollTrace> {
+    if !cfg!(tx_reactor_poll_metrics) {
+        return None;
+    }
+    let trace = REACTOR_POLL_TRACE.get(hart.0)?;
+    let phase = trace.phase.load(Ordering::Acquire);
+    Some(ReactorPollTrace {
+        sequence: trace.sequence.load(Ordering::Relaxed),
+        phase,
+        task_id: trace.task_id.load(Ordering::Relaxed),
+        generation: trace.generation.load(Ordering::Relaxed),
+        future_data: trace.future_data.load(Ordering::Relaxed),
+        future_vtable: trace.future_vtable.load(Ordering::Relaxed),
+    })
+}
+
 pub struct ReactorLocals {
     harts: [AtomicPtr<HartReactorLocal>; MAX_REACTOR_HARTS],
     len: AtomicUsize,
@@ -358,6 +467,10 @@ impl ReactorLocals {
         };
         let depths = local.scheduler().queue_depths();
         depths.kernel + depths.boosted + depths.new + depths.preempted
+    }
+
+    fn initialized_harts(&self) -> usize {
+        self.len.load(Ordering::Acquire)
     }
 }
 
@@ -609,12 +722,15 @@ impl SharedReactor {
                 continue;
             };
 
+            let poll_trace_sequence = begin_poll_trace(hart, key, &future);
             let waker = task_waker(wake_state);
             let mut cx = Context::from_waker(&waker);
             stats.polled += 1;
             let timing = PollTiming::start(slice, slice_clock);
             emit_poll_task_debug(b"debug.reactor.poll.begin", key.id());
+            set_poll_trace_phase(hart, poll_trace_sequence, 2);
             let result = future.as_mut().poll(&mut cx);
+            set_poll_trace_phase(hart, poll_trace_sequence, 3);
             let accounting = timing.finish(slice_clock);
             cancelled_slice_deadline |= accounting.cancelled_slice_deadline;
             emit_poll_duration_debug(key.id(), accounting.consumed_ns);
@@ -625,6 +741,7 @@ impl SharedReactor {
             crate::task::set_current_delegate_registry(hart.0, None);
 
             // Phase 3: commit state through task/scheduler/local locks.
+            set_poll_trace_phase(hart, poll_trace_sequence, 4);
             {
                 let mut view = reactor.hart_runtime_view(hart);
                 match result {
@@ -724,6 +841,7 @@ impl SharedReactor {
                 timer_wakes = timer_wakes.saturating_add(wakes);
                 report.merge(view.drain_wakes_for_hart(hart, signal));
             }
+            set_poll_trace_phase(hart, poll_trace_sequence, 0);
 
             if poll_budget.exhausted_by(stats.polled) {
                 break;
@@ -833,23 +951,6 @@ where
             self.mark_userspace_preempt_for_wake(placement, hint);
             self.report.record(action);
         }
-    }
-
-    fn route_wake_id(&mut self, id: TaskId) {
-        let Some((key, hint)) = self
-            .shared
-            .tasks
-            .lock()
-            .take_wake_if_parked_by_id_with_hint(id)
-        else {
-            return;
-        };
-        emit_wake_debug(
-            b"debug.wake.drain_hint",
-            key.id(),
-            mailbox_scheduler_hint_code(hint),
-        );
-        self.route_task_with_hint(key, hint);
     }
 
     fn route_task_with_hint(&mut self, key: TaskKey, hint: MailboxSchedulerHint) {
@@ -1028,17 +1129,41 @@ impl HartRuntimeView<'_> {
         S: RescheduleSignal,
     {
         self.locals.ensure_hart(current_hart);
-        let mut drained = self.shared.tasks.lock().drain_wake_ids();
-        if let Some(local) = self.locals.get(current_hart) {
-            drained.extend(Phase1Scheduler::drain_wake_inbox_from_local(
-                local.scheduler(),
-                Reactor::WAKE_INBOX_DRAIN_LIMIT,
-            ));
+        let mut drained = self
+            .locals
+            .get(current_hart)
+            .map(|local| {
+                Phase1Scheduler::drain_wake_inbox_from_local(
+                    local.scheduler(),
+                    Reactor::WAKE_INBOX_DRAIN_LIMIT,
+                )
+            })
+            .unwrap_or_default();
+        if self.shared.queued_wakes.load(Ordering::Acquire) != 0 {
+            drained.extend(self.shared.tasks.lock().drain_wake_ids());
+        }
+        if drained.is_empty() {
+            return WakeDispatchReport::empty();
         }
 
+        // Resolve the complete batch under one task-table acquisition. The
+        // old loop reacquired this global lock once for every wake id; dynamic
+        // BuildStorm sampling found a hart spinning at exactly that site.
+        let woken: Vec<_> = {
+            let mut tasks = self.shared.tasks.lock();
+            drained
+                .into_iter()
+                .filter_map(|id| tasks.take_wake_if_parked_by_id_with_hint(id))
+                .collect()
+        };
         let mut post = ReactorOwnerWakePost::new(self.shared, self.locals, current_hart, signal);
-        for id in drained {
-            post.route_wake_id(id);
+        for (key, hint) in woken {
+            emit_wake_debug(
+                b"debug.wake.drain_hint",
+                key.id(),
+                mailbox_scheduler_hint_code(hint),
+            );
+            post.route_task_with_hint(key, hint);
         }
         post.finish()
     }
@@ -1350,11 +1475,43 @@ impl HartRuntimeView<'_> {
 
     fn pick_next_local(&mut self, hart: HartId) -> Option<(TaskHandle, SliceConfig)> {
         self.locals.ensure_hart(hart);
-        self.locals.get(hart).and_then(|local| {
-            self.shared
+        let local = self.locals.get(hart)?;
+        if let Some(next) = self
+            .shared
+            .scheduler
+            .pick_next_from_local(hart, local.scheduler())
+        {
+            return Some(next);
+        }
+
+        // Pull balancing is idle-only and can move only tasks which have
+        // already completed a poll and entered a preempted queue.  Freshly
+        // submitted tasks remain in New until their first poll, so their
+        // initial per-hart userspace/trap state is installed before migration
+        // becomes possible. Polling, parked, boosted, pinned and kernel tasks
+        // are never eligible for this transfer.
+        let hart_count = self.locals.initialized_harts();
+        if hart_count <= 1 {
+            return None;
+        }
+        for offset in 1..hart_count {
+            let victim = HartId((hart.0 + offset) % hart_count);
+            let Some(victim_local) = self.locals.get(victim) else {
+                continue;
+            };
+            if self
+                .shared
                 .scheduler
-                .pick_next_from_local(hart, local.scheduler())
-        })
+                .try_steal_from_locals(hart, local.scheduler(), victim, victim_local.scheduler())
+                .is_some()
+            {
+                return self
+                    .shared
+                    .scheduler
+                    .pick_next_from_local(hart, local.scheduler());
+            }
+        }
+        None
     }
 
     pub fn take_userspace_preempt_marker(&self, hart: HartId) -> bool {
@@ -2178,6 +2335,19 @@ impl Reactor {
 
     pub fn scheduler_stats(&self) -> SchedulerStats {
         self.shared.scheduler.stats()
+    }
+
+    /// Snapshot one hart's physical queues so diagnostics can compare them
+    /// with scheduler ownership metadata.
+    pub fn scheduler_queued_tasks(
+        &self,
+        hart: HartId,
+        limit: usize,
+    ) -> (usize, Vec<(TaskId, crate::scheduler::Phase1QueueKind)>) {
+        self.locals
+            .get(hart)
+            .map(|local| local.scheduler().queued_tasks(limit))
+            .unwrap_or_default()
     }
 
     pub fn observability(&self) -> ReactorObservability {

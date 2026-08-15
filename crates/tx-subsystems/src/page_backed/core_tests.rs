@@ -518,6 +518,7 @@ fn user_page_gift_for_test() -> (crate::vm::UserPageGift, Ppn) {
 struct RecordingFs {
     fetches: AtomicUsize,
     fsyncs: AtomicUsize,
+    destroys: AtomicUsize,
     fsync_returns_enosys: AtomicBool,
     last_object: AtomicU64,
     last_offset: AtomicU64,
@@ -536,6 +537,7 @@ impl RecordingFs {
         Self {
             fetches: AtomicUsize::new(0),
             fsyncs: AtomicUsize::new(0),
+            destroys: AtomicUsize::new(0),
             fsync_returns_enosys: AtomicBool::new(fsync_returns_enosys),
             last_object: AtomicU64::new(0),
             last_offset: AtomicU64::new(0),
@@ -660,6 +662,7 @@ impl crate::vfs::FsOps for RecordingFs {
         _fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
     ) -> V3Out<(), NoProgress> {
+        self.destroys.fetch_add(1, Ordering::AcqRel);
         V3Out::done(())
     }
 }
@@ -1273,6 +1276,55 @@ fn file_page_container_identity_reuses_and_retires_exact_binding() {
     ));
 }
 
+#[test]
+fn file_page_container_keeps_object_alive_after_rnode_drop() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let mount = MountPayload::new_cap(
+        fs.clone() as Arc<dyn FsOps>,
+        fs.clone() as Arc<dyn FsPageBacking>,
+        None,
+        DevId::new(82),
+        MountOptions::default(),
+        "mockfs",
+        SourceLabel::Static("file-object-lifetime"),
+    )
+    .expect("mount payload");
+    let object = FsObjectId::from_inode_generation(82, 7);
+    let pc = PageContainer::new_cap(
+        PageContainerKind::File {
+            mount: MountPayloadPin::acquire_cap(&mount),
+            fs_object_id: object,
+        },
+        1,
+    )
+    .expect("file page container");
+    let rnode = RNode::new_cap_in_mount(
+        object,
+        InodeMeta::new(InodeKind::Regular, 0o100644),
+        RNodeBacking::PageBacked { pc: pc.clone() },
+        &mount,
+    )
+    .expect("file rnode");
+
+    drop(rnode);
+    tx_test_support::drain_to_quiescence();
+    assert_eq!(
+        fs.destroys.load(Ordering::Acquire),
+        0,
+        "a live mmap/page-cache holder must defer inode destruction"
+    );
+
+    drop(pc);
+    tx_test_support::drain_to_quiescence();
+    assert_eq!(
+        fs.destroys.load(Ordering::Acquire),
+        1,
+        "the final shared object pin must trigger exactly one destroy probe"
+    );
+}
+
 fn file_page_container_with_planner(
     fs_v3: Arc<dyn FsOps>,
     page_backing_v3: Arc<dyn FsPageBacking>,
@@ -1430,7 +1482,7 @@ fn vm_fault_script_waits_on_file_source_and_continues_resolved_recipe() {
 }
 
 #[test]
-fn vm_fault_script_retries_resident_publication_backpressure() {
+fn vm_fault_script_uses_locked_cache_when_resident_publication_is_backpressured() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
     setup_host_substrate();
 
@@ -1463,12 +1515,15 @@ fn vm_fault_script_retries_resident_publication_backpressure() {
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
 
-    assert!(matches!(future.as_mut().poll(&mut cx), Poll::Pending));
-    assert_eq!(aspace.pmap().stats().mapped_pages, 0);
     assert!(matches!(future.as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
     assert_eq!(aspace.pmap().stats().mapped_pages, 1);
     assert_eq!(pc.resident_pages(), 1);
-    assert_eq!(fs.fetches.load(Ordering::Acquire), 2);
+    assert_eq!(fs.fetches.load(Ordering::Acquire), 1);
+    let guard = step_engine::guard();
+    assert!(pc
+        .lookup_resident_with_guard_for_test(&guard, PageIndex::new(0))
+        .is_none());
+    assert!(pc.lookup(PageIndex::new(0)).is_some());
 }
 
 fn open_file_for_pc(pc: &PageContainer) -> OpenFile {
@@ -1913,6 +1968,34 @@ fn file_close_writeback_admission_queues_dirty_pages_without_fsync() {
 }
 
 #[test]
+fn final_page_container_drop_wakes_its_file_io_runtime_for_retirement() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let pc = file_page_container_cap(fs.clone(), fs, FsObjectId::new(970), 1);
+    let wake_source = Arc::new(ServiceWakeSource::new(0x7104));
+    assert!(pc.attach_file_io_wake_source(Arc::clone(&wake_source)));
+    let mailbox = Arc::new(tx_substrate::wake::TaskMailbox::new());
+    let generation = mailbox.next_generation();
+    let _subscription =
+        wake_source.subscribe(IoServiceKind::Page, Arc::downgrade(&mailbox), generation);
+
+    drop(pc);
+    tx_test_support::drain_to_quiescence();
+
+    assert!(matches!(
+        mailbox.poll(),
+        Some(tx_substrate::wake::MailboxEvent::SourceFired {
+            generation: seen_generation,
+            source,
+            interests,
+        }) if seen_generation == generation
+            && source.raw() == 0x7104
+            && interests.raw() == IoServiceKind::Page.mask_bits()
+    ));
+}
+
+#[test]
 fn file_fsync_session_waits_for_its_captured_writeback_without_duplicate_submission() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
     setup_host_substrate();
@@ -1977,6 +2060,56 @@ fn file_fsync_session_waits_for_its_captured_writeback_without_duplicate_submiss
         .expect("completion turn");
 
     assert_eq!(session.advance(), FileFsyncFrontierAdvance::Complete);
+}
+
+#[test]
+fn file_fsync_submission_kicks_a_parked_page_service() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let pc = file_page_container(fs.clone(), fs, FsObjectId::new(0x976), 4);
+    let wake_source = Arc::new(ServiceWakeSource::new(0x7197));
+    assert!(pc.attach_file_io_wake_source(Arc::clone(&wake_source)));
+    let mailbox = Arc::new(tx_substrate::wake::TaskMailbox::new());
+    let generation = mailbox.next_generation();
+    let _subscription =
+        wake_source.subscribe(IoServiceKind::Page, Arc::downgrade(&mailbox), generation);
+
+    let page = PageIndex::new(1);
+    let frame = cached_frame_for_test();
+    let ppn = frame.ppn;
+    {
+        let mut state = pc.state.lock();
+        state
+            .install_resident_if_absent(page, frame)
+            .expect("seed page");
+        let slot = state.page_slots.entry(page).or_default();
+        let PageSlotFetch::Owner {
+            generation: fetch_generation,
+        } = slot.begin_fetch()
+        else {
+            panic!("fetch owner");
+        };
+        slot.complete_fetch(fetch_generation, Ok(ppn))
+            .expect("resident slot");
+        slot.mark_dirty().expect("dirty slot");
+    }
+
+    let session = pc.begin_file_fsync_session().expect("file fsync session");
+    assert_eq!(
+        session.advance(),
+        FileFsyncFrontierAdvance::Submitted { pages: 1 }
+    );
+    assert!(matches!(
+        mailbox.poll(),
+        Some(tx_substrate::wake::MailboxEvent::SourceFired {
+            generation: seen_generation,
+            source,
+            interests,
+        }) if seen_generation == generation
+            && source.raw() == 0x7197
+            && interests.raw() == IoServiceKind::Page.mask_bits()
+    ));
 }
 
 #[test]
@@ -2444,6 +2577,8 @@ fn writeback_backend_yield_requeues_the_same_owned_request() {
             PageServiceBackendSubmitOutcome::Yield(wait)
         )] if *wait == WaitSourceId::new(91)
     ));
+    assert_eq!(yielded.backend_wait, Some(WaitSourceId::new(91)));
+    assert_eq!(yielded.kicks, 0, "backend contention must not self-spin");
     assert_eq!(pc.file_io_owner_count_for_test(), 1);
     assert_eq!(pc.file_io_request_count_for_test(), 1);
     assert_eq!(
@@ -2465,6 +2600,95 @@ fn writeback_backend_yield_requeues_the_same_owned_request() {
             .state,
         PageSlotState::Resident { ppn }
     );
+}
+
+#[test]
+fn file_io_service_waits_for_backend_readiness_instead_of_self_spinning() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+
+    const BACKEND_SOURCE_ID: u64 = 0x7b91;
+    struct YieldOncePlanner {
+        calls: AtomicUsize,
+    }
+
+    impl BackendPlanner for YieldOncePlanner {
+        fn plan_page_io(&self, request: BackendPageRequest) -> BackendPlan {
+            if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                return BackendPlan::Yield(WaitSourceId::new(BACKEND_SOURCE_ID));
+            }
+            BackendPlan::Complete(PageCompletionList::from_vec(alloc::vec![
+                PageCompletion::new(
+                    request.id,
+                    request.range,
+                    PageIoResult::Done,
+                    request.generation_hint.unwrap_or(PageGeneration::new(0)),
+                    PageIoCompletionKind::WritebackFinished,
+                ),
+            ]))
+        }
+    }
+
+    let backend_source = tx_substrate::wake::new_source(BACKEND_SOURCE_ID);
+    tx_substrate::wake::register_source(Arc::clone(&backend_source));
+    let fs = Arc::new(RecordingFs::new());
+    let planner = Arc::new(YieldOncePlanner {
+        calls: AtomicUsize::new(0),
+    });
+    let pc =
+        file_page_container_with_planner(fs.clone(), fs, FsObjectId::new(117), 4, planner.clone());
+    let page = PageIndex::new(0);
+    let frame = cached_frame_for_test();
+    let ppn = frame.ppn;
+    {
+        let mut state = pc.state.lock();
+        state
+            .install_resident_if_absent(page, frame)
+            .expect("seed page");
+        let slot = state.page_slots.entry(page).or_default();
+        let PageSlotFetch::Owner { generation } = slot.begin_fetch() else {
+            panic!("fetch owner");
+        };
+        slot.complete_fetch(generation, Ok(ppn))
+            .expect("resident slot");
+        slot.mark_dirty().expect("dirty slot");
+    }
+    pc.queue_file_page_writeback(page)
+        .expect("queue writeback request");
+
+    let wake_source = ServiceWakeSource::new(0x7b92);
+    let _ = wake_source.kick_with_post(ServiceKick::new(IoServiceKind::Page), |mailbox, event| {
+        mailbox.post(event)
+    });
+    let mut future = core::pin::pin!(crate::device::page_container_file_io_service_task_loop(
+        &pc,
+        BlockDeviceHandle::whole(&PAGE_BACKED_SERVICE_BLOCK_REG),
+        &wake_source,
+        crate::device::PageContainerFileIoServiceTaskConfig::run_turns(
+            2,
+            ServiceBudget::new(1),
+            ServiceBudget::new(1),
+        ),
+    ));
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    assert!(matches!(future.as_mut().poll(&mut cx), Poll::Pending));
+    assert_eq!(
+        planner.calls.load(Ordering::Acquire),
+        1,
+        "a yielded request must remain asleep until its backend fires"
+    );
+
+    backend_source.notify_limit_emit(tx_substrate::step::InterestMask::new(1), 1);
+    let Poll::Ready(report) = future.as_mut().poll(&mut cx) else {
+        panic!("backend readiness must resume the file-I/O service");
+    };
+    assert_eq!(report.waits_ready, 2);
+    assert_eq!(report.ready_turns, 2);
+    assert_eq!(report.waits_failed, 0);
+    assert_eq!(planner.calls.load(Ordering::Acquire), 2);
+    tx_substrate::wake::unregister_source(tx_substrate::step::WaitSourceId::new(BACKEND_SOURCE_ID));
 }
 
 #[test]
@@ -3325,6 +3549,49 @@ fn file_page_dependency_graph_releases_successor_through_owned_l6_runtime() {
         pc.materialize_page(page, MaterializeAccess::Read, &guard),
         V3Out::Done(_)
     ));
+}
+
+#[test]
+fn file_page_turn_kicks_block_service_after_owned_l6_admission() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let planner = Arc::new(DependencyGraphPlanner::new());
+    let pc = file_page_container_with_planner(fs.clone(), fs, FsObjectId::new(115), 4, planner);
+    let page = PageIndex::new(1);
+    let frame = cached_frame_for_test();
+    let ppn = frame.ppn;
+    {
+        let mut state = pc.state.lock();
+        state
+            .install_resident_if_absent(page, frame)
+            .expect("seed page");
+        let slot = state.page_slots.entry(page).or_default();
+        let PageSlotFetch::Owner { generation } = slot.begin_fetch() else {
+            panic!("slot fetch owner");
+        };
+        slot.complete_fetch(generation, Ok(ppn))
+            .expect("resident slot");
+        slot.mark_dirty().expect("dirty slot");
+    }
+    pc.queue_file_page_writeback(page)
+        .expect("queue writeback submission");
+
+    let mut kicks = Vec::new();
+    let turn = pc
+        .drive_file_io_service_once_owned(ServiceBudget::new(1), |kick| {
+            kicks.push(kick);
+            true
+        })
+        .expect("page service turn");
+
+    assert_eq!(turn.next, PageServiceNext::Sleeping);
+    assert_eq!(pc.file_io_block_queue_len_for_test(), 2);
+    assert_eq!(
+        kicks,
+        alloc::vec![ServiceKick::new(IoServiceKind::Block)],
+        "an L6 queue populated by the page phase must wake the later block phase"
+    );
 }
 
 #[test]
@@ -4421,6 +4688,55 @@ fn file_page_io_service_task_loop_waits_for_service_kick_and_drives_turn() {
 }
 
 #[test]
+fn file_page_io_service_task_yields_between_immediately_runnable_turns() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let planner = Arc::new(LockCheckingPlanner::new());
+    let pc = file_page_container_with_planner(fs.clone(), fs, FsObjectId::new(101), 4, planner);
+    {
+        let mut state = pc.state.lock();
+        state
+            .file_io_service
+            .submit(
+                pc.io_manager_key(),
+                PageIoRange::new(1, 1),
+                PageIoOp::Read,
+                PageIoPriority::Demand,
+                PageIoFlags::DEMAND,
+                Some(PageGeneration::new(1)),
+            )
+            .expect("staged service request");
+    }
+
+    let wake_source = ServiceWakeSource::new(0x7105);
+    let _ = wake_source.kick_with_post(ServiceKick::new(IoServiceKind::Page), |mailbox, event| {
+        mailbox.post(event)
+    });
+    let mut future = core::pin::pin!(crate::device::page_container_file_io_service_task_loop(
+        &pc,
+        BlockDeviceHandle::whole(&PAGE_BACKED_SERVICE_BLOCK_REG),
+        &wake_source,
+        crate::device::PageContainerFileIoServiceTaskConfig::run_turns(
+            2,
+            ServiceBudget::new(1),
+            ServiceBudget::new(1),
+        ),
+    ));
+    let waker = core::task::Waker::noop();
+    let mut cx = core::task::Context::from_waker(waker);
+
+    assert!(matches!(
+        future.as_mut().poll(&mut cx),
+        core::task::Poll::Pending
+    ));
+    let core::task::Poll::Ready(report) = future.as_mut().poll(&mut cx) else {
+        panic!("service loop must resume after one explicit scheduler boundary");
+    };
+    assert_eq!(report.ready_turns, 2);
+}
+
+#[test]
 fn file_page_io_service_owned_task_loop_holds_typed_claim_for_static_submission() {
     fn block_on_ready<F: core::future::Future>(future: F) -> F::Output {
         let waker = core::task::Waker::noop();
@@ -4929,7 +5245,7 @@ fn read_terminal_take_before_wait_publication_retries_without_orphaning_waiter()
 }
 
 #[test]
-fn read_completion_publication_backpressure_retires_fetch_and_wakes_waiter() {
+fn read_completion_publication_backpressure_keeps_locked_page_and_wakes_waiter() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
     setup_host_substrate();
     let fs = Arc::new(RecordingFs::new());
@@ -4976,7 +5292,10 @@ fn read_completion_publication_backpressure_retires_fetch_and_wakes_waiter() {
     };
     assert!(matches!(
         pc.apply_file_io_completion_route(&route),
-        Some(Err(PageSlotCompletionError::Backend(Errno::EAGAIN)))
+        Some(Ok(PageSlotSnapshot {
+            state: PageSlotState::Resident { .. },
+            ..
+        }))
     ));
 
     assert!(!pc.file_page_fetch_in_flight_for_test(page));
@@ -4985,10 +5304,15 @@ fn read_completion_publication_backpressure_retires_fetch_and_wakes_waiter() {
     assert!(matches!(
         pc.page_slot_snapshot_for_test(page),
         Some(PageSlotSnapshot {
-            state: PageSlotState::Empty,
+            state: PageSlotState::Resident { .. },
             ..
         })
     ));
+    let guard = step_engine::guard();
+    assert!(pc
+        .lookup_resident_with_guard_for_test(&guard, page)
+        .is_none());
+    assert!(pc.lookup(page).is_some());
     assert_eq!(
         ready_source.pending_mask_snapshot() & PageWaitInterest::READY.bits(),
         PageWaitInterest::READY.bits(),
@@ -5038,7 +5362,7 @@ fn compatibility_fetch_does_not_steal_generation_during_resident_publication() {
 }
 
 #[test]
-fn compatibility_fetch_backpressure_cancels_unowned_generation() {
+fn compatibility_fetch_backpressure_keeps_page_in_locked_cache() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
     setup_host_substrate();
     let fs = Arc::new(RecordingFs::new());
@@ -5051,27 +5375,51 @@ fn compatibility_fetch_backpressure_cancels_unowned_generation() {
     };
 
     PageContainer::force_resident_retire_backpressure_for_test();
-    assert!(matches!(
-        pc.install_fetched_file_page_from_owner(
-            page,
-            MaterializeAccess::Read,
-            Frame::new(page_allocator::zero_frame_ppn().expect("zero frame")),
-            fetch_id,
-        ),
-        V3Out::Continue { .. }
-    ));
+    let installed = pc.install_fetched_file_page_from_owner(
+        page,
+        MaterializeAccess::Read,
+        Frame::new(page_allocator::zero_frame_ppn().expect("zero frame")),
+        fetch_id,
+    );
+    assert!(matches!(installed, V3Out::Done(_)));
     assert!(!pc.file_page_fetch_in_flight_for_test(page));
     assert!(matches!(
         pc.page_slot_snapshot_for_test(page),
         Some(PageSlotSnapshot {
-            state: PageSlotState::Empty,
+            state: PageSlotState::Resident { .. },
             ..
         })
     ));
+    let guard = step_engine::guard();
+    assert!(pc
+        .lookup_resident_with_guard_for_test(&guard, page)
+        .is_none());
+    assert!(pc.lookup(page).is_some());
     assert!(matches!(
         pc.begin_file_page_fetch(page, MaterializeAccess::Read, true, false),
-        FilePageFetchStart::Owner(_)
+        FilePageFetchStart::Cached(Ok(_))
     ));
+
+    let original_ppn = pc.lookup(page).expect("locked-cache resident page");
+    let generation = pc
+        .page_slot_snapshot_for_test(page)
+        .expect("locked-cache resident slot")
+        .generation;
+    let replacement = cached_frame_for_test();
+    let replacement_ppn = replacement.ppn;
+    assert_eq!(
+        pc.replace_resident_if_match_published(page, original_ppn, generation, replacement)
+            .expect("replace a state-only resident page"),
+        replacement_ppn
+    );
+    assert_eq!(pc.lookup(page), Some(replacement_ppn));
+    assert!(pc
+        .lookup_resident_with_guard_for_test(&guard, page)
+        .is_none());
+    assert!(pc
+        .withdraw_resident_if_match_published(page, replacement_ppn, true)
+        .expect("withdraw a state-only resident page"));
+    assert_eq!(pc.lookup(page), None);
 }
 
 #[test]
@@ -5497,6 +5845,36 @@ fn fsync_op_backend_complete_notifies_planner_once() {
 }
 
 #[test]
+fn fsync_backend_submission_kicks_a_parked_page_service() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::fsync_fallback());
+    let planner = Arc::new(FsyncCompletionPlanner::new(Ok(())));
+    let pc = file_page_container_with_planner(fs.clone(), fs, FsObjectId::new(0x978), 2, planner);
+    let wake_source = Arc::new(ServiceWakeSource::new(0x7198));
+    assert!(pc.attach_file_io_wake_source(Arc::clone(&wake_source)));
+    let mailbox = Arc::new(tx_substrate::wake::TaskMailbox::new());
+    let generation = mailbox.next_generation();
+    let _subscription =
+        wake_source.subscribe(IoServiceKind::Page, Arc::downgrade(&mailbox), generation);
+    let mut op = crate::page_backed::FsyncOp::new(&pc);
+    let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
+
+    assert!(matches!(op.step(&mut ctx), V3Out::Continue { .. }));
+    assert!(matches!(
+        mailbox.poll(),
+        Some(tx_substrate::wake::MailboxEvent::SourceFired {
+            generation: seen_generation,
+            source,
+            interests,
+        }) if seen_generation == generation
+            && source.raw() == 0x7198
+            && interests.raw() == IoServiceKind::Page.mask_bits()
+    ));
+    assert_eq!(pc.file_io_diagnostic_snapshot().fsync_queued, 1);
+}
+
+#[test]
 fn fsync_op_backend_error_completes_and_wakes_with_errno_once() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
     setup_host_substrate();
@@ -5628,6 +6006,48 @@ fn vfs_fsync_op_calls_backing_once_after_an_empty_frontier_without_l4_fsync() {
         .file_io_service
         .find_submission(pc.io_manager_key(), PageIoRange::new(0, 2), PageIoOp::Fsync)
         .is_none());
+}
+
+#[test]
+fn vfs_fsync_op_flushes_dirty_pages_synchronously_without_a_backend_planner() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let pc = file_page_container_cap(fs.clone(), fs.clone(), FsObjectId::new(115), 2);
+    let page = PageIndex::new(0);
+    let frame = cached_frame_for_test();
+    let ppn = frame.ppn;
+    {
+        let mut state = pc.state.lock();
+        state
+            .install_resident_if_absent(page, frame)
+            .expect("seed page");
+        let slot = state.page_slots.entry(page).or_default();
+        let PageSlotFetch::Owner { generation } = slot.begin_fetch() else {
+            panic!("fetch owner");
+        };
+        slot.complete_fetch(generation, Ok(ppn))
+            .expect("resident slot");
+        slot.mark_dirty().expect("dirty slot");
+    }
+    let mut op = crate::vfs::FileFsyncOp {
+        page_backing: fs.clone(),
+        fs_object_id: FsObjectId::new(115),
+        page_container: Some(pc.clone()),
+        raw_block_device: false,
+        state: FileFsyncState::new(),
+    };
+    let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
+
+    assert_eq!(op.step(&mut ctx), V3Out::done(()));
+    assert_eq!(fs.fsyncs.load(Ordering::Acquire), 1);
+    assert_eq!(
+        pc.page_slot_snapshot_for_test(page)
+            .expect("flushed slot")
+            .state,
+        PageSlotState::Resident { ppn }
+    );
+    assert_eq!(pc.file_io_request_count_for_test(), 0);
 }
 
 #[test]
@@ -5813,10 +6233,74 @@ fn reclaim_clean_file_pages_drops_clean_cache_entries() {
     drop(map_pin);
     assert_eq!(pc.reclaim_clean_file_pages(1), 1);
     assert_eq!(pc.resident_pages(), 0);
-    // Physical pin release is EBR-delayed by the retired root. The new root
-    // no longer exposes this page, while an old root may retain it until a
-    // later grace period.
-    assert!(page_allocator::acquire_map_pin(ppn).is_ok());
+    // A retired immutable root may retain the withdrawn ResidentCell, but the
+    // cell-local materialization gate lets withdrawal release the binding pin
+    // immediately.  Frame allocation must not wait for the root's EBR grace
+    // period once no independent MapPin remains.
+    assert!(page_allocator::acquire_map_pin(ppn).is_err());
+}
+
+#[test]
+fn generic_file_cap_constructor_registers_global_reclaim_candidate() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let pc = file_page_container_cap(fs.clone(), fs, FsObjectId::new(156), 4);
+    let page = PageIndex::new(0);
+    let cached = cached_frame_for_test();
+
+    assert!(pc
+        .install_resident_if_absent_published(page, cached)
+        .expect("publish globally reclaimable file page"));
+    assert_eq!(pc.resident_pages(), 1);
+
+    assert_eq!(reclaim_clean_file_pages(1), 1);
+    assert_eq!(
+        pc.resident_pages(),
+        0,
+        "every cap-backed file PageContainer must enter the global reclaim index"
+    );
+}
+
+#[test]
+fn reclaim_budget_skips_dirty_prefix_and_reaches_clean_page() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let pc = file_page_container(fs.clone(), fs, FsObjectId::new(59), 4);
+    let dirty_page = PageIndex::new(0);
+    let clean_page = PageIndex::new(1);
+    let dirty = cached_frame_for_test();
+    let clean = cached_frame_for_test();
+    let clean_ppn = clean.ppn;
+
+    assert!(pc
+        .install_resident_if_absent_published(dirty_page, dirty)
+        .expect("publish dirty candidate"));
+    assert!(pc
+        .install_resident_if_absent_published(clean_page, clean)
+        .expect("publish clean candidate"));
+    {
+        let state = pc.state.lock();
+        state
+            .page_slots
+            .get(&dirty_page)
+            .expect("dirty slot")
+            .mark_dirty()
+            .expect("mark first page dirty");
+    }
+
+    assert_eq!(pc.reclaim_clean_file_pages(1), 1);
+    assert!(
+        pc.lookup(dirty_page).is_some(),
+        "dirty page must stay resident"
+    );
+    assert_eq!(
+        pc.lookup(clean_page),
+        None,
+        "clean page behind it is reclaimed"
+    );
+    assert!(page_allocator::acquire_map_pin(clean_ppn).is_err());
 }
 
 #[test]
@@ -6072,6 +6556,28 @@ fn page_container_materialize_page_dispatches_file_fetch_once() {
 }
 
 #[test]
+fn file_page_container_initial_window_is_not_a_growth_limit() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let guard = step_engine::guard();
+    let fs = Arc::new(RecordingFs::new());
+    let pc = file_page_container(fs.clone(), fs.clone(), FsObjectId::new(56), 1);
+
+    let page = match pc.materialize_page(PageIndex::new(2), MaterializeAccess::Write, &guard) {
+        V3Out::Done(page) => page,
+        other => panic!("file page beyond initial window must grow: {other:?}"),
+    };
+
+    assert!(page.newly_installed);
+    assert!(page.dirty);
+    assert_eq!(fs.fetches.load(Ordering::Acquire), 1);
+    assert_eq!(
+        fs.last_offset.load(Ordering::Acquire),
+        2 * crate::vm::USER_PAGE_SIZE as u64
+    );
+}
+
+#[test]
 fn file_page_miss_joins_reentrant_inflight_without_duplicate_fetch() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
     setup_host_substrate();
@@ -6315,10 +6821,15 @@ fn file_page_stale_owner_after_truncate_cannot_publish_page() {
         fetch_id,
     );
 
-    match stale {
-        V3Out::Err(errno) => assert_eq!(errno, V3Errno::EAGAIN),
-        other => panic!("expected stale owner publish to return EAGAIN, got {other:?}"),
-    }
+    assert!(
+        matches!(
+            stale,
+            V3Out::Continue {
+                progress: NoProgress
+            }
+        ),
+        "a stale fetch owner is an internal retry, not userspace EAGAIN; got {stale:?}"
+    );
     assert_eq!(pc.resident_pages(), 0);
     assert_eq!(pc.lookup(page), None);
     assert!(

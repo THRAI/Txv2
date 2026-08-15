@@ -48,6 +48,61 @@ fn tcp_loopback_pollcontext_moves_data_through_packet_queue() {
 }
 
 #[test]
+fn tcp_loopback_republishes_recv_when_raw_hint_is_already_set() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    loopback_iface().clear_for_test_or_bootstrap();
+    let (client, listener, _local, _remote) = prepare_loopback_connect(41_267, 51_267);
+    let guard = tx_substrate::epoch::guard();
+
+    assert!(matches!(
+        step_tcp_loopback_handshake(&client, &guard),
+        StepOutcome::Done(_)
+    ));
+    let accepted = match step_accept(&listener, &guard) {
+        StepOutcome::Done(accepted) => accepted.child,
+        _ => panic!("unexpected accept outcome"),
+    };
+
+    // Model a stale raw level left by an earlier receive while an epoll-style
+    // waiter has already consumed the corresponding mirrored edge.
+    accepted.readiness.fire_recv(RecvWireSet::HAS_DATA);
+    let source = tx_substrate::wake::lookup_source(tx_substrate::step::WaitSourceId::new(
+        accepted.wait_carriers.recv,
+    ))
+    .expect("registered recv mirror");
+    let mailbox = alloc::sync::Arc::new(tx_substrate::wake::TaskMailbox::new());
+    let generation = mailbox.next_generation();
+    let subscriber = source.register(
+        alloc::sync::Arc::downgrade(&mailbox),
+        generation,
+        tx_substrate::step::InterestMask::new(RecvWireSet::HAS_DATA.bits()),
+    );
+    source.unregister(subscriber);
+    assert_eq!(
+        source.pending_mask_snapshot() & RecvWireSet::HAS_DATA.bits(),
+        0
+    );
+
+    assert_eq!(
+        step_send_kernel_bytes(&client, b"wake", SendRecvFlags::empty(), &guard),
+        StepOutcome::Done(4)
+    );
+    assert!(matches!(
+        step_tcp_loopback_transfer(&client, 4, &guard),
+        StepOutcome::Done(_)
+    ));
+
+    assert_ne!(
+        source.pending_mask_snapshot() & RecvWireSet::HAS_DATA.bits(),
+        0,
+        "authoritative TCP data must republish the mirrored receive edge"
+    );
+}
+
+#[test]
 fn tcp_loopback_default_steps_use_persistent_loopback_iface() {
     init_zones();
     let _lock = crate::test_support::EPOCH_TEST_LOCK

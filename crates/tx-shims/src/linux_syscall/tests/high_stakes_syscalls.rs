@@ -171,6 +171,41 @@ fn read_user_u64(ctx: &SyscallCtx<'_>, uaddr: u64) -> u64 {
 }
 
 #[test]
+fn pagebacked_io_oneshot_round_trips_resident_regular_file() {
+    let _setup = hs_setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let (file, _pc) = pagebacked_file(92_000, 1, 0);
+    proc_cap.set_fd(6, Some(file.clone()));
+    let ctx = make_ctx(proc_cap, thread);
+
+    let source = map_user_bytes(&ctx, 0x51ff_e000, b"hot-pagebacked-io");
+    let write = SyscallRequest::new(NR_WRITE, [6, source, 17, 0, 0, 0]);
+    assert_eq!(
+        crate::linux_syscall::dispatch_pagebacked_io_oneshot(&write, &ctx),
+        Some(SyscallResult::Return(17))
+    );
+
+    file.set_offset(0);
+    let cold_destination = map_user_scratch(&ctx, 0x51ff_d000);
+    let cold_read = SyscallRequest::new(NR_READ, [6, cold_destination, 17, 0, 0, 0]);
+    assert_eq!(
+        crate::linux_syscall::dispatch_pagebacked_io_oneshot(&cold_read, &ctx),
+        None,
+        "a cold destination must fall through before advancing the file"
+    );
+    assert_eq!(file.offset(), 0);
+
+    let destination = map_user_bytes(&ctx, 0x51ff_f000, &[0]);
+    let read = SyscallRequest::new(NR_READ, [6, destination, 17, 0, 0, 0]);
+    assert_eq!(
+        crate::linux_syscall::dispatch_pagebacked_io_oneshot(&read, &ctx),
+        Some(SyscallResult::Return(17))
+    );
+    assert_eq!(read_user_bytes(&ctx, destination, 17), b"hot-pagebacked-io");
+}
+
+#[test]
 fn dispatch_close_range_closes_sparse_inclusive_range_and_clears_cloexec() {
     let _setup = setup();
     let _ops = install_capturing_console();

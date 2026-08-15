@@ -987,6 +987,25 @@ pub fn ast_dispatch(thread: &Cap<crate::thread_runtime::ThreadIdentity>) -> AstO
     outcome
 }
 
+/// Entry-side AST checkpoint for a caller which already owns the live thread
+/// payload driving the current userspace task.
+///
+/// The no-signal case is the normal syscall-return path.  Reading its packed
+/// summary directly avoids taking `ThreadIdentity.payload` merely to clone the
+/// same payload cap the caller already holds.  Interesting summaries retain
+/// the canonical [`ast_dispatch`] path and its full lifecycle revalidation.
+pub fn ast_dispatch_with_payload(
+    thread: &Cap<crate::thread_runtime::ThreadIdentity>,
+    payload: &PayloadCap<crate::thread_runtime::ThreadPayload>,
+) -> AstOutcome {
+    let summary = payload.interrupt_summary();
+    if !summary.termination && !summary.deliverable_signal && !summary.stop_requested {
+        AstOutcome::Continue
+    } else {
+        ast_dispatch(thread)
+    }
+}
+
 /// Result of a kill-style shim. `Delivered` if at least one thread
 /// received the post; `NoLiveThread` if the target is a zombie or its
 /// thread list is empty.

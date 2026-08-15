@@ -168,6 +168,22 @@ impl PmapIf for CountingPmap {
         Ok(Some(PmapUnmapResult::new(virt, phys, kind)))
     }
 
+    fn protect_mapping(
+        root: &PmapRoot,
+        virt: VirtAddr,
+        kind: PmapReserveKind,
+        _permissions: PmapPermissions,
+    ) -> Result<Option<PmapInvalidation>, PmapError> {
+        let state = COUNTING_PMAP_STATE.lock().expect("counting pmap lock");
+        if !state
+            .mappings
+            .contains_key(&(counting_root_key(root), virt.0))
+        {
+            return Ok(None);
+        }
+        Ok(Some(PmapInvalidation::new(virt, kind.size())))
+    }
+
     fn shootdown_mapping(asid: Asid, _invalidation: PmapInvalidation) {
         let mut state = COUNTING_PMAP_STATE.lock().expect("counting pmap lock");
         state.counters.shoots += 1;
@@ -1435,6 +1451,34 @@ fn vm_private_anon_prot_none_allocates_private_set_only_when_made_writable() {
 }
 
 #[test]
+fn vm_full_private_anon_prot_none_to_writable_allocates_private_set() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let mapped = range(0x10_0000, 4);
+    let original = VmEntry::new(
+        mapped,
+        Prot::NONE,
+        VmEntryFlags::PRIVATE,
+        VmBacking::PrivateAnon,
+    );
+    map_reserved(aspace.reserve_map(original, MapPlacement::RequireFree))
+        .commit()
+        .expect("prot-none map");
+
+    aspace
+        .try_mprotect(mapped, Prot::READ_WRITE)
+        .expect("make the full mapping writable");
+
+    let entry = aspace.lookup(mapped.start()).expect("writable mapping");
+    assert_eq!(entry.range, mapped);
+    assert_eq!(entry.prot, Prot::READ_WRITE);
+    assert!(
+        entry.private().is_some(),
+        "full-range writable private mapping needs CoW storage"
+    );
+}
+
+#[test]
 fn vm_address_space_finds_first_gap_inside_search_window() {
     setup_host_substrate();
     let aspace = AddressSpace::new();
@@ -1462,6 +1506,68 @@ fn vm_address_space_finds_first_gap_inside_search_window() {
         Some(range(0x3000, 2))
     );
     assert_eq!(aspace.find_free_range(range(0x1000, 6), 3), None);
+}
+
+#[test]
+fn vm_adjacent_independent_file_mappings_keep_their_own_zero_offsets() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let left = VmEntry::new(
+        range(0x20_0000, 2),
+        Prot::READ,
+        VmEntryFlags::PRIVATE,
+        page_backing(0),
+    );
+    let right = VmEntry::new(
+        range(0x20_2000, 2),
+        Prot::READ,
+        VmEntryFlags::PRIVATE,
+        page_backing_like_entry(&left, 0),
+    );
+
+    map_reserved(aspace.reserve_map(left, MapPlacement::RequireFree))
+        .commit()
+        .expect("left file mapping");
+    map_reserved(aspace.reserve_map(right, MapPlacement::RequireFree))
+        .commit()
+        .expect("right file mapping");
+
+    let recipes = aspace.recipes_snapshot();
+    assert_eq!(recipes.len(), 2, "independent mmaps must remain separate");
+    assert_eq!(recipes[0].range, range(0x20_0000, 2));
+    assert_eq!(recipes[1].range, range(0x20_2000, 2));
+    assert_eq!(recipes[0].page_backing().map(|(_, offset)| offset), Some(0));
+    assert_eq!(recipes[1].page_backing().map(|(_, offset)| offset), Some(0));
+}
+
+#[test]
+fn vm_adjacent_contiguous_file_mappings_still_coalesce() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let left = VmEntry::new(
+        range(0x21_0000, 2),
+        Prot::READ,
+        VmEntryFlags::PRIVATE,
+        page_backing(0),
+    );
+    let right = VmEntry::new(
+        range(0x21_2000, 2),
+        Prot::READ,
+        VmEntryFlags::PRIVATE,
+        page_backing_like_entry(&left, (2 * USER_PAGE_SIZE) as u64),
+    );
+
+    map_reserved(aspace.reserve_map(left, MapPlacement::RequireFree))
+        .commit()
+        .expect("left file mapping");
+    map_reserved(aspace.reserve_map(right, MapPlacement::RequireFree))
+        .commit()
+        .expect("right file mapping");
+
+    let recipes = aspace.recipes_snapshot();
+    assert_eq!(recipes.len(), 1, "contiguous file offsets may coalesce");
+    assert_eq!(recipes[0].range, range(0x21_0000, 4));
+    assert_eq!(recipes[0].page_backing().map(|(_, offset)| offset), Some(0));
 }
 
 #[test]
@@ -2373,7 +2479,7 @@ fn vm_pmap_publish_uses_reserve_commit_sequence() {
 }
 
 #[test]
-fn vm_pmap_protect_tears_down_for_refault_not_in_place_retag() {
+fn vm_pmap_protect_without_write_retags_resident_page_in_place() {
     setup_host_substrate();
     let aspace = AddressSpace::new();
     let entry = VmEntry::new(
@@ -2397,8 +2503,123 @@ fn vm_pmap_protect_tears_down_for_refault_not_in_place_retag() {
         .try_mprotect(range(0x5000, 1), Prot::READ)
         .expect("protect");
 
-    assert_eq!(aspace.pmap().lookup(UserPage(5)), None);
+    assert_eq!(
+        aspace
+            .pmap()
+            .lookup(UserPage(5))
+            .map(|mapping| mapping.prot),
+        Some(Prot::READ)
+    );
     assert_eq!(aspace.pmap().stats().shootdowns, 1);
+}
+
+#[test]
+fn vm_pmap_protect_granting_write_tears_down_for_refault() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let target = range(0x6000, 1);
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            target,
+            Prot::READ,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("map");
+    let outcome = aspace
+        .resolve_fault(VmFault::new(target.start(), AccessMode::Read))
+        .expect("fault resolves");
+    let materialized = outcome.materialize_pagebacked().expect("materialize");
+    aspace
+        .publish_fault_materialization(outcome, materialized)
+        .expect("publish");
+
+    aspace
+        .try_mprotect(target, Prot::READ_WRITE)
+        .expect("grant write");
+
+    assert_eq!(aspace.pmap().lookup(UserPage(6)), None);
+    assert_eq!(aspace.pmap().stats().shootdowns, 1);
+}
+
+#[test]
+fn vm_pmap_prot_none_tears_down_unrepresentable_rv64_leaf() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let target = range(0x68000, 1);
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            target,
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("map");
+    let outcome = aspace
+        .resolve_fault(VmFault::new(target.start(), AccessMode::Write))
+        .expect("fault resolves");
+    let materialized = outcome.materialize_pagebacked().expect("materialize");
+    aspace
+        .publish_fault_materialization(outcome, materialized)
+        .expect("publish");
+
+    aspace
+        .try_mprotect(target, Prot::NONE)
+        .expect("install guard page");
+
+    assert_eq!(aspace.pmap().lookup(target.start().containing_page()), None);
+    assert_eq!(aspace.pmap().stats().shootdowns, 1);
+}
+
+#[test]
+fn vm_pmap_repeated_mprotect_keeps_more_restrictive_cow_pte() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let target = range(0x7000, 1);
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            target,
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("map");
+    let outcome = aspace
+        .resolve_fault(VmFault::new(target.start(), AccessMode::Write))
+        .expect("fault resolves");
+    let materialized = outcome.materialize_pagebacked().expect("materialize");
+    aspace
+        .publish_fault_materialization(outcome, materialized)
+        .expect("publish");
+    aspace
+        .pmap()
+        .protect_range(target, Prot::READ)
+        .expect("simulate fork CoW demotion");
+    let shootdowns_before = aspace.pmap().stats().shootdowns;
+
+    let commit = aspace
+        .try_mprotect(target, Prot::READ_WRITE)
+        .expect("repeat recipe protection");
+
+    assert_eq!(commit.changed_pages, 0);
+    assert_eq!(
+        aspace
+            .pmap()
+            .lookup(UserPage(7))
+            .map(|mapping| mapping.prot),
+        Some(Prot::READ),
+        "a no-op recipe update must not bypass a CoW-demoted PTE"
+    );
+    assert_eq!(aspace.pmap().stats().shootdowns, shootdowns_before);
 }
 
 #[test]

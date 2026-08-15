@@ -375,7 +375,7 @@ impl PageContainer {
             self.mark_size_writeback_required();
         }
         let (size, size_generation, size_dirty) = self.size_writeback_snapshot();
-        match flush_dirty_pages_to_file_backing(self, guard) {
+        match flush_dirty_pages_to_file_backing(self, &dirty_pages, guard) {
             StepOutcome::Done(_) => {}
             StepOutcome::Continue { progress } => return StepOutcome::Continue { progress },
             StepOutcome::Yield { progress, shape } => {
@@ -397,7 +397,10 @@ impl PageContainer {
                 .fs_page_backing
                 .truncate(*fs_object_id, size, guard)
             {
-                V3::Done(()) => self.acknowledge_size_if_match(size_generation),
+                V3::Done(()) => {
+                    self.acknowledge_size_if_match(size_generation);
+                    stamp_write_times(mount, *fs_object_id, guard);
+                }
                 V3::Continue { progress: _ } => return V3::continue_with(PageProgress::EMPTY),
                 V3::Yield { progress: _, shape } => {
                     return V3::Yield {
@@ -448,6 +451,7 @@ impl PageContainer {
         {
             V3::Done(()) => {
                 self.acknowledge_size_if_match(generation);
+                stamp_write_times(mount, *fs_object_id, guard);
                 V3::done(())
             }
             V3::Continue { progress: _ } => V3::continue_with(PageProgress::EMPTY),
@@ -519,7 +523,7 @@ pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), Page
         pc.mark_size_writeback_required();
     }
     let (size, size_generation, size_dirty) = pc.size_writeback_snapshot();
-    let pages_so_far = match flush_dirty_pages_to_file_backing(pc, guard) {
+    let pages_so_far = match flush_dirty_pages_to_file_backing(pc, &dirty_pages, guard) {
         StepOutcome::Done(pages) => pages,
         StepOutcome::Continue { progress } => return StepOutcome::Continue { progress },
         StepOutcome::Yield { progress, shape } => return StepOutcome::Yield { progress, shape },
@@ -560,6 +564,9 @@ pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), Page
     {
         V3::Done(()) => {
             pc.acknowledge_size_if_match(size_generation);
+            if !dirty_pages.is_empty() || size_dirty {
+                stamp_write_times(mount, *fs_object_id, guard);
+            }
             V3::done(())
         }
         V3::Continue { progress: _ } => {
@@ -587,8 +594,45 @@ pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), Page
     }
 }
 
+/// Publish the write-visible inode times after page data and exact EOF have
+/// reached the filesystem backend.
+///
+/// Cargo and git deliberately use size/mtime/ctime as a fast-path change
+/// detector. Leaving a newly linked compiler artifact at ext4's zero creation
+/// timestamp makes the next Cargo invocation consider every local dependency
+/// older than its sources and rebuild it. The time update is best-effort here:
+/// the data transaction has already succeeded, while host fixtures do not
+/// install a platform realtime source and should keep their deterministic
+/// zero timestamps.
+fn stamp_write_times(
+    mount: &crate::mount::MountPayloadPin,
+    fs_object_id: FsObjectId,
+    guard: &Guard<'_>,
+) {
+    use crate::page_backed::adapter::step_engine::StepOutcome as V3;
+
+    let Some(now_ns) = tx_services::time::realtime_now_ns_hooked() else {
+        return;
+    };
+    let timestamp = crate::vfs::structure::Timespec::new(
+        (now_ns / 1_000_000_000) as i64,
+        (now_ns % 1_000_000_000) as i32,
+    );
+    let mut meta = match mount.payload().fs_ops.load_inode_meta(fs_object_id, guard) {
+        V3::Done(meta) => meta,
+        _ => return,
+    };
+    meta.mtime = timestamp;
+    meta.ctime = timestamp;
+    let _ = mount
+        .payload()
+        .fs_ops
+        .serialize_inode_meta(fs_object_id, &meta, guard);
+}
+
 fn flush_dirty_pages_to_file_backing(
     pc: &PageContainer,
+    dirty_pages: &[(PageIndex, Ppn, PageGeneration)],
     guard: &Guard<'_>,
 ) -> StepOutcome<u32, PageProgress> {
     use crate::page_backed::adapter::step_engine::StepOutcome as V3;
@@ -601,20 +645,48 @@ fn flush_dirty_pages_to_file_backing(
         return V3::done(0);
     };
 
+    // Match the current virtio maximum contiguous DMA chunk. Backends remain
+    // one-page-at-a-time unless they explicitly promise atomic range progress.
+    const MAX_SYNC_WRITEBACK_BATCH_PAGES: usize = 16;
+    let batch_limit = mount
+        .payload()
+        .fs_page_backing
+        .flush_batch_limit()
+        .clamp(1, MAX_SYNC_WRITEBACK_BATCH_PAGES);
+
     let mut pages_so_far: u32 = 0;
-    for (page, ppn, generation) in pc.dirty_pages_snapshot() {
-        let Some(offset) = page.as_u64().checked_mul(crate::vm::USER_PAGE_SIZE as u64) else {
+    let mut first = 0usize;
+    while first < dirty_pages.len() {
+        let mut end = first + 1;
+        while end < dirty_pages.len()
+            && end - first < batch_limit
+            && dirty_pages[end].0.as_u64() == dirty_pages[end - 1].0.as_u64().saturating_add(1)
+        {
+            end += 1;
+        }
+
+        let Some(offset) = dirty_pages[first]
+            .0
+            .as_u64()
+            .checked_mul(crate::vm::USER_PAGE_SIZE as u64)
+        else {
             return V3::err(Errno::EINVAL.into());
         };
-        match mount.payload().fs_page_backing.flush_page(
-            *fs_object_id,
-            offset,
-            &Frame::new(ppn),
-            guard,
-        ) {
+
+        let frames: Vec<Frame> = dirty_pages[first..end]
+            .iter()
+            .map(|(_, ppn, _)| Frame::new(*ppn))
+            .collect();
+        match mount
+            .payload()
+            .fs_page_backing
+            .flush_pages(*fs_object_id, offset, &frames, guard)
+        {
             V3::Done(()) => {
-                pc.clear_dirty_if_match(page, ppn, generation);
-                pages_so_far = pages_so_far.saturating_add(1);
+                for (page, ppn, generation) in &dirty_pages[first..end] {
+                    pc.clear_dirty_if_match(*page, *ppn, *generation);
+                }
+                pages_so_far = pages_so_far.saturating_add((end - first) as u32);
             }
             V3::Continue { progress: _ } => {
                 let progress = if pages_so_far == 0 {
@@ -641,6 +713,7 @@ fn flush_dirty_pages_to_file_backing(
             }
             V3::Err(v3_errno) => return V3::err(v3_errno),
         }
+        first = end;
     }
 
     V3::done(pages_so_far)
@@ -890,7 +963,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for FsyncOp<'a> {
         let PageContainerKind::File { mount, .. } = self.pc.kind() else {
             return V3::done(());
         };
-        if mount.payload().backend_planner().is_none() {
+        if !mount.payload().fs_page_backing.uses_async_writeback() {
             let guard = step_engine::guard();
             return step_fsync(self.pc, &guard);
         }

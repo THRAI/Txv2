@@ -288,6 +288,11 @@ pub struct PageServiceBackendDriven {
     pub work: Vec<PageServiceDrivenWork>,
     pub next: PageServiceNext,
     pub kicks: usize,
+    /// Backend readiness that must be observed before retrying a requeued
+    /// submission. Keeping this separate from `next` prevents a runnable page
+    /// queue from degenerating into a self-kick loop while its backend owner
+    /// is contended.
+    pub backend_wait: Option<WaitSourceId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -384,7 +389,12 @@ impl PageServiceDriver {
             0
         };
 
-        PageServiceBackendDriven { work, next, kicks }
+        PageServiceBackendDriven {
+            work,
+            next,
+            kicks,
+            backend_wait: None,
+        }
     }
 }
 
@@ -397,9 +407,28 @@ pub struct PageService {
     graphs: BTreeMap<PageIoRequestId, BackendGraphExecution>,
     pending_l6: BTreeMap<PageL6ActionId, PendingPageL6>,
     partial_l6: BTreeMap<PageIoRequestId, PartialL6Admission>,
+    l6_receipt_errors: usize,
     next_l6_action: u64,
     waiters: BTreeMap<PageIoRequestId, Vec<PageWaiter>>,
     next: PageServiceNext,
+}
+
+/// Allocation-free counters used by the kernel's one-shot stall dump.
+///
+/// These are observations only: no correctness path branches on them and the
+/// snapshot does not retain requests or page-cache leases.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PageServiceDiagnosticSnapshot {
+    pub(crate) submissions: usize,
+    pub(crate) completions: usize,
+    pub(crate) backend_resumes: usize,
+    pub(crate) metadata: usize,
+    pub(crate) graphs: usize,
+    pub(crate) pending_l6: usize,
+    pub(crate) partial_l6: usize,
+    pub(crate) l6_receipt_errors: usize,
+    pub(crate) waiter_requests: usize,
+    pub(crate) waiters: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -453,10 +482,17 @@ impl PageService {
             graphs: BTreeMap::new(),
             pending_l6: BTreeMap::new(),
             partial_l6: BTreeMap::new(),
+            l6_receipt_errors: 0,
             next_l6_action: 1,
             waiters: BTreeMap::new(),
             next: PageServiceNext::Sleeping,
         }
+    }
+
+    pub(crate) fn has_immediate_work(&self, include_submissions: bool) -> bool {
+        !self.completions.is_empty()
+            || !self.backend_resumes.is_empty()
+            || (include_submissions && !self.submissions.is_empty())
     }
 
     pub fn submit(
@@ -1184,6 +1220,7 @@ impl PageService {
         receipt: PageL6Receipt,
     ) -> Result<PageServiceL6Applied, PageServiceBackendSubmitError> {
         let Some(pending) = self.pending_l6.get(&receipt.id) else {
+            self.l6_receipt_errors = self.l6_receipt_errors.saturating_add(1);
             return Err(PageServiceBackendSubmitError::UnknownL6Action(receipt.id));
         };
         let expected = match pending {
@@ -1197,6 +1234,7 @@ impl PageService {
                 .is_some_and(|failure| failure.failed_index != receipt.submitted.len())
             || (receipt.failure.is_none() && receipt.submitted.len() != expected)
         {
+            self.l6_receipt_errors = self.l6_receipt_errors.saturating_add(1);
             return Err(PageServiceBackendSubmitError::Graph(
                 BackendGraphSchedulerError::InvalidSubmissionReceipt,
             ));
@@ -1290,11 +1328,18 @@ impl PageService {
                     .get_mut(&graph)
                     .expect("pending graph action retains its execution");
                 let failure_errno = failure.map(|failure| queue_error_errno(failure.error));
-                match execution.scheduler.apply_submission_receipt(
+                let advance = match execution.scheduler.apply_submission_receipt(
                     &nodes,
                     &receipt.submitted,
                     failure_errno,
-                )? {
+                ) {
+                    Ok(advance) => advance,
+                    Err(error) => {
+                        self.l6_receipt_errors = self.l6_receipt_errors.saturating_add(1);
+                        return Err(error.into());
+                    }
+                };
+                match advance {
                     BackendGraphAdvance::Pending { submitted } => {
                         PageServiceBackendSubmitOutcome::BlockGraphQueued {
                             request: execution.request.clone(),
@@ -1399,6 +1444,21 @@ impl PageService {
 
     pub fn submission_len(&self) -> usize {
         self.submissions.len()
+    }
+
+    pub(crate) fn diagnostic_snapshot(&self) -> PageServiceDiagnosticSnapshot {
+        PageServiceDiagnosticSnapshot {
+            submissions: self.submissions.len(),
+            completions: self.completions.len(),
+            backend_resumes: self.backend_resumes.len(),
+            metadata: self.metadata.len(),
+            graphs: self.graphs.len(),
+            pending_l6: self.pending_l6.len(),
+            partial_l6: self.partial_l6.len(),
+            l6_receipt_errors: self.l6_receipt_errors,
+            waiter_requests: self.waiters.len(),
+            waiters: self.waiters.values().map(Vec::len).sum(),
+        }
     }
 
     pub(crate) fn has_queued_submission(&self, request_id: PageIoRequestId) -> bool {

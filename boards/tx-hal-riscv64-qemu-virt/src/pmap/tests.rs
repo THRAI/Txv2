@@ -23,7 +23,10 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::vec::Vec;
 
-use tx_hal::{AllocError, PhysAddr, PmapError, PmapPermissions, PmapReserveKind, PtNode, VirtAddr};
+use tx_hal::{
+    AllocError, PhysAddr, PmapError, PmapInvalidation, PmapPermissions, PmapReserveKind, PtNode,
+    VirtAddr,
+};
 
 use super::address_space::{
     coalesce_invalidation_ranges, commit_mapping_from_root, create_pmap_root_from_bag,
@@ -51,7 +54,7 @@ use super::topology::{
 };
 use super::{
     l0_table_for_test, l0_table_mut, l1_table_for_test, reset_pt_node_pool_for_test,
-    shootdown_kernel_mapping, HighSentinelError, ASID_CAPACITY,
+    shootdown_kernel_mapping, should_flush_entire_asid, HighSentinelError, ASID_CAPACITY,
 };
 use crate::boot_static::{BootLinkedAddr, BootStaticBag, IdentityLive};
 
@@ -774,6 +777,24 @@ fn shootdown_batch_coalesces_contiguous_invalidations() {
     assert_eq!(batch[0].size(), 0x2000);
     assert_eq!(batch[1].virt(), VirtAddr(0x5000));
     assert_eq!(batch[1].size(), 0x2000);
+}
+
+#[test]
+fn shootdown_uses_full_asid_only_for_large_batches() {
+    assert!(!should_flush_entire_asid(&[PmapInvalidation::new(
+        VirtAddr(0x1000),
+        63 * PAGE_SIZE,
+    )]));
+    assert!(should_flush_entire_asid(&[PmapInvalidation::new(
+        VirtAddr(0x1000),
+        64 * PAGE_SIZE,
+    )]));
+
+    let scattered = [
+        PmapInvalidation::new(VirtAddr(0x1000), 32 * PAGE_SIZE),
+        PmapInvalidation::new(VirtAddr(0x100_0000), 32 * PAGE_SIZE),
+    ];
+    assert!(should_flush_entire_asid(&scattered));
 }
 
 #[test]

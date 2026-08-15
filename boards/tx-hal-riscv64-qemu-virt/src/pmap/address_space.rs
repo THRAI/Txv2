@@ -44,9 +44,9 @@ use super::pt_node::{
 use super::{
     encode_branch_pte, encode_leaf_pte_with_permissions, ensure_l0_table_for_reservation,
     l0_table_mut, page_table_mut_from_phys, pte_is_branch, pte_phys, rv64_1g_leaf_index,
-    rv64_2m_leaf_index, rv64_4k_leaf_index, sfence_vma_all, sfence_vma_range_asid,
-    validate_aligned_mapping, validate_aligned_virt, validate_rv64_leaf_permissions,
-    validate_user_mapping_virt,
+    rv64_2m_leaf_index, rv64_4k_leaf_index, sfence_vma_all, sfence_vma_asid_all,
+    sfence_vma_range_asid, should_flush_entire_asid, validate_aligned_mapping,
+    validate_aligned_virt, validate_rv64_leaf_permissions, validate_user_mapping_virt,
 };
 
 // ASID 位图字数：16 个 u64
@@ -440,9 +440,13 @@ pub(crate) fn shootdown_mappings(asid: Asid, invalidations: &[PmapInvalidation])
     let coalesced = coalesce_invalidation_ranges(invalidations); // 合并相邻区间减少 fence 次数
     let asid_usable = crate::hw_asid_tagging_usable();
     if asid_usable {
-        // 带 ASID 硬件：逐区间做地址+ASID 限定的精刷
-        for invalidation in &coalesced {
-            sfence_vma_range_asid(invalidation.virt(), invalidation.size(), asid);
+        if should_flush_entire_asid(&coalesced) {
+            sfence_vma_asid_all(asid);
+        } else {
+            // 小范围修改保留地址+ASID 限定的精刷。
+            for invalidation in &coalesced {
+                sfence_vma_range_asid(invalidation.virt(), invalidation.size(), asid);
+            }
         }
     } else {
         // SiFive U74 勘误 CIP-1200（JH7110/VF2）：带地址限定的 `sfence.vma`
@@ -469,8 +473,12 @@ pub(crate) fn synchronize_new_mappings(asid: Asid, invalidations: &[PmapInvalida
     }
     let coalesced = coalesce_invalidation_ranges(invalidations);
     if crate::hw_asid_tagging_usable() {
-        for invalidation in &coalesced {
-            sfence_vma_range_asid(invalidation.virt(), invalidation.size(), asid);
+        if should_flush_entire_asid(&coalesced) {
+            sfence_vma_asid_all(asid);
+        } else {
+            for invalidation in &coalesced {
+                sfence_vma_range_asid(invalidation.virt(), invalidation.size(), asid);
+            }
         }
     } else {
         // U74/CIP-1200 requires the conservative unqualified local fence.

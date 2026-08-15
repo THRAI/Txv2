@@ -64,6 +64,17 @@ use crate::mount::{MountIdentity, MountNamespace, MountPayload, MountTransaction
 /// page-cache / pager-facing backing surface. Page-cache-backed
 /// filesystems implement both; the traits do not subsume each other.
 pub trait FsOps: Send + Sync + 'static {
+    /// Version token for parent-local positive dentry caching.
+    ///
+    /// Backends that can mutate a directory through several live `DEntry`
+    /// instances return a monotonically changing token here. The walker may
+    /// trust a cached child only while its recorded token still matches.
+    /// Backends returning `None` retain the traditional VFS contract where
+    /// their mutation paths synchronously purge the relevant dentry cache.
+    fn lookup_cache_version(&self, _parent: FsObjectId) -> Option<u64> {
+        None
+    }
+
     fn lookup(
         &self,
         parent: FsObjectId,
@@ -76,6 +87,14 @@ pub trait FsOps: Send + Sync + 'static {
         fs_object_id: FsObjectId,
         guard: &Guard<'_>,
     ) -> StepOutcome<InodeMeta, NoProgress>;
+
+    /// Return a coherent inode metadata snapshot only when it is already
+    /// resident in a backend cache.  This hook must not submit I/O, allocate
+    /// storage, or wait.  Trap-local metadata probes use it as a conservative
+    /// fast path and fall back to [`FsOps::load_inode_meta`] on `None`.
+    fn cached_inode_meta(&self, _fs_object_id: FsObjectId) -> Option<InodeMeta> {
+        None
+    }
 
     fn serialize_inode_meta(
         &self,
@@ -1326,6 +1345,50 @@ impl<I: SubjectIdentity> StepOp<I> for ReadLinkByIdOp<'_> {
 impl OneShotStepOp for ReadLinkByIdOp<'_> {}
 impl OneShotStepOp<crate::process::ProcessIdentity> for ReadLinkByIdOp<'_> {}
 
+/// Wait-capable `FsOps::chmod_inode` invocation for an already-resolved
+/// inode.  ext4 serialises metadata mutations at the mount level, so this
+/// operation may yield while another mutation owns the admission permit.
+pub struct ChmodInodeOp<'a> {
+    pub fs_ops: &'a Arc<dyn FsOps>,
+    pub target: FsObjectId,
+    pub mode: u16,
+    pub cred: &'a Credential,
+}
+
+impl<I: SubjectIdentity> StepOp<I> for ChmodInodeOp<'_> {
+    type Output = ();
+    type Progress = NoProgress;
+
+    fn step(&mut self, ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let _ = ctx.subject();
+        let guard = step_engine::guard();
+        self.fs_ops
+            .chmod_inode(self.target, self.mode, self.cred, &guard)
+    }
+}
+
+/// Wait-capable `FsOps::chown_inode` invocation for an already-resolved
+/// inode.  See [`ChmodInodeOp`] for the ext4 admission semantics.
+pub struct ChownInodeOp<'a> {
+    pub fs_ops: &'a Arc<dyn FsOps>,
+    pub target: FsObjectId,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub cred: &'a Credential,
+}
+
+impl<I: SubjectIdentity> StepOp<I> for ChownInodeOp<'_> {
+    type Output = ();
+    type Progress = NoProgress;
+
+    fn step(&mut self, ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let _ = ctx.subject();
+        let guard = step_engine::guard();
+        self.fs_ops
+            .chown_inode(self.target, self.uid, self.gid, self.cred, &guard)
+    }
+}
+
 /// One-shot `FsOps::lookup` invocation in an already-resolved directory.
 pub struct LookupInParentOp<'a> {
     pub fs_ops: &'a Arc<dyn FsOps>,
@@ -2004,9 +2067,18 @@ impl<I: SubjectIdentity> StepOp<I> for FileFsyncOp {
                     | crate::page_backed::PageContainerKind::Device { .. } => None,
                 })
         {
-            if self.raw_block_device && mount.payload().backend_planner().is_none() {
+            // A plain mount has no file-I/O runtime that can consume the L4
+            // fsync frontier.  Keep that established synchronous path on
+            // `step_fsync`; otherwise the syscall would queue dirty pages and
+            // wait forever for a service task that the mount never created.
+            if mount.payload().backend_planner().is_none() {
                 let guard = step_engine::guard();
-                return match crate::page_backed::step_raw_block_fsync(container, &guard) {
+                let outcome = if self.raw_block_device {
+                    crate::page_backed::step_raw_block_fsync(container, &guard)
+                } else {
+                    crate::page_backed::step_fsync(container, &guard)
+                };
+                return match outcome {
                     V3::Done(()) => V3::Done(()),
                     V3::Err(e) => V3::Err(e),
                     V3::Continue { .. } => V3::Continue {

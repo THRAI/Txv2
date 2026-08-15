@@ -4,7 +4,10 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
+use core::future::{poll_fn, Future};
+use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::task::Poll;
 use tx_substrate::wake::{MailboxEvent, TaskMailbox};
 
 use crate::adapter::step_engine::{
@@ -14,6 +17,7 @@ use crate::adapter::step_engine::{
 use crate::adapter::wait_routing::WaitOutcome;
 
 use crate::execution::{Errno, Guard};
+use crate::fs_iface::WaitSourceId as BackendWaitSourceId;
 use crate::io_manager::backend::{BlockPageCompletion, BlockPageRequestTracker, PageFrameRef};
 use crate::io_manager::block::{
     BioVec, BlockCompletionSource, BlockDeviceCompletion, BlockDispatch, BlockDispatchExecutor,
@@ -734,6 +738,20 @@ impl<'a, 'g> BlockDeviceDispatchAdapter<'a, 'g> {
             return;
         }
 
+        // The L4/L6 service remains asynchronous even when the concrete
+        // device only exposes the synchronous BlockDeviceOps contract.  Do
+        // not call an optional non-blocking implementation unless the driver
+        // explicitly advertises that its request buffers remain valid across
+        // service turns.  This is also the compatibility path used by the
+        // original ext4/page-cache branch before device-level async VirtIO was
+        // added during the merge.
+        if !self.handle.supports_async_blocks() {
+            let result = self.execute_dispatch(dispatch);
+            self.completions
+                .push_back(BlockDeviceCompletion::new(dispatch.tag, result));
+            return;
+        }
+
         let cookie = NEXT_ASYNC_BLOCK_COOKIE
             .fetch_add(1, Ordering::AcqRel)
             .max(1);
@@ -1020,6 +1038,13 @@ impl FileIoManagerRuntimeClaim {
         let _ = (&self.page_submission, &self.block_submission);
     }
 
+    fn has_immediate_work(&self, include_page_submissions: bool) -> bool {
+        self.block_submission.has_immediate_work()
+            || self
+                .page_submission
+                .has_immediate_work(include_page_submissions)
+    }
+
     /// End this claim's reactor ownership and release its typed manager
     /// handles. The registration removal is idempotent against test cleanup.
     pub fn retire(self) -> bool {
@@ -1066,12 +1091,18 @@ struct RegisteredFileIoServiceRuntime {
 
 #[derive(Clone, Copy, Debug)]
 pub struct PageContainerFileIoServiceRuntimeSnapshot {
+    registration: FileIoManagerRuntimeRegistrationId,
     container: Weak<PageContainer>,
     handle: BlockDeviceHandle,
     source_id: u64,
+    claimed: bool,
 }
 
 impl PageContainerFileIoServiceRuntimeSnapshot {
+    pub const fn registration_id(&self) -> FileIoManagerRuntimeRegistrationId {
+        self.registration
+    }
+
     pub const fn handle(&self) -> BlockDeviceHandle {
         self.handle
     }
@@ -1080,8 +1111,31 @@ impl PageContainerFileIoServiceRuntimeSnapshot {
         self.source_id
     }
 
+    pub const fn is_claimed(&self) -> bool {
+        self.claimed
+    }
+
     pub fn is_live(&self, guard: &Guard<'_>) -> bool {
         self.container.upgrade(guard).is_some()
+    }
+
+    pub fn diagnostic_snapshot(
+        &self,
+        guard: &Guard<'_>,
+    ) -> Option<crate::page_backed::PageContainerFileIoDiagnosticSnapshot> {
+        self.container
+            .upgrade(guard)
+            .map(|container| container.file_io_diagnostic_snapshot())
+    }
+
+    pub fn page_wait_diagnostic_snapshots(
+        &self,
+        guard: &Guard<'_>,
+    ) -> Vec<crate::page_backed::FilePageWaitDiagnosticSnapshot> {
+        self.container
+            .upgrade(guard)
+            .map(|container| container.file_page_wait_diagnostic_snapshots())
+            .unwrap_or_default()
     }
 }
 
@@ -1205,9 +1259,11 @@ pub fn page_container_file_io_service_runtimes_snapshot(
         .lock()
         .iter()
         .map(|entry| PageContainerFileIoServiceRuntimeSnapshot {
+            registration: entry.id,
             container: entry.container,
             handle: entry.handle,
             source_id: entry.source_id,
+            claimed: matches!(entry.state, FileIoManagerRuntimeState::Claimed),
         })
         .collect()
 }
@@ -1240,23 +1296,34 @@ async fn page_container_file_io_service_task_loop_claim(
     config: PageContainerFileIoServiceTaskConfig,
 ) -> PageContainerFileIoServiceTaskReport {
     let mut report = PageContainerFileIoServiceTaskReport::default();
+    let mut backend_wait = None;
+    let mut turn_remains_runnable = false;
     while config
         .max_ready_turns
         .is_none_or(|max_ready_turns| report.ready_turns < max_ready_turns)
     {
-        let wait = crate::wait_source::wait_on_registered_endpoint(
-            claim.wake_source.wake_endpoint(),
-            file_io_service_interest_mask(),
-        );
-        if wait.await != WaitOutcome::Ready {
+        // Readiness is level-triggered by the owned manager queues.  A wake
+        // edge only closes the race between this check and waiter
+        // registration; it must not be the sole proof that work exists.
+        // In particular, a page turn can populate L6 after the block phase of
+        // the current cycle.  Rechecking L6 here prevents that dispatchable
+        // queue from sleeping forever after a coalesced/self wake.
+        let immediate = turn_remains_runnable || claim.has_immediate_work(backend_wait.is_none());
+        if !immediate
+            && wait_for_file_io_service_event(&claim.wake_source, backend_wait).await
+                != WaitOutcome::Ready
+        {
             report.waits_failed += 1;
             break;
         }
 
         report.waits_ready += 1;
         report.ready_turns += 1;
-        let guard = step_engine::guard();
-        let Some(container) = claim.container.upgrade(&guard) else {
+        let container = {
+            let guard = step_engine::guard();
+            claim.container.upgrade(&guard)
+        };
+        let Some(container) = container else {
             report.waits_failed += 1;
             break;
         };
@@ -1264,7 +1331,6 @@ async fn page_container_file_io_service_task_loop_claim(
         // complete page/block/page service turn: page completions publish a
         // new immutable resident root and can consume more retire credits than
         // one guarded epoch can replenish.
-        drop(guard);
         claim.retain_manager_custody();
         let turn = match drive_page_container_file_io_service_once_compact(
             &container,
@@ -1291,7 +1357,23 @@ async fn page_container_file_io_service_task_loop_claim(
                 .map(|turn| turn.kicks)
                 .unwrap_or(0)
             + turn.page_after.as_ref().map(|turn| turn.kicks).unwrap_or(0);
+        backend_wait = file_io_backend_wait(&turn);
+        turn_remains_runnable = turn.next == PageContainerFileIoServiceNext::Runnable;
         report.last_turn = Some(turn);
+
+        // A service task is a long-lived worker, not one indivisible reactor
+        // poll.  `Runnable` means another bounded manager turn can make
+        // progress; it does not permit this async loop to keep executing
+        // inside the current `Future::poll`.  Without this boundary a busy
+        // PageContainer can monopolise its hart indefinitely and starve the
+        // userspace thread which submitted the I/O.
+        if turn_remains_runnable
+            && config
+                .max_ready_turns
+                .is_none_or(|max_ready_turns| report.ready_turns < max_ready_turns)
+        {
+            tx_reactor::yield_now().await;
+        }
     }
 
     report
@@ -1304,15 +1386,12 @@ pub async fn page_container_file_io_service_task_loop(
     config: PageContainerFileIoServiceTaskConfig,
 ) -> PageContainerFileIoServiceTaskReport {
     let mut report = PageContainerFileIoServiceTaskReport::default();
+    let mut backend_wait = None;
     while config
         .max_ready_turns
         .is_none_or(|max_ready_turns| report.ready_turns < max_ready_turns)
     {
-        let wait = crate::wait_source::wait_on_registered_endpoint(
-            wake_source.wake_endpoint(),
-            file_io_service_interest_mask(),
-        );
-        if wait.await != WaitOutcome::Ready {
+        if wait_for_file_io_service_event(wake_source, backend_wait).await != WaitOutcome::Ready {
             report.waits_failed += 1;
             break;
         }
@@ -1343,10 +1422,58 @@ pub async fn page_container_file_io_service_task_loop(
                 .map(|turn| turn.kicks)
                 .unwrap_or(0)
             + turn.page_after.as_ref().map(|turn| turn.kicks).unwrap_or(0);
+        backend_wait = file_io_backend_wait(&turn);
+        let turn_remains_runnable = turn.next == PageContainerFileIoServiceNext::Runnable;
         report.last_turn = Some(turn);
+
+        if turn_remains_runnable
+            && config
+                .max_ready_turns
+                .is_none_or(|max_ready_turns| report.ready_turns < max_ready_turns)
+        {
+            tx_reactor::yield_now().await;
+        }
     }
 
     report
+}
+
+/// Sleep until either this PageContainer receives ordinary service work or a
+/// backend owner that rejected the previous submission becomes available.
+/// Polling both registrations prevents block-device progress from being
+/// hidden behind a contended filesystem admission point.
+async fn wait_for_file_io_service_event(
+    wake_source: &ServiceWakeSource,
+    backend_wait: Option<BackendWaitSourceId>,
+) -> WaitOutcome {
+    let mut service_wait = crate::wait_source::wait_on_registered_endpoint(
+        wake_source.wake_endpoint(),
+        file_io_service_interest_mask(),
+    );
+    let Some(backend_wait) = backend_wait else {
+        return service_wait.await;
+    };
+    let Some(backend_source) = tx_substrate::wake::lookup_source(
+        tx_substrate::step::WaitSourceId::new(backend_wait.raw()),
+    ) else {
+        return WaitOutcome::Interrupted;
+    };
+    let mut backend_ready =
+        crate::wait_source::wait_on_registered_endpoint(&backend_source, u64::MAX);
+    poll_fn(|cx| {
+        if let Poll::Ready(outcome) = Pin::new(&mut service_wait).poll(cx) {
+            return Poll::Ready(outcome);
+        }
+        Pin::new(&mut backend_ready).poll(cx)
+    })
+    .await
+}
+
+fn file_io_backend_wait(turn: &PageContainerFileIoServiceTurn) -> Option<BackendWaitSourceId> {
+    turn.page_before
+        .as_ref()
+        .and_then(|page| page.backend_wait)
+        .or_else(|| turn.page_after.as_ref().and_then(|page| page.backend_wait))
 }
 
 fn file_io_service_interest_mask() -> u64 {
@@ -2027,6 +2154,43 @@ mod tests {
         assert_eq!(completion.result, Ok(()));
         assert_eq!(LAST_READ_BLOCK.load(Ordering::SeqCst), 34);
         assert_eq!(adapter.poll_completion(), None);
+    }
+
+    #[test]
+    fn async_service_adapter_falls_back_for_synchronous_device() {
+        use crate::adapter::step_engine::guard;
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        reset_page_container_file_io_service_registry_for_test();
+        LAST_READ_BLOCK.store(u64::MAX, Ordering::SeqCst);
+        let guard = guard();
+        let handle = BlockDeviceHandle::partition(&BLOCK_REG, 32, 16);
+        let mut adapter = BlockDeviceDispatchAdapter::new_async(handle, &guard, 41);
+        let dispatch = BlockDispatch {
+            tag: BlockTag::new(7),
+            bio: Bio {
+                id: BlockRequestId::new(3),
+                plan: BioPlan::new(
+                    DeviceKey::new(BLOCK_REG.devt.raw()),
+                    BlockOp::Read,
+                    LbaRange::new(2, 8),
+                    alloc::vec![BioVec::new(0, 0, 4096)],
+                    BlockFlags::EMPTY,
+                ),
+            },
+        };
+
+        adapter.submit(&dispatch);
+
+        assert_eq!(LAST_READ_BLOCK.load(Ordering::SeqCst), 34);
+        assert_eq!(
+            adapter.poll_completion(),
+            Some(BlockDeviceCompletion::new(BlockTag::new(7), Ok(())))
+        );
+        assert_eq!(adapter.poll_completion(), None);
+        reset_page_container_file_io_service_registry_for_test();
     }
 
     #[test]

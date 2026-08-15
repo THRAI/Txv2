@@ -1099,7 +1099,8 @@ fn test_trap_frame(scause: usize, sepc: usize, stval: usize) -> Rv64TrapFrame {
         sstatus: 1 << 8,
         f: [0u64; 32],
         fcsr: 0,
-        _pad_fp: 0,
+        _fp_state_flags: 0,
+        _trap_tmp_sscratch: 0,
     }
 }
 
@@ -1112,6 +1113,7 @@ fn trap_frame_fp_context_round_trips_through_capture_restore() {
         *r = 0xf000_0000_0000_0000 | i as u64;
     }
     frame.fcsr = 0x05;
+    frame._fp_state_flags = 1;
 
     let ctx = frame.view_mut().capture_user_context();
 
@@ -1126,6 +1128,11 @@ fn trap_frame_fp_context_round_trips_through_capture_restore() {
     );
     assert_eq!(ctx.fp.regs, frame.f, "FP regs must round-trip");
     assert_eq!(ctx.fp.fcsr, 0x05, "fcsr must round-trip");
+    assert_eq!(
+        (frame.sstatus >> 13) & 3,
+        3,
+        "capturing a Dirty image must not demote a direct return to Clean"
+    );
 
     // Restore into a fresh frame and verify FP state is recovered.
     let mut frame2 = test_trap_frame(8, 0x2000, 0);
@@ -1134,12 +1141,28 @@ fn trap_frame_fp_context_round_trips_through_capture_restore() {
 
     assert_eq!(frame2.f, frame.f, "restored FP regs must match original");
     assert_eq!(frame2.fcsr, 0x05, "restored fcsr must match original");
-    // Restoring a valid FP context marks it dirty so the trap vector
-    // saves it on the next user trap.
+    // Restoring a saved image establishes a clean hardware copy. A later user
+    // FP write, rather than the kernel return itself, marks it dirty again.
     assert_eq!(
         (frame2.sstatus >> 13) & 3,
-        3,
-        "FS must be Dirty after restoring valid FP state"
+        2,
+        "FS must be Clean after restoring valid FP state"
+    );
+    assert_ne!(frame2._fp_state_flags & 2, 0);
+}
+
+#[test]
+fn clean_fp_trap_reuses_authoritative_payload_image() {
+    let mut frame = test_trap_frame(8, 0x1000, 0);
+    frame.sstatus = (1 << 5) | (2 << 13);
+    frame.f.fill(0xdead_beef_dead_beef);
+    frame._fp_state_flags = 0;
+
+    let ctx = frame.view_mut().capture_user_context();
+
+    assert!(
+        !ctx.fp.is_valid(),
+        "Clean FS must reuse the already-published payload image"
     );
 }
 

@@ -5,7 +5,7 @@ extern crate alloc;
 extern crate std;
 
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 mod boot_static;
 mod boot_trampoline;
@@ -98,8 +98,6 @@ const GOLDFISH_RTC_ALARM_STATUS: usize = 0x18;
 const GOLDFISH_RTC_CLEAR_INTERRUPT: usize = 0x1c;
 static ONLINE_CPUS: AtomicU64 = AtomicU64::new(0);
 const IPI_KIND_COUNT: usize = 5;
-static IPI_STATE_LOCKS: [AtomicBool; MAX_BOOT_CPUS] =
-    [const { AtomicBool::new(false) }; MAX_BOOT_CPUS];
 static IPI_PENDING: [AtomicU8; MAX_BOOT_CPUS] = [const { AtomicU8::new(0) }; MAX_BOOT_CPUS];
 static IPI_ACKED_CPUS: [AtomicU64; IPI_KIND_COUNT] = [const { AtomicU64::new(0) }; IPI_KIND_COUNT];
 #[cfg(test)]
@@ -199,6 +197,38 @@ pub struct KernelResumeCtx {
     pub sp: usize,      // offset 0
     pub ra: usize,      // offset 8
     pub s: [usize; 12], // offset 16..112
+    /// Address of the Rust userspace-entry frame's saved caller return PC.
+    ///
+    /// This is temporary fault-localisation state. The RV64 entry assembly
+    /// records it before `sret` so the trap path can identify the first phase
+    /// that damages the suspended kernel stack frame.
+    pub caller_ra_slot: usize, // offset 112
+    /// Value observed in `caller_ra_slot` immediately before `sret`.
+    pub caller_ra_expected: usize, // offset 120
+    /// Exact stack pointer loaded by the most recent resume longjmp.
+    pub resume_loaded_sp: usize, // offset 128
+    /// Exact return address loaded by the most recent resume longjmp.
+    pub resume_loaded_ra: usize, // offset 136
+    /// Monotonic generation assigned by the userspace-entry save helper.
+    pub entry_generation: usize, // offset 144
+    /// Entry generation observed by the most recent resume helper.
+    pub resume_generation: usize, // offset 152
+}
+
+impl KernelResumeCtx {
+    const fn zeroed() -> Self {
+        Self {
+            sp: 0,
+            ra: 0,
+            s: [0; 12],
+            caller_ra_slot: 0,
+            caller_ra_expected: 0,
+            resume_loaded_sp: 0,
+            resume_loaded_ra: 0,
+            entry_generation: 0,
+            resume_generation: 0,
+        }
+    }
 }
 
 // These offsets are referenced by literal byte offset in the trap-vector
@@ -208,10 +238,38 @@ pub struct KernelResumeCtx {
 const _KERNEL_RESUME_CTX_SP_OFFSET: usize = 0;
 const _KERNEL_RESUME_CTX_RA_OFFSET: usize = 8;
 const _KERNEL_RESUME_CTX_S0_OFFSET: usize = 16;
-const _: () = assert!(core::mem::size_of::<KernelResumeCtx>() == 14 * 8);
+const _KERNEL_RESUME_CTX_CALLER_RA_SLOT_OFFSET: usize = 112;
+const _KERNEL_RESUME_CTX_CALLER_RA_EXPECTED_OFFSET: usize = 120;
+const _KERNEL_RESUME_CTX_LOADED_SP_OFFSET: usize = 128;
+const _KERNEL_RESUME_CTX_LOADED_RA_OFFSET: usize = 136;
+const _KERNEL_RESUME_CTX_ENTRY_GENERATION_OFFSET: usize = 144;
+const _KERNEL_RESUME_CTX_RESUME_GENERATION_OFFSET: usize = 152;
+const _: () = assert!(core::mem::size_of::<KernelResumeCtx>() == 20 * 8);
 const _: () = assert!(core::mem::offset_of!(KernelResumeCtx, sp) == _KERNEL_RESUME_CTX_SP_OFFSET);
 const _: () = assert!(core::mem::offset_of!(KernelResumeCtx, ra) == _KERNEL_RESUME_CTX_RA_OFFSET);
 const _: () = assert!(core::mem::offset_of!(KernelResumeCtx, s) == _KERNEL_RESUME_CTX_S0_OFFSET);
+const _: () = assert!(
+    core::mem::offset_of!(KernelResumeCtx, caller_ra_slot)
+        == _KERNEL_RESUME_CTX_CALLER_RA_SLOT_OFFSET
+);
+const _: () = assert!(
+    core::mem::offset_of!(KernelResumeCtx, caller_ra_expected)
+        == _KERNEL_RESUME_CTX_CALLER_RA_EXPECTED_OFFSET
+);
+const _: () = assert!(
+    core::mem::offset_of!(KernelResumeCtx, resume_loaded_sp) == _KERNEL_RESUME_CTX_LOADED_SP_OFFSET
+);
+const _: () = assert!(
+    core::mem::offset_of!(KernelResumeCtx, resume_loaded_ra) == _KERNEL_RESUME_CTX_LOADED_RA_OFFSET
+);
+const _: () = assert!(
+    core::mem::offset_of!(KernelResumeCtx, entry_generation)
+        == _KERNEL_RESUME_CTX_ENTRY_GENERATION_OFFSET
+);
+const _: () = assert!(
+    core::mem::offset_of!(KernelResumeCtx, resume_generation)
+        == _KERNEL_RESUME_CTX_RESUME_GENERATION_OFFSET
+);
 
 /// Per-hart cell with `Sync` because the only writer/reader is the
 /// local hart's trap-vector / userspace-entry shim. Cross-hart
@@ -231,48 +289,8 @@ impl<T> PerHartCell<T> {
     }
 }
 
-static RV64_KERNEL_RESUME_CTX: [PerHartCell<KernelResumeCtx>; MAX_BOOT_CPUS] = [
-    PerHartCell::new(KernelResumeCtx {
-        sp: 0,
-        ra: 0,
-        s: [0; 12],
-    }),
-    PerHartCell::new(KernelResumeCtx {
-        sp: 0,
-        ra: 0,
-        s: [0; 12],
-    }),
-    PerHartCell::new(KernelResumeCtx {
-        sp: 0,
-        ra: 0,
-        s: [0; 12],
-    }),
-    PerHartCell::new(KernelResumeCtx {
-        sp: 0,
-        ra: 0,
-        s: [0; 12],
-    }),
-    PerHartCell::new(KernelResumeCtx {
-        sp: 0,
-        ra: 0,
-        s: [0; 12],
-    }),
-    PerHartCell::new(KernelResumeCtx {
-        sp: 0,
-        ra: 0,
-        s: [0; 12],
-    }),
-    PerHartCell::new(KernelResumeCtx {
-        sp: 0,
-        ra: 0,
-        s: [0; 12],
-    }),
-    PerHartCell::new(KernelResumeCtx {
-        sp: 0,
-        ra: 0,
-        s: [0; 12],
-    }),
-];
+static RV64_KERNEL_RESUME_CTX: [PerHartCell<KernelResumeCtx>; MAX_BOOT_CPUS] =
+    [const { PerHartCell::new(KernelResumeCtx::zeroed()) }; MAX_BOOT_CPUS];
 
 /// Per-CPU trap-handler stack. Sized 64 KiB; the trap vector
 /// `csrrw`-swaps onto its top via `sscratch` so trap-handler frames
@@ -333,12 +351,19 @@ pub extern "C" fn tx_rv64_kernel_tls_from_trap_stack_top(trap_stack_top: usize) 
     0
 }
 
-/// Pointer to the local hart's [`KernelResumeCtx`]. Asm helpers
-/// load/store at the documented field offsets; Rust callers in
-/// `apply_trap_action` use the pointer directly.
-pub fn current_kernel_resume_ctx_ptr() -> *mut KernelResumeCtx {
-    let cpu = current_cpu_id();
+/// Pointer to one hart's [`KernelResumeCtx`].
+///
+/// Trap return code uses the hart identity recovered from the dedicated trap
+/// stack instead of consulting `tp` again.  This keeps a transient TLS error
+/// from selecting a second hart's suspended kernel context.
+pub fn kernel_resume_ctx_ptr_for_cpu(cpu: CpuId) -> *mut KernelResumeCtx {
+    assert!(cpu.0 < MAX_BOOT_CPUS, "invalid RV64 resume-context CPU");
     RV64_KERNEL_RESUME_CTX[cpu.0].as_ptr()
+}
+
+/// Pointer to the local hart's [`KernelResumeCtx`].
+pub fn current_kernel_resume_ctx_ptr() -> *mut KernelResumeCtx {
+    kernel_resume_ctx_ptr_for_cpu(current_cpu_id())
 }
 
 #[cfg(not(target_arch = "riscv64"))]
@@ -593,11 +618,6 @@ impl PmapIf for Platform {
     /// 用户态每条取指都会永久缺页。
     fn activate_user_pmap(root: &PmapRoot) {
         let asid_usable = hw_asid_tagging_usable();
-        // Keep the outgoing root resident until hardware has stopped using
-        // it.  During the switch both ASIDs are conservatively resident on
-        // this hart; an unnecessary shootdown is safe, an early root free is
-        // not.
-        let switch = begin_asid_switch_on_current_cpu(root.asid());
         #[cfg(target_arch = "riscv64")]
         unsafe {
             const SATP_MODE_SV39: usize = 0x8 << 60;
@@ -613,13 +633,19 @@ impl PmapIf for Platform {
             let satp = SATP_MODE_SV39 | (asid << 44) | ppn;
             // 快路径:回到同一个地址空间(常见的 syscall 返回)。不写 CSR、不 fence——
             // 这个 root 的 TLB 项仍有效(ASID 硬件按 ASID 隔离;退化硬件靠下面的切换即刷
-            // 保证 TLB 里只留当前空间的项)。
+            // 保证 TLB 里只留当前空间的项)。先做这个判断，避免同地址
+            // 空间的高频返回反复写 ASID_RESIDENCY / ASID_TLB_HARTS 共享缓存行。
             let current: usize;
             core::arch::asm!("csrr {satp}, satp", satp = out(reg) current, options(nomem, nostack));
             if current == satp {
-                finish_asid_switch_on_current_cpu(switch);
                 return;
             }
+
+            // Keep the outgoing root resident until hardware has stopped
+            // using it. During a real switch both ASIDs are conservatively
+            // resident on this hart; an unnecessary shootdown is safe, an
+            // early root free is not.
+            let switch = begin_asid_switch_on_current_cpu(root.asid());
             // 换了 root:写 satp。ASID 硬件(QEMU:16 位)上无需在地址空间
             // 切换点额外 fence:
             //  - TLB 项带 ASID 标签,切 ASID 不用 fence。
@@ -638,10 +664,14 @@ impl PmapIf for Platform {
             if !asid_usable {
                 core::arch::asm!("sfence.vma", options(nostack));
             }
+            finish_asid_switch_on_current_cpu(switch);
         }
-        finish_asid_switch_on_current_cpu(switch);
         #[cfg(not(target_arch = "riscv64"))]
-        let _ = root;
+        {
+            let _ = asid_usable;
+            let switch = begin_asid_switch_on_current_cpu(root.asid());
+            finish_asid_switch_on_current_cpu(switch);
+        }
     }
 }
 impl IrqIf for Platform {
@@ -1056,15 +1086,12 @@ impl SmpIf for Platform {
         if target.0 >= IPI_PENDING.len() {
             return;
         }
-        let locked = lock_ipi_targets(CpuMask::single(target));
         IPI_PENDING[target.0].fetch_or(ipi_kind_bit(kind), Ordering::AcqRel);
         send_sbi_ipi(CpuMask::single(target));
-        unlock_ipi_targets(locked);
     }
 
     fn broadcast_ipi(mask: CpuMask, kind: IpiKind) {
         let targets = remote_ipi_targets_from(mask, current_cpu_id());
-        let locked = lock_ipi_targets(targets);
         let mut bits = targets.bits();
         while bits != 0 {
             let cpu = bits.trailing_zeros() as usize;
@@ -1074,7 +1101,6 @@ impl SmpIf for Platform {
             bits &= bits - 1;
         }
         send_sbi_ipi(targets);
-        unlock_ipi_targets(locked);
     }
 
     fn ack_ipi(kind: IpiKind) {
@@ -1082,13 +1108,18 @@ impl SmpIf for Platform {
         if cpu.0 >= IPI_PENDING.len() {
             return;
         }
-        let locked = lock_ipi_targets(CpuMask::single(cpu));
         IPI_PENDING[cpu.0].fetch_and(!ipi_kind_bit(kind), Ordering::AcqRel);
         mark_ipi_ack(cpu, kind);
         if IPI_PENDING[cpu.0].load(Ordering::Acquire) == 0 {
             clear_supervisor_software_interrupt();
+            // A sender can publish a different kind between the zero check
+            // and the hardware clear. Re-observe after the clear and recreate
+            // the edge locally if that happened. This closes the lost-SSIP
+            // race without taking a lock in interrupt context.
+            if IPI_PENDING[cpu.0].load(Ordering::Acquire) != 0 {
+                send_sbi_ipi(CpuMask::single(cpu));
+            }
         }
-        unlock_ipi_targets(locked);
     }
 
     fn clear_ipi_ack_cpus(kind: IpiKind, mask: CpuMask) {
@@ -2077,32 +2108,6 @@ const fn ipi_kind_bit(kind: IpiKind) -> u8 {
     1u8 << ipi_kind_index(kind)
 }
 
-fn lock_ipi_targets(mask: CpuMask) -> u64 {
-    let mut bits = mask.bits() & CpuMask::first(MAX_BOOT_CPUS).bits();
-    let mut locked = 0;
-    while bits != 0 {
-        let cpu = bits.trailing_zeros() as usize;
-        while IPI_STATE_LOCKS[cpu]
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
-        let bit = 1u64 << cpu;
-        locked |= bit;
-        bits &= bits - 1;
-    }
-    locked
-}
-
-fn unlock_ipi_targets(mut bits: u64) {
-    while bits != 0 {
-        let cpu = bits.trailing_zeros() as usize;
-        IPI_STATE_LOCKS[cpu].store(false, Ordering::Release);
-        bits &= bits - 1;
-    }
-}
-
 fn mark_ipi_ack(cpu_id: CpuId, kind: IpiKind) {
     if cpu_id.0 < u64::BITS as usize {
         IPI_ACKED_CPUS[ipi_kind_index(kind)].fetch_or(1u64 << cpu_id.0, Ordering::AcqRel);
@@ -2205,6 +2210,11 @@ pub(crate) fn remote_sfence_vma_asid_batch(asid: Asid, invalidations: &[PmapInva
             // local stale-translation bug to a remote hart.
             let error = sbi_remote_sfence_vma(targets.bits(), 0, 0, 0);
             assert_eq!(error, 0, "SBI remote full sfence.vma failed");
+            return;
+        }
+        if pmap::should_flush_entire_asid(invalidations) {
+            let error = sbi_remote_sfence_vma_asid(targets.bits(), 0, 0, 0, asid.0 as usize);
+            assert_eq!(error, 0, "SBI remote full-ASID sfence.vma failed");
             return;
         }
         for invalidation in invalidations {

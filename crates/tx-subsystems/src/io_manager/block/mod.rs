@@ -461,6 +461,16 @@ impl BlockQueue {
         self.pending.is_empty()
     }
 
+    pub(crate) fn dispatch_blocked_len(&self) -> usize {
+        self.dispatch_blocked.len()
+    }
+
+    pub(crate) fn front_dispatch_blocked(&self) -> bool {
+        self.pending
+            .front()
+            .is_some_and(|bio| self.dispatch_blocked.contains(&bio.id))
+    }
+
     pub fn submit(&mut self, plan: BioPlan) -> Result<SubmitOutcome, QueueError> {
         if plan.lba.is_empty() && !matches!(plan.op, BlockOp::Flush | BlockOp::Barrier) {
             return Err(QueueError::EmptyRange);

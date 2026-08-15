@@ -477,7 +477,11 @@ static LA64_KERNEL_RESUME_CTX: [PerHartCell<KernelResumeCtx>; LA64_MAX_BOOT_CPUS
 };
     LA64_MAX_BOOT_CPUS];
 
-const LA64_TRAP_STACK_SIZE: usize = 16 * 1024;
+// Direct trap-resume paths can execute cache-hit VFS/VM operations before
+// returning to userspace.  Keep the per-hart trap stack at the same depth as
+// RV64: 16 KiB was small enough for a BuildStorm `openat` chain to run past
+// its bottom and corrupt the adjacent KernelResumeCtx.
+const LA64_TRAP_STACK_SIZE: usize = 64 * 1024;
 
 #[repr(C, align(16))]
 pub struct La64TrapStack(pub [u8; LA64_TRAP_STACK_SIZE]);

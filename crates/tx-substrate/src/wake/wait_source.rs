@@ -72,6 +72,24 @@ impl SubscriberId {
     }
 }
 
+/// One subscriber row copied for an opt-in kernel stall report.
+///
+/// This surface is intentionally read-only and allocation-backed: production
+/// notify/register paths never call it.  It lets a stalled userspace task be
+/// connected to the exact object-owned wait source without exposing the
+/// subscriber table itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WaitSubscriberDiagnostic {
+    pub source: WaitSourceId,
+    pub source_pending_mask: u64,
+    pub source_subscribers: usize,
+    pub task_id_low: u32,
+    pub generation: WaitGeneration,
+    pub interests: InterestMask,
+    pub mailbox_len: usize,
+    pub mailbox_has_waker: bool,
+}
+
 /// Object-owned wait publication point.
 /// Each semantic object that may have blocked operations retrying on
 /// state transition owns one `WaitSource`. Subscribers register via
@@ -101,6 +119,38 @@ impl WaitSource {
 
     pub fn subscriber_count(&self) -> usize {
         self.subscribers.lock().len()
+    }
+
+    pub fn subscriber_diagnostics_for_task(
+        &self,
+        task_id_low: u32,
+    ) -> Vec<WaitSubscriberDiagnostic> {
+        self.subscriber_diagnostics()
+            .into_iter()
+            .filter(|subscriber| subscriber.task_id_low == task_id_low)
+            .collect()
+    }
+
+    pub fn subscriber_diagnostics(&self) -> Vec<WaitSubscriberDiagnostic> {
+        let subscribers = self.subscribers.lock();
+        let source_subscribers = subscribers.len();
+        let source_pending_mask = self.pending_mask.load(Ordering::Acquire);
+        subscribers
+            .iter()
+            .filter_map(|subscriber| {
+                let mailbox = subscriber.mailbox.upgrade()?;
+                Some(WaitSubscriberDiagnostic {
+                    source: self.id,
+                    source_pending_mask,
+                    source_subscribers,
+                    task_id_low: mailbox.task_id_low(),
+                    generation: subscriber.generation,
+                    interests: subscriber.interests,
+                    mailbox_len: mailbox.len(),
+                    mailbox_has_waker: mailbox.has_waker(),
+                })
+            })
+            .collect()
     }
 
     /// Snapshot latched readiness bits for opt-in kernel diagnostics.
@@ -615,6 +665,25 @@ pub fn registry_summary() -> RegistrySummary {
 /// the source was never registered.
 pub fn lookup_source(id: WaitSourceId) -> Option<Arc<WaitSource>> {
     REGISTRY.lock().get(&id.raw()).cloned()
+}
+
+/// Locate every live object wait currently subscribed by one task.
+/// Used only by explicit stall diagnostics.
+pub fn subscriber_diagnostics_for_task(task_id_low: u32) -> Vec<WaitSubscriberDiagnostic> {
+    let sources: Vec<Arc<WaitSource>> = REGISTRY.lock().values().cloned().collect();
+    sources
+        .into_iter()
+        .flat_map(|source| source.subscriber_diagnostics_for_task(task_id_low))
+        .collect()
+}
+
+/// Snapshot every live subscriber in the registry for an explicit stall dump.
+pub fn all_subscriber_diagnostics() -> Vec<WaitSubscriberDiagnostic> {
+    let sources: Vec<Arc<WaitSource>> = REGISTRY.lock().values().cloned().collect();
+    sources
+        .into_iter()
+        .flat_map(|source| source.subscriber_diagnostics())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

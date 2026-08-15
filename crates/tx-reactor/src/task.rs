@@ -439,18 +439,13 @@ impl TaskTable {
     }
 
     pub(crate) fn drain_wake_ids(&mut self) -> Vec<TaskId> {
-        let mut woken = Vec::new();
-        loop {
-            let id = {
-                let mut queue = self.wake_queue.lock();
-                queue.pop_front()
-            };
-            let Some(id) = id else {
-                break;
-            };
-            let previous = self.queued_wakes.fetch_sub(1, Ordering::AcqRel);
-            debug_assert!(previous > 0, "wake queue counter underflow");
-            woken.push(id);
+        let woken: Vec<_> = {
+            let mut queue = self.wake_queue.lock();
+            queue.drain(..).collect()
+        };
+        if !woken.is_empty() {
+            let previous = self.queued_wakes.fetch_sub(woken.len(), Ordering::AcqRel);
+            debug_assert!(previous >= woken.len(), "wake queue counter underflow");
         }
         woken
     }
@@ -503,7 +498,14 @@ impl TaskTable {
         match task.status {
             TaskStatus::Parked => task.status = TaskStatus::Runnable,
             TaskStatus::Runnable => {}
-            TaskStatus::Polling | TaskStatus::Completed | TaskStatus::Cancelled => return None,
+            TaskStatus::Polling => {
+                // Mailbox delivery does not have to invoke the future's raw
+                // waker.  Retain the race for the poll/park commit instead of
+                // exposing a future that is still owned by another hart.
+                task.wake_state.request_while_polling();
+                return None;
+            }
+            TaskStatus::Completed | TaskStatus::Cancelled => return None,
         }
         let hint = task.mailbox.take_scheduler_hint();
         Some((task.handle(), hint))
@@ -666,6 +668,27 @@ mod tests {
         assert_eq!(drained, [handle.id()]);
         assert_eq!(tasks.take_wake_if_parked_by_id_with_hint(handle.id()), None);
 
+        assert!(matches!(
+            tasks.finish_polled_pending(key, future),
+            Ok(PendingPollCommit::Woken { .. })
+        ));
+        assert_eq!(tasks.status(handle), Some(TaskStatus::Runnable));
+    }
+
+    #[test]
+    fn mailbox_wake_during_poll_is_deferred_to_poll_commit() {
+        let mut tasks = TaskTable::new();
+        let handle = tasks.submit(pending::<()>());
+        let (key, future, _, _) = tasks
+            .take_runnable_future_by_id(handle.id())
+            .expect("take task for polling");
+
+        assert_eq!(
+            tasks.make_owner_runnable_with_hint(handle.id(), handle.generation()),
+            None,
+            "mailbox delivery must not expose a future owned by a polling hart"
+        );
+        assert_eq!(tasks.status(handle), Some(TaskStatus::Polling));
         assert!(matches!(
             tasks.finish_polled_pending(key, future),
             Ok(PendingPollCommit::Woken { .. })

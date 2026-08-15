@@ -290,8 +290,19 @@ struct FutexWaiter {
     interest_mask: u64,
 }
 
-static EXACT_WAITERS: SpinMutex<Option<BTreeMap<FutexKey, FutexEntry>>> = SpinMutex::new(None);
-static WAITING_TIDS: SpinMutex<BTreeMap<u32, usize>> = SpinMutex::new(BTreeMap::new());
+// Exact futex keys are partitioned by the same fixed bucket count used for
+// wake routing. Rust's compiler worker pools wait on many unrelated words;
+// one global map lock serialized all WAIT/WAKE traffic across every process.
+static EXACT_WAITERS: [SpinMutex<Option<BTreeMap<FutexKey, FutexEntry>>>; FUTEX_BUCKET_COUNT] =
+    [const { SpinMutex::new(None) }; FUTEX_BUCKET_COUNT];
+
+fn exact_waiter_bucket(key: FutexKey) -> usize {
+    let domain = match key.domain {
+        FutexDomain::AddressSpace(id) => id.rotate_left(13),
+        FutexDomain::SharedPage(page) => u64::from(page).rotate_left(29),
+    };
+    bucket_index(key.offset ^ domain)
+}
 
 fn key_for(aspace: &AddressSpace, uaddr: u64, private: bool) -> Option<FutexKey> {
     let address_space_key = || FutexKey {
@@ -328,46 +339,18 @@ fn new_entry() -> FutexEntry {
     }
 }
 
-fn register_waiting_tid(tid: Option<u32>) {
-    let Some(tid) = tid else {
-        return;
-    };
-    let mut tids = WAITING_TIDS.lock();
-    let count = tids.entry(tid).or_insert(0);
-    *count = count.saturating_add(1);
-}
-
-fn unregister_waiting_tid(tid: Option<u32>) {
-    let Some(tid) = tid else {
-        return;
-    };
-    let mut tids = WAITING_TIDS.lock();
-    if let Some(count) = tids.get_mut(&tid) {
-        *count = count.saturating_sub(1);
-        if *count == 0 {
-            tids.remove(&tid);
-        }
-    }
-}
-
 pub fn thread_has_waiter(tid: u32) -> bool {
-    if WAITING_TIDS.lock().get(&tid).copied().unwrap_or(0) != 0 {
-        return true;
-    }
-    EXACT_WAITERS
-        .lock()
-        .as_ref()
-        .map(|table| {
+    EXACT_WAITERS.iter().any(|bucket| {
+        bucket.lock().as_ref().is_some_and(|table| {
             table
                 .values()
                 .any(|entry| entry.waiters.iter().any(|waiter| waiter.tid == Some(tid)))
         })
-        .unwrap_or(false)
+    })
 }
 
 fn new_waiter(tid: Option<u32>, interest_mask: u64) -> FutexWaiter {
     let wait_point = notification::new_wait_point();
-    register_waiting_tid(tid);
     let source_id = tx_substrate::wake::WaitEndpoint::source_id(wait_point.endpoint()).raw();
     let (_, wait_source) = wait_point.into_parts();
     FutexWaiter {
@@ -392,7 +375,7 @@ fn unregister_exact_waiter(
     let Some(key) = key_for(aspace, uaddr, private) else {
         return false;
     };
-    let mut table_guard = EXACT_WAITERS.lock();
+    let mut table_guard = EXACT_WAITERS[exact_waiter_bucket(key)].lock();
     let Some(table) = table_guard.as_mut() else {
         return false;
     };
@@ -409,7 +392,7 @@ fn unregister_exact_waiter(
     let Some(waiter) = entry.waiters.remove(pos) else {
         return false;
     };
-    unregister_waiting_tid(waiter.tid);
+    let _ = waiter.tid;
     if entry.waiters.is_empty() {
         table.remove(&key);
     }
@@ -425,7 +408,7 @@ fn exact_waiter_registered(
     let Some(key) = key_for(aspace, uaddr, private) else {
         return false;
     };
-    EXACT_WAITERS
+    EXACT_WAITERS[exact_waiter_bucket(key)]
         .lock()
         .as_ref()
         .and_then(|table| table.get(&key))
@@ -468,19 +451,23 @@ fn entry_sample_subscribers(entry: &FutexEntry) -> usize {
 #[cfg(test)]
 fn debug_exact_waiter_count() -> usize {
     EXACT_WAITERS
-        .lock()
-        .as_ref()
-        .map(|table| table.len())
-        .unwrap_or(0)
+        .iter()
+        .map(|bucket| bucket.lock().as_ref().map(BTreeMap::len).unwrap_or(0))
+        .sum()
 }
 
 #[cfg(test)]
 fn debug_exact_waiter_total() -> usize {
     EXACT_WAITERS
-        .lock()
-        .as_ref()
-        .map(|table| table.values().map(entry_waiter_count).sum())
-        .unwrap_or(0)
+        .iter()
+        .map(|bucket| {
+            bucket
+                .lock()
+                .as_ref()
+                .map(|table| table.values().map(entry_waiter_count).sum::<usize>())
+                .unwrap_or(0)
+        })
+        .sum()
 }
 
 #[cfg(test)]
@@ -496,45 +483,58 @@ struct FutexWaiterDebugRow {
 #[cfg(test)]
 fn debug_exact_waiter_snapshot() -> Vec<FutexWaiterDebugRow> {
     EXACT_WAITERS
-        .lock()
-        .as_ref()
-        .map(|table| {
-            table
-                .iter()
-                .map(|(key, entry)| FutexWaiterDebugRow {
-                    uaddr: key.offset,
-                    waiters: entry_waiter_count(entry),
-                    interest_mask: entry_interest_mask(entry),
-                    source_id: entry_sample_source_id(entry),
-                    subscribers: entry_sample_subscribers(entry),
+        .iter()
+        .flat_map(|bucket| {
+            bucket
+                .lock()
+                .as_ref()
+                .map(|table| {
+                    table
+                        .iter()
+                        .map(|(key, entry)| FutexWaiterDebugRow {
+                            uaddr: key.offset,
+                            waiters: entry_waiter_count(entry),
+                            interest_mask: entry_interest_mask(entry),
+                            source_id: entry_sample_source_id(entry),
+                            subscribers: entry_sample_subscribers(entry),
+                        })
+                        .collect::<Vec<_>>()
                 })
-                .collect()
+                .unwrap_or_default()
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 #[cfg(test)]
 fn exact_wait_source_for_source_id(source_id: u64) -> Option<Arc<WaitSource>> {
-    EXACT_WAITERS
-        .lock()
-        .as_ref()?
-        .values()
-        .flat_map(|entry| entry.waiters.iter())
-        .find(|waiter| waiter.source_id == source_id)
-        .map(|waiter| waiter.wait_source.clone())
+    for bucket in &EXACT_WAITERS {
+        let table = bucket.lock();
+        let Some(table) = table.as_ref() else {
+            continue;
+        };
+        if let Some(source) = table
+            .values()
+            .flat_map(|entry| entry.waiters.iter())
+            .find(|waiter| waiter.source_id == source_id)
+            .map(|waiter| waiter.wait_source.clone())
+        {
+            return Some(source);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
 fn reset_exact_waiters_for_tests() {
-    if let Some(table) = EXACT_WAITERS.lock().take() {
-        for (_, entry) in table {
-            for waiter in entry.waiters {
-                release_waiter_source(waiter.source_id);
-                unregister_waiting_tid(waiter.tid);
+    for bucket in &EXACT_WAITERS {
+        if let Some(table) = bucket.lock().take() {
+            for (_, entry) in table {
+                for waiter in entry.waiters {
+                    release_waiter_source(waiter.source_id);
+                }
             }
         }
     }
-    WAITING_TIDS.lock().clear();
 }
 
 /// Initialise the bucket table. Idempotent: a second call is a
@@ -664,7 +664,7 @@ fn step_futex_wait_masked_with_tid(
         return StepOutcome::Err(Errno::EFAULT);
     };
     let source_id = {
-        let mut table_guard = EXACT_WAITERS.lock();
+        let mut table_guard = EXACT_WAITERS[exact_waiter_bucket(key)].lock();
         let table = table_guard.get_or_insert_with(BTreeMap::new);
         let observed_again: u32 = match aspace.read_user(UserPtr::<u32>::new(uaddr as usize), guard)
         {
@@ -847,7 +847,7 @@ where
         return StepOutcome::Err(Errno::EFAULT);
     };
     let (waiters, waiters_before, subscribers_before) = {
-        let mut table_guard = EXACT_WAITERS.lock();
+        let mut table_guard = EXACT_WAITERS[exact_waiter_bucket(key)].lock();
         let Some(table) = table_guard.as_mut() else {
             emit_empty_wake_table_snapshot(uaddr);
             emit_futex_debug_sample(
@@ -878,7 +878,6 @@ where
         let mut remaining = VecDeque::new();
         while let Some(waiter) = entry.waiters.pop_front() {
             if waiters.len() < n as usize && (waiter.interest_mask & wake_mask) != 0 {
-                unregister_waiting_tid(waiter.tid);
                 waiters.push(waiter);
             } else {
                 remaining.push_back(waiter);
@@ -951,7 +950,7 @@ pub fn step_futex_cancel_wait_in(
         return StepOutcome::Err(Errno::EINVAL);
     }
     let key = private_key_for(aspace, uaddr);
-    let mut table_guard = EXACT_WAITERS.lock();
+    let mut table_guard = EXACT_WAITERS[exact_waiter_bucket(key)].lock();
     let Some(table) = table_guard.as_mut() else {
         return StepOutcome::Done(());
     };
@@ -971,7 +970,6 @@ pub fn step_futex_cancel_wait_in(
         table.remove(&key);
     }
     if let Some(waiter) = cancelled {
-        unregister_waiting_tid(waiter.tid);
         release_waiter_source(waiter.source_id);
     }
     if let Some(table) = table_guard.as_ref() {
@@ -1034,35 +1032,101 @@ pub fn step_futex_requeue_scoped_in(
     let Some(target_key) = key_for(aspace, uaddr2, private) else {
         return StepOutcome::Err(Errno::EFAULT);
     };
-    let moved = {
-        let mut table_guard = EXACT_WAITERS.lock();
-        let Some(table) = table_guard.as_mut() else {
+    let source_bucket = exact_waiter_bucket(source_key);
+    let target_bucket = exact_waiter_bucket(target_key);
+    let moved = if source_bucket == target_bucket {
+        let mut guard = EXACT_WAITERS[source_bucket].lock();
+        let Some(table) = guard.as_mut() else {
             return StepOutcome::Done(total);
         };
-        let Some(source_entry) = table.get_mut(&source_key) else {
-            return StepOutcome::Done(total);
-        };
-        let mut moved_waiters = VecDeque::new();
-        for _ in 0..requeue_n {
-            let Some(waiter) = source_entry.waiters.pop_front() else {
-                break;
-            };
-            moved_waiters.push_back(waiter);
-        }
-        let moved = moved_waiters.len();
+        let mut moved_waiters = take_requeued_waiters(table, source_key, requeue_n);
+        let moved = moved_waiters.len() as u32;
         if moved == 0 {
             return StepOutcome::Done(total);
         }
-        let source_now_empty = source_entry.waiters.is_empty();
-        if source_now_empty {
-            table.remove(&source_key);
-        }
-        let target_entry = table.entry(target_key).or_insert_with(new_entry);
-        target_entry.waiters.append(&mut moved_waiters);
+        table
+            .entry(target_key)
+            .or_insert_with(new_entry)
+            .waiters
+            .append(&mut moved_waiters);
         maybe_emit_requeue_table_snapshot(table, uaddr2);
-        moved as u32
+        moved
+    } else if source_bucket < target_bucket {
+        let mut source_guard = EXACT_WAITERS[source_bucket].lock();
+        let mut target_guard = EXACT_WAITERS[target_bucket].lock();
+        move_requeued_waiters_between_buckets(
+            &mut source_guard,
+            &mut target_guard,
+            source_key,
+            target_key,
+            requeue_n,
+            uaddr2,
+        )
+    } else {
+        // Always acquire the lower-numbered shard first so two opposite
+        // FUTEX_REQUEUE operations cannot deadlock.
+        let mut target_guard = EXACT_WAITERS[target_bucket].lock();
+        let mut source_guard = EXACT_WAITERS[source_bucket].lock();
+        move_requeued_waiters_between_buckets(
+            &mut source_guard,
+            &mut target_guard,
+            source_key,
+            target_key,
+            requeue_n,
+            uaddr2,
+        )
     };
     StepOutcome::Done(total.saturating_add(moved))
+}
+
+fn take_requeued_waiters(
+    table: &mut BTreeMap<FutexKey, FutexEntry>,
+    source_key: FutexKey,
+    requeue_n: u32,
+) -> VecDeque<FutexWaiter> {
+    let mut moved = VecDeque::new();
+    let remove_source = {
+        let Some(source) = table.get_mut(&source_key) else {
+            return moved;
+        };
+        for _ in 0..requeue_n {
+            let Some(waiter) = source.waiters.pop_front() else {
+                break;
+            };
+            moved.push_back(waiter);
+        }
+        source.waiters.is_empty()
+    };
+    if remove_source {
+        table.remove(&source_key);
+    }
+    moved
+}
+
+fn move_requeued_waiters_between_buckets(
+    source_guard: &mut Option<BTreeMap<FutexKey, FutexEntry>>,
+    target_guard: &mut Option<BTreeMap<FutexKey, FutexEntry>>,
+    source_key: FutexKey,
+    target_key: FutexKey,
+    requeue_n: u32,
+    target_uaddr: u64,
+) -> u32 {
+    let Some(source) = source_guard.as_mut() else {
+        return 0;
+    };
+    let mut moved_waiters = take_requeued_waiters(source, source_key, requeue_n);
+    let moved = moved_waiters.len() as u32;
+    if moved == 0 {
+        return 0;
+    }
+    let target = target_guard.get_or_insert_with(BTreeMap::new);
+    target
+        .entry(target_key)
+        .or_insert_with(new_entry)
+        .waiters
+        .append(&mut moved_waiters);
+    maybe_emit_requeue_table_snapshot(target, target_uaddr);
+    moved
 }
 
 /// `futex(uaddr, FUTEX_WAKE, n, ...)`.

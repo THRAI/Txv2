@@ -23,6 +23,53 @@ pub(crate) const MAX_EPOCH_CPUS: usize = 64;
 static GLOBAL_DOMAIN: EpochDomain = EpochDomain::new();
 static DRAIN_TRACE_SAMPLE: AtomicU64 = AtomicU64::new(0);
 
+/// Last EBR destructor invocation observed on one CPU.
+///
+/// The fields are deliberately plain integers backed by atomics. Fatal-trap
+/// diagnostics can therefore inspect them without allocating or taking an EBR
+/// lock while the failing hart may still be inside the callback itself.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReclaimTrace {
+    pub sequence: u64,
+    /// Zero after a callback returned, one while it is executing.
+    pub active: bool,
+    /// 1 = intrusive EBR head, 2 = zone slot, 3 = deferred Published drop.
+    pub kind: usize,
+    pub object: usize,
+    pub callback: usize,
+    pub next: usize,
+}
+
+#[repr(align(64))]
+struct ReclaimTraceCell {
+    sequence: AtomicU64,
+    active: AtomicBool,
+    kind: AtomicUsize,
+    object: AtomicUsize,
+    callback: AtomicUsize,
+    next: AtomicUsize,
+}
+
+impl ReclaimTraceCell {
+    const fn new() -> Self {
+        Self {
+            sequence: AtomicU64::new(0),
+            active: AtomicBool::new(false),
+            kind: AtomicUsize::new(0),
+            object: AtomicUsize::new(0),
+            callback: AtomicUsize::new(0),
+            next: AtomicUsize::new(0),
+        }
+    }
+}
+
+static RECLAIM_TRACE: [ReclaimTraceCell; MAX_EPOCH_CPUS] =
+    [const { ReclaimTraceCell::new() }; MAX_EPOCH_CPUS];
+
+pub(crate) const RECLAIM_KIND_INTRUSIVE: usize = 1;
+pub(crate) const RECLAIM_KIND_ZONE: usize = 2;
+pub(crate) const RECLAIM_KIND_DEFERRED_PUBLICATION: usize = 3;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EpochError {
     AlreadyInitialized,
@@ -578,6 +625,23 @@ impl EpochDomain {
 
     #[track_caller]
     fn guard(&'static self) -> Guard<'static> {
+        self.guard_with_admission_hook(|| {})
+    }
+
+    /// Enter the reader epoch after publishing a value which was stable across
+    /// the admission window.
+    ///
+    /// Loading the global epoch and publishing it into the CPU-local slot are
+    /// separate operations.  Without the validation load below, two remote
+    /// drainers can advance the domain twice between those operations and make
+    /// an old root reclaimable immediately before this reader dereferences it.
+    /// No protected load has happened when the validation fails.  The slow
+    /// path therefore repairs the published value while holding the same lock
+    /// that serialises the epoch CAS.  It deliberately keeps the local epoch
+    /// non-zero throughout: leaving and retrying would repeatedly expose a
+    /// quiescent window to aggressive remote drainers and can livelock a
+    /// reader on an otherwise idle SMP system.
+    fn guard_with_admission_hook(&'static self, admission_hook: impl FnOnce()) -> Guard<'static> {
         assert!(
             self.initialized.load(Ordering::Acquire),
             "epoch::guard called before epoch::init_on_bsp"
@@ -599,7 +663,6 @@ impl EpochDomain {
             "epoch::guard current CPU is not online in the epoch domain"
         );
 
-        let current_epoch = self.global_epoch.0.load(Ordering::Acquire);
         let active_epoch = local.current();
         if active_epoch != 0 {
             local.unpin();
@@ -608,11 +671,30 @@ impl EpochDomain {
                 cpu_id.0, active_epoch
             );
         }
+        let current_epoch = self.global_epoch.0.load(Ordering::Acquire);
+        admission_hook();
         local.enter(current_epoch);
         // Publish the local epoch before any protected load can float above the
-        // guard acquisition. This is the core EBR reader-side ordering rule.
+        // guard acquisition, then validate that no complete epoch advance
+        // raced ahead of the publication.
         fence(Ordering::SeqCst);
-        Guard::new(local, cpu_id, current_epoch, cpu_pin)
+        let observed_epoch = self.global_epoch.0.load(Ordering::Acquire);
+        let entered_epoch = if observed_epoch == current_epoch {
+            current_epoch
+        } else {
+            // `try_advance_epoch_with` performs its final membership check and
+            // epoch CAS under this lock.  Once held, every earlier scan has
+            // either committed or become stale.  Republish the newest epoch
+            // without ever advertising quiescence; a scan racing after this
+            // store may advance at most once, which is covered by the domain's
+            // two-epoch reclamation grace period.
+            let _epoch_commit = self.lock.lock();
+            let latest_epoch = self.global_epoch.0.load(Ordering::Acquire);
+            local.republish(latest_epoch);
+            fence(Ordering::SeqCst);
+            latest_epoch
+        };
+        Guard::new(local, cpu_id, entered_epoch, cpu_pin)
     }
 
     /// Return a borrow-mode guard for the current CPU if one is already active
@@ -723,6 +805,14 @@ impl EpochDomain {
             let current = self.global_epoch.0.load(Ordering::Acquire);
             let next = current.saturating_add(1);
             let mut blocked = false;
+
+            // Pair with the reader-side SeqCst publication fence. Without a
+            // scanner fence, a weakly ordered hart may observe a participant
+            // as quiescent, then commit an epoch advance after that reader has
+            // published its local epoch. Two such stale scans can otherwise
+            // advance through the complete grace period and reclaim a root
+            // while the newly admitted reader is cloning it.
+            fence(Ordering::SeqCst);
 
             for cpu in 0..self.possible_cpus.0.load(Ordering::Acquire) {
                 let state = &self.cpu_states[cpu];
@@ -935,9 +1025,17 @@ impl EpochDomain {
                 (*current).next = current;
             }
             let reclaim = unsafe { (*current).reclaim };
+            let trace_sequence = begin_reclaim_trace(
+                local_guard.cpu_id(),
+                RECLAIM_KIND_INTRUSIVE,
+                current as usize,
+                reclaim as usize,
+                head as usize,
+            );
             local_guard.with_local_execution_open(|local_guard| unsafe {
                 reclaim(current, local_guard);
             });
+            finish_reclaim_trace(local_guard.cpu_id(), trace_sequence);
             reclaimed += 1;
         }
         reclaimed
@@ -952,9 +1050,17 @@ impl EpochDomain {
         while let Some(current) = head {
             head = crate::zone::retiring_next(current);
             crate::zone::set_retiring_next(current, Some(current));
+            let trace_sequence = begin_reclaim_trace(
+                local_guard.cpu_id(),
+                RECLAIM_KIND_ZONE,
+                current.raw() as usize,
+                crate::zone::reclaim_retired_slot as usize,
+                head.map_or(0, |next| next.raw() as usize),
+            );
             local_guard.with_local_execution_open(|_| unsafe {
                 crate::zone::reclaim_retired_slot(current);
             });
+            finish_reclaim_trace(local_guard.cpu_id(), trace_sequence);
             reclaimed += 1;
         }
         reclaimed
@@ -1039,6 +1145,60 @@ fn emit_epoch_trace(name: &[u8], value: i64) {
     if let Some(observer) = tx_observe::current() {
         observer.debug_counter(name, value);
     }
+}
+
+pub(crate) fn begin_reclaim_trace(
+    cpu: CpuId,
+    kind: usize,
+    object: usize,
+    callback: usize,
+    next: usize,
+) -> u64 {
+    // Reclaim tracing is diagnostic-only.  Keeping it permanently enabled
+    // adds several atomic stores around every EBR destructor; persistent VM
+    // roots can retire a very large number of nodes during BuildStorm.
+    if !cfg!(tx_ds_metrics) {
+        return 0;
+    }
+    let Some(trace) = RECLAIM_TRACE.get(cpu.0) else {
+        return 0;
+    };
+    let sequence = trace.sequence.load(Ordering::Relaxed).wrapping_add(1);
+    trace.kind.store(kind, Ordering::Relaxed);
+    trace.object.store(object, Ordering::Relaxed);
+    trace.callback.store(callback, Ordering::Relaxed);
+    trace.next.store(next, Ordering::Relaxed);
+    trace.sequence.store(sequence, Ordering::Relaxed);
+    trace.active.store(true, Ordering::Release);
+    sequence
+}
+
+pub(crate) fn finish_reclaim_trace(cpu: CpuId, sequence: u64) {
+    if !cfg!(tx_ds_metrics) {
+        return;
+    }
+    let Some(trace) = RECLAIM_TRACE.get(cpu.0) else {
+        return;
+    };
+    if trace.sequence.load(Ordering::Relaxed) == sequence {
+        trace.active.store(false, Ordering::Release);
+    }
+}
+
+pub fn reclaim_trace(cpu: CpuId) -> Option<ReclaimTrace> {
+    if !cfg!(tx_ds_metrics) {
+        return None;
+    }
+    let trace = RECLAIM_TRACE.get(cpu.0)?;
+    let active = trace.active.load(Ordering::Acquire);
+    Some(ReclaimTrace {
+        sequence: trace.sequence.load(Ordering::Relaxed),
+        active,
+        kind: trace.kind.load(Ordering::Relaxed),
+        object: trace.object.load(Ordering::Relaxed),
+        callback: trace.callback.load(Ordering::Relaxed),
+        next: trace.next.load(Ordering::Relaxed),
+    })
 }
 
 #[cfg(test)]
@@ -1168,6 +1328,11 @@ pub fn init_on_ap(cpu: CpuId) -> Result<(), EpochError> {
 #[track_caller]
 pub(crate) fn guard() -> Guard<'static> {
     GLOBAL_DOMAIN.guard()
+}
+
+#[doc(hidden)]
+pub fn guard_with_admission_hook_for_test(admission_hook: impl FnOnce()) -> Guard<'static> {
+    GLOBAL_DOMAIN.guard_with_admission_hook(admission_hook)
 }
 
 pub(crate) fn borrow_guard() -> Option<Guard<'static>> {

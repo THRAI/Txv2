@@ -41,10 +41,15 @@ mod readiness {
         let read_source = wait_routing::new_wait_source(read_source_id);
         let write_source_id = crate::allocate_notification_source_id();
         let write_source = wait_routing::new_wait_source(write_source_id);
-        crate::wait_source::register_wait_source_with_id(read_source_id, Arc::clone(&read_source));
-        crate::wait_source::register_wait_source_with_id(
+        crate::wait_source::register_wait_source_with_diagnostic_kind(
+            read_source_id,
+            Arc::clone(&read_source),
+            "vfs-readable",
+        );
+        crate::wait_source::register_wait_source_with_diagnostic_kind(
             write_source_id,
             Arc::clone(&write_source),
+            "vfs-writable",
         );
         RNodeWaitPoints {
             read_source_id,

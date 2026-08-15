@@ -169,6 +169,37 @@ pub(super) async fn sys_brk(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResu
     }
 }
 
+/// Non-waiting `brk(2)` transaction used by the trap-local fast lane.
+///
+/// `AddressSpace::try_brk` is already the canonical first phase of
+/// [`sys_brk`].  Keep the Linux return convention here as well, but decline
+/// the fast lane on `WouldBlock` so the ordinary reactor driver can wait for
+/// the VM range lock instead of spinning in trap context.
+pub(super) fn sys_brk_try_oneshot(args: [u64; 6], ctx: &SyscallCtx<'_>) -> Option<SyscallResult> {
+    let requested = args[0];
+    let brk_base = ctx.process.brk_base();
+    let current_brk = ctx.process.current_brk();
+
+    if requested == 0 {
+        return Some(SyscallResult::Return(current_brk as i64));
+    }
+    if brk_growth_exceeds_soft_limit(brk_base, current_brk, requested) {
+        return Some(SyscallResult::Return(current_brk as i64));
+    }
+
+    let base = UserVirtAddr(brk_base as usize);
+    let current = UserVirtAddr(current_brk as usize);
+    let requested_addr = UserVirtAddr(requested as usize);
+    match ctx.aspace.try_brk(base, current, requested_addr) {
+        Ok(new_brk) => {
+            ctx.process.set_current_brk(new_brk.0 as u64);
+            Some(SyscallResult::Return(new_brk.0 as i64))
+        }
+        Err(VmMapError::WouldBlock) => None,
+        Err(_) => Some(SyscallResult::Return(current_brk as i64)),
+    }
+}
+
 // =====================================================================
 // Slice 2 of the shell-prompt roadmap — VM syscalls.
 //

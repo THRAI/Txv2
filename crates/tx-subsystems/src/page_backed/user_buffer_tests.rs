@@ -42,6 +42,53 @@ fn open_file_for_pc(pc: &PageContainer) -> OpenFile {
     )
 }
 
+#[test]
+fn pagebacked_materialize_retry_stays_internal_without_progress() {
+    let _lock = EPOCH_TEST_LOCK
+        .lock()
+        .expect("page-backed user-buffer test lock");
+    setup_host_substrate();
+    let pc = PageContainer::new(
+        PageContainerKind::Anon {
+            swap_policy: AnonSwapPolicy::Reclaimable,
+        },
+        1,
+    );
+    let reader = open_file_for_pc(&pc);
+    reader.set_offset(73);
+
+    assert_eq!(
+        super::user_buffer::continue_after_materialize_retry(&reader, 73, 0),
+        V3Out::Continue {
+            progress: step_engine::ByteProgress::EMPTY
+        }
+    );
+    assert_eq!(reader.offset(), 73);
+}
+
+#[test]
+fn pagebacked_materialize_retry_commits_completed_chunks_once() {
+    let _lock = EPOCH_TEST_LOCK
+        .lock()
+        .expect("page-backed user-buffer test lock");
+    setup_host_substrate();
+    let pc = PageContainer::new(
+        PageContainerKind::Anon {
+            swap_policy: AnonSwapPolicy::Reclaimable,
+        },
+        1,
+    );
+    let reader = open_file_for_pc(&pc);
+
+    assert_eq!(
+        super::user_buffer::continue_after_materialize_retry(&reader, 4096, 4096),
+        V3Out::Continue {
+            progress: step_engine::ByteProgress::new(4096)
+        }
+    );
+    assert_eq!(reader.offset(), 4096);
+}
+
 /// User-space mapping fixture: an `AddressSpace` with a single anon
 /// `PageContainer`-backed `VmEntry` covering `[user_va, user_va +
 /// page_count * 4096)`. The `user_pc` is a kernel-side handle on the

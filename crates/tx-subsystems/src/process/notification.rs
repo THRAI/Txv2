@@ -29,7 +29,11 @@ mod exit_source {
     pub(crate) fn new_exit_wait_point() -> ProcessExitWaitPoint {
         let source_id = crate::allocate_notification_source_id();
         let source = wait_routing::new_wait_source(source_id);
-        crate::wait_source::register_wait_source_with_id(source_id, source.clone());
+        crate::wait_source::register_wait_source_with_diagnostic_kind(
+            source_id,
+            source.clone(),
+            "process-exit",
+        );
         ProcessExitWaitPoint { source_id, source }
     }
 

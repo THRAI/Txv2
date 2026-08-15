@@ -48,6 +48,9 @@ tx-shims = { path = "../tx-shims", features = ["test-support"] }
 # Enable the per-reactor-step epoch/guard diagnostic console prints.
 # Off by default; noisy and not needed in normal test runs.
 diag-epoch-guards = []
+# Diagnostic-only syscall-mix counters for Cargo/BuildStorm processes.
+# Off by default and therefore absent from submitted performance kernels.
+syscall-profile = []
 
 [lints]
 workspace = true

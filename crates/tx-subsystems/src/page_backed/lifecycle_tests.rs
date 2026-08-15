@@ -21,6 +21,8 @@ fn setup_host_substrate() {
 
 struct LifecycleFs {
     flushes: AtomicUsize,
+    flush_batches: AtomicUsize,
+    last_flush_batch_len: AtomicUsize,
     fsyncs: AtomicUsize,
     truncates: AtomicUsize,
     fallocates: AtomicUsize,
@@ -32,12 +34,15 @@ struct LifecycleFs {
     truncate_outcome: V3Outcome<(), NoProgress>,
     truncate_continues_remaining: AtomicUsize,
     fallocate_outcome: V3Outcome<(), NoProgress>,
+    batch_flush_enabled: bool,
 }
 
 impl LifecycleFs {
     fn new() -> Self {
         Self {
             flushes: AtomicUsize::new(0),
+            flush_batches: AtomicUsize::new(0),
+            last_flush_batch_len: AtomicUsize::new(0),
             fsyncs: AtomicUsize::new(0),
             truncates: AtomicUsize::new(0),
             fallocates: AtomicUsize::new(0),
@@ -49,6 +54,7 @@ impl LifecycleFs {
             truncate_outcome: V3Outcome::done(()),
             truncate_continues_remaining: AtomicUsize::new(0),
             fallocate_outcome: V3Outcome::done(()),
+            batch_flush_enabled: false,
         }
     }
 
@@ -76,6 +82,13 @@ impl LifecycleFs {
     fn advancing_truncate_once() -> Self {
         Self {
             truncate_continues_remaining: AtomicUsize::new(1),
+            ..Self::new()
+        }
+    }
+
+    fn batching() -> Self {
+        Self {
+            batch_flush_enabled: true,
             ..Self::new()
         }
     }
@@ -920,6 +933,27 @@ fn pagebacked_step_fsync_flushes_dirty_file_pages_in_order_and_cleans_marks() {
 }
 
 #[test]
+fn pagebacked_step_fsync_groups_adjacent_dirty_pages_into_one_batch() {
+    let _lock = EPOCH_TEST_LOCK
+        .lock()
+        .expect("page-backed lifecycle test lock");
+    setup_host_substrate();
+    let guard = step_engine::guard();
+    let fs = Arc::new(LifecycleFs::batching());
+    let pc = file_page_container(fs.clone(), FsObjectId::new(0x54));
+    seed_dirty_file_page(&pc, PageIndex::new(0));
+    seed_dirty_file_page(&pc, PageIndex::new(1));
+
+    assert_eq!(step_fsync(&pc, &guard), V3Out::Done(()));
+
+    assert_eq!(fs.flush_batches.load(Ordering::Acquire), 1);
+    assert_eq!(fs.last_flush_batch_len.load(Ordering::Acquire), 2);
+    assert_eq!(fs.flushes.load(Ordering::Acquire), 2);
+    assert!(!pc.page_marks(PageIndex::new(0)).expect("page 0").dirty);
+    assert!(!pc.page_marks(PageIndex::new(1)).expect("page 1").dirty);
+}
+
+#[test]
 fn pagebacked_step_fsync_retries_exact_eof_after_truncate_advances() {
     let _lock = EPOCH_TEST_LOCK
         .lock()
@@ -1353,6 +1387,14 @@ impl FsOps for LifecycleFs {
 // for the page-backing slot. Anything that would be `Blocked` becomes
 // `Err(EAGAIN)`.
 impl crate::page_backed::FsPageBacking for LifecycleFs {
+    fn flush_batch_limit(&self) -> usize {
+        if self.batch_flush_enabled {
+            16
+        } else {
+            1
+        }
+    }
+
     fn fetch_page(
         &self,
         _fs_object_id: FsObjectId,
@@ -1384,6 +1426,35 @@ impl crate::page_backed::FsPageBacking for LifecycleFs {
         } else {
             V3Outcome::done(())
         }
+    }
+
+    fn flush_pages(
+        &self,
+        fs_object_id: FsObjectId,
+        first_offset: u64,
+        frames: &[Frame],
+        guard: &Guard<'_>,
+    ) -> V3Outcome<(), NoProgress> {
+        if !self.batch_flush_enabled {
+            let mut offset = first_offset;
+            for frame in frames {
+                match self.flush_page(fs_object_id, offset, frame, guard) {
+                    V3Outcome::Done(()) => {}
+                    other => return other,
+                }
+                offset += crate::vm::USER_PAGE_SIZE as u64;
+            }
+            return V3Outcome::done(());
+        }
+
+        self.flush_batches.fetch_add(1, Ordering::AcqRel);
+        self.flushes.fetch_add(frames.len(), Ordering::AcqRel);
+        self.last_flush_batch_len
+            .store(frames.len(), Ordering::Release);
+        self.last_object
+            .store(fs_object_id.as_u64(), Ordering::Release);
+        self.last_offset.store(first_offset, Ordering::Release);
+        V3Outcome::done(())
     }
 
     fn truncate(

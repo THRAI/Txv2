@@ -420,8 +420,8 @@ fn reactor_epoch_boundary_replenishes_publication_retire_credit_under_load() {
     // The reactor polls at most one task per outer iteration. Two successive
     // quiescent boundaries therefore cover the E -> E+2 grace period even
     // while runnable tasks keep the idle-maintenance path unreachable.
-    super::service_reactor_epoch_boundary();
-    super::service_reactor_epoch_boundary();
+    super::service_reactor_epoch_boundary(tx_hal::CpuId(0));
+    super::service_reactor_epoch_boundary(tx_hal::CpuId(0));
 
     let replenished = tx_substrate::epoch::try_reserve_local_retire()
         .expect("reactor boundaries must replenish publication retire credit");
@@ -520,15 +520,25 @@ fn file_io_runtime_task_submission_owns_one_runtime() {
     let runtime = runtimes.pop().expect("one file I/O runtime claim");
     assert!(runtimes.is_empty());
     let mut submitted = 0;
+    let mut submitted_meta = None;
 
     assert!(CoreInit::<TestPlatform>::submit_file_io_runtime_task_with(
         runtime,
-        |_runtime, _config, _meta| {
+        |_runtime, _config, meta| {
             submitted += 1;
+            submitted_meta = Some(meta);
             true
         },
     ));
     assert_eq!(submitted, 1);
+    let meta = submitted_meta.expect("file I/O service scheduling metadata");
+    assert!(
+        !meta.kernel_only,
+        "file I/O workers must not starve userspace"
+    );
+    assert!(!meta.userspace_thread);
+    assert_eq!(meta.migration, tx_reactor::MigrationPolicy::Pinned);
+    assert_eq!(meta.affinity, 1);
 }
 
 #[test]
@@ -546,12 +556,14 @@ fn userspace_sched_meta_exposes_online_harts_without_initial_migration() {
     assert!(meta.userspace_thread);
     assert!(!meta.spread_on_submit);
     assert_eq!(meta.migration, tx_reactor::MigrationPolicy::Pinned);
+    assert!(!meta.preempted_on_submit);
 
     let child = CoreInit::<TestPlatform>::userspace_child_thread_sched_meta_for(CpuId(3));
     assert_eq!(child.affinity, 0b1111);
     assert!(child.userspace_thread);
     assert!(child.spread_on_submit);
-    assert_eq!(child.migration, tx_reactor::MigrationPolicy::Pinned);
+    assert_eq!(child.migration, tx_reactor::MigrationPolicy::Movable);
+    assert!(!child.preempted_on_submit);
 }
 
 #[test]

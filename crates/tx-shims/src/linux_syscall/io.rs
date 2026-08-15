@@ -722,7 +722,7 @@ pub(super) async fn sys_writev<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     const IOVEC_BYTES: u64 = 16;
     let fd = args[0] as i32;
     let stdio_tty_file = if fd == 1 || fd == 2 {
-        resolve_fd(&ctx.process, fd as u32).filter(|file| {
+        ctx.fd(fd as u32).filter(|file| {
             matches!(
                 file.rnode().backing(),
                 tx_subsystems::vfs::RNodeBacking::StructBacked {
@@ -831,7 +831,7 @@ pub(super) fn sys_writev_pagebacked_oneshot<'a>(
         return Some(SyscallResult::Error(EBADF_VALUE));
     }
 
-    let file = match resolve_fd(&ctx.process, fd as u32) {
+    let file = match ctx.fd(fd as u32) {
         Some(file) => file,
         None => return Some(SyscallResult::Error(EBADF_VALUE)),
     };
@@ -950,7 +950,7 @@ pub(super) fn sys_writev_pagebacked_candidate<'a>(args: [u64; 6], ctx: &SyscallC
     if fd < 0 {
         return false;
     }
-    let Some(file) = resolve_fd(&ctx.process, fd as u32) else {
+    let Some(file) = ctx.fd(fd as u32) else {
         return false;
     };
     if file.posix_mq().is_some() || file.eventfd().is_some() {
@@ -1157,7 +1157,7 @@ where
             let events = i16::from_le_bytes(ent_bytes[4..6].try_into().unwrap());
             let mut revents: i16 = 0;
             if fd >= 0 {
-                if let Some(file) = resolve_fd(&ctx.process, fd as u32) {
+                if let Some(file) = ctx.fd(fd as u32) {
                     let guard = tx_substrate::epoch::guard();
                     if let Some(tfd) = file.timerfd() {
                         if events & POLLIN != 0 {
@@ -1528,7 +1528,7 @@ where
             if !want_read && !want_write && !want_except {
                 continue;
             }
-            let Some(file) = resolve_fd(&ctx.process, fd as u32) else {
+            let Some(file) = ctx.fd(fd as u32) else {
                 return SyscallResult::Error(EBADF_VALUE);
             };
 
@@ -1913,6 +1913,74 @@ async fn sys_write_pagebacked<'a>(
     }
 }
 
+/// Try the regular-file `write(2)` data path without constructing the broad
+/// wait-capable syscall future. The fast path is allowed to publish partial
+/// progress, just like Linux `write(2)`; a zero-progress wait returns `None`
+/// so the caller can fall back to the canonical async dispatcher.
+pub(super) fn sys_write_pagebacked_oneshot<'a>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> Option<SyscallResult> {
+    use tx_subsystems::vfs::structure::{OpenFileBacking, RNodeBacking};
+
+    let fd = args[0] as i32;
+    let buf_ptr = args[1] as usize;
+    let len = args[2] as usize;
+    if fd < 0 {
+        return Some(SyscallResult::Error(EBADF_VALUE));
+    }
+    let file = match ctx.fd(fd as u32) {
+        Some(file) => file,
+        None => return Some(SyscallResult::Error(EBADF_VALUE)),
+    };
+    let pc = match file.backing() {
+        OpenFileBacking::Rnode { rnode } => match rnode.backing() {
+            RNodeBacking::PageBacked { pc } => pc.clone(),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if !file.flags().write {
+        return Some(SyscallResult::Error(EBADF_VALUE));
+    }
+    if len == 0 {
+        return Some(SyscallResult::Return(0));
+    }
+
+    let Some(range) = super::user_copy::covering_user_range(buf_ptr as u64, len) else {
+        return Some(SyscallResult::Error(EFAULT_VALUE));
+    };
+    if !ctx
+        .aspace
+        .user_range_is_ready_for_access(range, tx_subsystems::vm::UserAccessKind::Read)
+    {
+        return None;
+    }
+
+    let guard = crate::adapter::step_engine::guard();
+    match tx_subsystems::page_backed::step_write_from_user(
+        &pc,
+        &file,
+        &ctx.aspace,
+        tx_hal::UserPtr::<u8>::new(buf_ptr),
+        len,
+        &guard,
+    ) {
+        tx_substrate::step::StepOutcome::Done(n) => Some(SyscallResult::Return(n as i64)),
+        tx_substrate::step::StepOutcome::Continue { progress } => {
+            Some(SyscallResult::Return(progress.bytes() as i64))
+        }
+        tx_substrate::step::StepOutcome::Yield { progress, .. } => {
+            let completed = progress.bytes();
+            (completed != 0).then_some(SyscallResult::Return(completed as i64))
+        }
+        tx_substrate::step::StepOutcome::Err(error) => {
+            let errno: tx_subsystems::execution::Errno = error.into();
+            Some(SyscallResult::error_from(errno))
+        }
+    }
+}
+
 async fn sys_pipe_write_buffered<'a>(
     payload: &Cap<tx_subsystems::pipe::PipePayload>,
     bytes: &[u8],
@@ -2147,7 +2215,7 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     // fd table. Holding the payload guard across the lookup is fine —
     // the resulting Cap is independent and the lock is released before
     // any `.await`.
-    let file = match resolve_fd(&ctx.process, fd as u32) {
+    let file = match ctx.fd(fd as u32) {
         Some(file) => file,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
@@ -2433,6 +2501,74 @@ async fn sys_read_pagebacked<'a, P: tx_hal::TimeIf>(
     }
 }
 
+/// Synchronous regular-file `read(2)` counterpart of
+/// [`sys_write_pagebacked_oneshot`]. Resident file pages and an immediately
+/// reservable destination avoid the per-syscall heap box; cold storage pages
+/// return `None` before progress and continue through the async path.
+pub(super) fn sys_read_pagebacked_oneshot<'a>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> Option<SyscallResult> {
+    use tx_subsystems::vfs::structure::{OpenFileBacking, RNodeBacking};
+
+    let fd = args[0] as i32;
+    let buf_ptr = args[1] as usize;
+    let len = args[2] as usize;
+    if fd < 0 {
+        return Some(SyscallResult::Error(EBADF_VALUE));
+    }
+    let file = match ctx.fd(fd as u32) {
+        Some(file) => file,
+        None => return Some(SyscallResult::Error(EBADF_VALUE)),
+    };
+    let pc = match file.backing() {
+        OpenFileBacking::Rnode { rnode } => match rnode.backing() {
+            RNodeBacking::PageBacked { pc } => pc.clone(),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if !file.flags().read {
+        return Some(SyscallResult::Error(EBADF_VALUE));
+    }
+    if len == 0 {
+        return Some(SyscallResult::Return(0));
+    }
+
+    let Some(range) = super::user_copy::covering_user_range(buf_ptr as u64, len) else {
+        return Some(SyscallResult::Error(EFAULT_VALUE));
+    };
+    if !ctx
+        .aspace
+        .user_range_is_ready_for_access(range, tx_subsystems::vm::UserAccessKind::Write)
+    {
+        return None;
+    }
+
+    let guard = crate::adapter::step_engine::guard();
+    match tx_subsystems::page_backed::step_read_to_user(
+        &pc,
+        &file,
+        &ctx.aspace,
+        tx_hal::UserPtr::<u8>::new(buf_ptr),
+        len,
+        &guard,
+    ) {
+        tx_substrate::step::StepOutcome::Done(n) => Some(SyscallResult::Return(n as i64)),
+        tx_substrate::step::StepOutcome::Continue { progress } => {
+            Some(SyscallResult::Return(progress.bytes() as i64))
+        }
+        tx_substrate::step::StepOutcome::Yield { progress, .. } => {
+            let completed = progress.bytes();
+            (completed != 0).then_some(SyscallResult::Return(completed as i64))
+        }
+        tx_substrate::step::StepOutcome::Err(error) => {
+            let errno: tx_subsystems::execution::Errno = error.into();
+            Some(SyscallResult::error_from(errno))
+        }
+    }
+}
+
 /// `read(fd, buf, count)`.
 ///
 /// Mirrors `sys_write`'s structure. For PageBacked files, delegates to
@@ -2453,7 +2589,7 @@ where
         return SyscallResult::Error(EBADF_VALUE);
     }
 
-    let file = match resolve_fd(&ctx.process, fd as u32) {
+    let file = match ctx.fd(fd as u32) {
         Some(file) => file,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
@@ -2762,7 +2898,7 @@ where
     if (offset as i64) < 0 {
         return SyscallResult::Error(EINVAL_VALUE);
     }
-    let file = match resolve_fd(&ctx.process, fd as u32) {
+    let file = match ctx.fd(fd as u32) {
         Some(file) => file,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
@@ -2785,7 +2921,7 @@ pub(super) async fn sys_pwrite64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     if (offset as i64) < 0 {
         return SyscallResult::Error(EINVAL_VALUE);
     }
-    let file = match resolve_fd(&ctx.process, fd as u32) {
+    let file = match ctx.fd(fd as u32) {
         Some(file) => file,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
@@ -3035,7 +3171,7 @@ pub(super) fn sys_fadvise64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
     if !(0..=5).contains(&advice) {
         return SyscallResult::Error(EINVAL_VALUE);
     }
-    let file = match resolve_fd(&ctx.process, fd as u32) {
+    let file = match ctx.fd(fd as u32) {
         Some(file) => file,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
@@ -3050,7 +3186,7 @@ pub(super) fn sys_readahead<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
     if fd < 0 {
         return SyscallResult::Error(EBADF_VALUE);
     }
-    let file = match resolve_fd(&ctx.process, fd as u32) {
+    let file = match ctx.fd(fd as u32) {
         Some(f) => f,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
@@ -3083,7 +3219,7 @@ pub(super) fn sys_sync_file_range<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     let nbytes = args[2] as i64;
     let flags = args[3] as u32;
     const SYNC_FILE_RANGE_KNOWN: u32 = 0x1 | 0x2 | 0x4;
-    if fd < 0 || resolve_fd(&ctx.process, fd as u32).is_none() {
+    if fd < 0 || ctx.fd(fd as u32).is_none() {
         return SyscallResult::Error(EBADF_VALUE);
     }
     if offset < 0 || nbytes < 0 || flags & !SYNC_FILE_RANGE_KNOWN != 0 {
@@ -3117,11 +3253,11 @@ pub(super) async fn sys_sendfile64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
         return SyscallResult::Return(0);
     }
 
-    let out_file = match resolve_fd(&ctx.process, out_fd as u32) {
+    let out_file = match ctx.fd(out_fd as u32) {
         Some(f) => f,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
-    let in_file = match resolve_fd(&ctx.process, in_fd as u32) {
+    let in_file = match ctx.fd(in_fd as u32) {
         Some(f) => f,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
@@ -3235,11 +3371,11 @@ pub(super) async fn sys_copy_file_range<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>
         return SyscallResult::Return(0);
     }
 
-    let in_file = match resolve_fd(&ctx.process, in_fd as u32) {
+    let in_file = match ctx.fd(in_fd as u32) {
         Some(f) => f,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
-    let out_file = match resolve_fd(&ctx.process, out_fd as u32) {
+    let out_file = match ctx.fd(out_fd as u32) {
         Some(f) => f,
         None => return SyscallResult::Error(EBADF_VALUE),
     };

@@ -5,7 +5,8 @@ use alloc::vec::Vec;
 
 use crate::page_backed::{
     reclaim_clean_file_pages_if_low, reserve_frame_with_reclaim, MaterializeAccess,
-    MaterializedPage, MaterializedPagePin, PageCacheError, PageContainer, PageIndex,
+    MaterializedPage, MaterializedPagePin, PageCacheError, PageContainer, PageContainerKind,
+    PageIndex,
 };
 use crate::vm::adapter::step_engine::Cap;
 use step_engine::page_allocator::{self, ZeroPolicy};
@@ -581,6 +582,33 @@ impl VmEntry {
         }
     }
 
+    /// Whether `other`, when placed immediately after `self`, continues the
+    /// same backing byte stream. Adjacent mappings of the same file are only
+    /// coalescible when the right-hand file offset follows the left range;
+    /// two independent mappings that both start at offset zero must remain
+    /// separate VMAs.
+    pub(in crate::vm) fn has_contiguous_backing_with(&self, other: &Self) -> bool {
+        match (self.backing, other.backing) {
+            (VmEntryBacking::None, VmEntryBacking::None)
+            | (VmEntryBacking::PrivateAnon, VmEntryBacking::PrivateAnon) => true,
+            (
+                VmEntryBacking::Page {
+                    offset: left_offset,
+                },
+                VmEntryBacking::Page {
+                    offset: right_offset,
+                },
+            ) => {
+                self.owners.page.as_ref() == other.owners.page.as_ref()
+                    && u64::try_from(self.range.len())
+                        .ok()
+                        .and_then(|len| left_offset.checked_add(len))
+                        == Some(right_offset)
+            }
+            _ => false,
+        }
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn debug_owner_strong_count(&self) -> usize {
         Arc::strong_count(&self.owners)
@@ -608,13 +636,27 @@ impl VmEntry {
         }
 
         if self.range == target {
-            return Ok(VmEntryRewrite {
-                before: None,
-                target: target_prot.map(|prot| {
+            let target_entry = match target_prot {
+                Some(prot) => {
                     let mut entry = self.clone();
                     entry.prot = prot;
-                    entry
-                }),
+                    // A writable MAP_PRIVATE entry must carry a private page
+                    // set. A full-range PROT_NONE -> RW transition does not
+                    // pass through `sub_entry`, so establish the same CoW
+                    // authority here before any write fault can publish a PTE.
+                    if entry.owners.private.is_none() && prot.write && !entry.flags.shared {
+                        let set = PrivatePageSet::new_cap()
+                            .map_err(PrivatePageError::Zone)
+                            .map_err(VmEntryError::Private)?;
+                        entry = entry.with_private(Some(set));
+                    }
+                    Some(entry)
+                }
+                None => None,
+            };
+            return Ok(VmEntryRewrite {
+                before: None,
+                target: target_entry,
                 after: None,
             });
         }
@@ -1090,6 +1132,66 @@ impl VmFaultOutcome {
         // installs an RO PTE pointing at the backing frame so concurrent
         // readers can share it.
         self.materialize_private(guard)
+    }
+
+    /// Materialize only an already-resident file page for speculative PTE
+    /// prefault. Unlike the demand-fault path, this method never starts I/O.
+    /// Private CoW state remains authoritative when the mapping already owns a
+    /// private frame.
+    pub(in crate::vm) fn materialize_resident_file_read(
+        &self,
+        guard: &crate::execution::Guard<'_>,
+    ) -> Option<Result<VmFaultMaterialization, VmFaultError>> {
+        if self.access == AccessMode::Write || self.pmap_materialization_deferred {
+            return None;
+        }
+        let (pc, _) = self.entry.page_backing()?;
+        if !matches!(pc.kind(), PageContainerKind::File { .. }) {
+            return None;
+        }
+        let page_index = match self.backing_page_index() {
+            Ok(page_index) => page_index,
+            Err(error) => return Some(Err(error)),
+        };
+        let page_off = match self.private_page_off() {
+            Ok(page_off) => page_off,
+            Err(error) => return Some(Err(error)),
+        };
+        if let Some(set) = self.entry.private() {
+            if let Some(snapshot) = set.lookup(page_off) {
+                return Some(self.publish_existing_private(
+                    snapshot,
+                    false,
+                    set,
+                    page_off,
+                    page_index,
+                    VmFaultMaterializationBacking::PageBacked,
+                ));
+            }
+        }
+        let access_byte = match page_index.as_u64().checked_mul(USER_PAGE_SIZE as u64) {
+            Some(access_byte) => access_byte,
+            None => return Some(Err(VmFaultError::BackingOffsetOverflow)),
+        };
+        if access_byte >= pc.size_bytes() {
+            return None;
+        }
+        let page = match pc.materialize_resident_read(page_index, guard)? {
+            Ok(page) => page,
+            Err(error) => return Some(Err(VmFaultError::PageCache(error))),
+        };
+        Some(Ok(VmFaultMaterialization {
+            backing: VmFaultMaterializationBacking::PageBacked,
+            page_index,
+            page,
+            publish_prot: if self.entry.flags.shared {
+                self.entry.prot
+            } else {
+                self.entry.prot.without_write()
+            },
+            replace_existing: false,
+            pmap_materialization_deferred: false,
+        }))
     }
 
     fn materialize_special(&self, special: VmSpecialBacking) -> VmFaultMaterializationStep {

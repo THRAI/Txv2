@@ -61,13 +61,15 @@ mod readiness {
 
         let reader_source = wait_routing::new_wait_source(reader_source_id);
         let writer_source = wait_routing::new_wait_source(writer_source_id);
-        crate::wait_source::register_wait_source_with_id(
+        crate::wait_source::register_wait_source_with_diagnostic_kind(
             reader_source_id,
             Arc::clone(&reader_source),
+            "pipe-readable",
         );
-        crate::wait_source::register_wait_source_with_id(
+        crate::wait_source::register_wait_source_with_diagnostic_kind(
             writer_source_id,
             Arc::clone(&writer_source),
+            "pipe-writable",
         );
 
         PipeWaitPoints {

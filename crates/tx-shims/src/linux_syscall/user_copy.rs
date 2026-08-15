@@ -94,6 +94,38 @@ fn user_access_guard() -> step_engine::Guard<'static> {
     step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard)
 }
 
+/// Prefault a user range without depending on a registered wait source.
+///
+/// Range materialisation is short and its owner is another runnable syscall
+/// task.  Dropping all guards, yielding the current task, and retrying the
+/// complete reservation avoids both exposing transient contention as `EIO`
+/// and sleeping forever when a one-shot range-lock notification races with
+/// registration.
+async fn reserve_user_range_yield_retry(
+    aspace: &AddressSpace,
+    range: UserRange,
+    access: UserAccessKind,
+) -> Result<(), Errno> {
+    loop {
+        match aspace.reserve_user_range_for_access(range, access) {
+            StepOutcome::Done(()) => return Ok(()),
+            StepOutcome::Err(error) => return Err(error.into()),
+            StepOutcome::Continue { .. } => continue,
+            StepOutcome::Yield { .. } => tx_reactor::yield_now().await,
+        }
+    }
+}
+
+pub(super) async fn validate_user_range_yield_retry(
+    aspace: &AddressSpace,
+    uaddr: u64,
+    len: usize,
+    access: UserAccessKind,
+) -> Result<(), Errno> {
+    let range = covering_user_range(uaddr, len).ok_or(Errno::EFAULT)?;
+    reserve_user_range_yield_retry(aspace, range, access).await
+}
+
 /// Bounded copy of a NUL-terminated user string into a kernel-owned
 /// `Vec<u8>` (NUL terminator stripped).
 ///
@@ -130,36 +162,53 @@ pub(super) async fn read_user_cstr_wait(
     uaddr: u64,
     max_len: usize,
 ) -> Result<Vec<u8>, ReadCStrError> {
+    loop {
+        if let Some(result) = read_user_cstr_oneshot(aspace, uaddr, max_len) {
+            return result;
+        }
+        // The competing materializer owns the wait token. Yielding the task
+        // lets that transaction publish before we retry the bounded scan; no
+        // epoch guard crosses this await.
+        tx_reactor::yield_now().await;
+    }
+}
+
+/// Try the runtime user-string copy once without suspending.
+///
+/// `None` is reserved for a transient VM materialisation collision. Callers
+/// that already run behind the trap handoff can use this to keep an otherwise
+/// synchronous syscall out of a heap-allocated async dispatcher, while the
+/// ordinary wait-capable path remains authoritative for the collision case.
+pub(super) fn read_user_cstr_oneshot(
+    aspace: &AddressSpace,
+    uaddr: u64,
+    max_len: usize,
+) -> Option<Result<Vec<u8>, ReadCStrError>> {
     use step_engine::{Errno as V3Errno, StepOutcome as V3};
 
     if uaddr == 0 {
-        return Err(ReadCStrError::Fault(Errno::EFAULT));
+        return Some(Err(ReadCStrError::Fault(Errno::EFAULT)));
     }
     if max_len == 0 {
-        return Err(ReadCStrError::TooLong);
+        return Some(Err(ReadCStrError::TooLong));
     }
 
     #[cfg(not(target_os = "none"))]
     {
-        return read_user_cstr(aspace, uaddr, max_len);
+        Some(read_user_cstr(aspace, uaddr, max_len))
     }
 
     #[cfg(target_os = "none")]
-    loop {
+    {
         let outcome = {
             let guard = user_access_guard();
             aspace.read_user_cstr(UserPtr::<u8>::new(uaddr as usize), max_len, &guard)
         };
         match outcome {
-            V3::Done(value) => return Ok(value),
-            V3::Err(V3Errno::ENAMETOOLONG) => return Err(ReadCStrError::TooLong),
-            V3::Err(error) => return Err(ReadCStrError::Fault(error.into())),
-            V3::Continue { .. } | V3::Yield { .. } => {
-                // The competing materializer owns the wait token. Yielding the
-                // task lets that transaction publish before we retry the
-                // bounded scan; no epoch guard crosses this await.
-                tx_reactor::yield_now().await;
-            }
+            V3::Done(value) => Some(Ok(value)),
+            V3::Err(V3Errno::ENAMETOOLONG) => Some(Err(ReadCStrError::TooLong)),
+            V3::Err(error) => Some(Err(ReadCStrError::Fault(error.into()))),
+            V3::Continue { .. } | V3::Yield { .. } => None,
         }
     }
 }
@@ -517,9 +566,7 @@ pub(super) async fn bootstrap_copy_from_user_wait(
         let Some(range) = covering_user_range(uaddr, dst.len()) else {
             return Err(Errno::EFAULT);
         };
-        aspace
-            .reserve_user_range_for_access_wait(range, UserAccessKind::Read)
-            .await?;
+        reserve_user_range_yield_retry(aspace, range, UserAccessKind::Read).await?;
 
         loop {
             let outcome = {
@@ -531,9 +578,7 @@ pub(super) async fn bootstrap_copy_from_user_wait(
                 V3::Err(error) => return Err(error.into()),
                 V3::Yield { .. } => {
                     tx_reactor::yield_now().await;
-                    aspace
-                        .reserve_user_range_for_access_wait(range, UserAccessKind::Read)
-                        .await?;
+                    reserve_user_range_yield_retry(aspace, range, UserAccessKind::Read).await?;
                 }
             }
         }
@@ -687,9 +732,8 @@ pub(super) async fn bootstrap_copy_to_user_wait_diagnosed(
                 retries: 0,
             });
         };
-        if let Err(errno) = aspace
-            .reserve_user_range_for_access_wait(range, UserAccessKind::Write)
-            .await
+        if let Err(errno) =
+            reserve_user_range_yield_retry(aspace, range, UserAccessKind::Write).await
         {
             return Err(UserCopyWaitFailure {
                 errno,
@@ -716,9 +760,8 @@ pub(super) async fn bootstrap_copy_to_user_wait_diagnosed(
                 V3::Yield { .. } => {
                     retries = retries.saturating_add(1);
                     tx_reactor::yield_now().await;
-                    if let Err(errno) = aspace
-                        .reserve_user_range_for_access_wait(range, UserAccessKind::Write)
-                        .await
+                    if let Err(errno) =
+                        reserve_user_range_yield_retry(aspace, range, UserAccessKind::Write).await
                     {
                         return Err(UserCopyWaitFailure {
                             errno,

@@ -2,7 +2,8 @@ use super::block_runtime::BlockSubmissionHandle;
 use crate::fs_iface::IoDataLeaseId;
 use crate::io_manager::backend::BioPlanList;
 use crate::io_manager::block::{
-    BioPlan, BioVec, BlockDeviceCompletion, BlockFlags, BlockOp, DeviceKey, LbaRange,
+    BioPlan, BioVec, BlockDeviceCompletion, BlockFlags, BlockOp, BlockServiceNext, DeviceKey,
+    LbaRange,
 };
 use crate::io_manager::page::{
     service::{
@@ -220,4 +221,36 @@ fn partial_page_receipt_commits_only_accepted_l6_routes() {
         .drive(ServiceBudget::new(1), |_| false)
         .dispatches
         .is_empty());
+}
+
+#[test]
+fn synchronous_completions_reopen_depth_for_queued_l6_tail() {
+    let manager = BlockSubmissionHandle::new(32, 16);
+    for index in 0..24u64 {
+        manager
+            .submit_direct(IoDataLeaseId::new(index + 1), read_plan(index * 2))
+            .expect("queue direct BIO");
+    }
+
+    let first = manager.drive(ServiceBudget::new(64), |_| false);
+    assert_eq!(first.dispatches.len(), 16);
+    assert_eq!(first.next, BlockServiceNext::WaitingForCompletion);
+    for dispatch in first.dispatches {
+        manager
+            .complete_receipt(BlockDeviceCompletion::new(dispatch.tag, Ok(())))
+            .expect("complete synchronous dispatch");
+    }
+
+    assert_eq!(manager.service_next(), BlockServiceNext::Runnable);
+    assert_eq!(manager.diagnostic_snapshot().queued, 8);
+    assert_eq!(manager.diagnostic_snapshot().depth_in_flight, 0);
+
+    let tail = manager.drive(ServiceBudget::new(64), |_| false);
+    assert_eq!(tail.dispatches.len(), 8);
+    for dispatch in tail.dispatches {
+        manager
+            .complete_receipt(BlockDeviceCompletion::new(dispatch.tag, Ok(())))
+            .expect("complete synchronous tail");
+    }
+    assert_eq!(manager.service_next(), BlockServiceNext::Sleeping);
 }

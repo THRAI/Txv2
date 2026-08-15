@@ -35,6 +35,7 @@ use crate::vm::{
 
 const PRIVATE_ANON_FAULT_BATCH_PAGES: usize = 16;
 const PRIVATE_ANON_FAULT_BATCH_MIN_VMA_BYTES: usize = USER_PAGE_SIZE * 2;
+const FILE_RESIDENT_PREFAULT_PAGES: usize = 16;
 
 pub fn page_align_up(addr: usize) -> usize {
     checked_page_align_up(addr).expect("page_align_up overflow")
@@ -45,6 +46,64 @@ pub fn checked_page_align_up(addr: usize) -> Option<usize> {
 }
 
 impl AddressSpace {
+    /// Complete a cached file read/execute fault without entering the async
+    /// fault driver.
+    ///
+    /// This is the trap-shell fast path: it is intentionally resident-only
+    /// and non-waiting.  A cold page, a contended range, userfaultfd, CoW, or
+    /// any publication race returns `false` without changing the canonical
+    /// fallback policy.  On success the faulting instruction may be retried
+    /// immediately because the PTE and its translation barrier are complete.
+    pub fn try_resident_file_fault_oneshot(&self, fault: VmFault) -> bool {
+        if !matches!(fault.access, AccessMode::Read | AccessMode::Execute) {
+            return false;
+        }
+        let page_range = match UserRange::containing_page(fault.addr) {
+            Ok(range) => range,
+            Err(_) => return false,
+        };
+        let page_guard = match self
+            .range_lock
+            .acquire_step(page_range, LockMode::Materializer)
+        {
+            V3StepOutcome::Done(guard) => guard,
+            V3StepOutcome::Yield { .. } => return false,
+            _ => return false,
+        };
+        let outcome = match require_fault_recipe(self, fault) {
+            Ok(outcome) if file_resident_prefault_shape(&outcome) => outcome,
+            _ => return false,
+        };
+
+        let page = outcome.page_range.start().containing_page();
+        if let Some(existing) = self.pmap.lookup(page) {
+            if !existing.prot.permits(outcome.access) {
+                return false;
+            }
+            let refreshed = self.pmap.refresh_page_translation(page).is_ok();
+            drop(page_guard);
+            return refreshed;
+        }
+
+        let guard = step_engine::guard();
+        let materialization = match outcome.materialize_resident_file_read(&guard) {
+            Some(Ok(materialization)) => materialization,
+            Some(Err(_)) | None => return false,
+        };
+        drop(guard);
+        let published = self
+            .publish_fault_materialization_locked_ref(&outcome, materialization)
+            .is_ok();
+        drop(page_guard);
+        if published {
+            // The page-cache miss which populated this page may also have
+            // completed its bounded readahead window.  Publish those already
+            // resident tail pages in the same direct-fault turn.
+            self.prefault_file_resident_batch(&outcome);
+        }
+        published
+    }
+
     pub fn resolve_fault(&self, fault: VmFault) -> Result<VmFaultOutcome, VmFaultError> {
         let page_range = UserRange::containing_page(fault.addr).map_err(VmFaultError::Range)?;
         let V3StepOutcome::Done(_guard) = self
@@ -167,6 +226,8 @@ impl AddressSpace {
         let parent_recipes = parent.recipes_snapshot();
         let child_recipes = parent.recipes.clone_shared(&guard);
         let child = AddressSpace::new_with_recipes_for_platform::<P>(child_recipes)?;
+        let mut private_protections = Vec::new();
+        let mut inherited_ranges = Vec::new();
 
         for entry in parent_recipes {
             let private = !entry.flags.shared;
@@ -177,30 +238,37 @@ impl AddressSpace {
                 child.recipes.replace_entry(child_entry)?;
             }
             if private {
-                parent
-                    .pmap
-                    .protect_range(range, entry.prot.without_write())?;
-                // Kernel copy_to_user may have populated a writable private
-                // page through the pmap-first lane without adding it to the
-                // recipe's PrivatePageSet. Preserve that authoritative
-                // resident content in the child; otherwise the child refaults
-                // from a zero/file backing and silently loses stack, argv or
-                // libc state inherited across fork.
+                private_protections.push((range, entry.prot.without_write()));
                 if entry.prot.write {
-                    for (page, snap) in parent.pmap.walk_range(range) {
-                        if let Ok(map_pin) = step_engine::page_allocator::acquire_map_pin(snap.ppn)
-                        {
-                            let _ = child.pmap.publish_page(
-                                page,
-                                snap.ppn,
-                                snap.prot.without_write(),
-                                MaterializedPagePin::Allocated(map_pin),
-                            );
-                        }
-                    }
+                    inherited_ranges.push(range);
                 }
             }
         }
+
+        // One fork owns the full parent range lock, so all private PTE
+        // demotions form one pmap transaction and one cross-hart shootdown.
+        parent.pmap.protect_ranges(&private_protections)?;
+
+        // Kernel copy_to_user may have populated writable private pages
+        // through the pmap-first lane without adding them to the recipe's
+        // PrivatePageSet. Preserve that authoritative resident content in the
+        // child. The child pmap is still detached, so all invalid-to-valid PTEs
+        // can cross one translation-visibility barrier instead of one barrier
+        // per resident page.
+        let mut inherited_pages = Vec::new();
+        for range in inherited_ranges {
+            for (page, snap) in parent.pmap.walk_range(range) {
+                if let Ok(map_pin) = step_engine::page_allocator::acquire_map_pin(snap.ppn) {
+                    inherited_pages.push(PmapBatchPage {
+                        page,
+                        ppn: snap.ppn,
+                        prot: snap.prot.without_write(),
+                        map_pin: MaterializedPagePin::Allocated(map_pin),
+                    });
+                }
+            }
+        }
+        let _ = child.pmap.publish_new_pages_best_effort(inherited_pages);
 
         child.stats.store(child.recipes.stats(&guard));
         Ok(child)
@@ -363,6 +431,7 @@ impl AddressSpace {
                     Ok(FaultScriptPublish::Done(published)) => {
                         emit_vm_trace(b"debug.vm.fault.script.phase", 1);
                         self.prefault_private_anon_write_batch(&outcome);
+                        self.prefault_file_resident_batch(&outcome);
                         emit_vm_trace(b"debug.vm.fault.script.phase", 2);
                         return Ok(published);
                     }
@@ -446,14 +515,21 @@ impl AddressSpace {
         emit_vm_trace(b"debug.vm.fault.publish.phase", 0);
         emit_vm_trace(b"debug.vm.fault.publish.phase", 1);
         emit_vm_trace(b"debug.vm.fault.publish.phase", 2);
-        emit_vm_trace(
-            b"debug.vm.fault.publish.pmap_mapped_pages",
-            self.pmap.stats().mapped_pages as i64,
-        );
-        emit_vm_trace(
-            b"debug.vm.fault.publish.private_len",
-            outcome.entry.private().map(|set| set.len()).unwrap_or(0) as i64,
-        );
+        // Keep diagnostic argument evaluation out of production page faults.
+        // `pmap.stats()` takes the same address-space pmap lock that the
+        // publication below needs, so evaluating it for a disabled trace
+        // doubled the lock traffic on every fault.
+        #[cfg(tx_vm_phase_metrics)]
+        {
+            emit_vm_trace(
+                b"debug.vm.fault.publish.pmap_mapped_pages",
+                self.pmap.stats().mapped_pages as i64,
+            );
+            emit_vm_trace(
+                b"debug.vm.fault.publish.private_len",
+                outcome.entry.private().map(|set| set.len()).unwrap_or(0) as i64,
+            );
+        }
         emit_vm_trace(b"debug.vm.fault.publish.phase", 3);
         let published = self.publish_fault_materialization_locked_ref(outcome, materialization)?;
         emit_vm_trace(b"debug.vm.fault.publish.phase", 4);
@@ -648,6 +724,95 @@ impl AddressSpace {
             b"debug.vm.fault.prefault.published_pages",
             published_pages as i64,
         );
+    }
+
+    /// Publish PTEs for file pages that the page-cache demand read already
+    /// brought into its bounded readahead window.  This is deliberately
+    /// resident-only: a speculative miss stops the batch and never admits
+    /// another I/O request.
+    fn prefault_file_resident_batch(&self, first: &VmFaultOutcome) {
+        if !file_resident_prefault_shape(first) {
+            return;
+        }
+        let current_page = first.page_range.start().containing_page().0;
+        let next_expected = current_page.saturating_add(1);
+        let previous_expected = self
+            .next_file_read_fault_page
+            .swap(next_expected, Ordering::Relaxed);
+        if previous_expected != current_page {
+            return;
+        }
+
+        let Some(batch_bytes) = FILE_RESIDENT_PREFAULT_PAGES.checked_mul(USER_PAGE_SIZE) else {
+            return;
+        };
+        let mut addr = first.page_range.end().0;
+        let batch_end = first.page_range.start().0.saturating_add(batch_bytes);
+        let end = core::cmp::min(first.entry.range.end().0, batch_end);
+        let Some(batch_range) =
+            UserRange::new_aligned(UserVirtAddr(addr), end.saturating_sub(addr)).ok()
+        else {
+            return;
+        };
+        if batch_range.is_empty() {
+            return;
+        }
+        let _batch_guard = match self
+            .range_lock
+            .acquire_step(batch_range, LockMode::Materializer)
+        {
+            V3StepOutcome::Done(guard) => guard,
+            V3StepOutcome::Yield { .. } => return,
+            _ => unreachable_acquire_step(),
+        };
+
+        let mut batch_pages = Vec::new();
+        while addr < end {
+            let page_addr = UserVirtAddr(addr);
+            let page = page_addr.containing_page();
+            if self.pmap.lookup(page).is_some() {
+                addr = match addr.checked_add(USER_PAGE_SIZE) {
+                    Some(next) => next,
+                    None => break,
+                };
+                continue;
+            }
+            let fault = VmFault::new(page_addr, first.access);
+            let candidate = match require_fault_recipe(self, fault) {
+                Ok(candidate)
+                    if candidate.entry == first.entry
+                        && candidate.page_range.start() == page_addr =>
+                {
+                    candidate
+                }
+                _ => break,
+            };
+            let guard = step_engine::guard();
+            let materialization = match candidate.materialize_resident_file_read(&guard) {
+                Some(Ok(materialization)) => materialization,
+                Some(Err(_)) | None => break,
+            };
+            drop(guard);
+            batch_pages.push(PmapBatchPage {
+                page,
+                ppn: materialization.page.ppn,
+                prot: materialization.publish_prot,
+                map_pin: materialization.page.map_pin,
+            });
+            addr = match addr.checked_add(USER_PAGE_SIZE) {
+                Some(next) => next,
+                None => break,
+            };
+        }
+        let published_pages = self.pmap.publish_new_pages_best_effort(batch_pages);
+        if published_pages > 0 {
+            self.next_file_read_fault_page.store(
+                current_page
+                    .saturating_add(1)
+                    .saturating_add(published_pages),
+                Ordering::Relaxed,
+            );
+        }
     }
 
     pub fn try_mmap(&self, request: VmMapRequest) -> Result<VmMapOutcome, VmMapError> {
@@ -865,7 +1030,7 @@ impl AddressSpace {
                 _ => unreachable_acquire_step(),
             };
             let commit = self.recipes.protect(range, prot)?;
-            self.pmap.teardown_range(range)?;
+            self.apply_mprotect_pmap(range, prot, commit.changed_pages)?;
             self.stats.apply_delta(commit.stats_delta);
             return Ok(commit);
         }
@@ -1184,12 +1349,35 @@ impl AddressSpace {
             b"debug.vm.protect.changed_pages",
             commit.changed_pages as i64,
         );
-        let pmap_removed = self.pmap.teardown_range(range)?;
+        let pmap_changed = self.apply_mprotect_pmap(range, prot, commit.changed_pages)?;
         emit_vm_trace(b"debug.vm.protect.phase", 3);
-        emit_vm_trace(b"debug.vm.protect.pmap_removed", pmap_removed as i64);
+        emit_vm_trace(b"debug.vm.protect.pmap_changed", pmap_changed as i64);
         self.stats.apply_delta(commit.stats_delta);
         emit_vm_trace(b"debug.vm.protect.phase", 4);
         Ok(commit)
+    }
+
+    /// Keep resident translations when the new protection can be represented
+    /// by a non-writable hardware leaf.  Granting write remains a
+    /// teardown-and-refault path: after fork the recipe may still be writable
+    /// while its resident PTE is deliberately read-only, so the pmap
+    /// restriction is authoritative.  PROT_NONE also tears down because RV64
+    /// uses a valid PTE with no R/W/X bits to denote a page-table branch, not a
+    /// protected leaf.
+    fn apply_mprotect_pmap(
+        &self,
+        range: UserRange,
+        prot: Prot,
+        changed_pages: usize,
+    ) -> Result<usize, VmMapError> {
+        if changed_pages == 0 {
+            return Ok(0);
+        }
+        if prot.write || (!prot.read && !prot.execute) {
+            self.pmap.teardown_range(range).map_err(Into::into)
+        } else {
+            self.pmap.protect_range(range, prot).map_err(Into::into)
+        }
     }
 
     /// Set or clear the `locked` flag on every recipe overlapping `range`.
@@ -1358,6 +1546,21 @@ fn private_anon_write_batch_shape(outcome: &VmFaultOutcome) -> bool {
         && matches!(outcome.entry.backing_kind(), VmEntryBacking::PrivateAnon)
         && outcome.entry.prot.write
         && outcome.entry.range.len() >= PRIVATE_ANON_FAULT_BATCH_MIN_VMA_BYTES
+}
+
+fn file_resident_prefault_shape(outcome: &VmFaultOutcome) -> bool {
+    if !matches!(outcome.access, AccessMode::Read | AccessMode::Execute)
+        || outcome.entry.ufd_registration.is_some()
+        || outcome.pmap_materialization_deferred
+        || (outcome.entry.flags.shared && outcome.entry.prot.write)
+        || outcome.entry.range.len() < USER_PAGE_SIZE * 2
+    {
+        return false;
+    }
+    let Some((pc, _)) = outcome.entry.page_backing() else {
+        return false;
+    };
+    matches!(pc.kind(), PageContainerKind::File { .. })
 }
 
 impl core::fmt::Debug for MapReserveResult<'_> {
@@ -1533,16 +1736,21 @@ async fn await_fault_wait(aspace: &AddressSpace, token: WaitToken) {
         await_range_lock(&aspace.range_lock, token).await;
         return;
     }
-    if let Some(source) =
-        tx_substrate::wake::lookup_source(tx_substrate::step::WaitSourceId::new(token.source_id()))
-    {
-        let _ = crate::wait_source::wait_on_endpoint(&source, token.interest()).await;
-        return;
-    }
+    // Resolve the unified registered carrier before falling back to the
+    // substrate WaitSource table.  Page-backed completion deliberately owns
+    // both carriers under the same id: its RawQueue is the authoritative
+    // level predicate, while the WaitSource supplies the owner-aware wake
+    // edge.  Looking up the edge first loses subscribe-after-completion
+    // callers once another waiter has consumed its pending bit, even though
+    // the page is already resident and the RawQueue remains ready.
     if let Some(wait) =
         crate::wait_source::wait_on_registered_source_id(token.source_id(), token.interest())
     {
         let _ = wait.await;
+    } else if let Some(source) =
+        tx_substrate::wake::lookup_source(tx_substrate::step::WaitSourceId::new(token.source_id()))
+    {
+        let _ = crate::wait_source::wait_on_endpoint(&source, token.interest()).await;
     } else {
         tx_reactor::yield_now().await;
     }

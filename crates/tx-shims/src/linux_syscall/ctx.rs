@@ -7,11 +7,11 @@
 use alloc::sync::{Arc, Weak as ArcWeak};
 use core::ops::{Deref, DerefMut};
 
-use crate::adapter::step_engine::Cap;
-use tx_substrate::step::DelegateRegistry;
+use crate::adapter::step_engine::{Cap, PayloadCap};
+use tx_substrate::step::{DelegateRegistry, RestrictionStackHandle};
 use tx_substrate::wake::mailbox::{MailboxEvent, MailboxSchedulerHint, TaskMailbox};
 use tx_subsystems::cred::{Cred, CredSnapshot};
-use tx_subsystems::process::ProcessIdentity;
+use tx_subsystems::process::{ProcessIdentity, ProcessPayload};
 use tx_subsystems::thread_runtime::ThreadIdentity;
 use tx_subsystems::vfs::structure::Credential;
 use tx_subsystems::vm::AddressSpace;
@@ -65,6 +65,10 @@ impl DerefMut for SubjectScriptCtx {
 
 pub struct SyscallCtx<'a> {
     pub process: Cap<ProcessIdentity>,
+    /// Retained payload captured with the live process at syscall entry.
+    /// Hot fd/cwd/resource lookups use this directly and avoid repeatedly
+    /// taking `ProcessIdentity.payload` before reaching the real sub-lock.
+    pub process_payload: PayloadCap<ProcessPayload>,
     pub thread: Cap<ThreadIdentity>,
     pub aspace: Cap<AddressSpace>,
     /// Per-task mailbox for yield resolution (drive-taskmb).
@@ -118,13 +122,14 @@ impl<'a> SyscallCtx<'a> {
         // mid-syscall `setuid` on the same process must not perturb
         // checks already taken under this snapshot.
         //
-        // `cred_snapshot()` returns `None` only for zombies (payload
-        // dropped — cred unobservable). A live syscall arm reaches
-        // this code path with `self.process` alive by definition; the
-        // `CredSnapshot::root()` fallback is purely defensive and
-        // mirrors today's `Cred::root()` fallback in `Self::cred`.
-        let cred_snapshot = process.cred_snapshot().unwrap_or_else(CredSnapshot::root);
-        Self::from_parts_with_cred_snapshot(process, thread, aspace, cred_snapshot)
+        // A live syscall must retain the payload before any other per-process
+        // state is resolved.  That retained capability is also reused by hot
+        // syscall helpers for the remainder of the frame.
+        let process_payload = process
+            .payload_cap()
+            .expect("live syscall process retains a payload");
+        let cred_snapshot = process_payload.cred_snapshot();
+        Self::from_parts_with_cred_snapshot(process, process_payload, thread, aspace, cred_snapshot)
     }
 
     /// Construct from an already-captured syscall-entry credential snapshot.
@@ -134,12 +139,14 @@ impl<'a> SyscallCtx<'a> {
     /// setup steps without paying for a second credential snapshot.
     pub fn from_parts_with_cred_snapshot(
         process: Cap<ProcessIdentity>,
+        process_payload: PayloadCap<ProcessPayload>,
         thread: Cap<ThreadIdentity>,
         aspace: Cap<AddressSpace>,
         cred_snapshot: CredSnapshot,
     ) -> Self {
         Self {
             process,
+            process_payload,
             thread,
             aspace,
             mailbox: None,
@@ -151,6 +158,52 @@ impl<'a> SyscallCtx<'a> {
             cred_snapshot,
             _lifetime: core::marker::PhantomData,
         }
+    }
+
+    #[inline]
+    pub fn fd(&self, fd: u32) -> Option<Cap<tx_subsystems::vfs::OpenFile>> {
+        self.process_payload.fd(fd)
+    }
+
+    #[inline]
+    pub fn cwd(&self) -> Option<Cap<tx_subsystems::vfs::DEntry>> {
+        self.process_payload.cwd()
+    }
+
+    #[inline]
+    pub fn cwd_binding(&self) -> Option<tx_subsystems::process::CwdBinding> {
+        self.process_payload.cwd_binding()
+    }
+
+    #[inline]
+    pub fn rlimit_nofile(&self) -> (u32, u32) {
+        self.process_payload.rlimit_nofile()
+    }
+
+    #[inline]
+    pub fn next_fd_above(&self, min: u32) -> u32 {
+        self.process_payload.allocate_fd_at_least(min)
+    }
+
+    #[inline]
+    pub fn install_new_fd(
+        &self,
+        file: Cap<tx_subsystems::vfs::OpenFile>,
+        cloexec: bool,
+    ) -> Option<u32> {
+        self.process_payload
+            .install_new_fd_at_least(0, file, cloexec)
+    }
+
+    #[inline]
+    pub fn install_new_fd_pair(
+        &self,
+        first: Cap<tx_subsystems::vfs::OpenFile>,
+        second: Cap<tx_subsystems::vfs::OpenFile>,
+        cloexec: bool,
+    ) -> Option<(u32, u32)> {
+        self.process_payload
+            .install_new_fd_pair(first, second, cloexec)
     }
 
     /// Attach a task mailbox for yield resolution (drive-taskmb).
@@ -282,8 +335,8 @@ impl<'a> SyscallCtx<'a> {
         Credential::from(&self.cred_snapshot)
     }
 
-    /// Snapshot the current process's `Cap<Cred>`. Returns a cloned
-    /// strong cap; the slab entry stays live until the cap drops.
+    /// Snapshot the retained process payload's current `Cap<Cred>`. Returns a
+    /// cloned strong cap; the slab entry stays live until the cap drops.
     ///
     /// PR-9 phase 5 (D5 Path A): the cred-mutators
     /// (`step_setuid` / `step_setgid` / ...) replace the slot's
@@ -293,15 +346,14 @@ impl<'a> SyscallCtx<'a> {
     /// pre-mutation cred — the syscall arm sees a coherent snapshot
     /// for the duration of its script frame.
     ///
-    /// Defensive fallback: zombies have no payload, so no cred-cap.
-    /// In that case we mint a fresh `Cap<Cred>` from `Cred::root()`.
-    /// Reaching this fallback inside a live syscall is impossible by
-    /// construction (the calling process is by definition alive).
     pub fn cred_cap(&self) -> Cap<Cred> {
-        self.process.cred_cap().unwrap_or_else(|| {
-            tx_subsystems::cred::sign_cred(Cred::root())
-                .expect("zone slab has capacity for defensive root cred")
-        })
+        self.process_payload.cred_cap()
+    }
+
+    /// Clone the immutable placeholder restriction authority retained by the
+    /// live process payload.
+    pub fn restrictions_cap(&self) -> Cap<RestrictionStackHandle> {
+        self.process_payload.restrictions_cap()
     }
 }
 
@@ -310,23 +362,12 @@ impl<'a> SyscallCtx<'a> {
 /// sys_write, sys_pipe2, sys_clone) call this at script entry so the
 /// step body receives `ctx.subject()` rather than `None`.
 ///
-/// Restrictions cap is a fresh placeholder per call until PR-K lands
-/// the real append-only stack (D5 §7). Each call mints one
-/// `Cap<RestrictionStackHandle>` from the substrate placeholder zone;
-/// the cap drops at script-frame exit (EBR retires the slab).
-///
-/// **Failure mode**: zone-slab exhaustion mints a defensive
-/// placeholder cap from `Cred::root()` and panics on
-/// restrictions-cap failure (the placeholder zone is sized for one
-/// cap per concurrent syscall — exhaustion is a kernel-wide pressure
-/// event PR-K will revisit). Production callers should not hit this
-/// path; for now the conservative-panic matches today's
-/// `expect("zone slab has capacity")` discipline elsewhere in this
-/// module.
+/// The placeholder restrictions authority is immutable and retained by the
+/// process payload. Script frames clone that cap instead of allocating and
+/// EBR-retiring an identical unit-valued zone object for every syscall.
 pub fn build_subject_script_ctx(ctx: &SyscallCtx<'_>) -> SubjectScriptCtx {
     let cred_cap = ctx.cred_cap();
-    let restrictions_cap = tx_subsystems::cred::placeholder_restrictions_cap()
-        .expect("placeholder restrictions zone has capacity per syscall entry");
+    let restrictions_cap = ctx.restrictions_cap();
     let authority = crate::KernelSubjectAuthority::new(cred_cap, restrictions_cap);
     let subject = crate::KernelSubjectContext::from_thread(
         ctx.process.clone(),

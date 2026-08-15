@@ -6,7 +6,7 @@
 //! bridges the two by allocating a transient frame, issuing a DMA operation,
 //! and copying between the frame and the caller's `[u8; 4096]` buffer.
 
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 use core::ptr::NonNull;
 
 use crate::devfs::adapter::step_engine::{
@@ -44,6 +44,14 @@ impl tx_ext4::mount::FilePageContainerBinder for Ext4FileIoRuntimeBinder {
         &self,
         container: tx_subsystems::adapter::step_engine::Cap<PageContainer>,
     ) {
+        // A runtime is one reactor task per inode. Small files cannot trigger
+        // the page cache's fault readahead window, so registering them only
+        // adds clone/exit/runqueue pressure to compiler workloads. They keep
+        // the synchronous pager path; large files receive the parallel read
+        // planner and bounded readahead service.
+        if container.page_count() < tx_subsystems::page_backed::FILE_READAHEAD_TRIGGER_PAGES {
+            return;
+        }
         let _runtime = device::register_page_container_file_io_service(container, self.handle);
     }
 }
@@ -83,16 +91,35 @@ impl BlockDeviceImage {
     }
 
     fn read_block_uncached(&self, block: u64, out: &mut Page4K) -> Result<()> {
+        let blocks = self.read_blocks_uncached(block, 1)?;
+        out.copy_from_slice(blocks[0].as_ref());
+        Ok(())
+    }
+
+    fn read_blocks_uncached(&self, first_block: u64, count: usize) -> Result<Vec<Arc<Page4K>>> {
+        if count == 0 {
+            return Err(Ext4FormatError::OutOfBounds);
+        }
         let spb = self
             .sectors_per_ext4_block()
             .ok_or(Ext4FormatError::Unsupported)?;
-        let lba = block.checked_mul(spb).ok_or(Ext4FormatError::OutOfBounds)?;
+        let lba = first_block
+            .checked_mul(spb)
+            .ok_or(Ext4FormatError::OutOfBounds)?;
 
-        let reservation = page_allocator::reserve_run(1, 1, ZeroPolicy::UninitFullOverwrite)
+        let reservation = page_allocator::reserve_run(count, 1, ZeroPolicy::UninitFullOverwrite)
             .map_err(|_| Ext4FormatError::Truncated)?;
         let run = reservation.commit();
-        let ppn = run.base();
-        let mut frame = Frame::new(ppn);
+        let base = run.base();
+        let mut frames = Vec::with_capacity(count);
+        for index in 0..count {
+            let mut ppn = base;
+            ppn.0 = ppn
+                .0
+                .checked_add(index)
+                .ok_or(Ext4FormatError::OutOfBounds)?;
+            frames.push(Frame::new(ppn));
+        }
 
         // Borrow the caller's active guard when one is already held (e.g.
         // exec_script's VFS-lookup guard).  Creating a nested guard would
@@ -100,11 +127,9 @@ impl BlockDeviceImage {
         // ops ignore the guard parameter entirely.  Fall back to a fresh guard
         // when no guard is active.
         let guard = borrow_current_guard().unwrap_or_else(guard);
-        let outcome = self.device.read_blocks(
-            PhysicalBlockNumber::new(lba),
-            core::slice::from_mut(&mut frame),
-            &guard,
-        );
+        let outcome = self
+            .device
+            .read_blocks(PhysicalBlockNumber::new(lba), &mut frames, &guard);
         drop(guard);
         match outcome {
             StepOutcome::Done(()) => {}
@@ -114,17 +139,31 @@ impl BlockDeviceImage {
             StepOutcome::Err(_) => return Err(Ext4FormatError::Truncated),
         }
 
-        let src = page_allocator::frame_kernel_addr(ppn).map_err(|_| Ext4FormatError::Truncated)?;
-        let src_nn = NonNull::new(src).ok_or(Ext4FormatError::Truncated)?;
-        // SAFETY: `src_nn` points to BLOCK_SIZE bytes of a frame we own
-        // through `run`. `out` is a `&mut [u8; BLOCK_SIZE]`. Both regions
-        // are valid for `BLOCK_SIZE` bytes and the kernel-VA mapping for
-        // a freshly reserved frame does not alias `out`.
-        unsafe {
-            core::ptr::copy_nonoverlapping(src_nn.as_ptr(), out.as_mut_ptr(), BLOCK_SIZE);
+        let mut blocks = Vec::with_capacity(count);
+        for frame in &frames {
+            let src = page_allocator::frame_kernel_addr(frame.ppn())
+                .map_err(|_| Ext4FormatError::Truncated)?;
+            let src_nn = NonNull::new(src).ok_or(Ext4FormatError::Truncated)?;
+            let mut page = [0u8; BLOCK_SIZE];
+            // SAFETY: `src_nn` points to one frame in `run`, which remains
+            // owned until every page has been copied into the adapter cache.
+            unsafe {
+                core::ptr::copy_nonoverlapping(src_nn.as_ptr(), page.as_mut_ptr(), BLOCK_SIZE);
+            }
+            blocks.push(Arc::new(page));
         }
         drop(run);
-        Ok(())
+        Ok(blocks)
+    }
+
+    fn cache_blocks(&self, first_block: u64, blocks: &[Arc<Page4K>]) {
+        let mut cache = self.cache.lock();
+        for (index, page) in blocks.iter().enumerate() {
+            let Some(block) = first_block.checked_add(index as u64) else {
+                break;
+            };
+            cache.insert(block, Arc::clone(page));
+        }
     }
 }
 
@@ -148,39 +187,89 @@ impl BlockImage for BlockDeviceImage {
         Ok(())
     }
 
+    fn read_data_block(&self, block: u64, out: &mut Page4K) -> Result<()> {
+        let cached = { self.cache.lock().get(block) };
+        if let Some(cached) = cached {
+            out.copy_from_slice(cached.as_ref());
+            return Ok(());
+        }
+
+        let remaining = self.total_blocks().saturating_sub(block);
+        let count = usize::try_from(remaining.min(DATA_READ_AHEAD_BLOCKS as u64))
+            .map_err(|_| Ext4FormatError::OutOfBounds)?;
+        if count == 0 {
+            return Err(Ext4FormatError::OutOfBounds);
+        }
+
+        match self.read_blocks_uncached(block, count) {
+            Ok(blocks) => {
+                out.copy_from_slice(blocks[0].as_ref());
+                self.cache_blocks(block, &blocks);
+                Ok(())
+            }
+            Err(_) if count > 1 => {
+                // Keep the one-block path as a correctness fallback when a
+                // contiguous multi-frame reservation is temporarily unavailable.
+                self.read_block(block, out)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     fn write_block(&mut self, block: u64, data: &Page4K) -> Result<()> {
+        self.write_blocks(block, core::slice::from_ref(&data))
+    }
+
+    fn write_blocks(&mut self, first_block: u64, data: &[&Page4K]) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
         let spb = self
             .sectors_per_ext4_block()
             .ok_or(Ext4FormatError::Unsupported)?;
-        let lba = block.checked_mul(spb).ok_or(Ext4FormatError::OutOfBounds)?;
+        let lba = first_block
+            .checked_mul(spb)
+            .ok_or(Ext4FormatError::OutOfBounds)?;
 
-        let reservation = page_allocator::reserve_run(1, 1, ZeroPolicy::UninitFullOverwrite)
-            .map_err(|_| Ext4FormatError::Truncated)?;
+        let reservation =
+            page_allocator::reserve_run(data.len(), 1, ZeroPolicy::UninitFullOverwrite)
+                .map_err(|_| Ext4FormatError::Truncated)?;
         let run = reservation.commit();
-        let ppn = run.base();
-        let frame = Frame::new(ppn);
-
-        let dst = page_allocator::frame_kernel_addr(ppn).map_err(|_| Ext4FormatError::Truncated)?;
-        let dst_nn = NonNull::new(dst).ok_or(Ext4FormatError::Truncated)?;
-        // SAFETY: `dst_nn` is the kernel direct-map VA of the freshly
-        // allocated frame we own through `run`. `data` is `&[u8; BLOCK_SIZE]`.
-        // Both regions are valid for BLOCK_SIZE bytes and disjoint.
-        unsafe {
-            core::ptr::copy_nonoverlapping(data.as_ptr(), dst_nn.as_ptr(), BLOCK_SIZE);
+        let base = run.base();
+        let mut frames = Vec::with_capacity(data.len());
+        for (index, page) in data.iter().enumerate() {
+            let mut ppn = base;
+            ppn.0 = ppn
+                .0
+                .checked_add(index)
+                .ok_or(Ext4FormatError::OutOfBounds)?;
+            let dst =
+                page_allocator::frame_kernel_addr(ppn).map_err(|_| Ext4FormatError::Truncated)?;
+            let dst_nn = NonNull::new(dst).ok_or(Ext4FormatError::Truncated)?;
+            // SAFETY: every destination is one distinct frame in the live
+            // contiguous run and every source references one complete ext4
+            // block for the duration of this synchronous submission.
+            unsafe {
+                core::ptr::copy_nonoverlapping(page.as_ptr(), dst_nn.as_ptr(), BLOCK_SIZE);
+            }
+            frames.push(Frame::new(ppn));
         }
 
         let guard = borrow_current_guard().unwrap_or_else(guard);
-        let outcome = self.device.write_blocks(
-            PhysicalBlockNumber::new(lba),
-            core::slice::from_ref(&frame),
-            &guard,
-        );
+        let outcome = self
+            .device
+            .write_blocks(PhysicalBlockNumber::new(lba), &frames, &guard);
         drop(guard);
         drop(run);
         match outcome {
             StepOutcome::Done(()) => {
-                let cached = Arc::new(*data);
-                self.cache.lock().insert(block, cached);
+                let mut cache = self.cache.lock();
+                for (index, page) in data.iter().enumerate() {
+                    let block = first_block
+                        .checked_add(index as u64)
+                        .ok_or(Ext4FormatError::OutOfBounds)?;
+                    cache.insert(block, Arc::new(**page));
+                }
                 Ok(())
             }
             StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
@@ -218,73 +307,106 @@ impl BlockImage for BlockDeviceImage {
 // seconds per command) — the dominant cost of every LTP shell test. The hot
 // set (busybox + ash scripts + libc + common test binaries) fits in a few MiB.
 const READ_BLOCK_CACHE_ENTRIES: usize = 4096;
+const READ_BLOCK_CACHE_WAYS: usize = 8;
+const READ_BLOCK_CACHE_SETS: usize = READ_BLOCK_CACHE_ENTRIES / READ_BLOCK_CACHE_WAYS;
+const DATA_READ_AHEAD_BLOCKS: usize = 8;
 
 struct ReadBlockCache {
     clock: u64,
-    // block -> (last_used, data). O(log n) lookup; the previous Vec scan was
-    // O(entries) per get and at 4096 entries × ~350 block reads per exec the
-    // index walk itself dominated (every shell command pays one exec).
-    entries: alloc::collections::BTreeMap<u64, (u64, Arc<Page4K>)>,
-    // last_used -> block mirror for O(log n) LRU eviction. last_used values
-    // are unique (clock strictly increases on every touch).
-    lru: alloc::collections::BTreeMap<u64, u64>,
+    // Eight-way set associativity bounds every hit to eight probes. The old
+    // pair of BTreeMaps performed a tree lookup, an LRU-tree removal and an
+    // LRU-tree insertion on every cached 4 KiB read while holding one lock.
+    entries: Vec<ReadBlockCacheEntry>,
+}
+
+struct ReadBlockCacheEntry {
+    block: u64,
+    last_used: u64,
+    data: Option<Arc<Page4K>>,
+}
+
+impl ReadBlockCacheEntry {
+    const fn empty() -> Self {
+        Self {
+            block: 0,
+            last_used: 0,
+            data: None,
+        }
+    }
 }
 
 impl ReadBlockCache {
     fn new() -> Self {
         Self {
             clock: 0,
-            entries: alloc::collections::BTreeMap::new(),
-            lru: alloc::collections::BTreeMap::new(),
+            entries: (0..READ_BLOCK_CACHE_ENTRIES)
+                .map(|_| ReadBlockCacheEntry::empty())
+                .collect(),
         }
     }
 
     fn get(&mut self, block: u64) -> Option<Arc<Page4K>> {
         self.clock = self.clock.wrapping_add(1);
         let clock = self.clock;
-        let (last_used, data) = self.entries.get_mut(&block)?;
-        self.lru.remove(last_used);
-        *last_used = clock;
-        self.lru.insert(clock, block);
-        Some(data.clone())
+        let index = read_block_cache_set(block).find(|index| {
+            let entry = &self.entries[*index];
+            entry.data.is_some() && entry.block == block
+        })?;
+        let entry = &mut self.entries[index];
+        entry.last_used = clock;
+        entry.data.clone()
     }
 
     fn insert(&mut self, block: u64, data: Arc<Page4K>) {
         self.clock = self.clock.wrapping_add(1);
         let clock = self.clock;
-        if let Some((last_used, slot)) = self.entries.get_mut(&block) {
-            self.lru.remove(last_used);
-            *last_used = clock;
-            *slot = data;
-            self.lru.insert(clock, block);
-            return;
-        }
-        if self.entries.len() >= READ_BLOCK_CACHE_ENTRIES {
-            if let Some((&oldest, &victim_block)) = self.lru.iter().next() {
-                self.lru.remove(&oldest);
-                self.entries.remove(&victim_block);
-            }
-        }
-        self.entries.insert(block, (clock, data));
-        self.lru.insert(clock, block);
+        let range = read_block_cache_set(block);
+        let victim = range
+            .clone()
+            .find(|index| {
+                let entry = &self.entries[*index];
+                entry.data.is_none() || entry.block == block
+            })
+            .unwrap_or_else(|| {
+                range
+                    .min_by_key(|index| self.entries[*index].last_used)
+                    .unwrap_or(0)
+            });
+        self.entries[victim] = ReadBlockCacheEntry {
+            block,
+            last_used: clock,
+            data: Some(data),
+        };
     }
 
     fn invalidate(&mut self, block: u64) {
-        if let Some((last_used, _)) = self.entries.remove(&block) {
-            self.lru.remove(&last_used);
+        for index in read_block_cache_set(block) {
+            let entry = &mut self.entries[index];
+            if entry.data.is_some() && entry.block == block {
+                entry.data = None;
+                return;
+            }
         }
     }
 
     fn clear(&mut self) {
-        self.entries.clear();
-        self.lru.clear();
+        for entry in &mut self.entries {
+            entry.data = None;
+        }
     }
+}
+
+fn read_block_cache_set(block: u64) -> core::ops::Range<usize> {
+    let mixed = block.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (block >> 23);
+    let first = mixed as usize % READ_BLOCK_CACHE_SETS * READ_BLOCK_CACHE_WAYS;
+    first..first + READ_BLOCK_CACHE_WAYS
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::devfs::adapter::step_engine::{page_allocator, NoProgress};
+    use crate::devfs::adapter::step_engine::{guard, page_allocator, NoProgress};
+    use core::sync::atomic::{AtomicUsize, Ordering};
     use tx_subsystems::device::{
         BlockDeviceHandle, BlockDeviceOps, BlockDeviceRegistration, DevT, PhysicalBlockNumber,
     };
@@ -388,6 +510,63 @@ mod tests {
 
     static CONTINUE_DEVICE: BlockingBlockDevice = BlockingBlockDevice::new(BlockingMode::Continue);
     static YIELD_DEVICE: BlockingBlockDevice = BlockingBlockDevice::new(BlockingMode::Yield);
+
+    struct ReadAheadBlockDevice;
+
+    static READ_AHEAD_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static READ_AHEAD_FRAMES: AtomicUsize = AtomicUsize::new(0);
+    static BATCH_WRITE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static BATCH_WRITE_FRAMES: AtomicUsize = AtomicUsize::new(0);
+    static BATCH_WRITE_LBA: AtomicUsize = AtomicUsize::new(0);
+
+    impl BlockDeviceOps for ReadAheadBlockDevice {
+        fn read_blocks(
+            &self,
+            block_id: PhysicalBlockNumber,
+            target: &mut [Frame],
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<(), NoProgress> {
+            READ_AHEAD_CALLS.fetch_add(1, Ordering::Relaxed);
+            READ_AHEAD_FRAMES.store(target.len(), Ordering::Relaxed);
+            for (index, frame) in target.iter().enumerate() {
+                let address = page_allocator::frame_kernel_addr(frame.ppn())
+                    .expect("read-ahead test frame mapping");
+                let value = block_id.as_u64().wrapping_add((index * 8) as u64) as u8;
+                // SAFETY: every frame belongs to the bridge's live contiguous
+                // allocation and exposes one complete 4 KiB DMA destination.
+                unsafe { core::ptr::write_bytes(address, value, BLOCK_SIZE) };
+            }
+            StepOutcome::done(())
+        }
+
+        fn write_blocks(
+            &self,
+            block_id: PhysicalBlockNumber,
+            source: &[Frame],
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<(), NoProgress> {
+            BATCH_WRITE_CALLS.fetch_add(1, Ordering::Relaxed);
+            BATCH_WRITE_FRAMES.store(source.len(), Ordering::Relaxed);
+            BATCH_WRITE_LBA.store(block_id.as_u64() as usize, Ordering::Relaxed);
+            StepOutcome::done(())
+        }
+
+        fn barrier(&self, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
+            StepOutcome::done(())
+        }
+    }
+
+    impl BlockDevice for ReadAheadBlockDevice {
+        fn total_blocks(&self) -> u64 {
+            1024
+        }
+
+        fn block_size(&self) -> u32 {
+            512
+        }
+    }
+
+    static READ_AHEAD_DEVICE: ReadAheadBlockDevice = ReadAheadBlockDevice;
     static FILE_IO_REGISTRATION: BlockDeviceRegistration = BlockDeviceRegistration {
         devt: DevT::new(8, 65),
         name: "ext4-test",
@@ -439,6 +618,53 @@ mod tests {
     }
 
     #[test]
+    fn ext4_data_read_prefetches_eight_blocks_with_one_device_request() {
+        let _serial = crate::test_support::FS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        init_bridge_test();
+        READ_AHEAD_CALLS.store(0, Ordering::Relaxed);
+        READ_AHEAD_FRAMES.store(0, Ordering::Relaxed);
+        let image = BlockDeviceImage::new(&READ_AHEAD_DEVICE);
+        let mut first = [0u8; BLOCK_SIZE];
+        let mut second = [0u8; BLOCK_SIZE];
+
+        image
+            .read_data_block(4, &mut first)
+            .expect("first prefetched data block");
+        image
+            .read_data_block(5, &mut second)
+            .expect("adjacent block cache hit");
+
+        assert_eq!(READ_AHEAD_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(READ_AHEAD_FRAMES.load(Ordering::Relaxed), 8);
+        assert_eq!(first[0], 32);
+        assert_eq!(second[0], 40);
+    }
+
+    #[test]
+    fn ext4_data_write_submits_one_contiguous_multi_frame_request() {
+        let _serial = crate::test_support::FS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        init_bridge_test();
+        BATCH_WRITE_CALLS.store(0, Ordering::Relaxed);
+        BATCH_WRITE_FRAMES.store(0, Ordering::Relaxed);
+        BATCH_WRITE_LBA.store(0, Ordering::Relaxed);
+        let mut image = BlockDeviceImage::new(&READ_AHEAD_DEVICE);
+        let first = [0x31u8; BLOCK_SIZE];
+        let second = [0x32u8; BLOCK_SIZE];
+
+        image
+            .write_blocks(4, &[&first, &second])
+            .expect("contiguous ext4 data write");
+
+        assert_eq!(BATCH_WRITE_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(BATCH_WRITE_FRAMES.load(Ordering::Relaxed), 2);
+        assert_eq!(BATCH_WRITE_LBA.load(Ordering::Relaxed), 32);
+    }
+
+    #[test]
     fn ext4_file_io_runtime_binder_registers_supplied_block_handle() {
         let _serial = crate::test_support::FS_TEST_LOCK
             .lock()
@@ -451,7 +677,7 @@ mod tests {
             tx_subsystems::page_backed::PageContainerKind::Anon {
                 swap_policy: tx_subsystems::page_backed::AnonSwapPolicy::Reclaimable,
             },
-            1,
+            tx_subsystems::page_backed::FILE_READAHEAD_TRIGGER_PAGES,
         )
         .expect("page container cap");
         let binder = Ext4FileIoRuntimeBinder::new(BlockDeviceHandle::whole(&FILE_IO_REGISTRATION));
@@ -463,15 +689,15 @@ mod tests {
 
         let runtimes = tx_subsystems::device::page_container_file_io_service_runtimes_snapshot();
         assert_eq!(runtimes.len(), 1);
-        assert!(runtimes[0].container().is_some());
+        assert!(runtimes[0].is_live(&guard()));
         assert_eq!(
             runtimes[0].handle().registration().devt,
             FILE_IO_REGISTRATION.devt
         );
         drop(container);
-        assert!(
-            tx_subsystems::device::page_container_file_io_service_runtimes_snapshot().is_empty()
-        );
+        let stale = tx_subsystems::device::page_container_file_io_service_runtimes_snapshot();
+        assert_eq!(stale.len(), 1);
+        assert!(!stale[0].is_live(&guard()));
         tx_subsystems::device::reset_page_container_file_io_service_registry_for_test();
     }
 }

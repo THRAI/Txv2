@@ -107,12 +107,28 @@ impl PmapMapping {
     fn into_pin(self) -> MaterializedPagePin {
         self.pin
     }
+
+    fn pinned_snapshot(&self) -> Option<PmapPinnedMapping> {
+        Some(PmapPinnedMapping {
+            snapshot: self.snapshot(),
+            pin: self.pin.retain(self.ppn).ok()?,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PmapMappingSnapshot {
     pub ppn: Ppn,
     pub prot: Prot,
+}
+
+/// A pmap observation paired with an independent pin for synchronous
+/// direct-map access.  The pin is acquired while `VmPmap::state` is locked,
+/// so teardown on another hart cannot free the frame between observation and
+/// pin acquisition.
+pub(in crate::vm) struct PmapPinnedMapping {
+    pub snapshot: PmapMappingSnapshot,
+    pub pin: MaterializedPagePin,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -195,6 +211,14 @@ impl VmPmap {
             .mappings
             .get(&page)
             .map(PmapMapping::snapshot)
+    }
+
+    pub(in crate::vm) fn lookup_pinned(&self, page: UserPage) -> Option<PmapPinnedMapping> {
+        self.state
+            .lock_with_progress(self.ops.service_pending_tlb_shootdown)
+            .mappings
+            .get(&page)
+            .and_then(PmapMapping::pinned_snapshot)
     }
 
     /// Returns mapped `(page, snapshot)` tuples for every page in `range`
@@ -516,41 +540,71 @@ impl VmPmap {
     /// stack, and data bytes. The next write faults through the recipe and
     /// materializes an exclusive private frame.
     pub fn protect_range(&self, range: UserRange, prot: Prot) -> Result<usize, VmPmapError> {
-        let permissions = permissions_for_prot(prot);
+        self.protect_ranges(&[(range, prot)])
+    }
+
+    /// Apply several disjoint protection changes under one pmap transaction
+    /// and one cross-hart TLB shootdown.
+    ///
+    /// Fork commonly demotes every private VMA in one operation. Issuing one
+    /// IPI round trip for every resident page made process creation scale with
+    /// `resident pages * online harts`; the software shadow and the HAL PTEs
+    /// can be updated page by page, but their invalidations are published as
+    /// one batch at the transaction boundary.
+    pub(in crate::vm) fn protect_ranges(
+        &self,
+        ranges: &[(UserRange, Prot)],
+    ) -> Result<usize, VmPmapError> {
         let mut protected = 0;
         let mut state = self
             .state
             .lock_with_progress(self.ops.service_pending_tlb_shootdown);
-        let pages = mapped_pages_in_range(&state, range);
+        let mut invalidations = Vec::new();
 
-        for page in pages {
-            let Some(current) = state.mappings.get(&page).map(PmapMapping::snapshot) else {
-                continue;
-            };
-            if current.prot == prot {
-                continue;
+        for &(range, prot) in ranges {
+            let permissions = permissions_for_prot(prot);
+            let pages = mapped_pages_in_range(&state, range);
+            for page in pages {
+                let Some(current) = state.mappings.get(&page).map(PmapMapping::snapshot) else {
+                    continue;
+                };
+                if current.prot == prot {
+                    continue;
+                }
+
+                let virt = match virt_for_page(page) {
+                    Ok(virt) => virt,
+                    Err(error) => {
+                        self.issue_protect_batch_locked(&mut state, &mut invalidations);
+                        return Err(error);
+                    }
+                };
+                let invalidation = match (self.ops.protect_mapping)(
+                    self.root(),
+                    virt,
+                    PmapReserveKind::Page4K,
+                    permissions,
+                ) {
+                    Ok(Some(invalidation)) => invalidation,
+                    Ok(None) => {
+                        self.issue_protect_batch_locked(&mut state, &mut invalidations);
+                        return Err(VmPmapError::MappingMismatch);
+                    }
+                    Err(error) => {
+                        self.issue_protect_batch_locked(&mut state, &mut invalidations);
+                        return Err(VmPmapError::Pmap(error));
+                    }
+                };
+
+                if let Some(mapping) = state.mappings.get_mut(&page) {
+                    mapping.prot = prot;
+                }
+                invalidations.push(invalidation);
+                protected += 1;
             }
-
-            let virt = virt_for_page(page)?;
-            let invalidation = match (self.ops.protect_mapping)(
-                self.root(),
-                virt,
-                PmapReserveKind::Page4K,
-                permissions,
-            ) {
-                Ok(Some(invalidation)) => invalidation,
-                Ok(None) => return Err(VmPmapError::MappingMismatch),
-                Err(error) => return Err(VmPmapError::Pmap(error)),
-            };
-
-            if let Some(mapping) = state.mappings.get_mut(&page) {
-                mapping.prot = prot;
-            }
-            (self.ops.shootdown_mappings)(self.asid(), &[invalidation]);
-            state.shootdowns += 1;
-            protected += 1;
         }
 
+        self.issue_protect_batch_locked(&mut state, &mut invalidations);
         Ok(protected)
     }
 
@@ -638,6 +692,19 @@ impl VmPmap {
         state.shootdowns += 1;
         invalidations.clear();
         pins.clear();
+    }
+
+    fn issue_protect_batch_locked(
+        &self,
+        state: &mut VmPmapState,
+        invalidations: &mut Vec<PmapInvalidation>,
+    ) {
+        if invalidations.is_empty() {
+            return;
+        }
+        (self.ops.shootdown_mappings)(self.asid(), invalidations);
+        state.shootdowns += 1;
+        invalidations.clear();
     }
 }
 

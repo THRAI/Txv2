@@ -5,25 +5,54 @@
 //! - `run_walker` — start a walk, return after terminal or first yield
 //! - `resume_walker` — resume from a `ResumeToken` after IO
 
-use alloc::sync::Arc;
-use alloc::vec::Vec;
-
 use crate::execution::{Errno, Guard};
 use crate::mount::MountNamespace;
 use crate::vfs::adapter::step_engine::Cap;
 use crate::vfs::structure::{Credential, DEntry};
 use crate::vfs::walker;
-use crate::vfs::FsOps;
 
 use super::error::classify;
 use super::state::{
     try_copy_path, FinalSymlinkPolicy, IORequest, IOResult, KernelStep, PathResolution,
-    ResumeToken, WalkCause, WalkMode, WalkState, WalkingState,
+    RemainingPath, ResumeToken, WalkCause, WalkMode, WalkState, WalkingState,
 };
 use super::step::{
     kernel_step, kernel_step_after_lookup_io, kernel_step_after_materialise_io,
     kernel_step_after_meta_io, kernel_step_after_readlink_io, TerminalRules,
 };
+
+/// Resolve the filesystem scope already carried by the walk before falling
+/// back to the RNode weak binding. A namespace-aware walk holds its current
+/// `MountIdentity` strongly, so upgrading that payload once supplies both the
+/// filesystem operations and mount payload for the whole component step.
+fn mount_payload_for_walking(
+    walking: &WalkingState,
+    guard: &Guard<'_>,
+) -> Option<Cap<crate::mount::MountPayload>> {
+    walking
+        .current_mount
+        .as_ref()
+        .and_then(|mount| mount.payload_cap().ok())
+        .map(|payload| payload.into_cap())
+        .or_else(|| walker::mount_payload_for(&walking.current, guard))
+        .or_else(|| walker::mount_payload_for(&walking.mount_root, guard))
+}
+
+fn fs_scope_for_walking(
+    walking: &WalkingState,
+    guard: &Guard<'_>,
+) -> Option<(
+    alloc::sync::Arc<dyn crate::vfs::FsOps>,
+    Option<Cap<crate::mount::MountPayload>>,
+)> {
+    let mount_payload = mount_payload_for_walking(walking, guard);
+    let fs_ops = mount_payload
+        .as_ref()
+        .map(|payload| payload.fs_ops.clone())
+        .or_else(|| walker::fs_ops_for(&walking.current, guard))
+        .or_else(|| walker::fs_ops_for(&walking.mount_root, guard))?;
+    Some((fs_ops, mount_payload))
+}
 
 /// Drive a walk from start to terminal, synchronously.
 ///
@@ -78,34 +107,59 @@ pub fn walk_to_completion_with_mount_namespace_and_origin(
     origin_mount: Option<&Cap<crate::mount::MountIdentity>>,
     guard: &Guard<'_>,
 ) -> Result<PathResolution, Errno> {
+    walk_to_completion_with_mount_namespace_and_origin_policy(
+        rooted_at,
+        path,
+        mode,
+        policy,
+        cred,
+        mount_namespace,
+        origin_mount,
+        false,
+        guard,
+    )
+}
+
+/// Resolve a path using only authoritative positive dentry-cache entries.
+/// `EAGAIN` means at least one component needs backend lookup or
+/// materialisation and is the caller's signal to use the wait-capable path.
+pub fn walk_cached_to_completion_with_mount_namespace_and_origin(
+    rooted_at: Cap<DEntry>,
+    path: &[u8],
+    mode: WalkMode,
+    policy: FinalSymlinkPolicy,
+    cred: &Credential,
+    mount_namespace: Option<&Cap<MountNamespace>>,
+    origin_mount: Option<&Cap<crate::mount::MountIdentity>>,
+    guard: &Guard<'_>,
+) -> Result<PathResolution, Errno> {
+    walk_to_completion_with_mount_namespace_and_origin_policy(
+        rooted_at,
+        path,
+        mode,
+        policy,
+        cred,
+        mount_namespace,
+        origin_mount,
+        true,
+        guard,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_to_completion_with_mount_namespace_and_origin_policy(
+    rooted_at: Cap<DEntry>,
+    path: &[u8],
+    mode: WalkMode,
+    policy: FinalSymlinkPolicy,
+    cred: &Credential,
+    mount_namespace: Option<&Cap<MountNamespace>>,
+    origin_mount: Option<&Cap<crate::mount::MountIdentity>>,
+    cache_only: bool,
+    guard: &Guard<'_>,
+) -> Result<PathResolution, Errno> {
     let (current, remaining, mount_root, current_mount, mount_root_mount, must_be_directory) =
         initial_walk_frame(rooted_at, path, mount_namespace, origin_mount)?;
-
-    let _fs_ops: Arc<dyn FsOps> = walker::fs_ops_for(&current, guard)
-        .or_else(|| walker::fs_ops_for(&mount_root, guard))
-        .ok_or_else(|| {
-            use super::diagnostic;
-            let rn = current.rnode();
-            diagnostic::record_ctx(
-                8, // walk_to_completion: fs_ops_for None (pre-loop)
-                current.name().as_bytes(),
-                rn.fs_object_id(),
-                &remaining,
-                rn.containing_mount_weak().is_some(),
-            );
-            Errno::ENODEV
-        })?;
-
-    let _mount_payload = walker::mount_payload_for(&current, guard)
-        .or_else(|| walker::mount_payload_for(&mount_root, guard));
-    // record if mount_payload is None here (non-fatal, but diagnostic)
-    if walker::mount_payload_for(&current, guard).is_none()
-        && walker::mount_payload_for(&mount_root, guard).is_none()
-    {
-        use super::diagnostic;
-        diagnostic::record_diag(9); // walk_to_completion: mount_payload_for None
-        diagnostic::record_label(b"walk_to_completion: no mount_payload");
-    }
 
     let mut state = WalkState::Walking(WalkingState {
         current,
@@ -126,63 +180,82 @@ pub fn walk_to_completion_with_mount_namespace_and_origin(
             WalkState::Error(cause) => return Err(classify(&cause)),
         };
 
-        let fs_ops = walker::fs_ops_for(&walking.current, guard)
-            .or_else(|| walker::fs_ops_for(&walking.mount_root, guard))
-            .ok_or_else(|| {
-                use super::diagnostic;
-                let rn = walking.current.rnode();
-                diagnostic::record_ctx(
-                    8, // walk_to_completion loop: fs_ops_for None
-                    walking.current.name().as_bytes(),
-                    rn.fs_object_id(),
-                    &walking.remaining,
-                    rn.containing_mount_weak().is_some(),
-                );
-                Errno::ENODEV
-            })?;
+        let (fs_ops, mount_payload) = fs_scope_for_walking(&walking, guard).ok_or_else(|| {
+            use super::diagnostic;
+            let rn = walking.current.rnode();
+            diagnostic::record_ctx(
+                8, // walk_to_completion loop: fs_ops_for None
+                walking.current.name().as_bytes(),
+                rn.fs_object_id(),
+                &walking.remaining,
+                rn.containing_mount_weak().is_some(),
+            );
+            Errno::ENODEV
+        })?;
 
-        let mount_payload = walker::mount_payload_for(&walking.current, guard)
-            .or_else(|| walker::mount_payload_for(&walking.mount_root, guard));
-
+        // Rich failure snapshots are useful while debugging the walker, but
+        // cloning the dentry and copying the remaining path on every successful
+        // component makes ordinary release path lookup pay for diagnostics it
+        // never consumes.
+        #[cfg(debug_assertions)]
         let diagnostic_current = walking.current.clone();
-        let mut diagnostic_remaining = [0u8; 128];
-        let diagnostic_len = walking.remaining.len().min(diagnostic_remaining.len());
-        diagnostic_remaining[..diagnostic_len]
-            .copy_from_slice(&walking.remaining[..diagnostic_len]);
+        #[cfg(debug_assertions)]
+        let (diagnostic_remaining, diagnostic_len) = {
+            let mut remaining = [0u8; 128];
+            let len = walking.remaining.len().min(remaining.len());
+            remaining[..len].copy_from_slice(&walking.remaining[..len]);
+            (remaining, len)
+        };
         let rules = TerminalRules::new(mode, policy);
-        match kernel_step(
-            walking,
-            fs_ops,
-            mount_payload,
-            mount_namespace,
-            cred,
-            rules,
-            guard,
-        ) {
+        let step = if cache_only {
+            super::step::kernel_step_cached(
+                walking,
+                fs_ops,
+                mount_payload,
+                mount_namespace,
+                cred,
+                rules,
+                guard,
+            )
+        } else {
+            kernel_step(
+                walking,
+                fs_ops,
+                mount_payload,
+                mount_namespace,
+                cred,
+                rules,
+                guard,
+            )
+        };
+        match step {
             KernelStep::Continue(next) => state = next,
             KernelStep::Error(cause) => {
-                // Capture walker failure context before returning.
-                let rn = diagnostic_current.rnode();
                 let errno = classify(&cause);
-                let stage = match &cause {
-                    WalkCause::TraverseDenied => 30,
-                    WalkCause::ComponentNotFound => 31,
-                    WalkCause::NotADirectory => 32,
-                    WalkCause::SymlinkLimit => 33,
-                    WalkCause::MountPointGap => 34,
-                    WalkCause::FsOpsRejected(_) => 35,
-                    WalkCause::Permission(_) => 36,
-                    WalkCause::TerminalOpenFailed(_) => 37,
-                };
-                super::diagnostic::record_ctx(
-                    stage,
-                    diagnostic_current.name().as_bytes(),
-                    rn.fs_object_id(),
-                    &diagnostic_remaining[..diagnostic_len],
-                    rn.containing_mount_weak().is_some(),
-                );
-                // Also stamp the legacy diag for old sentinel compatibility.
-                super::diagnostic::record_diag(stage);
+                #[cfg(debug_assertions)]
+                {
+                    // Capture walker failure context before returning.
+                    let rn = diagnostic_current.rnode();
+                    let stage = match &cause {
+                        WalkCause::TraverseDenied => 30,
+                        WalkCause::ComponentNotFound => 31,
+                        WalkCause::NotADirectory => 32,
+                        WalkCause::SymlinkLimit => 33,
+                        WalkCause::MountPointGap => 34,
+                        WalkCause::FsOpsRejected(_) => 35,
+                        WalkCause::Permission(_) => 36,
+                        WalkCause::TerminalOpenFailed(_) => 37,
+                    };
+                    super::diagnostic::record_ctx(
+                        stage,
+                        diagnostic_current.name().as_bytes(),
+                        rn.fs_object_id(),
+                        &diagnostic_remaining[..diagnostic_len],
+                        rn.containing_mount_weak().is_some(),
+                    );
+                    // Also stamp the legacy diag for old sentinel compatibility.
+                    super::diagnostic::record_diag(stage);
+                }
                 return Err(errno);
             }
             KernelStep::NeedIO(_req, _token) => return Err(Errno::EAGAIN),
@@ -324,7 +397,7 @@ fn initial_walk_frame(
 ) -> Result<
     (
         Cap<DEntry>,
-        Vec<u8>,
+        RemainingPath,
         Cap<DEntry>,
         Option<Cap<crate::mount::MountIdentity>>,
         Option<Cap<crate::mount::MountIdentity>>,
@@ -337,10 +410,15 @@ fn initial_walk_frame(
         None => (walker::mount_root_dentry(&rooted_at), None),
     };
     let absolute = path.first() == Some(&b'/');
-    let (current, remaining): (Cap<DEntry>, Vec<u8>) = if absolute {
-        (mount_root.clone(), try_copy_path(&path[1..])?)
+    let remaining: RemainingPath = if absolute {
+        try_copy_path(&path[1..])?.into()
     } else {
-        (rooted_at, try_copy_path(path)?)
+        try_copy_path(path)?.into()
+    };
+    let current = if absolute {
+        mount_root.clone()
+    } else {
+        rooted_at
     };
     let must_be_directory = remaining.last().copied() == Some(b'/');
     let current_mount = if absolute {
@@ -372,11 +450,8 @@ fn apply_io_result(
             IORequest::DirLookup { fs_object_id, name },
             IOResult::DirLookup(Ok(child_fs_object_id)),
         ) => {
-            let fs_ops = walker::fs_ops_for(&token.walking.current, guard)
-                .or_else(|| walker::fs_ops_for(&token.walking.mount_root, guard))
-                .ok_or(Errno::ENODEV)?;
-            let mount_payload = walker::mount_payload_for(&token.walking.current, guard)
-                .or_else(|| walker::mount_payload_for(&token.walking.mount_root, guard));
+            let (fs_ops, mount_payload) =
+                fs_scope_for_walking(&token.walking, guard).ok_or(Errno::ENODEV)?;
             let rules = TerminalRules::new(mode, policy);
             Ok(kernel_step_to_walk_state(
                 kernel_step_after_lookup_io(
@@ -395,11 +470,8 @@ fn apply_io_result(
             ))
         }
         (IORequest::LoadInodeMeta { fs_object_id }, IOResult::LoadInodeMeta(Ok(child_meta))) => {
-            let fs_ops = walker::fs_ops_for(&token.walking.current, guard)
-                .or_else(|| walker::fs_ops_for(&token.walking.mount_root, guard))
-                .ok_or(Errno::ENODEV)?;
-            let mount_payload = walker::mount_payload_for(&token.walking.current, guard)
-                .or_else(|| walker::mount_payload_for(&token.walking.mount_root, guard));
+            let (fs_ops, mount_payload) =
+                fs_scope_for_walking(&token.walking, guard).ok_or(Errno::ENODEV)?;
             let rules = TerminalRules::new(mode, policy);
             Ok(kernel_step_to_walk_state(
                 kernel_step_after_meta_io(
@@ -417,8 +489,7 @@ fn apply_io_result(
             ))
         }
         (IORequest::ReadLink { fs_object_id, meta }, IOResult::ReadLink(Ok(target))) => {
-            let mount_payload = walker::mount_payload_for(&token.walking.current, guard)
-                .or_else(|| walker::mount_payload_for(&token.walking.mount_root, guard));
+            let mount_payload = mount_payload_for_walking(&token.walking, guard);
             let rules = TerminalRules::new(mode, policy);
             Ok(kernel_step_to_walk_state(
                 kernel_step_after_readlink_io(
@@ -436,8 +507,7 @@ fn apply_io_result(
             ))
         }
         (IORequest::MaterialiseRnode { .. }, IOResult::MaterialiseRnode(Ok(rnode))) => {
-            let mount_payload = walker::mount_payload_for(&token.walking.current, guard)
-                .or_else(|| walker::mount_payload_for(&token.walking.mount_root, guard));
+            let mount_payload = mount_payload_for_walking(&token.walking, guard);
             let rules = TerminalRules::new(mode, policy);
             Ok(kernel_step_to_walk_state(
                 kernel_step_after_materialise_io(
@@ -534,15 +604,10 @@ fn drive_walk_state(
             WalkState::Error(cause) => return WalkState::Error(cause),
         };
 
-        let fs_ops = match walker::fs_ops_for(&walking.current, guard)
-            .or_else(|| walker::fs_ops_for(&walking.mount_root, guard))
-        {
-            Some(fs_ops) => fs_ops,
+        let (fs_ops, mount_payload) = match fs_scope_for_walking(&walking, guard) {
+            Some(scope) => scope,
             None => return WalkState::Error(WalkCause::FsOpsRejected(Errno::ENODEV)),
         };
-
-        let mount_payload = walker::mount_payload_for(&walking.current, guard)
-            .or_else(|| walker::mount_payload_for(&walking.mount_root, guard));
 
         let rules = TerminalRules::new(mode, policy);
         match kernel_step(

@@ -26,8 +26,8 @@
 //! `docs/progress/decisions/2026-04-29-rv64-pmap-helper-extraction.md`。
 
 use tx_hal::{
-    BootstrapPmapInfo, PhysAddr, PhysRange, PmapError, PmapReservationIntermediates, PtNode,
-    VirtAddr, VirtRange,
+    BootstrapPmapInfo, PhysAddr, PhysRange, PmapError, PmapInvalidation,
+    PmapReservationIntermediates, PtNode, VirtAddr, VirtRange,
 };
 
 use crate::boot_static::{BootStaticBag, IdentityDropped, IdentityLive, PageTable};
@@ -568,6 +568,41 @@ pub(crate) fn sfence_vma_all() {
     unsafe {
         core::arch::asm!("sfence.vma", options(nostack));
     }
+}
+
+// A range fence is one instruction per 4 KiB page on RISC-V.  Past this
+// point, invalidating every translation for the same ASID is both cheaper and
+// still isolated from other processes.  Keep small mutations precise so a
+// single-page fault/protect operation does not discard the whole address
+// space's hot TLB state.
+const SFENCE_VMA_ASID_PAGE_THRESHOLD: usize = 64;
+
+pub(crate) fn should_flush_entire_asid(invalidations: &[PmapInvalidation]) -> bool {
+    let mut pages = 0usize;
+    for invalidation in invalidations {
+        let range_pages = invalidation.size().div_ceil(PAGE_SIZE);
+        pages = pages.saturating_add(range_pages);
+        if pages >= SFENCE_VMA_ASID_PAGE_THRESHOLD {
+            return true;
+        }
+    }
+    false
+}
+
+// Flush every local translation tagged with one ASID while preserving entries
+// belonging to other address spaces.
+pub(crate) fn sfence_vma_asid_all(asid: tx_hal::Asid) {
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        core::arch::asm!(
+            "sfence.vma x0, {asid}",
+            asid = in(reg) asid.0 as usize,
+            options(nostack)
+        );
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    let _ = asid;
 }
 
 // 按 ASID 对给定虚拟范围逐页 sfence.vma，只失效该地址段的本核 TLB 项。

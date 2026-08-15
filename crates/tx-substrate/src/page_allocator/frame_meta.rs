@@ -24,6 +24,7 @@ const PIN_COUNT_ONE: u32 = 1 << PIN_COUNT_SHIFT;
 
 const FLAG_DIRECT_MAPPED: u16 = 1 << 2;
 const FLAG_RESERVED: u16 = 1 << 3;
+const FLAG_PERMANENT: u16 = 1 << 4;
 
 /// Per-physical-frame metadata.
 ///
@@ -34,9 +35,10 @@ const FLAG_RESERVED: u16 = 1 << 3;
 /// - bits `20..28`: page-cache inclusion count
 /// - bits `28..32`: DMA/long-term pin count
 ///
-/// `flags` holds non-counter properties such as `reserved` and
-/// `direct_mapped`. Reserved frames cannot return through the normal allocator
-/// free path.
+/// `flags` holds non-counter properties such as `reserved`, `direct_mapped`,
+/// and `permanent`. Reserved frames cannot return through the normal allocator
+/// free path. Permanent frames are kernel-lifetime anchors and must not have
+/// their reserved/direct-map protection removed by any typed teardown path.
 #[repr(C, align(8))]
 pub struct FrameMeta {
     state: AtomicU32,
@@ -67,7 +69,24 @@ impl FrameMeta {
 
     /// Clear the reserved flag before an explicit owner-specific teardown.
     pub fn clear_reserved(&self) {
+        assert!(
+            !self.is_permanent(),
+            "permanent frame cannot lose reserved protection"
+        );
         self.flags.fetch_and(!FLAG_RESERVED, Ordering::AcqRel);
+    }
+
+    /// True when this frame is anchored for the entire kernel lifetime.
+    pub fn is_permanent(&self) -> bool {
+        self.flags.load(Ordering::Acquire) & FLAG_PERMANENT != 0
+    }
+
+    /// Permanently protect a kernel-lifetime frame from allocator teardown.
+    pub fn mark_permanent(&self) {
+        self.flags.fetch_or(
+            FLAG_PERMANENT | FLAG_RESERVED | FLAG_DIRECT_MAPPED,
+            Ordering::AcqRel,
+        );
     }
 
     /// Mark the frame as covered by the kernel direct map.
@@ -82,6 +101,10 @@ impl FrameMeta {
 
     /// Clear the direct-map bookkeeping flag.
     pub fn clear_direct_mapped(&self) {
+        assert!(
+            !self.is_permanent(),
+            "permanent frame cannot lose direct-map protection"
+        );
         self.flags.fetch_and(!FLAG_DIRECT_MAPPED, Ordering::AcqRel);
     }
 

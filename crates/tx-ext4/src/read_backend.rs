@@ -1,9 +1,10 @@
 use core::cell::UnsafeCell;
 use core::convert::TryFrom;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::adapter::step_engine::{Cap, Guard, PayloadCap, SpinMutex, Weak as ZoneWeak};
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak as ArcWeak};
 use alloc::vec;
@@ -30,6 +31,8 @@ use crate::planner::Ext4MappingTable;
 
 pub(crate) const EXT4_ROOT_INODE: u32 = 2;
 pub(crate) const READDIR_WINDOW_ENTRIES: usize = 64;
+const DIR_VERSION_SHARDS: usize = 256;
+const INODE_META_VERSION_SHARDS: usize = 1024;
 pub trait FilePageContainerBinder: Send + Sync {
     fn bind_file_page_container(&self, container: Cap<PageContainer>);
 }
@@ -123,7 +126,7 @@ where
             .as_ref()
             .and_then(ArcWeak::upgrade)
             .ok_or(Errno::EIO)?;
-        let inode = inode_no(FsObjectId::new(request.object.raw()))?;
+        let (inode, _) = backend.resolve_object(FsObjectId::new(request.object.raw()))?;
         if backend.is_read_only() {
             return Err(Errno::EROFS);
         }
@@ -131,26 +134,21 @@ where
             return Err(Errno::EOPNOTSUPP);
         }
 
-        // The runtime replaces this placeholder with the L4-owned source.
-        // The format plan therefore remains metadata-only from L5's view.
-        if request.range.page_count() == 1 {
-            return backend.with_pager(|pager| {
-                pager.plan_write_page(
-                    inode,
-                    request.range.start_page(),
-                    &[0; BLOCK_SIZE],
-                    FsyncStamp::new(generation.raw()),
-                )
-            });
+        // The runtime replaces these placeholders with the L4-owned sources.
+        // Planning all pages together lets ext4 allocate holes once and fold
+        // the PageContainer's byte-precise EOF into the same transaction.
+        if request.range.page_count() > 1 {
+            validate_multi_page_write_source(&request.source, request.range.page_count())?;
         }
-        validate_multi_page_write_source(&request.source, request.range.page_count())?;
         let page_count = usize::try_from(request.range.page_count()).map_err(|_| Errno::EINVAL)?;
         let pages = vec![[0; BLOCK_SIZE]; page_count];
+        let exact_size = backend.file_page_container_size(FsObjectId::new(request.object.raw()));
         backend.with_pager(|pager| {
-            pager.plan_write_pages(
+            pager.plan_write_pages_with_size(
                 inode,
                 request.range.start_page(),
                 &pages,
+                exact_size,
                 FsyncStamp::new(generation.raw()),
             )
         })
@@ -187,9 +185,23 @@ pub(crate) struct Ext4FsInstance<I> {
     pager: Ext4PagerCell<I>,
     backend_planner: Option<Arc<dyn BackendPlanner>>,
     extent_mapping: Option<Arc<Ext4MappingTable>>,
-    lookup_cache: SpinMutex<LookupCache>,
+    lookup_cache: LookupCache,
     dir_cache: SpinMutex<DirCache>,
-    inode_meta_cache: SpinMutex<InodeMetaCache>,
+    /// Lock-free namespace generations used to validate lookup/readdir cache
+    /// fills against concurrent directory mutations.
+    ///
+    /// Pager operations serialize the disk snapshot, but cache insertion runs
+    /// after that pager guard is released. A generation prevents an old read
+    /// from being published after a creator has committed and invalidated the
+    /// directory caches.
+    dir_versions: [AtomicU64; DIR_VERSION_SHARDS],
+    /// Versioned publication prevents a reader that started before a metadata
+    /// mutation from inserting its old pager snapshot after invalidation.
+    /// Hash collisions only cause conservative misses.
+    inode_meta_versions: [AtomicU64; INODE_META_VERSION_SHARDS],
+    /// Whole-cache generation used by journal settlement and shutdown.
+    inode_meta_epoch: AtomicU64,
+    inode_meta_cache: InodeMetaCache,
     pub(crate) mount_pin: SpinMutex<Option<MountPayloadPin>>,
     file_page_container_binder: SpinMutex<Option<Arc<dyn FilePageContainerBinder>>>,
     file_page_containers: SpinMutex<BTreeMap<FsObjectId, ZoneWeak<PageContainer>>>,
@@ -238,9 +250,12 @@ impl<I: BlockImage> Ext4FsInstance<I> {
             pager: Ext4PagerCell::new(Ext4Pager::open(image).map_err(map_format_error)?),
             backend_planner,
             extent_mapping,
-            lookup_cache: SpinMutex::new(LookupCache::empty()),
+            lookup_cache: LookupCache::empty(),
             dir_cache: SpinMutex::new(DirCache::empty()),
-            inode_meta_cache: SpinMutex::new(InodeMetaCache::empty()),
+            dir_versions: core::array::from_fn(|_| AtomicU64::new(0)),
+            inode_meta_versions: core::array::from_fn(|_| AtomicU64::new(0)),
+            inode_meta_epoch: AtomicU64::new(0),
+            inode_meta_cache: InodeMetaCache::empty(),
             mount_pin: SpinMutex::new(None),
             file_page_container_binder: SpinMutex::new(None),
             file_page_containers: SpinMutex::new(BTreeMap::new()),
@@ -283,6 +298,18 @@ impl<I: BlockImage> Ext4FsInstance<I> {
     /// size and resident-page namespace.
     pub(crate) fn invalidate_file_page_container(&self, fs_object_id: FsObjectId) {
         self.file_page_containers.lock().remove(&fs_object_id);
+    }
+
+    pub(crate) fn file_page_container_size(&self, fs_object_id: FsObjectId) -> Option<u64> {
+        let guard = tx_substrate::epoch::borrow_current_guard()
+            .unwrap_or_else(crate::adapter::step_engine::guard);
+        let container = {
+            let index = self.file_page_containers.lock();
+            index
+                .get(&fs_object_id)
+                .and_then(|container| container.upgrade(&guard))
+        }?;
+        Some(container.size_bytes())
     }
 
     pub(crate) fn file_page_container_for_materialized_inode(
@@ -348,6 +375,27 @@ impl<I: BlockImage> Ext4FsInstance<I> {
         self.metadata_mutation_admission.try_acquire()
     }
 
+    pub(crate) fn lock_metadata_mutation_for_frontend(
+        &self,
+    ) -> Option<JournalMetadataMutationPermit> {
+        // A compatibility mount performs the complete mutation synchronously
+        // in the caller. Returning `Yield` here is incorrect for close: the
+        // VFS has already detached the descriptor and can only defer the
+        // writeback, so a concurrent creator may observe a zero-length file.
+        // Wait locally just like the pager's existing spin lock. Journal
+        // mounts remain nonblocking because their permit can be retained by
+        // L4 across an actual asynchronous I/O completion.
+        if self.metadata_mutation_runtime().is_none() && self.legacy_writeback_enabled() {
+            loop {
+                if let Some(permit) = self.metadata_mutation_admission.try_acquire() {
+                    return Some(permit);
+                }
+                core::hint::spin_loop();
+            }
+        }
+        self.try_lock_metadata_mutation_admission()
+    }
+
     pub(crate) fn wait_for_metadata_mutation_admission<T>(
         &self,
     ) -> crate::adapter::step_engine::StepOutcome<T, crate::adapter::step_engine::NoProgress> {
@@ -387,6 +435,36 @@ impl<I: BlockImage> Ext4FsInstance<I> {
         Ok(())
     }
 
+    /// Execute one planner result using the mount's selected commit model.
+    ///
+    /// Journal-backed mounts retain the asynchronous transaction runtime.
+    /// Compatibility read-write mounts apply the same rich mutation plan
+    /// directly, preserving the fast root-filesystem path used before the
+    /// async integration without falling back to reduced namespace support.
+    pub(crate) fn commit_metadata_mutation(
+        &self,
+        mutation: &Ext4MutationPlan,
+        guard: &Guard<'_>,
+    ) -> Result<(), Errno>
+    where
+        I: Send + 'static,
+    {
+        if let Some(runtime) = self.metadata_mutation_runtime() {
+            return self
+                .begin_metadata_mutation(&runtime, mutation, guard)
+                .map_err(|error| match error {
+                    JournalMutationRuntimeError::Busy(_) => Errno::EBUSY,
+                    JournalMutationRuntimeError::Image(_)
+                    | JournalMutationRuntimeError::Stage(_) => Errno::EIO,
+                    JournalMutationRuntimeError::Settlement(errno) => errno,
+                });
+        }
+        if !self.legacy_writeback_enabled() {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        self.with_pager(|pager| pager.apply_mutation_direct(mutation))
+    }
+
     /// Returns `true` when this mount was opened with `MS_RDONLY`
     /// (or via `mount_ext4_read_only`). Mutating `FsOps` methods
     /// consult this and short-circuit with `EROFS`.
@@ -419,35 +497,213 @@ impl<I: BlockImage> Ext4FsInstance<I> {
         f(&mut pager).map_err(map_format_error)
     }
 
+    pub(crate) fn dir_version(&self, object: FsObjectId) -> u64 {
+        self.dir_versions[dir_version_shard(object)].load(Ordering::Acquire)
+    }
+
+    fn bump_dir_version(&self, object: FsObjectId) {
+        self.dir_versions[dir_version_shard(object)].fetch_add(1, Ordering::AcqRel);
+    }
+
     pub(crate) fn lookup_cached(
         &self,
-        parent: InodeNo,
+        parent: FsObjectId,
+        parent_inode: InodeNo,
         name: &[u8],
     ) -> Result<Option<InodeNo>, Errno> {
-        if let Some(cached) = self.lookup_cache.lock().get(parent, name) {
-            return Ok(cached);
+        'stable_snapshot: loop {
+            let version = self.dir_version(parent);
+            if let Some(cached) = self.lookup_cache.get(parent, name, version) {
+                if self.dir_version(parent) == version {
+                    return Ok(cached);
+                }
+                continue;
+            }
+
+            // Scan in byte-offset windows and populate every observed name,
+            // not just the requested one. Cargo probes thousands of siblings
+            // in `target/debug/deps`; making each first-time name restart a
+            // private linear scan throws away nearly all locality. The window
+            // cache also makes a concurrent readdir share the same snapshot.
+            let mut offset = 0u64;
+            loop {
+                let mut entries = [DirEntryLite::empty(); READDIR_WINDOW_ENTRIES];
+                let mut next_offsets = [0u64; READDIR_WINDOW_ENTRIES];
+                let count = self.read_dir_entries_cached(
+                    parent,
+                    parent_inode,
+                    offset,
+                    &mut entries,
+                    &mut next_offsets,
+                )?;
+
+                // A namespace mutation can commit between two windows. Do not
+                // combine entries from different directory generations.
+                if self.dir_version(parent) != version {
+                    continue 'stable_snapshot;
+                }
+                if let Some(entry) = entries
+                    .iter()
+                    .take(count)
+                    .find(|entry| entry.name() == name)
+                {
+                    return Ok(Some(entry.inode));
+                }
+                if count == 0 {
+                    self.lookup_cache
+                        .insert(parent, name, InodeNo::new(0), version);
+                    return Ok(None);
+                }
+                offset = next_offsets[count - 1];
+            }
         }
-        if let Some(cached) = self.dir_cache.lock().lookup(parent, name) {
+    }
+
+    /// Resolve a directory name to its persistent inode incarnation.
+    ///
+    /// The directory scan initially knows only the numeric inode. Cache the
+    /// generation-bearing object ID in the same versioned name entry after the
+    /// first inode read, so repeated stat/open probes do not serialize on the
+    /// pager merely to reconstruct an identity they have already validated.
+    pub(crate) fn lookup_object_cached(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+    ) -> Result<Option<FsObjectId>, Errno> {
+        loop {
+            let version = self.dir_version(parent);
+            if let Some(cached) = self.lookup_cache.get_object(parent, name, version) {
+                if self.dir_version(parent) == version {
+                    return Ok(cached);
+                }
+                continue;
+            }
+            // A versioned object-ID hit above has already validated both the
+            // directory incarnation and the child incarnation. Only a miss
+            // needs to re-read/validate the parent before scanning on disk;
+            // doing this before every hit serialized all Cargo path probes on
+            // the mount-wide directory-metadata cache.
+            let (parent_inode, _) = self.resolve_directory_object_cached(parent)?;
+            if self.dir_version(parent) != version {
+                continue;
+            }
+            let Some(inode) = self.lookup_cached(parent, parent_inode, name)? else {
+                return Ok(None);
+            };
+            if self.dir_version(parent) != version {
+                continue;
+            }
+            let object = self.object_id_for_inode(inode)?;
+            if self.dir_version(parent) != version {
+                continue;
+            }
             self.lookup_cache
-                .lock()
-                .insert(parent, name, cached.unwrap_or(InodeNo::new(0)));
-            return Ok(cached);
+                .set_object(parent, name, inode, object, version);
+            return Ok(Some(object));
         }
-        let found = self.with_pager(|pager| pager.lookup(parent, name))?;
-        // Cache negatives too (inode 0 sentinel): every shell command's PATH
-        // search stats mostly-nonexistent names against testcases/bin
-        // (~2800 entries); an uncached miss is a full linear directory scan
-        // (~48 ms under TCG, measured) repeated for every command.
-        self.lookup_cache
-            .lock()
-            .insert(parent, name, found.unwrap_or(InodeNo::new(0)));
-        Ok(found)
     }
 
     pub(crate) fn inode_meta_cached(&self, inode: InodeNo) -> Result<InodeMetaLite, Errno> {
-        if let Some(meta) = self.inode_meta_cache.lock().get(inode) {
+        loop {
+            let version = self.inode_meta_version(inode);
+            if let Some(meta) = self.inode_meta_cache.get(inode, version) {
+                return Ok(meta);
+            }
+            let meta = self.inode_meta_with_mapping(inode)?;
+            if self.inode_meta_version(inode) != version {
+                continue;
+            }
+            self.inode_meta_cache.insert(inode, meta, version);
             return Ok(meta);
         }
+    }
+
+    /// Read the versioned inode cache without filling it.  A concurrent
+    /// invalidation either makes the initial lookup miss or changes the
+    /// version checked after the lookup; both cases conservatively fall back
+    /// to the ordinary metadata path.
+    pub(crate) fn inode_meta_cached_only(&self, inode: InodeNo) -> Option<InodeMetaLite> {
+        loop {
+            let version = self.inode_meta_version(inode);
+            let meta = self.inode_meta_cache.get(inode, version)?;
+            if self.inode_meta_version(inode) == version {
+                return Some(meta);
+            }
+        }
+    }
+
+    fn inode_meta_version(&self, inode: InodeNo) -> InodeMetaCacheVersion {
+        InodeMetaCacheVersion {
+            epoch: self.inode_meta_epoch.load(Ordering::Acquire),
+            inode: self.inode_meta_versions[inode_meta_version_shard(inode)]
+                .load(Ordering::Acquire),
+        }
+    }
+
+    pub(crate) fn invalidate_inode_meta_for(&self, object: FsObjectId) {
+        self.invalidate_inode_meta_no(InodeNo::new(object.inode_number()));
+    }
+
+    pub(crate) fn invalidate_inode_meta_no(&self, inode: InodeNo) {
+        self.inode_meta_versions[inode_meta_version_shard(inode)].fetch_add(1, Ordering::AcqRel);
+        self.inode_meta_cache.invalidate(inode);
+    }
+
+    /// Resolve and validate one persistent inode incarnation.
+    ///
+    /// ext4 can reuse a numeric inode immediately after the last reference to
+    /// an unlinked object disappears.  Every externally supplied object ID
+    /// therefore carries both the inode number and its on-disk generation;
+    /// accepting only the low inode bits would let an old dentry or page cache
+    /// address a newly allocated file.
+    pub(crate) fn resolve_object(
+        &self,
+        fs_object_id: FsObjectId,
+    ) -> Result<(InodeNo, InodeMetaLite), Errno> {
+        let inode = inode_no(fs_object_id)?;
+        let meta = self.inode_meta_cached(inode)?;
+        if meta.mode == 0 {
+            return Err(Errno::ENOENT);
+        }
+        if meta.generation != fs_object_id.inode_generation() {
+            return Err(Errno::ESTALE);
+        }
+        Ok((inode, meta))
+    }
+
+    /// Directory-only identity validation with a mount-local metadata cache.
+    /// Path walking repeatedly validates the same handful of parent
+    /// directories; their generation and kind are immutable for the lifetime
+    /// of the object, and namespace mutation invalidates the corresponding
+    /// cache entry before a later lookup can observe a reused inode.
+    pub(crate) fn resolve_directory_object_cached(
+        &self,
+        fs_object_id: FsObjectId,
+    ) -> Result<(InodeNo, InodeMetaLite), Errno> {
+        let inode = inode_no(fs_object_id)?;
+        let meta = self.inode_meta_cached(inode)?;
+        if !inode_meta_is_dir(meta) {
+            return Err(if meta.mode == 0 {
+                Errno::ENOENT
+            } else {
+                Errno::ENOTDIR
+            });
+        }
+        if meta.generation != fs_object_id.inode_generation() {
+            return Err(Errno::ESTALE);
+        }
+        Ok((inode, meta))
+    }
+
+    pub(crate) fn object_id_for_inode(&self, inode: InodeNo) -> Result<FsObjectId, Errno> {
+        let meta = self.inode_meta_cached(inode)?;
+        if meta.mode == 0 {
+            return Err(Errno::ENOENT);
+        }
+        Ok(fs_object_id(inode, meta.generation))
+    }
+
+    fn inode_meta_with_mapping(&self, inode: InodeNo) -> Result<InodeMetaLite, Errno> {
         let (meta, extent_root) = match self.extent_mapping.as_ref() {
             Some(_) => self.with_pager(|pager| pager.inode_meta_and_extent_root(inode))?,
             None => (
@@ -460,55 +716,59 @@ impl<I: BlockImage> Ext4FsInstance<I> {
                 mapping.insert_extent_root(inode.get() as u64, &extent_root)?;
             }
         }
-        if inode_meta_is_dir(meta) {
-            self.inode_meta_cache.lock().insert(inode, meta);
-        }
         Ok(meta)
     }
 
     pub(crate) fn read_dir_entries_cached(
         &self,
+        object: FsObjectId,
         inode: InodeNo,
         start_offset: u64,
         out: &mut [DirEntryLite; READDIR_WINDOW_ENTRIES],
         next_offsets: &mut [u64; READDIR_WINDOW_ENTRIES],
     ) -> Result<usize, Errno> {
-        if let Some(count) = self
-            .dir_cache
-            .lock()
-            .get(inode, start_offset, out, next_offsets)
+        let version = self.dir_version(object);
+        if let Some(count) =
+            self.dir_cache
+                .lock()
+                .get(object, start_offset, version, out, next_offsets)
         {
             return Ok(count);
         }
 
         let mut entries = [DirEntryLite::empty(); READDIR_WINDOW_ENTRIES];
         let mut cached_next_offsets = [0u64; READDIR_WINDOW_ENTRIES];
-        let count = self.with_pager(|pager| {
-            pager.read_dir_entries_from_offset(
+        let (count, snapshot_version) = self.with_pager(|pager| {
+            let count = pager.read_dir_entries_from_offset(
                 inode,
                 start_offset,
                 &mut entries,
                 &mut cached_next_offsets,
-            )
+            )?;
+            Ok((count, self.dir_version(object)))
         })?;
-        self.dir_cache
-            .lock()
-            .insert(inode, start_offset, &entries, &cached_next_offsets, count);
-        {
-            let mut lookup_cache = self.lookup_cache.lock();
-            for entry in entries.iter().take(count) {
-                lookup_cache.insert(inode, entry.name(), entry.inode);
-            }
+        self.dir_cache.lock().insert(
+            object,
+            start_offset,
+            snapshot_version,
+            &entries,
+            &cached_next_offsets,
+            count,
+        );
+        for entry in entries.iter().take(count) {
+            self.lookup_cache
+                .insert(object, entry.name(), entry.inode, snapshot_version);
         }
         out[..count].copy_from_slice(&entries[..count]);
         next_offsets[..count].copy_from_slice(&cached_next_offsets[..count]);
         Ok(count)
     }
 
-    pub(crate) fn invalidate_lookup_cache_for(&self, parent: InodeNo) {
-        self.lookup_cache.lock().invalidate_parent(parent);
+    pub(crate) fn invalidate_lookup_cache_for(&self, parent: FsObjectId) {
+        self.bump_dir_version(parent);
+        self.lookup_cache.invalidate_parent(parent);
         self.dir_cache.lock().invalidate(parent);
-        self.inode_meta_cache.lock().invalidate(parent);
+        self.invalidate_inode_meta_for(parent);
     }
 
     /// Rebuild every mount-local derived view after durable journal settlement.
@@ -525,32 +785,23 @@ impl<I: BlockImage> Ext4FsInstance<I> {
         if let Some(mapping) = self.extent_mapping.as_ref() {
             mapping.clear();
         }
-        *self.lookup_cache.lock() = LookupCache::empty();
+        self.lookup_cache.clear();
         *self.dir_cache.lock() = DirCache::empty();
-        *self.inode_meta_cache.lock() = InodeMetaCache::empty();
+        self.inode_meta_epoch.fetch_add(1, Ordering::AcqRel);
+        self.inode_meta_cache.clear();
     }
 
     #[cfg(test)]
     pub(crate) fn cache_entry_counts(&self) -> (usize, usize, usize) {
         (
-            self.lookup_cache
-                .lock()
-                .entries
-                .iter()
-                .filter(|entry| entry.valid)
-                .count(),
+            self.lookup_cache.entry_count(),
             self.dir_cache
                 .lock()
                 .entries
                 .iter()
                 .filter(|entry| entry.valid)
                 .count(),
-            self.inode_meta_cache
-                .lock()
-                .entries
-                .iter()
-                .filter(|entry| entry.valid)
-                .count(),
+            self.inode_meta_cache.entry_count(),
         )
     }
 }
@@ -559,6 +810,16 @@ impl<I: BlockImage + Send + 'static> JournalSettlementObserver for Ext4FsInstanc
     fn settle_after_checkpoint(&self) {
         self.settle_metadata_caches();
     }
+}
+
+fn dir_version_shard(object: FsObjectId) -> usize {
+    let raw = object.as_u64();
+    (raw ^ (raw >> 32)) as usize % DIR_VERSION_SHARDS
+}
+
+fn inode_meta_version_shard(inode: InodeNo) -> usize {
+    let raw = inode.get() as usize;
+    raw.wrapping_mul(0x9e37_79b9) % INODE_META_VERSION_SHARDS
 }
 
 fn inode_meta_is_dir(meta: InodeMetaLite) -> bool {
@@ -582,14 +843,15 @@ impl DirCache {
 
     fn get(
         &mut self,
-        inode: InodeNo,
+        object: FsObjectId,
         start_offset: u64,
+        version: u64,
         out: &mut [DirEntryLite; READDIR_WINDOW_ENTRIES],
         next_offsets: &mut [u64; READDIR_WINDOW_ENTRIES],
     ) -> Option<usize> {
         let (index, window_index) =
             self.entries.iter().enumerate().find_map(|(index, entry)| {
-                if !entry.valid || entry.inode != inode {
+                if !entry.valid || entry.object != object || entry.version != version {
                     return None;
                 }
                 if entry.start_offset == start_offset {
@@ -611,11 +873,11 @@ impl DirCache {
         Some(count)
     }
 
-    fn lookup(&mut self, inode: InodeNo, name: &[u8]) -> Option<Option<InodeNo>> {
+    fn lookup(&mut self, object: FsObjectId, name: &[u8], version: u64) -> Option<Option<InodeNo>> {
         let mut complete_first_window = None;
         let mut found_index = None;
         for (index, entry) in self.entries.iter().enumerate() {
-            if !entry.valid || entry.inode != inode {
+            if !entry.valid || entry.object != object || entry.version != version {
                 continue;
             }
             if entry.start_offset == 0 && entry.count < READDIR_WINDOW_ENTRIES {
@@ -653,8 +915,9 @@ impl DirCache {
 
     fn insert(
         &mut self,
-        inode: InodeNo,
+        object: FsObjectId,
         start_offset: u64,
+        version: u64,
         entries: &[DirEntryLite; READDIR_WINDOW_ENTRIES],
         next_offsets: &[u64; READDIR_WINDOW_ENTRIES],
         count: usize,
@@ -664,7 +927,7 @@ impl DirCache {
             .entries
             .iter()
             .position(|entry| {
-                !entry.valid || (entry.inode == inode && entry.start_offset == start_offset)
+                !entry.valid || (entry.object == object && entry.start_offset == start_offset)
             })
             .unwrap_or_else(|| {
                 if self.entries.len() < DIR_CACHE_ENTRIES {
@@ -681,8 +944,9 @@ impl DirCache {
             });
         let entry = &mut self.entries[victim];
         entry.valid = true;
-        entry.inode = inode;
+        entry.object = object;
         entry.start_offset = start_offset;
+        entry.version = version;
         entry.count = count.min(READDIR_WINDOW_ENTRIES);
         entry.last_used = self.clock;
         entry.entries.clear();
@@ -693,9 +957,9 @@ impl DirCache {
             .extend_from_slice(&next_offsets[..entry.count]);
     }
 
-    fn invalidate(&mut self, inode: InodeNo) {
+    fn invalidate(&mut self, object: FsObjectId) {
         for entry in &mut self.entries {
-            if entry.valid && entry.inode == inode {
+            if entry.valid && entry.object == object {
                 entry.valid = false;
             }
         }
@@ -704,8 +968,9 @@ impl DirCache {
 
 struct DirCacheEntry {
     valid: bool,
-    inode: InodeNo,
+    object: FsObjectId,
     start_offset: u64,
+    version: u64,
     count: usize,
     entries: Vec<DirEntryLite>,
     next_offsets: Vec<u64>,
@@ -716,8 +981,9 @@ impl DirCacheEntry {
     fn empty() -> Self {
         Self {
             valid: false,
-            inode: InodeNo::new(0),
+            object: FsObjectId::new(0),
             start_offset: 0,
+            version: 0,
             count: 0,
             entries: Vec::new(),
             next_offsets: Vec::new(),
@@ -726,55 +992,137 @@ impl DirCacheEntry {
     }
 }
 
-const INODE_META_CACHE_ENTRIES: usize = 64;
+// Cargo's cached dependency check stats several thousand files. Keep metadata
+// separately from retained DEntries so closing a file may release its
+// PageContainer without forcing the next stat through the mount-wide pager
+// lock. A sharded four-way cache bounds both lock contention and lookup work.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InodeMetaCacheVersion {
+    epoch: u64,
+    inode: u64,
+}
+
+const INODE_META_CACHE_ENTRIES: usize = 4096;
+const INODE_META_CACHE_WAYS: usize = 4;
+const INODE_META_CACHE_SHARDS: usize = 64;
+const INODE_META_CACHE_ENTRIES_PER_SHARD: usize =
+    INODE_META_CACHE_ENTRIES / INODE_META_CACHE_SHARDS;
+const INODE_META_CACHE_SETS_PER_SHARD: usize =
+    INODE_META_CACHE_ENTRIES_PER_SHARD / INODE_META_CACHE_WAYS;
 
 struct InodeMetaCache {
-    clock: u64,
-    entries: [InodeMetaCacheEntry; INODE_META_CACHE_ENTRIES],
+    shards: Box<[SpinMutex<InodeMetaCacheShard>]>,
 }
 
 impl InodeMetaCache {
-    const fn empty() -> Self {
+    fn empty() -> Self {
+        let mut shards = Vec::with_capacity(INODE_META_CACHE_SHARDS);
+        for _ in 0..INODE_META_CACHE_SHARDS {
+            shards.push(SpinMutex::new(InodeMetaCacheShard::empty()));
+        }
         Self {
-            clock: 0,
-            entries: [InodeMetaCacheEntry::empty(); INODE_META_CACHE_ENTRIES],
+            shards: shards.into_boxed_slice(),
         }
     }
 
-    fn get(&mut self, inode: InodeNo) -> Option<InodeMetaLite> {
-        let index = self
-            .entries
+    fn get(&self, inode: InodeNo, version: InodeMetaCacheVersion) -> Option<InodeMetaLite> {
+        let (shard, range) = inode_meta_cache_location(inode);
+        self.shards[shard].lock().get(inode, version, range)
+    }
+
+    fn insert(&self, inode: InodeNo, meta: InodeMetaLite, version: InodeMetaCacheVersion) {
+        let (shard, range) = inode_meta_cache_location(inode);
+        self.shards[shard]
+            .lock()
+            .insert(inode, meta, version, range);
+    }
+
+    fn invalidate(&self, inode: InodeNo) {
+        let (shard, range) = inode_meta_cache_location(inode);
+        self.shards[shard].lock().invalidate(inode, range);
+    }
+
+    fn clear(&self) {
+        for shard in self.shards.iter() {
+            *shard.lock() = InodeMetaCacheShard::empty();
+        }
+    }
+
+    #[cfg(test)]
+    fn entry_count(&self) -> usize {
+        self.shards
             .iter()
-            .position(|entry| entry.valid && entry.inode == inode)?;
+            .map(|shard| {
+                shard
+                    .lock()
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.valid)
+                    .count()
+            })
+            .sum()
+    }
+}
+
+struct InodeMetaCacheShard {
+    clock: u64,
+    entries: [InodeMetaCacheEntry; INODE_META_CACHE_ENTRIES_PER_SHARD],
+}
+
+impl InodeMetaCacheShard {
+    const fn empty() -> Self {
+        Self {
+            clock: 0,
+            entries: [InodeMetaCacheEntry::empty(); INODE_META_CACHE_ENTRIES_PER_SHARD],
+        }
+    }
+
+    fn get(
+        &mut self,
+        inode: InodeNo,
+        version: InodeMetaCacheVersion,
+        mut range: core::ops::Range<usize>,
+    ) -> Option<InodeMetaLite> {
+        let index = range.find(|index| {
+            let entry = &self.entries[*index];
+            entry.valid && entry.inode == inode && entry.version == version
+        })?;
         self.clock = self.clock.wrapping_add(1);
         self.entries[index].last_used = self.clock;
         Some(self.entries[index].meta)
     }
 
-    fn insert(&mut self, inode: InodeNo, meta: InodeMetaLite) {
+    fn insert(
+        &mut self,
+        inode: InodeNo,
+        meta: InodeMetaLite,
+        version: InodeMetaCacheVersion,
+        range: core::ops::Range<usize>,
+    ) {
         self.clock = self.clock.wrapping_add(1);
-        let victim = self
-            .entries
-            .iter()
-            .position(|entry| !entry.valid || entry.inode == inode)
+        let victim = range
+            .clone()
+            .find(|index| {
+                let entry = &self.entries[*index];
+                !entry.valid || (entry.inode == inode && entry.version == version)
+            })
             .unwrap_or_else(|| {
-                self.entries
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, entry)| entry.last_used)
-                    .map(|(index, _)| index)
+                range
+                    .min_by_key(|index| self.entries[*index].last_used)
                     .unwrap_or(0)
             });
         self.entries[victim] = InodeMetaCacheEntry {
             valid: true,
             inode,
             meta,
+            version,
             last_used: self.clock,
         };
     }
 
-    fn invalidate(&mut self, inode: InodeNo) {
-        for entry in &mut self.entries {
+    fn invalidate(&mut self, inode: InodeNo, range: core::ops::Range<usize>) {
+        for index in range {
+            let entry = &mut self.entries[index];
             if entry.valid && entry.inode == inode {
                 entry.valid = false;
             }
@@ -787,6 +1135,7 @@ struct InodeMetaCacheEntry {
     valid: bool,
     inode: InodeNo,
     meta: InodeMetaLite,
+    version: InodeMetaCacheVersion,
     last_used: u64,
 }
 
@@ -796,6 +1145,7 @@ impl InodeMetaCacheEntry {
             valid: false,
             inode: InodeNo::new(0),
             meta: InodeMetaLite {
+                generation: 0,
                 mode: 0,
                 uid: 0,
                 gid: 0,
@@ -807,27 +1157,134 @@ impl InodeMetaCacheEntry {
                 ctime: 0,
                 mtime: 0,
             },
+            version: InodeMetaCacheVersion { epoch: 0, inode: 0 },
             last_used: 0,
         }
     }
 }
 
-// 512 entries: PATH searches alone touch (commands × 7 PATH dirs) names per
-// shell test, most of them misses against a ~2800-entry testcases/bin — the
-// negative entries below only pay off if the working set fits.
-const LOOKUP_CACHE_ENTRIES: usize = 512;
+fn inode_meta_cache_location(inode: InodeNo) -> (usize, core::ops::Range<usize>) {
+    let hash = (inode.get() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let global_set = hash as usize % (INODE_META_CACHE_ENTRIES / INODE_META_CACHE_WAYS);
+    let shard = global_set % INODE_META_CACHE_SHARDS;
+    let local_set = global_set / INODE_META_CACHE_SHARDS;
+    debug_assert!(local_set < INODE_META_CACHE_SETS_PER_SHARD);
+    let first = local_set * INODE_META_CACHE_WAYS;
+    (shard, first..first + INODE_META_CACHE_WAYS)
+}
+
+// Cargo's `target/debug/deps` and the OSComp `testcases/bin` directory both
+// exceed 512 names. A cache smaller than either working set turns unique stat
+// probes back into repeated full-directory scans. Four thousand entries cost
+// well below 1 MiB per ext4 mount and retain the complete measured workloads.
+const LOOKUP_CACHE_ENTRIES: usize = 4096;
 const LOOKUP_CACHE_NAME_BYTES: usize = 96;
+const LOOKUP_CACHE_WAYS: usize = 4;
+const LOOKUP_CACHE_SHARDS: usize = 64;
+const LOOKUP_CACHE_ENTRIES_PER_SHARD: usize = LOOKUP_CACHE_ENTRIES / LOOKUP_CACHE_SHARDS;
+const LOOKUP_CACHE_SETS_PER_SHARD: usize = LOOKUP_CACHE_ENTRIES_PER_SHARD / LOOKUP_CACHE_WAYS;
 
 struct LookupCache {
-    clock: u64,
-    entries: [LookupCacheEntry; LOOKUP_CACHE_ENTRIES],
+    shards: Box<[SpinMutex<LookupCacheShard>]>,
 }
 
 impl LookupCache {
+    fn empty() -> Self {
+        let mut shards = Vec::with_capacity(LOOKUP_CACHE_SHARDS);
+        for _ in 0..LOOKUP_CACHE_SHARDS {
+            shards.push(SpinMutex::new(LookupCacheShard::empty()));
+        }
+        Self {
+            shards: shards.into_boxed_slice(),
+        }
+    }
+
+    fn get(&self, parent: FsObjectId, name: &[u8], version: u64) -> Option<Option<InodeNo>> {
+        let (shard, range) = lookup_cache_location(parent, name);
+        self.shards[shard].lock().get(parent, name, version, range)
+    }
+
+    fn get_object(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        version: u64,
+    ) -> Option<Option<FsObjectId>> {
+        let (shard, range) = lookup_cache_location(parent, name);
+        self.shards[shard]
+            .lock()
+            .get_object(parent, name, version, range)
+    }
+
+    fn insert(&self, parent: FsObjectId, name: &[u8], inode: InodeNo, version: u64) {
+        if name.len() > LOOKUP_CACHE_NAME_BYTES {
+            return;
+        }
+        let (shard, range) = lookup_cache_location(parent, name);
+        self.shards[shard]
+            .lock()
+            .insert(parent, name, inode, version, range);
+    }
+
+    fn set_object(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        inode: InodeNo,
+        object: FsObjectId,
+        version: u64,
+    ) {
+        let (shard, range) = lookup_cache_location(parent, name);
+        self.shards[shard]
+            .lock()
+            .set_object(parent, name, inode, object, version, range);
+    }
+
+    fn invalidate_parent(&self, parent: FsObjectId) {
+        for shard in self.shards.iter() {
+            shard.lock().invalidate_parent(parent);
+        }
+    }
+
+    fn clear(&self) {
+        for shard in self.shards.iter() {
+            *shard.lock() = LookupCacheShard::empty();
+        }
+    }
+
+    #[cfg(test)]
+    fn entry_count(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| {
+                shard
+                    .lock()
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.valid)
+                    .count()
+            })
+            .sum()
+    }
+
+    #[cfg(test)]
+    fn occupied_for(&self, parent: FsObjectId, name: &[u8]) -> usize {
+        let (shard, range) = lookup_cache_location(parent, name);
+        let shard = self.shards[shard].lock();
+        range.filter(|index| shard.entries[*index].valid).count()
+    }
+}
+
+struct LookupCacheShard {
+    clock: u64,
+    entries: [LookupCacheEntry; LOOKUP_CACHE_ENTRIES_PER_SHARD],
+}
+
+impl LookupCacheShard {
     const fn empty() -> Self {
         Self {
             clock: 0,
-            entries: [LookupCacheEntry::empty(); LOOKUP_CACHE_ENTRIES],
+            entries: [LookupCacheEntry::empty(); LOOKUP_CACHE_ENTRIES_PER_SHARD],
         }
     }
 
@@ -835,11 +1292,16 @@ impl LookupCache {
     /// `Some(Some(ino))` = cached hit. Negative entries reuse `inode == 0`
     /// (ext4 inode numbers start at 1) and are invalidated by the same
     /// `invalidate_parent` calls that cover create/unlink/rename.
-    fn get(&mut self, parent: InodeNo, name: &[u8]) -> Option<Option<InodeNo>> {
-        let index = self
-            .entries
-            .iter()
-            .position(|entry| entry.matches(parent, name))?;
+    fn get(
+        &mut self,
+        parent: FsObjectId,
+        name: &[u8],
+        version: u64,
+        range: core::ops::Range<usize>,
+    ) -> Option<Option<InodeNo>> {
+        let index = range
+            .clone()
+            .find(|index| self.entries[*index].matches(parent, name, version))?;
         self.clock = self.clock.wrapping_add(1);
         self.entries[index].last_used = self.clock;
         let inode = self.entries[index].inode;
@@ -850,27 +1312,77 @@ impl LookupCache {
         }
     }
 
-    fn insert(&mut self, parent: InodeNo, name: &[u8], inode: InodeNo) {
-        if name.len() > LOOKUP_CACHE_NAME_BYTES {
-            return;
-        }
+    fn insert(
+        &mut self,
+        parent: FsObjectId,
+        name: &[u8],
+        inode: InodeNo,
+        version: u64,
+        range: core::ops::Range<usize>,
+    ) {
         self.clock = self.clock.wrapping_add(1);
-        let victim = self
-            .entries
-            .iter()
-            .position(|entry| !entry.valid)
+        let victim = range
+            .clone()
+            .find(|index| {
+                let entry = &self.entries[*index];
+                !entry.valid || entry.same_name(parent, name)
+            })
             .unwrap_or_else(|| {
-                self.entries
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, entry)| entry.last_used)
-                    .map(|(index, _)| index)
+                range
+                    .min_by_key(|index| self.entries[*index].last_used)
                     .unwrap_or(0)
             });
-        self.entries[victim] = LookupCacheEntry::new(parent, name, inode, self.clock);
+        self.entries[victim] = LookupCacheEntry::new(parent, name, inode, version, self.clock);
     }
 
-    fn invalidate_parent(&mut self, parent: InodeNo) {
+    /// Return a cached incarnation when the name entry has already paid for
+    /// the child-inode read. A negative name entry needs no object ID and is
+    /// therefore immediately authoritative.
+    fn get_object(
+        &mut self,
+        parent: FsObjectId,
+        name: &[u8],
+        version: u64,
+        range: core::ops::Range<usize>,
+    ) -> Option<Option<FsObjectId>> {
+        let index = range
+            .clone()
+            .find(|index| self.entries[*index].matches(parent, name, version))?;
+        self.clock = self.clock.wrapping_add(1);
+        let entry = &mut self.entries[index];
+        entry.last_used = self.clock;
+        if entry.inode == InodeNo::new(0) {
+            Some(None)
+        } else if entry.object_valid {
+            Some(Some(entry.object))
+        } else {
+            None
+        }
+    }
+
+    fn set_object(
+        &mut self,
+        parent: FsObjectId,
+        name: &[u8],
+        inode: InodeNo,
+        object: FsObjectId,
+        version: u64,
+        range: core::ops::Range<usize>,
+    ) {
+        let Some(index) = range.clone().find(|index| {
+            let entry = &self.entries[*index];
+            entry.matches(parent, name, version) && entry.inode == inode
+        }) else {
+            return;
+        };
+        self.clock = self.clock.wrapping_add(1);
+        let entry = &mut self.entries[index];
+        entry.object = object;
+        entry.object_valid = true;
+        entry.last_used = self.clock;
+    }
+
+    fn invalidate_parent(&mut self, parent: FsObjectId) {
         for entry in &mut self.entries {
             if entry.valid && entry.parent == parent {
                 entry.valid = false;
@@ -882,8 +1394,11 @@ impl LookupCache {
 #[derive(Clone, Copy)]
 struct LookupCacheEntry {
     valid: bool,
-    parent: InodeNo,
+    parent: FsObjectId,
     inode: InodeNo,
+    object: FsObjectId,
+    object_valid: bool,
+    version: u64,
     name_len: u8,
     name: [u8; LOOKUP_CACHE_NAME_BYTES],
     last_used: u64,
@@ -893,31 +1408,60 @@ impl LookupCacheEntry {
     const fn empty() -> Self {
         Self {
             valid: false,
-            parent: InodeNo::new(0),
+            parent: FsObjectId::new(0),
             inode: InodeNo::new(0),
+            object: FsObjectId::new(0),
+            object_valid: false,
+            version: 0,
             name_len: 0,
             name: [0; LOOKUP_CACHE_NAME_BYTES],
             last_used: 0,
         }
     }
 
-    fn new(parent: InodeNo, name: &[u8], inode: InodeNo, last_used: u64) -> Self {
+    fn new(parent: FsObjectId, name: &[u8], inode: InodeNo, version: u64, last_used: u64) -> Self {
         let mut entry = Self::empty();
         entry.valid = true;
         entry.parent = parent;
         entry.inode = inode;
+        entry.version = version;
         entry.name_len = name.len() as u8;
         entry.name[..name.len()].copy_from_slice(name);
         entry.last_used = last_used;
         entry
     }
 
-    fn matches(&self, parent: InodeNo, name: &[u8]) -> bool {
+    fn matches(&self, parent: FsObjectId, name: &[u8], version: u64) -> bool {
+        self.valid
+            && self.parent == parent
+            && self.version == version
+            && self.name_len as usize == name.len()
+            && &self.name[..name.len()] == name
+    }
+
+    fn same_name(&self, parent: FsObjectId, name: &[u8]) -> bool {
         self.valid
             && self.parent == parent
             && self.name_len as usize == name.len()
             && &self.name[..name.len()] == name
     }
+}
+
+fn lookup_cache_location(parent: FsObjectId, name: &[u8]) -> (usize, core::ops::Range<usize>) {
+    // FNV-1a is sufficient here: the key is not attacker-visible hash-table
+    // state, and a four-way set bounds every lookup to four fixed-size entry
+    // probes instead of scanning all 512 cached names under one spin lock.
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in parent.as_u64().to_le_bytes().iter().chain(name) {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let global_set = hash as usize % (LOOKUP_CACHE_ENTRIES / LOOKUP_CACHE_WAYS);
+    let shard = global_set % LOOKUP_CACHE_SHARDS;
+    let local_set = global_set / LOOKUP_CACHE_SHARDS;
+    debug_assert!(local_set < LOOKUP_CACHE_SETS_PER_SHARD);
+    let first = local_set * LOOKUP_CACHE_WAYS;
+    (shard, first..first + LOOKUP_CACHE_WAYS)
 }
 
 struct Ext4PagerCell<I> {
@@ -972,15 +1516,15 @@ impl<I> Drop for Ext4PagerGuard<'_, I> {
 }
 
 pub(crate) fn inode_no(fs_object_id: FsObjectId) -> Result<InodeNo, Errno> {
-    let raw = u32::try_from(fs_object_id.as_u64()).map_err(|_| Errno::ENOENT)?;
+    let raw = fs_object_id.inode_number();
     if raw == 0 {
         return Err(Errno::ENOENT);
     }
     Ok(InodeNo::new(raw))
 }
 
-pub(crate) fn fs_object_id(inode: InodeNo) -> FsObjectId {
-    FsObjectId::new(inode.get() as u64)
+pub(crate) fn fs_object_id(inode: InodeNo, generation: u32) -> FsObjectId {
+    FsObjectId::from_inode_generation(inode.get(), generation)
 }
 
 pub(crate) fn map_inode_meta(meta: InodeMetaLite) -> InodeMeta {
@@ -1028,5 +1572,116 @@ fn timespec(sec: u32) -> Timespec {
     Timespec {
         sec: sec as i64,
         nsec: 0,
+    }
+}
+
+#[cfg(test)]
+mod lookup_cache_tests {
+    use super::*;
+
+    fn inode_meta(generation: u32, size: u64) -> InodeMetaLite {
+        InodeMetaLite {
+            generation,
+            mode: 0o100644,
+            uid: 0,
+            gid: 0,
+            size,
+            nlinks: 1,
+            blocks_512: size.div_ceil(512),
+            flags: 0,
+            atime: 0,
+            ctime: 0,
+            mtime: 0,
+        }
+    }
+
+    #[test]
+    fn sharded_inode_meta_cache_hits_and_invalidates_one_inode() {
+        let cache = InodeMetaCache::empty();
+        let first = InodeNo::new(41);
+        let second = InodeNo::new(42);
+        let version = InodeMetaCacheVersion { epoch: 2, inode: 5 };
+        cache.insert(first, inode_meta(3, 4096), version);
+        cache.insert(second, inode_meta(7, 8192), version);
+
+        assert_eq!(cache.get(first, version), Some(inode_meta(3, 4096)));
+        assert_eq!(cache.get(second, version), Some(inode_meta(7, 8192)));
+        cache.invalidate(first);
+        assert_eq!(cache.get(first, version), None);
+        assert_eq!(cache.get(second, version), Some(inode_meta(7, 8192)));
+    }
+
+    #[test]
+    fn sharded_inode_meta_cache_replaces_same_inode_without_duplicate_slot() {
+        let cache = InodeMetaCache::empty();
+        let inode = InodeNo::new(73);
+        let version = InodeMetaCacheVersion { epoch: 0, inode: 4 };
+        cache.insert(inode, inode_meta(1, 16), version);
+        cache.insert(inode, inode_meta(1, 32), version);
+
+        assert_eq!(cache.get(inode, version), Some(inode_meta(1, 32)));
+        assert_eq!(cache.entry_count(), 1);
+    }
+
+    #[test]
+    fn inode_meta_cache_rejects_a_pre_invalidation_publication() {
+        let cache = InodeMetaCache::empty();
+        let inode = InodeNo::new(91);
+        let old = InodeMetaCacheVersion { epoch: 3, inode: 8 };
+        let new = InodeMetaCacheVersion { epoch: 3, inode: 9 };
+
+        cache.insert(inode, inode_meta(1, 1024), old);
+        assert_eq!(cache.get(inode, new), None);
+        cache.insert(inode, inode_meta(1, 2048), new);
+        assert_eq!(cache.get(inode, new), Some(inode_meta(1, 2048)));
+    }
+
+    #[test]
+    fn set_associative_lookup_cache_replaces_a_stale_name_version_in_place() {
+        let parent = FsObjectId::from_inode_generation(7, 3);
+        let cache = LookupCache::empty();
+        cache.insert(parent, b"libcore.rlib", InodeNo::new(41), 1);
+        assert_eq!(
+            cache.get(parent, b"libcore.rlib", 1),
+            Some(Some(InodeNo::new(41)))
+        );
+
+        cache.insert(parent, b"libcore.rlib", InodeNo::new(52), 2);
+        assert_eq!(cache.get(parent, b"libcore.rlib", 1), None);
+        assert_eq!(
+            cache.get(parent, b"libcore.rlib", 2),
+            Some(Some(InodeNo::new(52)))
+        );
+        let occupied = cache.occupied_for(parent, b"libcore.rlib");
+        assert_eq!(
+            occupied, 1,
+            "a new directory version replaces its stale slot"
+        );
+    }
+
+    #[test]
+    fn set_associative_lookup_cache_preserves_negative_entries_and_parent_invalidation() {
+        let parent = FsObjectId::from_inode_generation(9, 1);
+        let cache = LookupCache::empty();
+        cache.insert(parent, b"missing-tool", InodeNo::new(0), 4);
+        assert_eq!(cache.get(parent, b"missing-tool", 4), Some(None));
+        cache.invalidate_parent(parent);
+        assert_eq!(cache.get(parent, b"missing-tool", 4), None);
+    }
+
+    #[test]
+    fn lookup_cache_promotes_an_inode_hit_to_a_persistent_object_id() {
+        let parent = FsObjectId::from_inode_generation(11, 2);
+        let child = FsObjectId::from_inode_generation(73, 9);
+        let cache = LookupCache::empty();
+        cache.insert(parent, b"liballoc.rlib", InodeNo::new(73), 6);
+
+        assert_eq!(cache.get_object(parent, b"liballoc.rlib", 6), None);
+        cache.set_object(parent, b"liballoc.rlib", InodeNo::new(73), child, 6);
+        assert_eq!(
+            cache.get_object(parent, b"liballoc.rlib", 6),
+            Some(Some(child))
+        );
+        assert_eq!(cache.get_object(parent, b"liballoc.rlib", 7), None);
     }
 }

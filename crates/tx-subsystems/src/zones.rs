@@ -465,6 +465,44 @@ fn dump_process_summary<P: TxPlatform>() {
 pub fn dump_smp_wait_diagnostics<P: TxPlatform>() {
     console_write_str::<P>("txkernel:smp-stall:processes:begin\n");
 
+    let diagnostic_guard = guard();
+    for runtime in crate::device::page_container_file_io_service_runtimes_snapshot() {
+        for wait in runtime.page_wait_diagnostic_snapshots(&diagnostic_guard) {
+            console_write_str::<P>("txkernel:smp-stall:file-page-wait:runtime=");
+            write_usize::<P>(runtime.registration_id().raw() as usize);
+            console_write_str::<P>(":fsid=");
+            write_hex_u64::<P>(wait.fs_object_id);
+            console_write_str::<P>(":page=");
+            write_usize::<P>(wait.page as usize);
+            console_write_str::<P>(":source=");
+            write_hex_u64::<P>(wait.source_id);
+            console_write_str::<P>(":pending=");
+            write_hex_u64::<P>(wait.source_pending_mask);
+            console_write_str::<P>(":subscribers=");
+            write_usize::<P>(wait.source_subscribers);
+            console_write_str::<P>(":resident=");
+            write_usize::<P>(wait.resident as usize);
+            console_write_str::<P>(":slot_state=");
+            write_usize::<P>(wait.slot_state as usize);
+            console_write_str::<P>(":slot_generation=");
+            write_usize::<P>(wait.slot_generation as usize);
+            console_write_str::<P>(":fetch_present=");
+            write_usize::<P>(wait.fetch_present as usize);
+            console_write_str::<P>(":fetch_id=");
+            write_usize::<P>(wait.fetch_id as usize);
+            console_write_str::<P>(":fetch_generation=");
+            write_usize::<P>(wait.fetch_generation as usize);
+            console_write_str::<P>(":request_id=");
+            write_usize::<P>(wait.request_id as usize);
+            console_write_str::<P>(":joined=");
+            write_usize::<P>(wait.joined as usize);
+            console_write_str::<P>(":compat=");
+            write_usize::<P>(wait.compatibility_only as usize);
+            console_write_str::<P>("\n");
+        }
+    }
+    drop(diagnostic_guard);
+
     for (pid, _) in crate::process::all_pids() {
         let Some(process) = crate::process::process_by_pid(pid) else {
             continue;
@@ -491,6 +529,18 @@ pub fn dump_smp_wait_diagnostics<P: TxPlatform>() {
         write_usize::<P>(fds.len());
         console_write_str::<P>(":comm=");
         console_write_str::<P>(proc_comm_bytes(&comm_bytes));
+        if let Some(aspace) = process.aspace_cap() {
+            let range_lock = aspace.range_lock().diagnostic_snapshot();
+            let pmap = aspace.pmap().stats();
+            console_write_str::<P>(":range_active=");
+            write_usize::<P>(range_lock.active);
+            console_write_str::<P>(":range_pending=");
+            write_usize::<P>(range_lock.pending_writers);
+            console_write_str::<P>(":range_source=");
+            write_hex_u64::<P>(range_lock.wait_source_id);
+            console_write_str::<P>(":pmap_mapped=");
+            write_usize::<P>(pmap.mapped_pages);
+        }
         if let Some(source) = process.exit_wait_source() {
             console_write_str::<P>(":exit_source=");
             write_hex_u64::<P>(source.id().raw());
@@ -562,6 +612,15 @@ pub fn dump_smp_wait_diagnostics<P: TxPlatform>() {
         }
 
         for (fd, file) in fds {
+            if let crate::vfs::structure::OpenFileBacking::Rnode { rnode } = file.backing() {
+                console_write_str::<P>("txkernel:smp-stall:fd:pid=");
+                write_usize::<P>(pid.0 as usize);
+                console_write_str::<P>(":fd=");
+                write_usize::<P>(fd as usize);
+                console_write_str::<P>(":fsid=");
+                write_hex_u64::<P>(rnode.fs_object_id().as_u64());
+                console_write_str::<P>("\n");
+            }
             if let Some((pipe, side)) = file.pipe_endpoint() {
                 dump_pipe_fd::<P>(
                     pid.0,
@@ -578,6 +637,26 @@ pub fn dump_smp_wait_diagnostics<P: TxPlatform>() {
                 dump_pipe_fd::<P>(pid.0, fd, "socketpair-tx", &tx);
             }
         }
+    }
+
+    for subscriber in tx_substrate::wake::all_subscriber_diagnostics() {
+        console_write_str::<P>("txkernel:smp-stall:wait-subscriber:source=");
+        write_hex_u64::<P>(subscriber.source.raw());
+        console_write_str::<P>(":source_pending=");
+        write_hex_u64::<P>(subscriber.source_pending_mask);
+        console_write_str::<P>(":source_subscribers=");
+        write_usize::<P>(subscriber.source_subscribers);
+        console_write_str::<P>(":task=");
+        write_usize::<P>(subscriber.task_id_low as usize);
+        console_write_str::<P>(":generation=");
+        write_usize::<P>(subscriber.generation.raw() as usize);
+        console_write_str::<P>(":interests=");
+        write_hex_u64::<P>(subscriber.interests.raw());
+        console_write_str::<P>(":mailbox_len=");
+        write_usize::<P>(subscriber.mailbox_len);
+        console_write_str::<P>(":mailbox_waker=");
+        write_usize::<P>(subscriber.mailbox_has_waker as usize);
+        console_write_str::<P>("\n");
     }
 
     console_write_str::<P>("txkernel:smp-stall:processes:end\n");

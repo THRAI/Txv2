@@ -42,7 +42,11 @@ pub mod wait_routing {
     pub fn new_wait_source() -> Arc<WaitSource> {
         let source_id = tx_subsystems::allocate_notification_source_id();
         let source = tx_substrate::wake::new_source(source_id);
-        tx_substrate::wake::register_source(Arc::clone(&source));
+        tx_subsystems::wait_source::register_wait_source_with_diagnostic_kind(
+            source_id,
+            Arc::clone(&source),
+            "ext4-metadata-admission",
+        );
         source
     }
 
@@ -51,6 +55,7 @@ pub mod wait_routing {
     }
 
     pub fn unregister_source(source: &Arc<WaitSource>) {
+        tx_subsystems::wait_source::release_wait_source(source.id().raw());
         tx_substrate::wake::unregister_source(WaitSourceId::new(source.id().raw()));
     }
 }

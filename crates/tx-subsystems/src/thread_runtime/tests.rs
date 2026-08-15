@@ -460,6 +460,37 @@ fn userspace_slot_round_trip_resolves_with_syscall() {
     assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Ready(trap));
 }
 
+#[test]
+fn thread_exit_wakes_retained_userspace_future_with_terminal_latch() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let leader = first_thread(&proc_cap);
+    let payload = leader.payload_cap_for_test().expect("alive");
+
+    let slot = payload.userspace_slot().clone();
+    let mut wait = slot.start_request().expect("start userspace wait");
+    let request = wait.request();
+    payload.set_active_userspace_request(Some(request));
+
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let waker = counting_waker(Arc::clone(&wakes));
+    let mut cx = Context::from_waker(&waker);
+    assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Pending);
+
+    let _ = step_thread_exit(leader, 0);
+
+    assert!(
+        payload.exit_intent(),
+        "a retained task payload must observe identity teardown without relocking the identity"
+    );
+    assert!(wakes.load(Ordering::SeqCst) >= 1);
+    assert_eq!(
+        Pin::new(&mut wait).poll(&mut cx),
+        Poll::Ready(UserspaceTrapInfo::TimerPreempt),
+        "teardown must resolve an in-flight userspace wait so run_thread can reach its latch"
+    );
+}
+
 /// `pending_syscall_return` is a one-shot slot drained by the
 /// userspace-entry shim. Plan B writeback discipline: the trap shell
 /// never writes the return; the shim drains and writes it into the
@@ -516,6 +547,40 @@ fn install_saved_context(
     ctx.regs[A0_INDEX] = 0xDEAD;
     payload.store_saved_user_context(Some(ctx));
     ctx
+}
+
+#[test]
+fn clean_trap_capture_retains_previous_fp_image() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let leader = first_thread(&proc_cap);
+    let payload = leader.payload_cap_for_test().expect("alive");
+
+    let mut previous = UserTrapContext::empty();
+    previous.pc = 0x1000;
+    previous.fp.flags = tx_hal::UserFpContext::FLAG_VALID;
+    previous.fp.regs[3] = 0xfeed_face_cafe_beef;
+    payload.store_saved_user_context(Some(previous));
+
+    let mut clean_capture = UserTrapContext::empty();
+    clean_capture.pc = 0x2000;
+    clean_capture.regs[10] = 7;
+    payload.store_captured_user_context(clean_capture);
+
+    let merged = payload.saved_user_context().expect("merged capture");
+    assert_eq!(merged.pc, 0x2000);
+    assert_eq!(merged.regs[10], 7);
+    assert!(merged.fp.is_valid());
+    assert_eq!(merged.fp.regs[3], 0xfeed_face_cafe_beef);
+
+    let mut dirty_capture = clean_capture;
+    dirty_capture.pc = 0x3000;
+    dirty_capture.fp.flags = tx_hal::UserFpContext::FLAG_VALID;
+    dirty_capture.fp.regs[3] = 0x1234;
+    payload.store_captured_user_context(dirty_capture);
+    let replaced = payload.saved_user_context().expect("replaced capture");
+    assert_eq!(replaced.pc, 0x3000);
+    assert_eq!(replaced.fp.regs[3], 0x1234);
 }
 
 #[test]

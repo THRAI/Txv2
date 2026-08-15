@@ -127,6 +127,19 @@ impl RecipeIndex {
         borrow_current_guard().unwrap_or_else(epoch_guard)
     }
 
+    /// Take ownership of the immutable root before starting a writer rewrite.
+    ///
+    /// Readers deliberately keep borrowing the published tree under EBR.  A
+    /// writer, however, may traverse the old tree, allocate many replacement
+    /// nodes, and recursively clone shared branches before it publishes.  It
+    /// must not keep a raw reference to the publication wrapper throughout
+    /// that work.  Cloning `RecipeTree` is O(1) for both backends and pins the
+    /// complete immutable root graph through its owning `Arc`.
+    fn writer_snapshot(&self) -> RecipeTree {
+        let guard = Self::writer_guard();
+        self.pinned(&guard).clone()
+    }
+
     fn rewrite_with_debug<F>(
         &self,
         op: RecipePublishOp,
@@ -373,12 +386,11 @@ impl RecipeIndex {
             let lock_start = recipe_phase_clock_now();
             let _writer = self.mutation.lock();
             emit_recipe_phase_duration_start(b"debug.vm.recipe.phase.lock_wait_ns", lock_start);
-            let guard = Self::writer_guard();
-            let current = self.pinned(&guard);
+            let current = self.writer_snapshot();
             match placement {
                 MapPlacement::RequireFree => {
-                    validate_insert_free(current, &entry)?;
-                    self.rewrite_with_debug(RecipePublishOp::MapRequireFree, current, |current| {
+                    validate_insert_free(&current, &entry)?;
+                    self.rewrite_with_debug(RecipePublishOp::MapRequireFree, &current, |current| {
                         let changed_pages = entry.range.page_count();
                         let (rewritten, stats_delta, touched_entries) =
                             insert_coalescing_adjacent(current, entry)?;
@@ -386,7 +398,7 @@ impl RecipeIndex {
                     })
                 }
                 MapPlacement::FixedReplace => {
-                    self.rewrite_with_debug(RecipePublishOp::MapFixedReplace, current, |current| {
+                    self.rewrite_with_debug(RecipePublishOp::MapFixedReplace, &current, |current| {
                         rewrite_fixed(current, &entry)
                     })
                 }
@@ -400,9 +412,8 @@ impl RecipeIndex {
             let lock_start = recipe_phase_clock_now();
             let _writer = self.mutation.lock();
             emit_recipe_phase_duration_start(b"debug.vm.recipe.phase.lock_wait_ns", lock_start);
-            let guard = Self::writer_guard();
-            let current = self.pinned(&guard);
-            self.rewrite_with_debug(RecipePublishOp::Unmap, current, |current| {
+            let current = self.writer_snapshot();
+            self.rewrite_with_debug(RecipePublishOp::Unmap, &current, |current| {
                 rewrite_unmap(current, range)
             })
         };
@@ -420,11 +431,27 @@ impl RecipeIndex {
             let _writer = self.mutation.lock();
             emit_recipe_phase_duration_start(b"debug.vm.recipe.phase.lock_wait_ns", lock_start);
             emit_vm_recipe_trace(b"debug.vm.recipe.protect.phase", 1);
-            let guard = Self::writer_guard();
-            let current = self.pinned(&guard);
-            self.rewrite_with_debug(RecipePublishOp::Protect, current, |current| {
-                rewrite_protect(current, range, prot)
-            })
+            let current = self.writer_snapshot();
+            if range_has_protection(&current, range, prot)? {
+                // Linux permits repeated mprotect calls.  Keeping the same
+                // immutable root also keeps its generation stable, avoids an
+                // EBR retirement, and lets the caller leave any CoW-demoted
+                // PTEs more restrictive than the recipe.
+                Ok(RecipeRewriteResult {
+                    commit: VmMapCommit {
+                        changed_pages: 0,
+                        stats_delta: AddressSpaceStatsDelta::default(),
+                    },
+                    touched_entries: 0,
+                    publish_debug: None,
+                    rewrite_ns: None,
+                    publish_ns: None,
+                })
+            } else {
+                self.rewrite_with_debug(RecipePublishOp::Protect, &current, |current| {
+                    rewrite_protect(current, range, prot)
+                })
+            }
         };
         let result = result?;
         let touched_entries = result.touched_entries;
@@ -451,9 +478,8 @@ impl RecipeIndex {
             let lock_start = recipe_phase_clock_now();
             let _writer = self.mutation.lock();
             emit_recipe_phase_duration_start(b"debug.vm.recipe.phase.lock_wait_ns", lock_start);
-            let guard = Self::writer_guard();
-            let current = self.pinned(&guard);
-            self.rewrite_with_debug(RecipePublishOp::Locked, current, |current| {
+            let current = self.writer_snapshot();
+            self.rewrite_with_debug(RecipePublishOp::Locked, &current, |current| {
                 rewrite_locked(current, range, locked)
             })
         };
@@ -471,13 +497,12 @@ impl RecipeIndex {
             let lock_start = recipe_phase_clock_now();
             let _writer = self.mutation.lock();
             emit_recipe_phase_duration_start(b"debug.vm.recipe.phase.lock_wait_ns", lock_start);
-            let guard = Self::writer_guard();
-            let current = self.pinned(&guard);
+            let current = self.writer_snapshot();
             let op = match placement {
                 VmRemapPlacement::Move => RecipePublishOp::RemapMove,
                 VmRemapPlacement::InPlace => RecipePublishOp::RemapInPlace,
             };
-            self.rewrite_with_debug(op, current, |current| match placement {
+            self.rewrite_with_debug(op, &current, |current| match placement {
                 VmRemapPlacement::Move => {
                     rewrite_remap_disjoint(current, old_range, new_range, destination)
                 }
@@ -492,9 +517,8 @@ impl RecipeIndex {
             let lock_start = recipe_phase_clock_now();
             let _writer = self.mutation.lock();
             emit_recipe_phase_duration_start(b"debug.vm.recipe.phase.lock_wait_ns", lock_start);
-            let guard = Self::writer_guard();
-            let current = self.pinned(&guard);
-            self.rewrite_with_debug(RecipePublishOp::ReplaceEntry, current, |current| {
+            let current = self.writer_snapshot();
+            self.rewrite_with_debug(RecipePublishOp::ReplaceEntry, &current, |current| {
                 let (rewritten, touched_entries) = current.replace_exact(entry)?;
                 let stats_delta = stats_delta_between(current, &rewritten);
                 Ok((rewritten, 0, stats_delta, touched_entries))
@@ -528,9 +552,8 @@ impl RecipeIndex {
             let lock_start = recipe_phase_clock_now();
             let _writer = self.mutation.lock();
             emit_recipe_phase_duration_start(b"debug.vm.recipe.phase.lock_wait_ns", lock_start);
-            let guard = Self::writer_guard();
-            let current = self.pinned(&guard);
-            self.rewrite_with_debug(RecipePublishOp::UfdTag, current, |current| {
+            let current = self.writer_snapshot();
+            self.rewrite_with_debug(RecipePublishOp::UfdTag, &current, |current| {
                 rewrite_tag_ufd_registration(current, range, tag)
             })
         };
@@ -765,7 +788,7 @@ fn try_merge_adjacent_entries(
     if left.range.end() != right.range.start()
         || left.prot != right.prot
         || left.flags != right.flags
-        || !left.same_backing(right)
+        || !left.has_contiguous_backing_with(right)
         || left.ufd_registration != right.ufd_registration
     {
         return Ok(None);
@@ -1017,6 +1040,22 @@ fn rewrite_protect(
     let (rewritten, _, touched_entries) = entries.replace_range_summary(range, replacements);
 
     Ok((rewritten, changed_pages, stats_delta, touched_entries))
+}
+
+fn range_has_protection(
+    entries: &RecipeTree,
+    range: UserRange,
+    prot: Prot,
+) -> Result<bool, VmMapError> {
+    if !range_is_fully_mapped(entries, range) {
+        return Err(VmMapError::MissingMapping);
+    }
+
+    let mut unchanged = true;
+    entries.for_each_overlapping(range, &mut |entry| {
+        unchanged &= entry.prot == prot;
+    });
+    Ok(unchanged)
 }
 
 fn rewrite_locked(

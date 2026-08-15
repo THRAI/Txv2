@@ -289,6 +289,62 @@ fn local_retire_guard_remote_cpu_active_blocks_epoch_advance() {
 }
 
 #[test]
+fn reader_admission_repairs_two_epoch_race_without_reopening_quiescence() {
+    let _isolation = EPOCH_TEST_LOCK.lock().expect("epoch test lock");
+    reset_epoch();
+    let before = epoch::summary().global_epoch;
+
+    let guard = testing::guard_with_admission_hook_for_test(|| {
+        assert_eq!(epoch::try_drain(0).advanced_epochs, 1);
+        assert_eq!(epoch::try_drain(0).advanced_epochs, 1);
+    });
+
+    assert_eq!(epoch::summary().global_epoch, before + 2);
+    assert_eq!(guard.entered_epoch(), before + 2);
+    assert_eq!(
+        epoch::try_drain(0).advanced_epochs,
+        1,
+        "one advance may pass an active reader at the current epoch",
+    );
+    assert_eq!(
+        epoch::try_drain(0).advanced_epochs,
+        0,
+        "the active reader must block the second advance needed for reclamation",
+    );
+    drop(guard);
+}
+
+#[test]
+fn prescanned_advance_cannot_be_followed_by_a_second_advance_past_reader() {
+    let _isolation = EPOCH_TEST_LOCK.lock().expect("epoch test lock");
+    reset_epoch();
+    let scanned = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let remote_scanned = scanned.clone();
+    let remote_release = release.clone();
+
+    let stale_scanner = std::thread::spawn(move || {
+        set_current_cpu(1);
+        testing::try_advance_with_membership_change_for_test(|| {
+            remote_scanned.wait();
+            remote_release.wait();
+        })
+    });
+
+    scanned.wait();
+    let guard = epoch::guard();
+    release.wait();
+    let stale = stale_scanner.join().expect("stale scanner thread");
+    assert!(stale.advanced, "the pre-admission scan may advance once");
+    assert_eq!(
+        epoch::try_drain(0).advanced_epochs,
+        0,
+        "the reader publication must block the second grace-period advance",
+    );
+    drop(guard);
+}
+
+#[test]
 fn local_retire_guard_is_not_send_or_sync() {
     assert_not_impl_any!(LocalExecutionGuard: Send, Sync);
 }

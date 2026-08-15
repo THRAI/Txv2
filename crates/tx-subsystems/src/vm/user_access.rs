@@ -36,6 +36,9 @@
 //! materialisation cannot complete inline.
 
 use alloc::vec::Vec;
+use core::future::{poll_fn, Future};
+use core::pin::Pin;
+use core::task::Poll;
 use step_engine::page_allocator;
 use tx_hal::UserPtr;
 
@@ -87,6 +90,124 @@ impl AddressSpace {
                 .lookup(page)
                 .is_some_and(|snapshot| snapshot.prot.permits(kind.required_prot()))
         })
+    }
+
+    /// Read a NUL-terminated user string only from already-published PTEs.
+    ///
+    /// `None` means that at least one page is not resident and the caller must
+    /// use the ordinary fault-capable path. `Some(Err(_))` is a terminal
+    /// validation/allocation failure. Each page is pinned while its direct-map
+    /// bytes are inspected, so concurrent unmap cannot reclaim the frame under
+    /// the trap-local reader.
+    pub fn read_user_cstr_resident(
+        &self,
+        src: UserPtr<u8>,
+        max_len: usize,
+    ) -> Option<Result<Vec<u8>, Errno>> {
+        if src.addr() == 0 {
+            return Some(Err(Errno::EFAULT));
+        }
+        if max_len == 0 {
+            return Some(Err(Errno::ENAMETOOLONG));
+        }
+
+        let mut out = Vec::new();
+        if out.try_reserve_exact(core::cmp::min(max_len, 256)).is_err() {
+            return Some(Err(Errno::ENOMEM));
+        }
+        let mut consumed = 0usize;
+        while consumed < max_len {
+            let Some(user_addr) = src.addr().checked_add(consumed) else {
+                return Some(Err(Errno::EFAULT));
+            };
+            let page_addr = user_addr & !(USER_PAGE_SIZE - 1);
+            let within = user_addr - page_addr;
+            let chunk = core::cmp::min(max_len - consumed, USER_PAGE_SIZE - within);
+            let page = UserVirtAddr(page_addr).containing_page();
+            let mapping = self.pmap.lookup_pinned(page)?;
+            if !mapping
+                .snapshot
+                .prot
+                .permits(UserAccessKind::Read.required_prot())
+            {
+                return Some(Err(Errno::EFAULT));
+            }
+            let frame_base = match page_allocator::frame_kernel_addr(mapping.snapshot.ppn) {
+                Ok(base) => base,
+                Err(_) => return Some(Err(Errno::EFAULT)),
+            };
+            for offset in 0..chunk {
+                // SAFETY: `mapping.pin` retains the mapped frame and the
+                // current chunk is bounded by the end of that frame.
+                let byte = unsafe { core::ptr::read(frame_base.add(within + offset)) };
+                if byte == 0 {
+                    return Some(Ok(out));
+                }
+                if out.len() == out.capacity() {
+                    let additional =
+                        core::cmp::min(out.capacity().max(1), max_len.saturating_sub(out.len()));
+                    if out.try_reserve(additional).is_err() {
+                        return Some(Err(Errno::ENOMEM));
+                    }
+                }
+                out.push(byte);
+            }
+            consumed += chunk;
+        }
+        Some(Err(Errno::ENAMETOOLONG))
+    }
+
+    /// Write one small value through an already-published writable PTE.
+    ///
+    /// `None` is a clean cache miss: the caller must use the ordinary
+    /// fault-capable user-copy path.  Values crossing a page boundary also
+    /// decline so this operation cannot partially modify user memory before
+    /// falling back.  The mapping pin keeps the frame alive for the complete
+    /// direct-map copy.
+    pub fn write_user_resident<T: Copy>(
+        &self,
+        dst: UserPtr<T>,
+        value: T,
+    ) -> Option<Result<(), Errno>> {
+        let len = core::mem::size_of::<T>();
+        if dst.addr() == 0 {
+            return Some(Err(Errno::EFAULT));
+        }
+        if len == 0 {
+            return Some(Ok(()));
+        }
+        let last = match dst.addr().checked_add(len - 1) {
+            Some(last) => last,
+            None => return Some(Err(Errno::EFAULT)),
+        };
+        let page_addr = dst.addr() & !(USER_PAGE_SIZE - 1);
+        if last & !(USER_PAGE_SIZE - 1) != page_addr {
+            return None;
+        }
+        let within = dst.addr() - page_addr;
+        let page = UserVirtAddr(page_addr).containing_page();
+        let mapping = self.pmap.lookup_pinned(page)?;
+        if !mapping
+            .snapshot
+            .prot
+            .permits(UserAccessKind::Write.required_prot())
+        {
+            return Some(Err(Errno::EFAULT));
+        }
+        let frame_base = match page_allocator::frame_kernel_addr(mapping.snapshot.ppn) {
+            Ok(base) => base,
+            Err(_) => return Some(Err(Errno::EFAULT)),
+        };
+        // SAFETY: `mapping.pin` retains the mapped frame, the checked value
+        // lies wholly inside that frame, and `value` is a valid `Copy` source.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                core::ptr::addr_of!(value) as *const u8,
+                frame_base.add(within),
+                len,
+            );
+        }
+        Some(Ok(()))
     }
 
     /// Copy `dst.len()` bytes from user-space `src` to kernel-side `dst`.
@@ -251,11 +372,56 @@ impl AddressSpace {
                 V3::Yield { shape, .. } => {
                     let token =
                         crate::vm::notification::wait_token_from_shape(&shape).ok_or(Errno::EIO)?;
-                    if let Some(wait) = crate::wait_source::wait_on_registered_source_id(
+                    let mut wait = crate::wait_source::wait_on_registered_source_id(
                         token.source_id(),
                         token.interest(),
-                    ) {
-                        let _ = wait.await;
+                    )
+                    .ok_or(Errno::EIO)?;
+
+                    // Publish the subscription before checking the semantic
+                    // predicate again. A single pending-mask bit cannot
+                    // broadcast an already-fired transition to several late
+                    // subscribers: the first subscriber may consume it while
+                    // another parks after the page or RangeLock is ready.
+                    // With this order, a transition either precedes the
+                    // recheck and is observed as ready, or follows a blocked
+                    // recheck and must see the installed subscription.
+                    let completed = poll_fn(|cx| {
+                        if Future::poll(Pin::new(&mut wait), cx).is_ready() {
+                            return Poll::Ready(None);
+                        }
+
+                        match self.reserve_user_range_for_access(range, kind) {
+                            V3::Done(()) => Poll::Ready(Some(Ok(()))),
+                            V3::Err(error) => Poll::Ready(Some(Err(error.into()))),
+                            V3::Continue { .. } => Poll::Ready(None),
+                            V3::Yield {
+                                shape: rechecked_shape,
+                                ..
+                            } => {
+                                let Some(rechecked) =
+                                    crate::vm::notification::wait_token_from_shape(
+                                        &rechecked_shape,
+                                    )
+                                else {
+                                    return Poll::Ready(Some(Err(Errno::EIO)));
+                                };
+                                if rechecked.source_id() == token.source_id()
+                                    && rechecked.interest() & token.interest() != 0
+                                {
+                                    Poll::Pending
+                                } else {
+                                    // The operation advanced to another wait
+                                    // object. Re-enter the outer loop and
+                                    // subscribe to that exact source.
+                                    Poll::Ready(None)
+                                }
+                            }
+                        }
+                    })
+                    .await;
+                    if let Some(result) = completed {
+                        return result;
                     }
                 }
             }
@@ -387,23 +553,22 @@ impl AddressSpace {
             let page_addr = user_addr & !(USER_PAGE_SIZE - 1);
             let within = user_addr - page_addr;
             let chunk = core::cmp::min(max_len - consumed, USER_PAGE_SIZE - within);
-            let frame_base =
+            let resolved =
                 match resolve_user_page_addr(self, page_addr, UserAccessKind::Read, guard) {
-                    ResolveOutcome::Done(addr) => addr,
+                    ResolveOutcome::Done(resolved) => resolved,
                     ResolveOutcome::Err(e) => return V3::Err(e.into()),
                     ResolveOutcome::Blocked(t) => {
                         return crate::vm::notification::yield_wait_token(NoProgress, t);
                     }
                 };
+            let frame_base = resolved.frame_base;
             // SAFETY: frame_base.add(within) is a valid kernel
             // direct-map pointer to the requested user byte; we read
             // up to `chunk` bytes which fit inside `USER_PAGE_SIZE -
             // within`. The page stayed live across this scan because
             // we hold the materialisation pin via the resolve helper.
-            // Note: ResolveOutcome only carries the bare address — we
-            // re-resolve every page rather than threading the
-            // `MaterializedPage` through the loop because the
-            // c-string scan may exit mid-page.
+            // The resolved value retains its independent pin through this
+            // page's scan and is dropped before the next page is resolved.
             for i in 0..chunk {
                 let byte = unsafe { core::ptr::read(frame_base.add(within + i)) };
                 if byte == 0 {
@@ -456,7 +621,8 @@ fn copy_in(
         emit_vm_user_trace(b"debug.vm.user.copy_in.chunk", chunk as i64);
         emit_vm_user_trace(b"debug.vm.user.copy_in.phase", 0);
         match resolve_user_page_addr(aspace, page_addr, UserAccessKind::Read, guard) {
-            ResolveOutcome::Done(frame_base) => {
+            ResolveOutcome::Done(resolved) => {
+                let frame_base = resolved.frame_base;
                 emit_vm_user_trace(b"debug.vm.user.copy_in.phase", 1);
                 // SAFETY: `frame_base.add(within)` is a valid kernel
                 // direct-map pointer to the requested user byte; we
@@ -521,7 +687,8 @@ fn copy_out(
         let within = user_addr - page_addr;
         let chunk = core::cmp::min(total - copied, USER_PAGE_SIZE - within);
         match resolve_user_page_addr(aspace, page_addr, UserAccessKind::Write, guard) {
-            ResolveOutcome::Done(frame_base) => {
+            ResolveOutcome::Done(resolved) => {
+                let frame_base = resolved.frame_base;
                 // SAFETY: same as `copy_in`, with direction reversed
                 // — frame_base is the kernel direct-map view of the
                 // user-page being written; the source slice has at
@@ -552,15 +719,16 @@ fn copy_out(
 /// Outcome of resolving one user page to its kernel direct-map
 /// address.
 enum ResolveOutcome {
-    /// Kernel direct-map base pointer for the resolved page. The
-    /// `MaterializedPage` pin is dropped before returning, so the
-    /// pointer is only safe for the synchronous remainder of the
-    /// containing tool-step. Both `copy_in` / `copy_out` use the
-    /// pointer immediately for one `copy_nonoverlapping` and discard
-    /// it; `read_user_cstr` re-resolves per page.
-    Done(*mut u8),
+    /// Kernel direct-map base pointer plus independent liveness evidence for
+    /// the synchronous copy/scan performed by the caller.
+    Done(ResolvedUserPage),
     Err(Errno),
     Blocked(WaitToken),
+}
+
+struct ResolvedUserPage {
+    frame_base: *mut u8,
+    _pin: crate::page_backed::MaterializedPagePin,
 }
 
 /// Look up the `VmEntry` covering `page_addr`, validate the access
@@ -569,11 +737,10 @@ enum ResolveOutcome {
 ///
 /// Pmap-first probe (per VM_v1_2 §"No rmap"): if the page already has
 /// a published pmap entry whose `Prot` permits the access, return the
-/// cached frame's kernel direct-map address directly. The frame is
-/// kept resident by the existing pmap entry's `MapPin`; the caller
-/// only borrows the pointer for the synchronous remainder of the
-/// containing tool-step (matching the existing `ResolveOutcome::Done`
-/// contract — the pin is **not** plumbed through). On miss (or
+/// cached frame's kernel direct-map address directly. While the pmap state is
+/// locked, the lookup retains a second `MapPin` and returns it with the
+/// pointer; this prevents concurrent `munmap`/replacement from freeing the
+/// frame before the synchronous copy finishes. On miss (or
 /// insufficient cached prot), fall through to the per-call materialise
 /// path which preserves the original eager-walk semantics.
 ///
@@ -597,21 +764,24 @@ fn resolve_user_page_addr(
     emit_vm_user_trace(b"debug.vm.user.resolve.kind", kind_id);
     emit_vm_user_trace(b"debug.vm.user.resolve.phase", 0);
 
-    // Pmap-first lookup. The published mapping pins the frame; we
-    // borrow the kernel direct-map pointer for the synchronous copy
-    // and release it before returning, matching `ResolveOutcome::Done`'s
-    // existing contract (no MapPin threaded out). This is the hot path
-    // for repeated user copies from pthread stack/TLS pages that are
-    // already resident.
+    // Pmap-first lookup. Retain a second pin under the pmap lock and carry it
+    // with the direct-map pointer until the caller completes its synchronous
+    // copy. This is the hot path for repeated user copies from pthread
+    // stack/TLS pages that are already resident.
     emit_vm_user_trace(b"debug.vm.user.resolve.phase", 1);
-    let cached = aspace.pmap.lookup(user_page);
-    if let Some(snapshot) = cached {
+    let cached_pinned = aspace.pmap.lookup_pinned(user_page);
+    let cached = cached_pinned.as_ref().map(|mapping| mapping.snapshot);
+    if let Some(mapping) = cached_pinned {
+        let snapshot = mapping.snapshot;
         if snapshot.prot.permits(kind.required_prot()) {
             emit_vm_user_trace(b"debug.vm.user.resolve.phase", 2);
             return match page_allocator::frame_kernel_addr(snapshot.ppn) {
                 Ok(p) => {
                     emit_vm_user_trace(b"debug.vm.user.resolve.phase", 3);
-                    ResolveOutcome::Done(p)
+                    ResolveOutcome::Done(ResolvedUserPage {
+                        frame_base: p,
+                        _pin: mapping.pin,
+                    })
                 }
                 Err(_) => {
                     emit_vm_user_trace(b"debug.vm.user.resolve.err", 1);
@@ -686,7 +856,17 @@ fn resolve_user_page_addr(
             return ResolveOutcome::Blocked(t);
         }
     };
-    // Publish via pmap so the next call hits the cache. The
+    // Retain an independent pin for the direct-map copy before transferring
+    // the materialization's original pin into pmap ownership.  This also
+    // keeps the current copy safe if publication races and fails.
+    let copy_pin = match materialised.map_pin.retain(materialised.ppn) {
+        Ok(pin) => pin,
+        Err(_) => {
+            emit_vm_user_trace(b"debug.vm.user.resolve.err", 7);
+            return ResolveOutcome::Err(Errno::EFAULT);
+        }
+    };
+
     // `publish_prot` mirrors `fault_script`: read access on a
     // private-anon page publishes a read-only mapping (the next write
     // would refault and republish writable); write access publishes
@@ -718,7 +898,10 @@ fn resolve_user_page_addr(
     match page_allocator::frame_kernel_addr(materialised.ppn) {
         Ok(p) => {
             emit_vm_user_trace(b"debug.vm.user.resolve.phase", 12);
-            ResolveOutcome::Done(p)
+            ResolveOutcome::Done(ResolvedUserPage {
+                frame_base: p,
+                _pin: copy_pin,
+            })
         }
         Err(_) => {
             emit_vm_user_trace(b"debug.vm.user.resolve.err", 6);

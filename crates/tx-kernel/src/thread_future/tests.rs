@@ -16,13 +16,15 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
 use std::sync::Mutex;
 
+use crate::adapter::boot_runtime::ast::AstBatch;
 use crate::adapter::boot_runtime::userspace::{
-    PageFaultAccess, PageFaultInfo, SyscallRequest, UserAddr, UserspaceTrapInfo,
+    PageFaultAccess, PageFaultInfo, SyscallRequest, UserAddr, UserspaceEntryDecision,
+    UserspaceTrapInfo,
 };
 use crate::adapter::step_engine::{Cap, PayloadCap};
 use tx_hal::{
-    AllocError, Arch, Asid, BootHandoff, BootInfo, BootPlatformIf, BootProtocol, ConsoleIf, InitIf,
-    ObserverIf, PhysAddr, PlatformConfig, PlatformInfo, PmapError, PmapPermissions,
+    AllocError, Arch, Asid, BootHandoff, BootInfo, BootPlatformIf, BootProtocol, ConsoleIf, CpuId,
+    InitIf, ObserverIf, PhysAddr, PlatformConfig, PlatformInfo, PmapError, PmapPermissions,
     PmapReservation, PmapReserveKind, PmapRoot, PtNode,
 };
 use tx_shims::linux_syscall::{
@@ -35,8 +37,9 @@ use tx_subsystems::process::ExitStatus;
 use tx_subsystems::reactor_submit::SubmitChildThreadStatus;
 use tx_subsystems::signal::{SigDisposition, Signum};
 use tx_subsystems::thread_runtime::{
-    clear_current_thread_payload, current_thread_payload, drain_pending_syscall_return,
-    ThreadPayload,
+    clear_current_thread_identity, clear_current_thread_payload, clear_current_userspace_payload,
+    clear_current_userspace_thread_identity, current_thread_payload, current_userspace_payload,
+    current_userspace_thread_identity, drain_pending_syscall_return, ThreadPayload,
 };
 use tx_subsystems::vm::{
     AccessMode, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntryFlags, VmFault,
@@ -44,11 +47,11 @@ use tx_subsystems::vm::{
 };
 
 use crate::thread_future::{
-    fatal_signal_teardown_with_posts, handle_page_fault_trap, interrupted_syscall_signal_errno,
-    pf_access_to_vm_access, restore_sigreturn_frame, run_thread, siginfo_to_user_abi,
-    signal_frame_source_context, signal_saved_context_with_pending_return,
+    enter_userspace_once, fatal_signal_teardown_with_posts, handle_page_fault_trap,
+    interrupted_syscall_signal_errno, pf_access_to_vm_access, restore_sigreturn_frame, run_thread,
+    siginfo_to_user_abi, signal_frame_source_context, signal_saved_context_with_pending_return,
     syscall_return_consumes_hot_budget, syscall_return_may_publish_wake_handoff,
-    syscall_return_needs_handoff, PerHartSlotted, ThreadTaskResult,
+    syscall_return_needs_handoff, userspace_preempt_boundary, PerHartSlotted, ThreadTaskResult,
 };
 use crate::trap::direct_trap_syscall_needs_wake_handoff;
 
@@ -175,6 +178,7 @@ impl tx_hal::MonotonicCounterIf for TestPlatform {
 
 static TEST_MONOTONIC_NS: AtomicU64 = AtomicU64::new(0);
 static TEST_HAL_DEADLINE_ARM_COUNT: AtomicUsize = AtomicUsize::new(0);
+static TEST_CURRENT_CPU: AtomicUsize = AtomicUsize::new(0);
 
 impl tx_hal::DeadlineTimerIf for TestPlatform {
     fn set_deadline_ns(_deadline: u64) {
@@ -186,10 +190,18 @@ impl tx_hal::DeadlineTimerIf for TestPlatform {
 
 impl tx_hal::PersistentClockIf for TestPlatform {}
 
-impl tx_hal::PercpuIf for TestPlatform {}
+impl tx_hal::PercpuIf for TestPlatform {
+    fn current_cpu_id() -> CpuId {
+        CpuId(TEST_CURRENT_CPU.load(Ordering::Acquire))
+    }
+}
 impl tx_hal::CacheIf for TestPlatform {}
 impl tx_hal::DmaIf for TestPlatform {}
-impl tx_hal::SmpIf for TestPlatform {}
+impl tx_hal::SmpIf for TestPlatform {
+    fn current_cpu_id() -> CpuId {
+        CpuId(TEST_CURRENT_CPU.load(Ordering::Acquire))
+    }
+}
 impl tx_hal::EntropyIf for TestPlatform {}
 impl ObserverIf for TestPlatform {}
 
@@ -246,8 +258,14 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
     tx_subsystems::cross_crate_test_support::reset_pid_counter();
     tx_subsystems::cross_crate_test_support::reset_tid_counter();
     TEST_MONOTONIC_NS.store(0, Ordering::Release);
+    TEST_CURRENT_CPU.store(0, Ordering::Release);
     // Ensure the per-hart slot is empty across tests.
-    let _ = clear_current_thread_payload(0);
+    for hart in 0..4 {
+        let _ = clear_current_thread_identity(hart);
+        let _ = clear_current_thread_payload(hart);
+        let _ = clear_current_userspace_payload(hart);
+        let _ = clear_current_userspace_thread_identity(hart);
+    }
     USERSPACE_A0_LOG
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -502,6 +520,39 @@ fn getppid_uses_cap_only_immediate_fast_path() {
 
 fn noop_waker() -> Waker {
     Waker::noop().clone()
+}
+
+#[test]
+fn userspace_preempt_boundary_yields_once_without_self_wake_dependency() {
+    let mut boundary = userspace_preempt_boundary();
+    let mut pinned = unsafe { Pin::new_unchecked(&mut boundary) };
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    assert_eq!(pinned.as_mut().poll(&mut cx), Poll::Pending);
+    assert_eq!(pinned.as_mut().poll(&mut cx), Poll::Ready(()));
+}
+
+#[test]
+fn userspace_preempt_boundary_repolls_through_payload_waker() {
+    let _g = setup();
+    let payload = bootstrap_payload();
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS populated post-bootstrap");
+    let leader = init.nth_thread(0).expect("leader");
+    let payload_for_inner = payload.clone();
+    let inner = async move {
+        payload_for_inner.request_task_repoll();
+        userspace_preempt_boundary().await;
+    };
+    let wrapped = PerHartSlotted::<TestPlatform, _>::new(leader, payload, inner);
+    let reactor = crate::adapter::boot_runtime::Reactor::new();
+    let _task = reactor.submit_task(wrapped);
+
+    let result = reactor.run_until_idle();
+
+    assert_eq!(result.polled, 2);
+    assert_eq!(result.completed, 1);
 }
 
 /// Drive `fut` to completion via a spin-poll loop. Mirrors the
@@ -791,6 +842,48 @@ fn per_hart_slotted_commits_explicit_thread_exit_status() {
     assert!(init.is_zombie());
 }
 
+#[test]
+fn userspace_entry_reports_the_hart_whose_slots_it_published() {
+    let _g = setup();
+    let payload = bootstrap_payload();
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS populated post-bootstrap");
+    let leader = init.nth_thread(0).expect("leader");
+    let aspace = init.aspace_cap().expect("init aspace");
+    payload.store_saved_user_context(Some(tx_hal::UserTrapContext::empty()));
+
+    let wait = payload
+        .userspace_slot()
+        .start_request()
+        .expect("start userspace run");
+    let request = wait.request();
+    payload.set_active_userspace_request(Some(request));
+    payload
+        .userspace_slot()
+        .checkpoint_userspace_entry_batch(request, AstBatch::default(), |_| {
+            UserspaceEntryDecision::EnterUserspace
+        })
+        .expect("dispatch userspace run");
+
+    let entry_hart =
+        enter_userspace_once::<TestPlatform>(&leader, &payload, &aspace, request, None)
+            .expect("live process enters userspace");
+    assert_eq!(entry_hart, 0);
+    assert!(current_userspace_payload(0).is_some());
+    assert!(current_userspace_thread_identity(0).is_some());
+
+    TEST_CURRENT_CPU.store(2, Ordering::Release);
+    let _ = clear_current_userspace_payload(entry_hart);
+    let _ = clear_current_userspace_thread_identity(entry_hart);
+    assert!(
+        current_userspace_payload(0).is_none(),
+        "the slot from the actual userspace-entry hart must be cleared"
+    );
+    assert!(current_userspace_thread_identity(0).is_none());
+    assert!(current_userspace_payload(2).is_none());
+    drop(wait);
+}
+
 /// `PerHartSlotted` also binds the reactor task mailbox into the
 /// thread payload while the task is polled. Signal delivery posts its
 /// wake hint through this weak handle, so a syscall parked inside
@@ -834,6 +927,58 @@ fn per_hart_slotted_binds_current_task_mailbox() {
             .is_some(),
         "payload retains a weak handle to the task mailbox after poll",
     );
+}
+
+/// A task mailbox is shared by several independent wait protocols. An event
+/// left for another consumer therefore cannot be treated as readiness for the
+/// currently-polled future. Doing so makes the wrapper self-wake forever while
+/// the inner future remains Pending (the BuildStorm/CAgent task-28 livelock).
+#[test]
+fn per_hart_slotted_does_not_spin_on_unmatched_mailbox_event() {
+    let _g = setup();
+    let payload = bootstrap_payload();
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS populated post-bootstrap");
+    let leader = init.nth_thread(0).expect("leader");
+    let polls = std::sync::Arc::new(AtomicUsize::new(0));
+    let polls_for_inner = std::sync::Arc::clone(&polls);
+
+    let inner = core::future::poll_fn(move |_cx| {
+        let poll = polls_for_inner.fetch_add(1, Ordering::AcqRel);
+        if poll == 0 {
+            let hart = <TestPlatform as tx_hal::SmpIf>::current_cpu_id().0;
+            let mailbox = crate::adapter::boot_runtime::current_task_mailbox(hart)
+                .expect("reactor exposes the current task mailbox");
+            assert!(mailbox.post(MailboxEvent::SourceFired {
+                generation: tx_substrate::wake::WaitGeneration::new(1),
+                source: tx_substrate::step::WaitSourceId::new(0xfeed),
+                interests: tx_substrate::step::InterestMask::new(1),
+            }));
+        }
+        // Bound a broken implementation: repeated self-wakes eventually make
+        // the future Ready instead of hanging the host test forever.
+        if poll >= 3 {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    });
+    let wrapped = PerHartSlotted::<TestPlatform, _>::new(leader, payload, inner);
+    let reactor = crate::adapter::boot_runtime::Reactor::new();
+    let task = reactor.submit_task(wrapped);
+
+    let result = reactor.run_until_idle();
+
+    assert_eq!(
+        result.polled, 2,
+        "only the producer wake may cause a re-poll"
+    );
+    assert_eq!(result.completed, 0);
+    assert_eq!(
+        reactor.task_status(task.id()),
+        Some(crate::adapter::boot_runtime::TaskStatus::Parked)
+    );
+    assert_eq!(polls.load(Ordering::Acquire), 2);
 }
 
 #[test]
@@ -915,9 +1060,17 @@ fn entry_timer_poll_rearms_periodic_itimer_with_current_timer_context() {
         );
 
         TEST_HAL_DEADLINE_ARM_COUNT.store(0, Ordering::Release);
-        assert!(
-            super::poll_entry_timers_and_liveness::<TestPlatform>(&leader_for_inner),
-            "entry timer poll should keep live thread/process running",
+        let process_payload = init_for_inner
+            .payload_cap()
+            .expect("live timer-test process payload");
+        let aspace = super::poll_entry_timers_and_address_space::<TestPlatform>(
+            &init_for_inner,
+            &process_payload,
+        );
+        assert_eq!(
+            aspace.key(),
+            process_payload.aspace_cap().key(),
+            "entry timer poll should retain the process's current address space",
         );
         assert_eq!(
             TEST_HAL_DEADLINE_ARM_COUNT.load(Ordering::Acquire),
@@ -1297,9 +1450,10 @@ fn thread_future_pf_err_retries_while_exec_owns_lifecycle() {
         access: PageFaultAccess::Write,
         present: false,
     };
+    let aspace = init.aspace_cap().expect("init aspace");
 
     let control = block_on(handle_page_fault_trap::<TestPlatform>(
-        &leader, &payload, fault,
+        &leader, &payload, &init, &aspace, fault,
     ));
 
     assert!(matches!(

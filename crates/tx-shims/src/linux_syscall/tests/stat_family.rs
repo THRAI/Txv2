@@ -21,6 +21,10 @@ use tx_subsystems::vfs::structure::{
     S_IFDIR, S_IFLNK,
 };
 use tx_subsystems::vfs::{FsOps, OpenFile};
+use tx_subsystems::vm::{
+    MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntryFlags, VmMapRequest,
+    USER_PAGE_SIZE,
+};
 
 use crate::linux_syscall::{
     AT_EMPTY_PATH, AT_FDCWD, NR_CHDIR, NR_FCHDIR, NR_FCHMODAT, NR_FSTAT, NR_FSTATFS, NR_GETCWD,
@@ -149,6 +153,26 @@ fn nul_terminate(path: &[u8]) -> Vec<u8> {
     v.extend_from_slice(path);
     v.push(0);
     v
+}
+
+fn map_resident_user_bytes(ctx: &SyscallCtx<'_>, uaddr: usize, bytes: &[u8]) -> u64 {
+    let range = UserRange::new_aligned(UserVirtAddr(uaddr), USER_PAGE_SIZE).expect("user range");
+    ctx.aspace
+        .try_mmap(VmMapRequest::fixed(
+            range,
+            MapPlacement::FixedReplace,
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ))
+        .expect("map statx user page");
+    let guard = guard();
+    assert_eq!(
+        ctx.aspace
+            .copy_to_user(tx_hal::UserPtr::<u8>::new(uaddr), bytes, &guard),
+        StepOutcome::Done(bytes.len())
+    );
+    uaddr as u64
 }
 
 /// Build a directory OpenFile rooted at `root_rnode`. Used by the
@@ -540,6 +564,15 @@ fn dispatch_statx_on_root_writes_statx_struct() {
     let (proc_cap, thread) = bootstrap_with_cwd(root_dentry, _root_mount);
     let ctx = make_ctx(proc_cap, thread);
 
+    // Mounted-node lookup is reachable from cached stat-family operations
+    // while their walker guard is still active. It must borrow that guard
+    // instead of trying to enter the non-nestable EBR domain again.
+    let outer_guard = guard();
+    assert!(
+        crate::linux_syscall::fs_mounted::MountedNode::from_rnode_direct(&root_rnode).is_some()
+    );
+    drop(outer_guard);
+
     let path = nul_terminate(b"/");
     let mut statxbuf = vec![0u8; STATX_BYTES];
     let req = SyscallRequest::new(
@@ -569,6 +602,55 @@ fn dispatch_statx_on_root_writes_statx_struct() {
     );
     assert_eq!(read_u64_at(&statxbuf, STATX_SIZE_OFF), 0);
     drop(path);
+}
+
+#[test]
+fn direct_statx_reads_resident_cached_fd_without_reactor_handoff() {
+    let _setup = stat_setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let (reader, _writer) = step_pipe2(PipeFlags::default()).expect("pipe for direct statx");
+    let expected_ino = reader.rnode().fs_object_id().as_u64();
+    proc_cap.set_fd(11, Some(reader));
+    let ctx = make_ctx(proc_cap, thread);
+
+    let path_uaddr = map_resident_user_bytes(&ctx, 0x63a0_0000, b"\0");
+    // Materialise the anonymous destination page before entering the
+    // cache-only trap lane; a cold user page must deliberately fall back.
+    let statx_uaddr = map_resident_user_bytes(&ctx, 0x63a0_1000, &[0]);
+    let request = SyscallRequest::new(
+        NR_STATX,
+        [
+            11,
+            path_uaddr,
+            AT_EMPTY_PATH as u64,
+            crate::linux_syscall::numbers::STATX_BASIC_STATS as u64,
+            statx_uaddr,
+            0,
+        ],
+    );
+    assert_eq!(
+        dispatch_direct_trap_oneshot::<ShimsTestPmap>(
+            &request,
+            &ctx.process,
+            &ctx.thread,
+            &ctx.aspace,
+        ),
+        Some(SyscallResult::Return(0))
+    );
+
+    let mut statxbuf = vec![0u8; STATX_BYTES];
+    let guard = guard();
+    assert_eq!(
+        ctx.aspace.copy_from_user(
+            &mut statxbuf,
+            tx_hal::UserPtr::<u8>::new(statx_uaddr as usize),
+            &guard,
+        ),
+        StepOutcome::Done(STATX_BYTES)
+    );
+    assert_eq!(read_u64_at(&statxbuf, STATX_INO_OFF), expected_ino);
+    assert_eq!(read_u16_at(&statxbuf, STATX_MODE_OFF) & 0o170000, 0o010000);
 }
 
 /// `statx(fd, "", AT_EMPTY_PATH, STATX_BASIC_STATS, statxbuf)`

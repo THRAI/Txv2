@@ -437,9 +437,17 @@ pub(crate) fn drain_deferred_drops(budget: usize) -> DeferredDropStats {
                 break;
             }
             let reclaim = unsafe { (*current).reclaim };
+            let trace_sequence = epoch::begin_reclaim_trace(
+                cpu,
+                epoch::RECLAIM_KIND_DEFERRED_PUBLICATION,
+                current as usize,
+                reclaim as usize,
+                0,
+            );
             local_guard.with_local_execution_open(|local_guard| unsafe {
                 reclaim(current, local_guard);
             });
+            epoch::finish_reclaim_trace(cpu, trace_sequence);
             dropped += 1;
         }
         DeferredDropStats {
