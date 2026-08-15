@@ -21,8 +21,12 @@ pub mod tx_ext4 {
         Ext4MountWire, MountedExt4,
     };
     pub use tx_ext4_format::capability::RwProfile;
-    pub use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
-    pub use tx_ext4_format::{Ext4FormatError, Result as Ext4Result};
+    pub use tx_ext4_format::pager::{BlockImage, Ext4Pager, Page4K, BLOCK_SIZE};
+    pub use tx_ext4_format::{
+        diagnose_recovery_preflight, diagnose_recovery_preflight_linux_uuid_semantics,
+        preflight_recovery, Ext4FormatError, JournalPreflightError, JournalPreflightUnsupported,
+        JournalReplayReport, RecoveryReport, Result as Ext4Result,
+    };
 }
 mod tx_ext4_bridge;
 

@@ -16,7 +16,7 @@
 
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use std::sync::Mutex;
+use std::{format, sync::Mutex};
 
 use tx_hal::{
     AllocError, Arch, Asid, BootHandoff, BootInfo, BootPlatformIf, BootProtocol, ConsoleIf, CpuId,
@@ -32,6 +32,7 @@ const TEST_PAGE_SIZE: usize = 4096;
 
 use crate::init::{
     console_tty, dev_mount, dev_shm_mount, publish_boot_mountpoint_dentry, root_mount, CoreInit,
+    RootExt4JournalPreflightDecision,
 };
 
 use crate::adapter::step_engine::{self as step_engine, guard, page_allocator, StepOutcome};
@@ -819,6 +820,139 @@ fn root_mount_mode_honors_the_last_standard_ro_or_rw_token() {
     assert!(CoreInit::<TestPlatform>::root_mount_is_read_only_from_boot(
         "tx.root=sda rw ro"
     ));
+}
+
+#[test]
+fn root_ext4_journal_preflight_is_exact_opt_in_and_requires_final_ro() {
+    use RootExt4JournalPreflightDecision as Decision;
+
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_ext4_journal_preflight_decision_from_boot("tx.root=sda1 ro"),
+        Decision::Disabled,
+    );
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_ext4_journal_preflight_decision_from_boot(
+            "tx.root=sda1 tx.ext4.journal-preflight=1 ro"
+        ),
+        Decision::Run,
+    );
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_ext4_journal_preflight_decision_from_boot(
+            "tx.root=sda1 ro rw tx.ext4.journal-preflight=1"
+        ),
+        Decision::RefusedNotReadOnly,
+    );
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_ext4_journal_preflight_decision_from_boot(
+            "tx.root=sda1 tx.ext4.journal-preflight=invalid"
+        ),
+        Decision::RefusedNotReadOnly,
+        "any present token on a non-RO mount reports refused:not-ro first",
+    );
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_ext4_journal_preflight_decision_from_boot(
+            "tx.root=sda1 rw ro tx.ext4.journal-preflight=1"
+        ),
+        Decision::Run,
+    );
+    for invalid in ["", "0", "01", "true", "yes"] {
+        let cmdline = format!("tx.root=sda1 ro tx.ext4.journal-preflight={invalid}");
+        assert_eq!(
+            CoreInit::<TestPlatform>::root_ext4_journal_preflight_decision_from_boot(&cmdline),
+            Decision::RefusedInvalidToken,
+            "value {invalid:?} must be rejected",
+        );
+    }
+}
+
+#[test]
+fn root_ext4_journal_preflight_last_same_name_token_wins() {
+    use RootExt4JournalPreflightDecision as Decision;
+
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_ext4_journal_preflight_decision_from_boot(
+            "ro tx.ext4.journal-preflight=bad tx.ext4.journal-preflight=1"
+        ),
+        Decision::Run,
+    );
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_ext4_journal_preflight_decision_from_boot(
+            "ro tx.ext4.journal-preflight=1 tx.ext4.journal-preflight=0"
+        ),
+        Decision::RefusedInvalidToken,
+    );
+}
+
+#[test]
+fn root_ext4_journal_preflight_error_labels_are_stable_and_exhaustive() {
+    use tx_fs::tx_ext4::Ext4FormatError;
+
+    let cases = [
+        (Ext4FormatError::BadMagic, "bad-magic"),
+        (Ext4FormatError::Corrupt, "corrupt"),
+        (Ext4FormatError::OutOfBounds, "out-of-bounds"),
+        (Ext4FormatError::Truncated, "truncated"),
+        (Ext4FormatError::Unsupported, "unsupported"),
+        (
+            Ext4FormatError::ExtentTreeFull {
+                inode: 1,
+                logical_block: 2,
+                depth: 3,
+                entries: 4,
+            },
+            "extent-tree-full",
+        ),
+        (Ext4FormatError::WouldBlock, "would-block"),
+        (Ext4FormatError::ReadOnly, "read-only"),
+        (Ext4FormatError::Io, "io"),
+        (Ext4FormatError::NotEmpty, "not-empty"),
+        (Ext4FormatError::IsDirectory, "is-directory"),
+        (Ext4FormatError::NotDirectory, "not-directory"),
+        (Ext4FormatError::InvalidInput, "invalid-input"),
+    ];
+
+    for (error, expected) in cases {
+        assert_eq!(
+            CoreInit::<TestPlatform>::ext4_format_error_label(error),
+            expected,
+        );
+    }
+}
+
+#[test]
+fn root_ext4_journal_preflight_unsupported_detail_labels_are_stable() {
+    use tx_fs::tx_ext4::JournalPreflightUnsupported;
+
+    let cases = [
+        (
+            JournalPreflightUnsupported::DescriptorTagFlags,
+            "descriptor-tag-flags",
+        ),
+        (
+            JournalPreflightUnsupported::DescriptorDeletedTag,
+            "descriptor-deleted-tag",
+        ),
+        (
+            JournalPreflightUnsupported::DescriptorUuidMismatch,
+            "descriptor-uuid-mismatch",
+        ),
+        (JournalPreflightUnsupported::RevokeRecord, "revoke-record"),
+        (
+            JournalPreflightUnsupported::CommitChecksum,
+            "commit-checksum",
+        ),
+        (
+            JournalPreflightUnsupported::UnknownBlockType(9),
+            "unknown-block-type-9",
+        ),
+    ];
+
+    for (unsupported, expected) in cases {
+        assert_eq!(
+            CoreInit::<TestPlatform>::root_ext4_journal_preflight_unsupported_label(unsupported),
+            expected,
+        );
+    }
 }
 
 #[test]

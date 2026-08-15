@@ -792,6 +792,14 @@ enum RootBlockDeviceResolveError {
     InvalidPartitionRange,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RootExt4JournalPreflightDecision {
+    Disabled,
+    Run,
+    RefusedInvalidToken,
+    RefusedNotReadOnly,
+}
+
 mod boot_args;
 mod boot_plan;
 mod exec;
@@ -1390,6 +1398,24 @@ impl<P: TxPlatform> CoreInit<P> {
         let handle = root.handle;
 
         let boot_info = <P as tx_hal::BootInfoIf>::boot_info();
+        match Self::root_ext4_journal_preflight_decision_from_boot(boot_info.cmdline.unwrap_or(""))
+        {
+            RootExt4JournalPreflightDecision::Disabled => {}
+            RootExt4JournalPreflightDecision::Run => {
+                if !Self::run_root_ext4_journal_preflight(dev_name, handle) {
+                    return false;
+                }
+            }
+            RootExt4JournalPreflightDecision::RefusedInvalidToken => {
+                Self::write_root_ext4_journal_preflight_status(dev_name, "refused:invalid-token");
+                return false;
+            }
+            RootExt4JournalPreflightDecision::RefusedNotReadOnly => {
+                Self::write_root_ext4_journal_preflight_status(dev_name, "refused:not-ro");
+                return false;
+            }
+        }
+
         if dev_name == "vda"
             && Self::should_autodetect_boot_media_layout(
                 boot_info.cmdline.unwrap_or(""),
@@ -1732,6 +1758,174 @@ impl<P: TxPlatform> CoreInit<P> {
             }
         }
         read_only
+    }
+
+    fn root_ext4_journal_preflight_decision_from_boot(
+        cmdline: &str,
+    ) -> RootExt4JournalPreflightDecision {
+        let mut value = None;
+        for token in cmdline.split_ascii_whitespace() {
+            if let Some(candidate) = token.strip_prefix("tx.ext4.journal-preflight=") {
+                value = Some(candidate);
+            }
+        }
+
+        match value {
+            None => RootExt4JournalPreflightDecision::Disabled,
+            Some(_) if !Self::root_mount_is_read_only_from_boot(cmdline) => {
+                RootExt4JournalPreflightDecision::RefusedNotReadOnly
+            }
+            Some("1") => RootExt4JournalPreflightDecision::Run,
+            Some(_) => RootExt4JournalPreflightDecision::RefusedInvalidToken,
+        }
+    }
+
+    fn run_root_ext4_journal_preflight(
+        device_name: &'static str,
+        handle: tx_subsystems::device::BlockDeviceHandle,
+    ) -> bool {
+        use tx_fs::tx_ext4::{
+            diagnose_recovery_preflight_linux_uuid_semantics, BlockDeviceImage, Ext4Pager,
+            RecoveryReport,
+        };
+
+        let mut pager = match Ext4Pager::open(BlockDeviceImage::new(handle)) {
+            Ok(pager) => pager,
+            Err(error) => {
+                Self::write_root_ext4_journal_preflight_error(device_name, error);
+                return false;
+            }
+        };
+        let superblock = pager.superblock();
+        if !superblock.needs_recovery() {
+            Self::write_root_ext4_journal_preflight_status(device_name, "not-required");
+            return true;
+        }
+        let geometry = match pager.journal_geometry() {
+            Ok(geometry) => geometry,
+            Err(error) => {
+                Self::write_root_ext4_journal_preflight_required_error(
+                    device_name,
+                    "geometry",
+                    error,
+                );
+                return false;
+            }
+        };
+        match diagnose_recovery_preflight_linux_uuid_semantics(
+            pager.image(),
+            &superblock,
+            &geometry,
+        ) {
+            Ok(RecoveryReport::NotRequired) => true,
+            Ok(RecoveryReport::Replayed(report)) => {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(&alloc::format!(
+                    ":mount:rootfs:ext4-journal-preflight:device={device_name}:status=ok:\
+                         transactions={}:blocks={}:next={}\n",
+                    report.transactions,
+                    report.blocks_replayed,
+                    report.next_sequence,
+                ));
+                true
+            }
+            Err(failure) => {
+                Self::write_root_ext4_journal_preflight_scan_error(device_name, failure);
+                false
+            }
+        }
+    }
+
+    fn write_root_ext4_journal_preflight_status(device_name: &str, status: &str) {
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(&alloc::format!(
+            ":mount:rootfs:ext4-journal-preflight:device={device_name}:status={status}\n"
+        ));
+    }
+
+    fn write_root_ext4_journal_preflight_error(
+        device_name: &str,
+        error: tx_fs::tx_ext4::Ext4FormatError,
+    ) {
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(&alloc::format!(
+            ":mount:rootfs:ext4-journal-preflight:device={device_name}:status=err:error={}\n",
+            Self::ext4_format_error_label(error),
+        ));
+    }
+
+    fn write_root_ext4_journal_preflight_required_error(
+        device_name: &str,
+        stage: &'static str,
+        error: tx_fs::tx_ext4::Ext4FormatError,
+    ) {
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(&alloc::format!(
+            ":mount:rootfs:ext4-journal-preflight:device={device_name}:status=err:\
+             recovery-required=1:stage={stage}:error={}\n",
+            Self::ext4_format_error_label(error),
+        ));
+    }
+
+    fn write_root_ext4_journal_preflight_scan_error(
+        device_name: &str,
+        failure: tx_fs::tx_ext4::JournalPreflightError,
+    ) {
+        Self::write_board_sentinel_prefix();
+        let detail = failure
+            .unsupported
+            .map(Self::root_ext4_journal_preflight_unsupported_label);
+        match detail {
+            Some(detail) => tx_hal::console_write_str::<P>(&alloc::format!(
+                ":mount:rootfs:ext4-journal-preflight:device={device_name}:status=err:\
+                 recovery-required=1:stage=scan:error={}:detail={detail}\n",
+                Self::ext4_format_error_label(failure.error),
+            )),
+            None => tx_hal::console_write_str::<P>(&alloc::format!(
+                ":mount:rootfs:ext4-journal-preflight:device={device_name}:status=err:\
+                 recovery-required=1:stage=scan:error={}\n",
+                Self::ext4_format_error_label(failure.error),
+            )),
+        }
+    }
+
+    fn root_ext4_journal_preflight_unsupported_label(
+        unsupported: tx_fs::tx_ext4::JournalPreflightUnsupported,
+    ) -> alloc::string::String {
+        use tx_fs::tx_ext4::JournalPreflightUnsupported;
+
+        match unsupported {
+            JournalPreflightUnsupported::DescriptorTagFlags => "descriptor-tag-flags".into(),
+            JournalPreflightUnsupported::DescriptorDeletedTag => "descriptor-deleted-tag".into(),
+            JournalPreflightUnsupported::DescriptorUuidMismatch => {
+                "descriptor-uuid-mismatch".into()
+            }
+            JournalPreflightUnsupported::RevokeRecord => "revoke-record".into(),
+            JournalPreflightUnsupported::CommitChecksum => "commit-checksum".into(),
+            JournalPreflightUnsupported::UnknownBlockType(block_type) => {
+                alloc::format!("unknown-block-type-{block_type}")
+            }
+        }
+    }
+
+    fn ext4_format_error_label(error: tx_fs::tx_ext4::Ext4FormatError) -> &'static str {
+        use tx_fs::tx_ext4::Ext4FormatError;
+
+        match error {
+            Ext4FormatError::BadMagic => "bad-magic",
+            Ext4FormatError::Corrupt => "corrupt",
+            Ext4FormatError::OutOfBounds => "out-of-bounds",
+            Ext4FormatError::Truncated => "truncated",
+            Ext4FormatError::Unsupported => "unsupported",
+            Ext4FormatError::ExtentTreeFull { .. } => "extent-tree-full",
+            Ext4FormatError::WouldBlock => "would-block",
+            Ext4FormatError::ReadOnly => "read-only",
+            Ext4FormatError::Io => "io",
+            Ext4FormatError::NotEmpty => "not-empty",
+            Ext4FormatError::IsDirectory => "is-directory",
+            Ext4FormatError::NotDirectory => "not-directory",
+            Ext4FormatError::InvalidInput => "invalid-input",
+        }
     }
 
     fn root_ext4_rw_profile() -> Result<tx_fs::tx_ext4::RwProfile, ()> {
@@ -3759,6 +3953,48 @@ impl<P: TxPlatform> CoreInit<P> {
                 let guard = step_engine::guard();
                 tx_hal::console_write_str::<P>(":live=");
                 Self::write_u64(runtime.is_live(&guard) as u64);
+                tx_hal::console_write_str::<P>(":claimed=");
+                Self::write_u64(runtime.is_claimed() as u64);
+                if let Some(source) = tx_substrate::wake::lookup_source(
+                    tx_substrate::step::WaitSourceId::new(runtime.source_id()),
+                ) {
+                    tx_hal::console_write_str::<P>(":subscribers=");
+                    Self::write_u64(source.subscriber_count() as u64);
+                    tx_hal::console_write_str::<P>(":pending=");
+                    Self::write_u64(source.pending_mask_snapshot());
+                } else {
+                    tx_hal::console_write_str::<P>(":source_missing=1");
+                }
+                if let Some((
+                    page_in_flight,
+                    page_queued,
+                    page_admitted,
+                    block_queued,
+                    block_tracked,
+                    block_tags,
+                    block_in_flight,
+                    wake_attached,
+                )) = runtime.diagnostic_counts(&guard)
+                {
+                    tx_hal::console_write_str::<P>(":page_in_flight=");
+                    Self::write_u64(page_in_flight as u64);
+                    tx_hal::console_write_str::<P>(":page_queued=");
+                    Self::write_u64(page_queued as u64);
+                    tx_hal::console_write_str::<P>(":page_admitted=");
+                    Self::write_u64(page_admitted as u64);
+                    tx_hal::console_write_str::<P>(":block_queued=");
+                    Self::write_u64(block_queued as u64);
+                    tx_hal::console_write_str::<P>(":block_tracked=");
+                    Self::write_u64(block_tracked as u64);
+                    tx_hal::console_write_str::<P>(":block_tags=");
+                    Self::write_u64(block_tags as u64);
+                    tx_hal::console_write_str::<P>(":block_in_flight=");
+                    Self::write_u64(block_in_flight as u64);
+                    tx_hal::console_write_str::<P>(":wake_attached=");
+                    Self::write_u64(wake_attached as u64);
+                } else {
+                    tx_hal::console_write_str::<P>(":diag_missing=1");
+                }
                 tx_hal::console_write_str::<P>("\n");
             }
 
