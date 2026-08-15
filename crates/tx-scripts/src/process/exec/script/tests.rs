@@ -1102,6 +1102,28 @@ fn exec_step_preserves_wait_source_yield_instead_of_returning_ebusy() {
 }
 
 #[test]
+fn exec_wait_retention_keeps_each_page_container_cap_once() {
+    let _setup = setup();
+    let container = PageContainer::new_cap(
+        PageContainerKind::Anon {
+            swap_policy: AnonSwapPolicy::Reclaimable,
+        },
+        1,
+    )
+    .expect("exec retention page container");
+    let weak = container.downgrade();
+    let mut retained = Vec::new();
+
+    super::retain_exec_page_container(&mut retained, &container);
+    super::retain_exec_page_container(&mut retained, &container);
+    assert_eq!(retained.len(), 1);
+
+    drop(container);
+    let guard = guard();
+    assert!(weak.upgrade(&guard).is_some());
+}
+
+#[test]
 fn real_page_container_eagain_makes_exec_script_op_continue_but_eio_stays_eio() {
     for (errno, expected) in [
         (
