@@ -437,6 +437,40 @@ impl CpuLocalEpochState {
         }
     }
 
+    /// Enter only if this CPU already has a published reader guard.
+    ///
+    /// This is the counted half of `borrow_current_guard`: the returned guard
+    /// may outlive the guard that was active at the call site, so it must own a
+    /// real depth contribution of its own. The successful depth CAS prevents
+    /// the concurrent final outer drop from clearing `local_epoch`.
+    pub(crate) fn try_enter_nested(&self) -> Option<u64> {
+        let mut depth = self.active_guards.load(Ordering::Relaxed);
+        loop {
+            if depth == 0 {
+                return None;
+            }
+            let next = depth
+                .checked_add(1)
+                .expect("epoch guard nesting depth overflowed");
+            match self.active_guards.compare_exchange_weak(
+                depth,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => depth = observed,
+            }
+        }
+
+        let entered_epoch = self.local_epoch.load(Ordering::Acquire);
+        assert_ne!(
+            entered_epoch, 0,
+            "nested epoch guard found a quiescent CPU-local participant"
+        );
+        Some(entered_epoch)
+    }
+
     pub(crate) fn leave(&self) {
         let previous_depth = self.active_guards.fetch_sub(1, Ordering::Relaxed);
         assert!(previous_depth > 0, "epoch guard depth underflow");

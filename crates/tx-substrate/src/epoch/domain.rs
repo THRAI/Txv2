@@ -319,17 +319,16 @@ impl LocalRetireGuard {
 
     pub(crate) unsafe fn try_enqueue_slot_after_barrier(
         &mut self,
-        key: crate::zone::SlotKey,
+        retired: crate::zone::RetiredSlot,
         epoch: u64,
-        link: impl FnOnce(Option<crate::zone::SlotKey>),
     ) -> Result<(), EpochError> {
         let state = unsafe { &mut *self.local.retire_state_ptr() };
         let bag = state
             .bag_for_epoch_mut(epoch)
             .ok_or(EpochError::RetireBagOccupied)?;
         let previous_head = bag.zone_head;
-        link(previous_head);
-        bag.zone_head = Some(key);
+        crate::zone::set_retiring_next(retired, previous_head);
+        bag.zone_head = Some(retired);
         bag.zone_count += 1;
         self.local.publish_retire_summary(state);
         Ok(())
@@ -618,10 +617,11 @@ impl EpochDomain {
         Guard::new(local, cpu_id, entered_epoch, cpu_pin)
     }
 
-    /// Return a borrow-mode guard for the current CPU if one is already active
-    /// (local_epoch != 0).  The returned guard does not call `local.enter()` or
-    /// increment `active_guards`; its Drop is a no-op.  Returns `None` when no
-    /// guard is held.
+    /// Return a real nested guard for the current CPU if one is already active.
+    ///
+    /// The nested guard owns both a membership pin and a depth contribution,
+    /// so it remains protective even if the original outer guard drops first.
+    /// Returns `None` when no guard is held.
     fn borrow_guard(&'static self) -> Option<Guard<'static>> {
         if !self.initialized.load(Ordering::Acquire) {
             return None;
@@ -630,14 +630,14 @@ impl EpochDomain {
         let cpu_pin = (hooks.pin_current_cpu)(CpuPinReason::EpochBorrow);
         let cpu_id = cpu_pin.cpu_id();
         let local = self.cpu_state(cpu_id)?;
-        if local.membership() != CpuMembership::Online {
+        if !local.try_pin_online() {
             return None;
         }
-        let local_epoch = local.current();
-        if local_epoch == 0 {
+        let Some(entered_epoch) = local.try_enter_nested() else {
+            local.unpin();
             return None;
-        }
-        Some(Guard::new_borrowed(local, cpu_id, local_epoch, cpu_pin))
+        };
+        Some(Guard::new(local, cpu_id, entered_epoch, cpu_pin))
     }
 
     unsafe fn retire_intrusive(&'static self, head: NonNull<RcuHead>) -> Result<(), EpochError> {
@@ -729,6 +729,15 @@ impl EpochDomain {
     }
 
     fn try_advance_epoch_with(&'static self, membership_change: impl FnOnce()) -> AdvanceAttempt {
+        self.try_advance_epoch_with_hooks(membership_change, || {}, |_| {})
+    }
+
+    fn try_advance_epoch_with_hooks(
+        &'static self,
+        membership_change: impl FnOnce(),
+        mut after_publication_fence: impl FnMut(),
+        mut before_participant_scan: impl FnMut(CpuId),
+    ) -> AdvanceAttempt {
         let version_before = self.membership_version.0.load(Ordering::Acquire);
         let mut membership_change = Some(membership_change);
         let mut scan_attempts = 0usize;
@@ -740,6 +749,14 @@ impl EpochDomain {
             let current = self.global_epoch.0.load(Ordering::Acquire);
             let next = current.saturating_add(1);
             let mut blocked = false;
+
+            // Pairs with the reader's SeqCst epoch publication/fence. Without
+            // this collector-side fence, a weakly ordered CPU may observe a
+            // participant as quiescent while that participant has already
+            // started protected loads. Every membership-version retry must
+            // execute the fence again before rescanning participants.
+            fence(Ordering::SeqCst);
+            after_publication_fence();
 
             let possible_cpu_mask = self.possible_cpu_mask();
             for cpu in 0..MAX_EPOCH_CPUS {
@@ -754,6 +771,7 @@ impl EpochDomain {
                     continue;
                 }
 
+                before_participant_scan(CpuId(cpu));
                 let local = state.current();
                 if state.retire_active() || (local != 0 && local < current) {
                     blocked = true;
@@ -967,14 +985,14 @@ impl EpochDomain {
     fn reclaim_zone_list(
         &'static self,
         local_guard: &mut LocalRetireGuard,
-        mut head: Option<crate::zone::SlotKey>,
+        mut head: Option<crate::zone::RetiredSlot>,
     ) -> usize {
         let mut reclaimed = 0usize;
         while let Some(current) = head {
             head = crate::zone::retiring_next(current);
             crate::zone::set_retiring_next(current, Some(current));
-            local_guard.with_local_execution_open(|_| unsafe {
-                crate::zone::reclaim_retired_slot(current);
+            local_guard.with_local_execution_open(|local_guard| unsafe {
+                crate::zone::reclaim_retired_slot(current, local_guard);
             });
             reclaimed += 1;
         }
@@ -1290,6 +1308,18 @@ pub fn try_advance_with_membership_change_for_test(
     membership_change: impl FnOnce(),
 ) -> AdvanceAttempt {
     GLOBAL_DOMAIN.try_advance_epoch_with(membership_change)
+}
+
+#[doc(hidden)]
+pub fn try_advance_with_publication_fence_hooks_for_test(
+    after_publication_fence: impl FnMut(),
+    before_participant_scan: impl FnMut(CpuId),
+) -> AdvanceAttempt {
+    GLOBAL_DOMAIN.try_advance_epoch_with_hooks(
+        || {},
+        after_publication_fence,
+        before_participant_scan,
+    )
 }
 
 #[doc(hidden)]

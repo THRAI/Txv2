@@ -40,6 +40,7 @@ pub use policy::{
     ZonePolicy,
 };
 pub use published_binding::PublishedBinding;
+pub(crate) use registry::RetiredSlot;
 pub use registry::{
     lookup, register_static_zone, registered_zone_count, snapshot, EmptySlabTrimStats, SlotKey,
     ZoneId, ZoneInfo,
@@ -52,32 +53,19 @@ pub use runtime::{
 pub use slab::ZoneLayoutProbe;
 pub use slab::ZoneSlab;
 
-pub(crate) fn retiring_next(key: SlotKey) -> Option<SlotKey> {
-    let meta = registry::slot_meta(key).expect("retiring Zone key must resolve");
-    unsafe { meta.as_ref() }
-        .load(Ordering::Acquire)
-        .retiring_next_raw()
-        .map(SlotKey::from_raw)
+pub(crate) fn retiring_next(retired: RetiredSlot) -> Option<RetiredSlot> {
+    registry::retiring_next(retired)
 }
 
-pub(crate) fn set_retiring_next(key: SlotKey, next: Option<SlotKey>) {
-    let meta = registry::slot_meta(key).expect("retiring Zone key must resolve");
-    let meta = unsafe { meta.as_ref() };
-    loop {
-        let current = meta.load(Ordering::Acquire);
-        debug_assert_eq!(current.state(), SlotState::Retiring);
-        let linked = current.with_retiring_next(next.map(SlotKey::raw));
-        if meta
-            .compare_exchange(current, linked, Ordering::Release, Ordering::Relaxed)
-            .is_ok()
-        {
-            return;
-        }
-    }
+pub(crate) fn set_retiring_next(retired: RetiredSlot, next: Option<RetiredSlot>) {
+    registry::set_retiring_next(retired, next);
 }
 
-pub(crate) unsafe fn reclaim_retired_slot(key: SlotKey) {
-    unsafe { registry::reclaim_slot(key) }
+pub(crate) unsafe fn reclaim_retired_slot(
+    retired: RetiredSlot,
+    local_guard: &mut crate::epoch::LocalRetireGuard,
+) {
+    unsafe { registry::reclaim_slot(retired, local_guard) }
 }
 
 const ZONE_ID_INITIALIZING: usize = usize::MAX;
@@ -237,14 +225,24 @@ impl<T: 'static> Zone<T> {
         });
     }
 
-    pub(crate) fn return_slot_from_reclaim(&self, slot: core::ptr::NonNull<slot::Slot<T>>) {
+    pub(crate) fn return_slot_from_reclaim(
+        &self,
+        slot: core::ptr::NonNull<slot::Slot<T>>,
+        local_guard: &mut crate::epoch::LocalRetireGuard,
+        generation_exhausted: bool,
+    ) {
         measure_zone!(b"debug.ds.substrate.zone.return_slot_from_reclaim", T, {
-            self.keg.return_slot_without_slab_retire(slot);
+            self.keg
+                .return_slot_from_reclaim(slot, local_guard, generation_exhausted);
         });
     }
 
     pub(crate) fn trim_empty_slabs(&self, limit: usize) -> usize {
         self.keg.trim_empty_slabs(limit)
+    }
+
+    fn snapshot_slab_backing_ppns(&self, out: &mut [Option<usize>]) -> usize {
+        self.keg.snapshot_backing_ppns(out)
     }
 
     pub(crate) fn flush_current_cpu_bucket(&'static self) -> Result<(), ZoneError> {
@@ -428,6 +426,13 @@ pub mod testing {
         Some(unsafe { slot.as_ref().meta().load(Ordering::Acquire) })
     }
 
+    pub fn slab_backing_ppns<T: 'static>(
+        zone: &super::Zone<T>,
+        out: &mut [Option<usize>],
+    ) -> usize {
+        zone.snapshot_slab_backing_ppns(out)
+    }
+
     pub unsafe fn force_generation<T: 'static>(key: super::SlotKey, generation: u16) {
         let slot = super::registry::slot_for::<T>(key).expect("test slot must resolve");
         let meta = unsafe { slot.as_ref().meta() };
@@ -441,6 +446,20 @@ pub mod testing {
                 return;
             }
         }
+    }
+
+    /// Invoke a typed reclaim callback for an exact key+generation token.
+    /// This is only for deterministic stale-callback regression tests.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure no epoch guard can observe the retiring object.
+    pub unsafe fn reclaim_retired_slot_now(key: super::SlotKey, expected_generation: u16) {
+        let retired = super::RetiredSlot::new(key, expected_generation);
+        crate::epoch::with_local_retire_guard(|local_guard| unsafe {
+            super::reclaim_retired_slot(retired, local_guard);
+        })
+        .expect("test reclaim requires initialized local epoch retirement");
     }
 
     /// Return a `Cap` pointing at the reserved (not yet live) slot.

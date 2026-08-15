@@ -82,6 +82,47 @@ impl SlotKey {
     }
 }
 
+/// One logical Zone retirement, including the occupant generation expected by
+/// its EBR callback.
+///
+/// `SlotKey` alone names reusable storage. Carrying the generation prevents a
+/// delayed callback from reclaiming a later occupant of the same physical
+/// slot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RetiredSlot {
+    key: SlotKey,
+    generation: u16,
+}
+
+impl RetiredSlot {
+    pub(crate) const fn new(key: SlotKey, generation: u16) -> Self {
+        Self { key, generation }
+    }
+
+    pub(crate) const fn key(self) -> SlotKey {
+        self.key
+    }
+
+    pub(crate) const fn generation(self) -> u16 {
+        self.generation
+    }
+
+    pub(crate) const fn encode_link(self) -> u64 {
+        (1 << 63) | ((self.generation as u64) << 32) | self.key.raw() as u64
+    }
+
+    pub(crate) const fn decode_link(raw: u64) -> Option<Self> {
+        if raw & (1 << 63) == 0 {
+            None
+        } else {
+            Some(Self::new(
+                SlotKey::from_raw(raw as u32),
+                ((raw >> 32) & u16::MAX as u64) as u16,
+            ))
+        }
+    }
+}
+
 impl core::fmt::Debug for SlotKey {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("SlotKey")
@@ -138,8 +179,11 @@ struct RegisteredZone {
     trim_empty_slabs: fn(*const (), usize) -> usize,
     /// Resolve a logical key to a typed slot pointer, erased for storage.
     slot_from_key: fn(*const (), SlotKey) -> Option<*mut ()>,
+    /// Read or replace the generation-bearing intrusive retirement link.
+    retiring_next: fn(*const (), RetiredSlot) -> Option<RetiredSlot>,
+    set_retiring_next: fn(*const (), RetiredSlot, Option<RetiredSlot>),
     /// Reclaim one typed slot selected from a mixed Zone retirement bag.
-    reclaim_slot: unsafe fn(*const (), SlotKey),
+    reclaim_slot: unsafe fn(*const (), RetiredSlot, &mut crate::epoch::LocalRetireGuard),
 }
 
 static NEXT_ZONE_ID: AtomicUsize = AtomicUsize::new(1);
@@ -162,6 +206,8 @@ pub fn register_static_zone<T: 'static>(zone: &'static Zone<T>) -> Result<ZoneIn
         flush_current_cpu_bucket: flush_current_cpu_bucket::<T>,
         trim_empty_slabs: trim_empty_slabs_for::<T>,
         slot_from_key: slot_from_key::<T>,
+        retiring_next: retiring_next_for::<T>,
+        set_retiring_next: set_retiring_next_for::<T>,
         reclaim_slot: reclaim_slot_for::<T>,
     };
     REGISTRY.register(entry)?;
@@ -196,12 +242,19 @@ pub(crate) fn slot_for<T: 'static>(key: SlotKey) -> Option<NonNull<Slot<T>>> {
     REGISTRY.slot_for::<T>(key)
 }
 
-pub(crate) fn slot_meta(key: SlotKey) -> Option<NonNull<super::meta::SlotMeta>> {
-    REGISTRY.slot_meta(key)
+pub(crate) fn retiring_next(retired: RetiredSlot) -> Option<RetiredSlot> {
+    REGISTRY.retiring_next(retired)
 }
 
-pub(crate) unsafe fn reclaim_slot(key: SlotKey) {
-    unsafe { REGISTRY.reclaim_slot(key) }
+pub(crate) fn set_retiring_next(retired: RetiredSlot, next: Option<RetiredSlot>) {
+    REGISTRY.set_retiring_next(retired, next);
+}
+
+pub(crate) unsafe fn reclaim_slot(
+    retired: RetiredSlot,
+    local_guard: &mut crate::epoch::LocalRetireGuard,
+) {
+    unsafe { REGISTRY.reclaim_slot(retired, local_guard) }
 }
 
 pub(crate) fn slot_lookup_debug<T: 'static>(key: SlotKey) -> SlotLookupDebug {
@@ -242,12 +295,49 @@ fn slot_from_key<T: 'static>(erased: *const (), key: SlotKey) -> Option<*mut ()>
     zone.slot_from_key(key).map(|slot| slot.as_ptr() as *mut ())
 }
 
-unsafe fn reclaim_slot_for<T: 'static>(erased: *const (), key: SlotKey) {
+fn retiring_next_for<T: 'static>(erased: *const (), retired: RetiredSlot) -> Option<RetiredSlot> {
     let zone = unsafe { &*(erased as *const Zone<T>) };
-    let slot = zone
-        .slot_from_key(key)
-        .expect("retired Zone slot must remain directory-resolvable");
-    unsafe { super::slot::reclaim_slot(slot) };
+    let slot = zone.slot_from_key(retired.key())?;
+    let slot = unsafe { slot.as_ref() };
+    let current = slot.meta().load(Ordering::Acquire);
+    if current.state() != super::SlotState::Retiring
+        || current.generation() != retired.generation()
+        || current.reclaim_claimed()
+    {
+        return None;
+    }
+    slot.retiring_next()
+}
+
+fn set_retiring_next_for<T: 'static>(
+    erased: *const (),
+    retired: RetiredSlot,
+    next: Option<RetiredSlot>,
+) {
+    let zone = unsafe { &*(erased as *const Zone<T>) };
+    let Some(slot) = zone.slot_from_key(retired.key()) else {
+        return;
+    };
+    let slot = unsafe { slot.as_ref() };
+    let current = slot.meta().load(Ordering::Acquire);
+    if current.state() == super::SlotState::Retiring
+        && current.generation() == retired.generation()
+        && !current.reclaim_claimed()
+    {
+        slot.set_retiring_next(next);
+    }
+}
+
+unsafe fn reclaim_slot_for<T: 'static>(
+    erased: *const (),
+    retired: RetiredSlot,
+    local_guard: &mut crate::epoch::LocalRetireGuard,
+) {
+    let zone = unsafe { &*(erased as *const Zone<T>) };
+    let Some(slot) = zone.slot_from_key(retired.key()) else {
+        return;
+    };
+    unsafe { super::slot::reclaim_slot(slot, retired.generation(), local_guard) };
 }
 
 struct ZoneRegistry {
@@ -389,30 +479,37 @@ impl ZoneRegistry {
         NonNull::new(ptr.cast::<Slot<T>>())
     }
 
-    fn slot_meta(&self, key: SlotKey) -> Option<NonNull<super::meta::SlotMeta>> {
-        let zone_id = key.zone_id();
-        if zone_id.0 == 0 || zone_id.0 > MAX_REGISTERED_ZONES {
-            return None;
-        }
-        let entry = self.entry_at(zone_id.0 - 1)?;
-        if entry.zone_id != zone_id {
-            return None;
-        }
-        let ptr = (entry.slot_from_key)(entry.erased, key)?;
-        NonNull::new(ptr.cast::<super::meta::SlotMeta>())
+    fn retiring_next(&self, retired: RetiredSlot) -> Option<RetiredSlot> {
+        let zone_id = retired.key().zone_id();
+        let index = zone_id.0.checked_sub(1)?;
+        let entry = self.entry_at(index)?;
+        (entry.retiring_next)(entry.erased, retired)
     }
 
-    unsafe fn reclaim_slot(&self, key: SlotKey) {
-        let zone_id = key.zone_id();
-        let entry = self
-            .entry_at(
-                zone_id
-                    .0
-                    .checked_sub(1)
-                    .expect("retired key has nonzero zone id"),
-            )
-            .expect("retired key has registered zone");
-        unsafe { (entry.reclaim_slot)(entry.erased, key) };
+    fn set_retiring_next(&self, retired: RetiredSlot, next: Option<RetiredSlot>) {
+        let zone_id = retired.key().zone_id();
+        let Some(index) = zone_id.0.checked_sub(1) else {
+            return;
+        };
+        let Some(entry) = self.entry_at(index) else {
+            return;
+        };
+        (entry.set_retiring_next)(entry.erased, retired, next);
+    }
+
+    unsafe fn reclaim_slot(
+        &self,
+        retired: RetiredSlot,
+        local_guard: &mut crate::epoch::LocalRetireGuard,
+    ) {
+        let zone_id = retired.key().zone_id();
+        let Some(index) = zone_id.0.checked_sub(1) else {
+            return;
+        };
+        let Some(entry) = self.entry_at(index) else {
+            return;
+        };
+        unsafe { (entry.reclaim_slot)(entry.erased, retired, local_guard) };
     }
 
     fn slot_lookup_debug<T: 'static>(&self, key: SlotKey) -> SlotLookupDebug {

@@ -29,6 +29,13 @@ struct SingleSlotObject {
 static SINGLE_SLOT_ZONE: Zone<SingleSlotObject> = Zone::const_new();
 
 #[derive(Debug)]
+struct SmpSingleSlotObject {
+    bytes: [u8; 3000],
+}
+
+static SMP_SINGLE_SLOT_ZONE: Zone<SmpSingleSlotObject> = Zone::const_new();
+
+#[derive(Debug)]
 struct AllocationFailureObject;
 
 static ALLOCATION_FAILURE_ZONE: Zone<AllocationFailureObject> = Zone::const_new();
@@ -38,6 +45,38 @@ struct DropObject;
 
 static DROP_ZONE: Zone<DropObject> = Zone::const_new();
 static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug)]
+struct ReclaimOnceNode {
+    value: u32,
+}
+
+impl Drop for ReclaimOnceNode {
+    fn drop(&mut self) {
+        RECLAIM_ONCE_NODE_DROPS.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+#[derive(Debug)]
+struct ReclaimOnceObject {
+    nodes: std::collections::BTreeMap<u32, ReclaimOnceNode>,
+    _single_slot_padding: [u8; 3000],
+}
+
+static RECLAIM_ONCE_ZONE: Zone<ReclaimOnceObject> = Zone::const_new();
+static RECLAIM_ONCE_NODE_DROPS: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug)]
+struct GenerationMaxObject;
+static GENERATION_MAX_ZONE: Zone<GenerationMaxObject> = Zone::const_new();
+
+#[derive(Debug)]
+struct GenerationExhaustedObject;
+static GENERATION_EXHAUSTED_ZONE: Zone<GenerationExhaustedObject> = Zone::const_new();
+
+#[derive(Debug)]
+struct EmptyRotationObject;
+static EMPTY_ROTATION_ZONE: Zone<EmptyRotationObject> = Zone::const_new();
 
 #[derive(Debug)]
 struct ZeroKeyObject;
@@ -72,6 +111,30 @@ unsafe impl ZoneAllocated for DropObject {
     }
 }
 
+unsafe impl ZoneAllocated for ReclaimOnceObject {
+    fn zone() -> &'static Zone<Self> {
+        &RECLAIM_ONCE_ZONE
+    }
+}
+
+unsafe impl ZoneAllocated for GenerationMaxObject {
+    fn zone() -> &'static Zone<Self> {
+        &GENERATION_MAX_ZONE
+    }
+}
+
+unsafe impl ZoneAllocated for GenerationExhaustedObject {
+    fn zone() -> &'static Zone<Self> {
+        &GENERATION_EXHAUSTED_ZONE
+    }
+}
+
+unsafe impl ZoneAllocated for EmptyRotationObject {
+    fn zone() -> &'static Zone<Self> {
+        &EMPTY_ROTATION_ZONE
+    }
+}
+
 unsafe impl ZoneAllocated for ZeroKeyObject {
     fn zone() -> &'static Zone<Self> {
         &ZERO_KEY_ZONE
@@ -93,6 +156,12 @@ unsafe impl ZoneAllocated for LargeObject {
 unsafe impl ZoneAllocated for SingleSlotObject {
     fn zone() -> &'static Zone<Self> {
         &SINGLE_SLOT_ZONE
+    }
+}
+
+unsafe impl ZoneAllocated for SmpSingleSlotObject {
+    fn zone() -> &'static Zone<Self> {
+        &SMP_SINGLE_SLOT_ZONE
     }
 }
 
@@ -154,6 +223,85 @@ fn slot_lifecycle_is_four_state_and_reclaims_after_grace() {
 }
 
 #[test]
+fn stale_reclaim_key_cannot_drop_free_or_reused_btree_occupant() {
+    const NODE_COUNT: usize = 24;
+
+    fn value(seed: u32) -> ReclaimOnceObject {
+        let nodes = (0..NODE_COUNT as u32)
+            .map(|index| {
+                (
+                    index,
+                    ReclaimOnceNode {
+                        value: seed + index,
+                    },
+                )
+            })
+            .collect();
+        ReclaimOnceObject {
+            nodes,
+            _single_slot_padding: [seed as u8; 3000],
+        }
+    }
+
+    fn assert_value(cap: &Cap<ReclaimOnceObject>, seed: u32) {
+        assert_eq!(cap.nodes.len(), NODE_COUNT);
+        for (index, node) in &cap.nodes {
+            assert_eq!(node.value, seed + *index);
+        }
+    }
+
+    let _guard = reset_zone_and_epoch();
+    RECLAIM_ONCE_NODE_DROPS.store(0, Ordering::Release);
+    zone::register_zone_for::<ReclaimOnceObject>().expect("reclaim-once zone registration");
+
+    let original = zone::sign(value(1000)).expect("original BTreeMap allocation");
+    let stale_key = original.key();
+    let stale_generation = original.binding_token().generation();
+    assert_value(&original, 1000);
+    drop(original);
+
+    // First let the real callback complete normally, then replay its exact
+    // key+generation token while the physical storage is Free.
+    for _ in 0..3 {
+        let _ = epoch::drain_with_budget(usize::MAX);
+    }
+    assert_eq!(RECLAIM_ONCE_NODE_DROPS.load(Ordering::Acquire), NODE_COUNT);
+    unsafe { zone::testing::reclaim_retired_slot_now(stale_key, stale_generation) };
+    assert_eq!(
+        RECLAIM_ONCE_NODE_DROPS.load(Ordering::Acquire),
+        NODE_COUNT,
+        "a repeated callback must not destruct uninitialized Free storage"
+    );
+
+    // The padded value gives this zone one slot per slab, making reuse of the
+    // exact physical SlotKey deterministic.
+    let replacement = zone::sign(value(2000)).expect("replacement BTreeMap allocation");
+    assert_eq!(replacement.key(), stale_key);
+    assert_ne!(replacement.binding_token().generation(), stale_generation);
+    assert_value(&replacement, 2000);
+
+    // Retire the replacement, then replay the old generation while the same
+    // key is Retiring again. State-only validation would destruct the new
+    // BTreeMap here; generation-bearing validation must reject it.
+    drop(replacement);
+    unsafe { zone::testing::reclaim_retired_slot_now(stale_key, stale_generation) };
+    assert_eq!(
+        RECLAIM_ONCE_NODE_DROPS.load(Ordering::Acquire),
+        NODE_COUNT,
+        "an old generation must not destruct the reused Retiring occupant"
+    );
+
+    for _ in 0..3 {
+        let _ = epoch::drain_with_budget(usize::MAX);
+    }
+    assert_eq!(
+        RECLAIM_ONCE_NODE_DROPS.load(Ordering::Acquire),
+        NODE_COUNT * 2,
+        "each BTreeMap node must be dropped exactly once per real occupant"
+    );
+}
+
+#[test]
 fn weak_observation_survives_retirement_until_guard_drop() {
     let _isolation = reset_zone_and_epoch();
     zone::register_zone_for::<Object>().expect("object zone registration");
@@ -172,6 +320,37 @@ fn weak_observation_survives_retirement_until_guard_drop() {
     let drained = epoch::drain_with_budget(usize::MAX);
     assert_eq!(drained.bag_reclaimed, 1);
     assert!(weak.observe(&epoch::guard()).is_none());
+}
+
+#[test]
+fn borrowed_guard_outliving_outer_blocks_zone_reclaim() {
+    let _isolation = reset_zone_and_epoch();
+    zone::register_zone_for::<DropObject>().expect("drop zone registration");
+    let cap = zone::sign(DropObject).expect("drop object allocation");
+    let generation = cap.binding_token().generation();
+    let outer = epoch::guard();
+    let borrowed = epoch::borrow_current_guard().expect("nested epoch guard");
+    let ident = cap.ident_ref(&borrowed);
+
+    assert_eq!(epoch::summary().active_guards, 2);
+    drop(outer);
+    drop(cap);
+
+    for _ in 0..3 {
+        let drained = epoch::drain_with_budget(usize::MAX);
+        assert_eq!(
+            drained.bag_reclaimed, 0,
+            "a live borrowed guard must keep its IdentRef storage intact"
+        );
+    }
+    assert_eq!(ident.binding_token().generation(), generation);
+    assert_eq!(DROP_COUNT.load(Ordering::Acquire), 0);
+
+    drop(ident);
+    drop(borrowed);
+    let drained = epoch::drain_with_budget(usize::MAX);
+    assert_eq!(drained.bag_reclaimed, 1);
+    assert_eq!(DROP_COUNT.load(Ordering::Acquire), 1);
 }
 
 #[test]
@@ -231,20 +410,20 @@ fn slot_key_zero_is_a_real_intrusive_member() {
 #[test]
 fn generation_max_quarantines_without_reuse() {
     let _guard = reset_zone_and_epoch();
-    zone::register_zone_for::<DropObject>().expect("drop zone registration");
-    let cap = zone::sign(DropObject).expect("allocation");
+    zone::register_zone_for::<GenerationMaxObject>().expect("generation-max zone registration");
+    let cap = zone::sign(GenerationMaxObject).expect("allocation");
     let key = cap.key();
-    unsafe { zone::testing::force_generation::<DropObject>(key, u16::MAX) };
+    unsafe { zone::testing::force_generation::<GenerationMaxObject>(key, u16::MAX) };
     drop(cap);
     let _ = epoch::drain_with_budget(usize::MAX);
     let _ = epoch::drain_with_budget(usize::MAX);
-    let word =
-        zone::testing::slot_word::<DropObject>(key).expect("quarantined slot remains resolvable");
+    let word = zone::testing::slot_word::<GenerationMaxObject>(key)
+        .expect("quarantined slot remains resolvable");
     assert_eq!(word.state(), zone::SlotState::Free);
     assert_eq!(word.generation(), u16::MAX);
     assert!(word.generation_exhausted());
 
-    let replacement = zone::sign(DropObject).expect("replacement allocation");
+    let replacement = zone::sign(GenerationMaxObject).expect("replacement allocation");
     assert_ne!(
         replacement.key(),
         key,
@@ -255,19 +434,18 @@ fn generation_max_quarantines_without_reuse() {
 #[test]
 fn generation_exhausted_full_slab_is_retired_and_replaced() {
     let _guard = reset_zone_and_epoch();
-    zone::register_zone_for::<DropObject>().expect("drop zone registration");
+    zone::register_zone_for::<GenerationExhaustedObject>()
+        .expect("generation-exhausted zone registration");
 
-    let mut caps: Vec<Cap<DropObject>> = Vec::new();
+    let mut caps: Vec<Cap<GenerationExhaustedObject>> = Vec::new();
     for _ in 0..64 {
-        let cap = zone::sign(DropObject).expect("first slab allocation");
+        let cap = zone::sign(GenerationExhaustedObject).expect("first slab allocation");
         if let Some(first) = caps.first() {
-            assert_eq!(
-                cap.key().slab_id(),
-                first.key().slab_id(),
-                "test setup expects the first slab to fill before a new slab"
-            );
+            assert_eq!(cap.key().slab_id(), first.key().slab_id());
         }
-        unsafe { zone::testing::force_generation::<DropObject>(cap.key(), u16::MAX) };
+        unsafe {
+            zone::testing::force_generation::<GenerationExhaustedObject>(cap.key(), u16::MAX)
+        };
         caps.push(cap);
     }
 
@@ -280,7 +458,7 @@ fn generation_exhausted_full_slab_is_retired_and_replaced() {
     let _ = epoch::drain_with_budget(usize::MAX);
 
     assert!(
-        zone::testing::slot_word::<DropObject>(old_key).is_none(),
+        zone::testing::slot_word::<GenerationExhaustedObject>(old_key).is_none(),
         "a fully generation-exhausted slab must unpublish instead of trapping the zone"
     );
     assert!(
@@ -288,7 +466,8 @@ fn generation_exhausted_full_slab_is_retired_and_replaced() {
         "old weak handles must not resolve after exhausted slab retirement"
     );
 
-    let replacement = zone::sign(DropObject).expect("replacement after exhausted slab");
+    let replacement =
+        zone::sign(GenerationExhaustedObject).expect("replacement after exhausted slab");
     assert_ne!(
         replacement.key().slab_id(),
         old_slab_id,
@@ -299,11 +478,11 @@ fn generation_exhausted_full_slab_is_retired_and_replaced() {
 #[test]
 fn empty_slab_reuse_rotates_slot_start_after_maintenance_flush() {
     let _guard = reset_zone_and_epoch();
-    zone::register_zone_for::<DropObject>().expect("drop zone registration");
+    zone::register_zone_for::<EmptyRotationObject>().expect("empty-rotation zone registration");
 
     let mut slot_indices = [0usize; 3];
     for slot_index in &mut slot_indices {
-        let cap = zone::sign(DropObject).expect("allocation");
+        let cap = zone::sign(EmptyRotationObject).expect("allocation");
         *slot_index = cap.key().slot_index();
         drop(cap);
 
@@ -361,6 +540,131 @@ fn single_slot_slab_refill_does_not_allocate_bucket_capacity_of_new_slabs() {
         replacement.key().slab_id(),
         first_key.slab_id(),
         "non-exhausted single-slot slabs should be reused instead of churned"
+    );
+}
+
+#[test]
+fn smp_single_slot_refill_returns_once_and_defers_slab_frame_reuse_until_grace() {
+    const WORKERS: usize = 4;
+
+    let _guard = reset_zone_and_epoch();
+    zone::register_zone_for::<SmpSingleSlotObject>().expect("SMP single-slot zone registration");
+    let phase = std::sync::Barrier::new(WORKERS + 1);
+    let drain_lock = std::sync::Mutex::new(());
+    let mut claimed_ppns = [None; WORKERS];
+
+    std::thread::scope(|scope| {
+        for _ in 0..WORKERS {
+            let phase = &phase;
+            let drain_lock = &drain_lock;
+            scope.spawn(move || {
+                let mut bucket = zone::ZoneBucket::<SmpSingleSlotObject, 8>::new();
+                phase.wait();
+                SMP_SINGLE_SLOT_ZONE
+                    .refill_bucket(&mut bucket)
+                    .expect("concurrent single-slot refill");
+                assert_eq!(
+                    bucket.len(),
+                    1,
+                    "a refill may allocate at most one new slab when no reusable slot exists"
+                );
+                phase.wait();
+                phase.wait();
+
+                // The host test hook represents one logical CPU, so serialize
+                // the retire-guard portion while retaining concurrent Keg
+                // allocation above. Real SMP coverage runs this path with one
+                // local retire state per CPU.
+                let _drain = drain_lock.lock().expect("serialized host bucket drain");
+                SMP_SINGLE_SLOT_ZONE.drain_bucket_to_keg(&mut bucket);
+                assert!(bucket.is_empty());
+            });
+        }
+
+        phase.wait();
+        phase.wait();
+        let claimed = zone::lookup(SMP_SINGLE_SLOT_ZONE.id()).expect("SMP zone after claims");
+        assert_eq!(claimed.slab_count, WORKERS);
+        assert_eq!(claimed.allocated_slots, WORKERS);
+        assert_eq!(
+            zone::testing::slab_backing_ppns(&SMP_SINGLE_SLOT_ZONE, &mut claimed_ppns),
+            WORKERS
+        );
+        claimed_ppns.sort_unstable();
+        assert!(
+            claimed_ppns.windows(2).all(|pair| pair[0] != pair[1]),
+            "four simultaneous claims must own four distinct single-slot frames"
+        );
+        phase.wait();
+    });
+
+    let free_after_claims =
+        tx_substrate::page_allocator::free_count().expect("free after SMP claims");
+    let after_returns = zone::lookup(SMP_SINGLE_SLOT_ZONE.id()).expect("SMP zone after returns");
+    assert_eq!(after_returns.slab_count, 1);
+    assert_eq!(after_returns.allocated_slots, 1);
+    assert_eq!(
+        tx_substrate::page_allocator::free_count().expect("free before slab grace"),
+        free_after_claims,
+        "logical slab retirement must not make a backing frame reusable before grace"
+    );
+
+    let mut retained_ppn = [None; 1];
+    assert_eq!(
+        zone::testing::slab_backing_ppns(&SMP_SINGLE_SLOT_ZONE, &mut retained_ppn),
+        1
+    );
+
+    // The retained low-water slab supplies one slot. The other three objects
+    // must allocate fresh frames because the three retired frames have not yet
+    // crossed an epoch grace period.
+    let mut caps = Vec::new();
+    for byte in 0..WORKERS as u8 {
+        caps.push(
+            zone::sign(SmpSingleSlotObject {
+                bytes: [byte; 3000],
+            })
+            .expect("allocation while retired frames await grace"),
+        );
+    }
+    assert_eq!(caps[3].bytes[0], 3);
+    let mut live_ppns = [None; WORKERS];
+    assert_eq!(
+        zone::testing::slab_backing_ppns(&SMP_SINGLE_SLOT_ZONE, &mut live_ppns),
+        WORKERS
+    );
+    assert!(live_ppns.contains(&retained_ppn[0]));
+    for retired in claimed_ppns
+        .iter()
+        .copied()
+        .filter(|ppn| *ppn != retained_ppn[0])
+    {
+        assert!(
+            !live_ppns.contains(&retired),
+            "a logically retired slab frame was reused before its grace period"
+        );
+    }
+
+    drop(caps);
+    for _ in 0..3 {
+        let _ = epoch::drain_with_budget(usize::MAX);
+    }
+    let stats = zone::maintenance_tick(ZoneMaintenanceBudget {
+        epoch_reclaim_budget: usize::MAX,
+        empty_slab_budget: usize::MAX,
+    });
+    assert_eq!(stats.empty_slabs.retired_slabs, WORKERS - 1);
+    for _ in 0..3 {
+        let _ = epoch::drain_with_budget(usize::MAX);
+    }
+
+    let cleaned = zone::lookup(SMP_SINGLE_SLOT_ZONE.id()).expect("SMP zone after cleanup");
+    assert_eq!(cleaned.slab_count, 1);
+    assert_eq!(cleaned.allocated_slots, 1);
+    let mut final_ppn = [None; 1];
+    assert_eq!(
+        zone::testing::slab_backing_ppns(&SMP_SINGLE_SLOT_ZONE, &mut final_ppn),
+        1
     );
 }
 
