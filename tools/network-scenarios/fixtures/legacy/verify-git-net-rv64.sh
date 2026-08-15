@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 # Fixed-topology regression fixture behind tools/verify-git-net.sh (rv64-qemu).
 #
+# CRITICAL VALIDATION-SCOPE WARNING:
+# This fixture boots a tmpfs root, mounts the competition ext4 image only as
+# the `/musl` sidecar, and performs every Git filesystem operation below
+# `/home`, which is tmpfs.  It is useful for Git/network/TLS/DNS/IRQ behavior,
+# but its score MUST NOT be cited as evidence that `tx.root=vda rw` works, that
+# JBD2 commit/replay/checkpoint is correct, or that any Git data survives a
+# reboot.  Persistent-storage acceptance requires a separate direct-root ext4
+# RW -> write/clone -> fsync/sync -> reboot same image -> RO verification loop.
+#
 # Sets up a real git server on the host, boots the guest kernel under QEMU, runs
 # the full git pipeline inside the guest, and prints PASS/FAIL per check with the
 # raw evidence. Nothing is faked: every result is the guest's own git output,
@@ -125,6 +134,8 @@ BB=/musl/bin/busybox
 IP=/sbin/ip
 [ -x "$IP" ] || IP=/usr/sbin/ip
 WORKROOT="/home/txverify-$$"
+# Deliberately tmpfs: do not reinterpret these results as an ext4 durability
+# witness.  See the validation-scope warning at the top of this fixture.
 export GIT_PAGER=cat HOME="$WORKROOT" GIT_EXEC_PATH=/musl/usr/libexec/git-core GIT_TEMPLATE_DIR= \
        GIT_CURL_VERBOSE=1 PATH=/musl/usr/bin:/musl/bin:/usr/bin:/bin
 G="git -c gc.auto=0 -c maintenance.auto=false -c user.email=g@g -c user.name=guest"

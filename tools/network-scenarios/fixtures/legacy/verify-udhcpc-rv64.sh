@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # Fixed-topology BusyBox udhcpc regression fixture.
 #
+# VALIDATION-SCOPE WARNING:
+# This fixture boots a tmpfs root and mounts the ext4 image as `/musl`.  Its
+# optional Git clone is written under `/home` tmpfs, so the result validates
+# DHCP/DNS/TLS/Git transport only.  It MUST NOT be cited as evidence for a
+# direct-root ext4 RW mount, JBD2 durability, or survival across reboot.
+#
 # Every environment-specific input is replaceable:
 #   TXKERNEL               kernel ELF
 #   TX_DHCP_IMAGE          Alpine ext4 image containing udhcpc

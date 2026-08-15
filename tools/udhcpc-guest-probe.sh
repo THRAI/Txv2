@@ -1,5 +1,9 @@
 #!/bin/sh
 # Guest-side witness for tools/verify-udhcpc-rv64.sh.
+#
+# VALIDATION-SCOPE WARNING:
+# The optional clone below deliberately uses `/home`, which is tmpfs in this
+# tx.runsh boot.  Its result is not an ext4 RW or reboot-persistence witness.
 
 BB=/bin/busybox
 IP=/sbin/ip
