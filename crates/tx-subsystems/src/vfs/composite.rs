@@ -50,7 +50,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for ChmodOp<'a> {
 
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
         let __guard = step_engine::guard();
-        let target = match self.target.take() {
+        let target = match self.target.clone() {
             Some(d) => d,
             None => {
                 let rooted_at = self.rooted_at.clone();
@@ -73,9 +73,6 @@ impl<'a, I: SubjectIdentity> StepOp<I> for ChmodOp<'a> {
     }
 }
 
-impl OneShotStepOp<ProcessIdentity> for ChmodOp<'_> {}
-impl OneShotStepOp<crate::process::ProcessIdentity> for ChmodOp<'_> {}
-
 // ============================================================================
 // ChownOp — fchownat
 // ============================================================================
@@ -95,7 +92,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for ChownOp<'a> {
 
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
         let __guard = step_engine::guard();
-        let target = match self.target.take() {
+        let target = match self.target.clone() {
             Some(d) => d,
             None => {
                 let rooted_at = self.rooted_at.clone();
@@ -118,9 +115,6 @@ impl<'a, I: SubjectIdentity> StepOp<I> for ChownOp<'a> {
         )
     }
 }
-
-impl OneShotStepOp<ProcessIdentity> for ChownOp<'_> {}
-impl OneShotStepOp<crate::process::ProcessIdentity> for ChownOp<'_> {}
 
 // ============================================================================
 // AccessOp — faccessat / faccessat2
@@ -482,6 +476,8 @@ pub struct RenameOp<'a> {
     pub oldpath: &'a [u8],
     pub newpath: &'a [u8],
     pub cred: &'a Credential,
+    /// Owned, pre-resolved retry state. Caps and inline names may cross a
+    /// yield; guard-scoped witnesses and reservations are deliberately absent.
     pub state: Option<(Cap<DEntry>, InlineName, Cap<DEntry>, InlineName)>,
 }
 
@@ -496,7 +492,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for RenameOp<'a> {
         // reserve — N/A: rename reserves zone slots via FsOps
         // commit
         // publish — N/A: no signal attachments
-        let (old_parent, old_name, new_parent, new_name) = match self.state.take() {
+        let (old_parent, old_name, new_parent, new_name) = match self.state.clone() {
             Some(p) => p,
             None => {
                 let rooted_at = self.rooted_at.clone();
@@ -548,9 +544,6 @@ impl<'a, I: SubjectIdentity> StepOp<I> for RenameOp<'a> {
         outcome
     }
 }
-
-impl OneShotStepOp<ProcessIdentity> for RenameOp<'_> {}
-impl OneShotStepOp<crate::process::ProcessIdentity> for RenameOp<'_> {}
 
 // ============================================================================
 // TruncateOp — truncate / ftruncate

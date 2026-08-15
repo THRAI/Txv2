@@ -3,6 +3,7 @@
 use super::*;
 use alloc::sync::Arc;
 use alloc::vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::adapter::step_engine::{
     self as step_engine, guard, page_allocator, reserve_for, sign_for, StepOutcome,
@@ -17,7 +18,7 @@ use tx_subsystems::page_backed::FsPageBacking;
 use tx_subsystems::pipe::{step_pipe2, PipeFlags};
 use tx_subsystems::process::{step_chdir, step_set_mount_namespace};
 use tx_subsystems::vfs::structure::{
-    Credential, DEntry, DirCursor, FsObjectId, InlineName, InodeKind, InodeMeta, RNode,
+    Credential, DEntry, DirCursor, DirEntry, FsObjectId, InlineName, InodeKind, InodeMeta, RNode,
     RNodeBacking, S_IFDIR,
 };
 use tx_subsystems::vfs::FsOps;
@@ -83,8 +84,19 @@ fn fm_setup() -> TestSetup {
 
 fn build_tmpfs_root() -> (Cap<DEntry>, Arc<Tmpfs>) {
     let tmpfs = Arc::new(Tmpfs::new());
-    let payload = MountPayload::new_cap(
+    let root_dentry = build_tmpfs_root_with_ops(
+        tmpfs.clone(),
         tmpfs.clone() as Arc<dyn tx_subsystems::vfs::FsOps>,
+    );
+    (root_dentry, tmpfs)
+}
+
+fn build_tmpfs_root_with_ops(
+    tmpfs: Arc<Tmpfs>,
+    fs_ops: Arc<dyn tx_subsystems::vfs::FsOps>,
+) -> Cap<DEntry> {
+    let payload = MountPayload::new_cap(
+        fs_ops,
         tmpfs.clone() as Arc<dyn tx_subsystems::page_backed::FsPageBacking>,
         None,
         DevId::new(411),
@@ -116,7 +128,179 @@ fn build_tmpfs_root() -> (Cap<DEntry>, Arc<Tmpfs>) {
     .expect("mount identity");
 
     let root_dentry = DEntry::new_cap(InlineName::ROOT, root_rnode).expect("root dentry");
-    (root_dentry, tmpfs)
+    root_dentry
+}
+
+/// Test-only filesystem seam that delegates namespace mutation to tmpfs while
+/// allowing rename admission to yield once and orphan cleanup to be unavailable.
+struct RenameTestFs {
+    inner: Arc<Tmpfs>,
+    rename_calls: AtomicUsize,
+    destroy_calls: AtomicUsize,
+    yield_once_source_id: Option<u64>,
+}
+
+impl RenameTestFs {
+    fn new(inner: Arc<Tmpfs>) -> Self {
+        Self {
+            inner,
+            rename_calls: AtomicUsize::new(0),
+            destroy_calls: AtomicUsize::new(0),
+            yield_once_source_id: None,
+        }
+    }
+
+    fn yielding_once(inner: Arc<Tmpfs>, source_id: u64) -> Self {
+        Self {
+            inner,
+            rename_calls: AtomicUsize::new(0),
+            destroy_calls: AtomicUsize::new(0),
+            yield_once_source_id: Some(source_id),
+        }
+    }
+}
+
+impl FsOps for RenameTestFs {
+    fn lookup(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<FsObjectId, step_engine::NoProgress> {
+        <Tmpfs as FsOps>::lookup(&self.inner, parent, name, guard)
+    }
+
+    fn load_inode_meta(
+        &self,
+        fs_object_id: FsObjectId,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<InodeMeta, step_engine::NoProgress> {
+        <Tmpfs as FsOps>::load_inode_meta(&self.inner, fs_object_id, guard)
+    }
+
+    fn serialize_inode_meta(
+        &self,
+        fs_object_id: FsObjectId,
+        meta: &InodeMeta,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        <Tmpfs as FsOps>::serialize_inode_meta(&self.inner, fs_object_id, meta, guard)
+    }
+
+    fn create_inode(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        mode: u16,
+        cred: &Credential,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<(FsObjectId, InodeMeta), step_engine::NoProgress> {
+        <Tmpfs as FsOps>::create_inode(&self.inner, parent, name, mode, cred, guard)
+    }
+
+    fn unlink(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        target: FsObjectId,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        <Tmpfs as FsOps>::unlink(&self.inner, parent, name, target, guard)
+    }
+
+    fn rename(
+        &self,
+        old_parent: FsObjectId,
+        old_name: &[u8],
+        new_parent: FsObjectId,
+        new_name: &[u8],
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        let call = self.rename_calls.fetch_add(1, Ordering::Relaxed);
+        if call == 0 {
+            if let Some(source_id) = self.yield_once_source_id {
+                return StepOutcome::yield_on_wait_source(step_engine::NoProgress, source_id, 1);
+            }
+        }
+        <Tmpfs as FsOps>::rename(
+            &self.inner,
+            old_parent,
+            old_name,
+            new_parent,
+            new_name,
+            guard,
+        )
+    }
+
+    fn link(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        target: FsObjectId,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        <Tmpfs as FsOps>::link(&self.inner, parent, name, target, guard)
+    }
+
+    fn mkdir(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        mode: u16,
+        cred: &Credential,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<(FsObjectId, InodeMeta), step_engine::NoProgress> {
+        <Tmpfs as FsOps>::mkdir(&self.inner, parent, name, mode, cred, guard)
+    }
+
+    fn rmdir(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        target: FsObjectId,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        <Tmpfs as FsOps>::rmdir(&self.inner, parent, name, target, guard)
+    }
+
+    fn symlink(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        link_target: &[u8],
+        cred: &Credential,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<(FsObjectId, InodeMeta), step_engine::NoProgress> {
+        <Tmpfs as FsOps>::symlink(&self.inner, parent, name, link_target, cred, guard)
+    }
+
+    fn readdir(
+        &self,
+        fs_object_id: FsObjectId,
+        cursor: DirCursor,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<Option<(DirEntry, DirCursor)>, step_engine::NoProgress> {
+        <Tmpfs as FsOps>::readdir(&self.inner, fs_object_id, cursor, guard)
+    }
+
+    fn destroy_inode(
+        &self,
+        _fs_object_id: FsObjectId,
+        _guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        self.destroy_calls.fetch_add(1, Ordering::Relaxed);
+        StepOutcome::Err(step_engine::Errno::ENOSYS)
+    }
+
+    fn materialise_rnode(
+        &self,
+        fs_object_id: FsObjectId,
+        meta: InodeMeta,
+        mount: &Cap<MountPayload>,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<Cap<RNode>, step_engine::NoProgress> {
+        <Tmpfs as FsOps>::materialise_rnode(&self.inner, fs_object_id, meta, mount, guard)
+    }
 }
 
 fn bootstrap_with_cwd(root_dentry: Cap<DEntry>) -> (Cap<ProcessIdentity>, Cap<ThreadIdentity>) {
@@ -1079,6 +1263,109 @@ fn dispatch_renameat2_same_directory_succeeds() {
     drop(newpath);
 }
 
+/// A backend may yield while a prior metadata transaction checkpoints.
+/// `renameat2(..., flags=0)` must wait and retry the same pre-resolved
+/// namespace operation instead of translating the first yield to `-EIO`.
+#[test]
+fn dispatch_renameat2_waits_for_yield_once_backend_then_succeeds() {
+    let _setup = fm_setup();
+    let tmpfs = Arc::new(Tmpfs::new());
+    create_regular(&tmpfs, b"shallow.lock");
+
+    let source_id =
+        step_engine::WaitSourceId::new(tx_subsystems::allocate_notification_source_id());
+    let source = Arc::new(tx_substrate::wake::WaitSource::new(source_id));
+    tx_substrate::wake::register_source(source.clone());
+    source.notify(step_engine::InterestMask::new(1));
+
+    let yielding_fs = Arc::new(RenameTestFs::yielding_once(tmpfs.clone(), source_id.raw()));
+    let root_dentry = build_tmpfs_root_with_ops(
+        tmpfs.clone(),
+        yielding_fs.clone() as Arc<dyn tx_subsystems::vfs::FsOps>,
+    );
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap, thread);
+    let oldpath = nul_terminate(b"/shallow.lock");
+    let newpath = nul_terminate(b"/shallow");
+    let req = SyscallRequest::new(
+        NR_RENAMEAT2,
+        [
+            AT_FDCWD as i64 as u64,
+            oldpath.as_ptr() as u64,
+            AT_FDCWD as i64 as u64,
+            newpath.as_ptr() as u64,
+            0,
+            0,
+        ],
+    );
+
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    tx_substrate::wake::unregister_source(source_id);
+
+    assert_eq!(result, SyscallResult::Return(0));
+    assert_eq!(yielding_fs.rename_calls.load(Ordering::Relaxed), 2);
+    assert!(!lookup_exists(&tmpfs, b"shallow.lock"));
+    assert!(lookup_exists(&tmpfs, b"shallow"));
+    drop(oldpath);
+    drop(newpath);
+}
+
+/// The retryable RenameOp state contains owned Caps/names, not guard-scoped
+/// witnesses. A resume must reuse those inputs rather than re-walking paths
+/// that may no longer resolve through the same namespace view.
+#[test]
+fn rename_op_preserves_pre_resolved_parents_across_yield() {
+    let _setup = fm_setup();
+    let tmpfs = Arc::new(Tmpfs::new());
+    create_regular(&tmpfs, b"source");
+
+    let source_id =
+        step_engine::WaitSourceId::new(tx_subsystems::allocate_notification_source_id());
+    let source = Arc::new(tx_substrate::wake::WaitSource::new(source_id));
+    tx_substrate::wake::register_source(source.clone());
+    source.notify(step_engine::InterestMask::new(1));
+
+    let yielding_fs = Arc::new(RenameTestFs::yielding_once(tmpfs.clone(), source_id.raw()));
+    let root_dentry = build_tmpfs_root_with_ops(
+        tmpfs.clone(),
+        yielding_fs.clone() as Arc<dyn tx_subsystems::vfs::FsOps>,
+    );
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry.clone());
+    let ctx = make_ctx(proc_cap, thread);
+    let cred = ctx.walker_cred();
+    let mut script_ctx = crate::linux_syscall::build_subject_script_ctx(&ctx);
+    let mailbox = script_ctx.mailbox().cloned();
+    let delegate_registry = script_ctx.delegate_registry().cloned();
+    let timer_registrar = script_ctx.timer_registrar().cloned();
+    let op = tx_subsystems::vfs::composite::RenameOp {
+        rooted_at: &root_dentry,
+        oldpath: b"/must-not-be-rewalked/source",
+        newpath: b"/must-not-be-rewalked/target",
+        cred: &cred,
+        state: Some((
+            root_dentry.clone(),
+            InlineName::new(b"source").expect("source name"),
+            root_dentry.clone(),
+            InlineName::new(b"target").expect("target name"),
+        )),
+    };
+
+    let result = block_on(tx_scripts::drive(
+        op,
+        &mut script_ctx,
+        step_engine::DriveMode::Waiting,
+        mailbox.as_ref(),
+        delegate_registry.as_deref(),
+        timer_registrar.as_ref(),
+    ));
+    tx_substrate::wake::unregister_source(source_id);
+
+    assert_eq!(result, Ok(()));
+    assert_eq!(yielding_fs.rename_calls.load(Ordering::Relaxed), 2);
+    assert!(!lookup_exists(&tmpfs, b"source"));
+    assert!(lookup_exists(&tmpfs, b"target"));
+}
+
 /// Rename-over at the syscall layer must complete the VFS lifetime
 /// protocol by destroying the displaced inode after tmpfs drops its
 /// last link. Otherwise repeated temp-file replacement keeps old
@@ -1122,6 +1409,62 @@ fn dispatch_renameat2_over_existing_destroys_displaced_inode() {
         tmpfs.load_inode_meta(displaced_id, &guard),
         StepOutcome::Err(step_engine::Errno::ENOENT),
         "rename-over should destroy the displaced zero-link inode"
+    );
+    drop(oldpath);
+    drop(newpath);
+}
+
+/// Once rename-over has committed the namespace change, failure of the
+/// displaced inode's best-effort cleanup must not rewrite success to ENOSYS.
+#[test]
+fn dispatch_renameat2_over_existing_ignores_post_commit_destroy_enosys() {
+    let _setup = fm_setup();
+    let tmpfs = Arc::new(Tmpfs::new());
+    create_regular(&tmpfs, b"source");
+    create_regular(&tmpfs, b"target");
+
+    let first_guard = guard();
+    let displaced_id = match tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"target", &first_guard) {
+        StepOutcome::Done(id) => id,
+        other => panic!("lookup target before rename: {other:?}"),
+    };
+    drop(first_guard);
+
+    let cleanup_fs = Arc::new(RenameTestFs::new(tmpfs.clone()));
+    let root_dentry = build_tmpfs_root_with_ops(
+        tmpfs.clone(),
+        cleanup_fs.clone() as Arc<dyn tx_subsystems::vfs::FsOps>,
+    );
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap, thread);
+    let oldpath = nul_terminate(b"/source");
+    let newpath = nul_terminate(b"/target");
+    let req = SyscallRequest::new(
+        NR_RENAMEAT2,
+        [
+            AT_FDCWD as i64 as u64,
+            oldpath.as_ptr() as u64,
+            AT_FDCWD as i64 as u64,
+            newpath.as_ptr() as u64,
+            0,
+            0,
+        ],
+    );
+
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(req, &ctx)),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(cleanup_fs.destroy_calls.load(Ordering::Relaxed), 1);
+    assert!(!lookup_exists(&tmpfs, b"source"));
+    assert!(lookup_exists(&tmpfs, b"target"));
+    let guard = guard();
+    assert!(
+        matches!(
+            tmpfs.load_inode_meta(displaced_id, &guard),
+            StepOutcome::Done(_)
+        ),
+        "failed best-effort cleanup leaves the zero-link orphan backend-owned"
     );
     drop(oldpath);
     drop(newpath);

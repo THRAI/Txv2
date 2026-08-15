@@ -240,17 +240,26 @@ pub(super) async fn sys_fchmodat<P: PmapIf>(
     }
     let new_mode = chmod_mode_after_linux_fsetid_clear(requested_mode, &target_meta, ctx);
 
-    let result = {
-        let mut script_ctx = build_subject_script_ctx(ctx);
-        let mut op = ChmodOp {
-            rooted_at: &rooted_at,
-            path: &path,
-            mode: new_mode,
-            cred: &walker_cred,
-            target: Some(target_dentry),
-        };
-        step_engine::drive_oneshot(&mut op, &mut script_ctx)
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox = script_ctx.mailbox().cloned();
+    let delegate_registry = script_ctx.delegate_registry().cloned();
+    let timer_registrar = script_ctx.timer_registrar().cloned();
+    let op = ChmodOp {
+        rooted_at: &rooted_at,
+        path: &path,
+        mode: new_mode,
+        cred: &walker_cred,
+        target: Some(target_dentry),
     };
+    let result = tx_scripts::drive(
+        op,
+        &mut script_ctx,
+        step_engine::DriveMode::Waiting,
+        mailbox.as_ref(),
+        delegate_registry.as_deref(),
+        timer_registrar.as_ref(),
+    )
+    .await;
     match result {
         Ok(()) => SyscallResult::Return(0),
         Err(v3errno) => SyscallResult::Error(fs_change_errno_magnitude(Errno::from(v3errno))),
@@ -347,18 +356,27 @@ pub(super) async fn sys_fchownat<P: PmapIf>(
         return SyscallResult::error_from(e);
     }
 
-    let result = {
-        let mut script_ctx = build_subject_script_ctx(ctx);
-        let mut op = ChownOp {
-            rooted_at: &rooted_at,
-            path: &path,
-            uid,
-            gid,
-            cred: &walker_cred,
-            target: Some(target_dentry),
-        };
-        step_engine::drive_oneshot(&mut op, &mut script_ctx)
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox = script_ctx.mailbox().cloned();
+    let delegate_registry = script_ctx.delegate_registry().cloned();
+    let timer_registrar = script_ctx.timer_registrar().cloned();
+    let op = ChownOp {
+        rooted_at: &rooted_at,
+        path: &path,
+        uid,
+        gid,
+        cred: &walker_cred,
+        target: Some(target_dentry),
     };
+    let result = tx_scripts::drive(
+        op,
+        &mut script_ctx,
+        step_engine::DriveMode::Waiting,
+        mailbox.as_ref(),
+        delegate_registry.as_deref(),
+        timer_registrar.as_ref(),
+    )
+    .await;
     match result {
         Ok(()) => SyscallResult::Return(0),
         Err(v3errno) => SyscallResult::Error(fs_change_errno_magnitude(Errno::from(v3errno))),

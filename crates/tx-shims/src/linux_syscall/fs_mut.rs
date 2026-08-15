@@ -517,10 +517,10 @@ pub(super) async fn sys_symlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
 /// `linkat(olddirfd, oldpath, newdirfd, newpath, flags)`. Linux RV64
 /// generic ABI `__NR_linkat = 37`.
 ///
-/// Slice 8: same-filesystem hard link only — the existing tmpfs
-/// `FsOps::link` returns `-ENOSYS` for now (Phase 3b carryover), so
-/// this arm forwards whatever the FsOps surface produces. The
-/// `AT_SYMLINK_FOLLOW` flag bit is silently accepted; default
+/// Same-filesystem hard link. The namespace backend may yield while another
+/// metadata mutation owns admission, so the `FsOps::link` step is driven in
+/// waiting mode rather than translating a valid pending state into an I/O
+/// error. The `AT_SYMLINK_FOLLOW` flag bit is silently accepted; default
 /// (no-flag) Linux behaviour is "do not follow symlinks", but
 /// `step_walk` follows symlinks unconditionally — Slice 8 carries
 /// that limitation forward (deferred under `TODO(phase-linkat-nofollow)`).
@@ -591,7 +591,6 @@ pub(super) async fn sys_linkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
         return SyscallResult::Error(EPERM_VALUE);
     }
     let new_parent_id = new_parent_dentry.rnode().fs_object_id();
-    use StepOutcome as V3;
     let fs_ops = match fs_ops_for_dentry(&new_parent_dentry) {
         Some(o) => o,
         None => return SyscallResult::Error(EROFS_VALUE),
@@ -610,17 +609,32 @@ pub(super) async fn sys_linkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     if let Err(e) = cred_checks::authorize_link(ctx.cred_snapshot(), &new_parent_meta) {
         return SyscallResult::error_from(e);
     }
-    let outcome = {
-        let guard = step_engine::guard();
-        fs_ops.link(new_parent_id, new_basename, source_id, &guard)
+    use tx_scripts::drive;
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    let op = tx_subsystems::vfs::LinkInParentOp {
+        fs_ops: &fs_ops,
+        parent: new_parent_id,
+        name: new_basename,
+        target: source_id,
     };
-    match outcome {
-        V3::Done(()) => {
+    match drive(
+        op,
+        &mut script_ctx,
+        step_engine::DriveMode::Waiting,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
+        timer_registrar_handle.as_ref(),
+    )
+    .await
+    {
+        Ok(()) => {
             new_parent_dentry.remove_cached_child_by_name(new_basename);
             SyscallResult::Return(0)
         }
-        V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        V3::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
+        Err(errno) => SyscallResult::error_from(Errno::from(errno)),
     }
 }
 
@@ -1906,7 +1920,7 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
         const EXDEV_VALUE: i32 = 18;
         return SyscallResult::Error(EXDEV_VALUE);
     }
-    let outcome = if (flags & RENAME_EXCHANGE) != 0 {
+    let outcome: StepOutcome<(), step_engine::NoProgress> = if (flags & RENAME_EXCHANGE) != 0 {
         const TMP_NAME: &[u8] = b".tx_rename_exchange_tmp";
         let guard = step_engine::guard();
         match fs_ops.rename(
@@ -1943,14 +1957,43 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
             &guard,
         )
     } else {
-        let guard = step_engine::guard();
-        fs_ops.rename(
-            old_parent_dentry.rnode().fs_object_id(),
-            old_basename,
-            new_parent_dentry.rnode().fs_object_id(),
-            new_basename,
-            &guard,
+        let old_name = match tx_subsystems::vfs::InlineName::new(old_basename) {
+            Ok(name) => name,
+            Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
+        };
+        let new_name = match tx_subsystems::vfs::InlineName::new(new_basename) {
+            Ok(name) => name,
+            Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
+        };
+        let mut script_ctx = build_subject_script_ctx(ctx);
+        let mailbox = script_ctx.mailbox().cloned();
+        let delegate_registry = script_ctx.delegate_registry().cloned();
+        let timer_registrar = script_ctx.timer_registrar().cloned();
+        let op = RenameOp {
+            rooted_at: &old_root,
+            oldpath: &oldpath,
+            newpath: &newpath,
+            cred: &cred,
+            state: Some((
+                old_parent_dentry.clone(),
+                old_name,
+                new_parent_dentry.clone(),
+                new_name,
+            )),
+        };
+        match tx_scripts::drive(
+            op,
+            &mut script_ctx,
+            step_engine::DriveMode::Waiting,
+            mailbox.as_ref(),
+            delegate_registry.as_deref(),
+            timer_registrar.as_ref(),
         )
+        .await
+        {
+            Ok(()) => StepOutcome::done(()),
+            Err(errno) => StepOutcome::err(errno),
+        }
     };
     match outcome {
         StepOutcome::Done(()) => {
@@ -1960,19 +2003,15 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
             // Namespace mutation only drops the destination's link count. The
             // backend owns the final lifetime decision: tmpfs reclaims a
             // zero-link inode now, while ext4 defers it if a coherent page
-            // container/open file still holds the orphan alive.
+            // container/open file still holds the orphan alive. Rename has
+            // already linearized at this point, so orphan cleanup is
+            // best-effort: a backend-owned zero-link inode may remain for its
+            // normal lifetime/recovery path, but cleanup failure must not
+            // retroactively rewrite the committed namespace result.
             if (flags & RENAME_EXCHANGE) == 0 {
                 if let Some(displaced) = displaced_dentry.as_ref() {
                     let guard = step_engine::guard();
-                    match fs_ops.destroy_inode(displaced.rnode().fs_object_id(), &guard) {
-                        StepOutcome::Done(()) => {}
-                        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
-                            return SyscallResult::Error(EIO_VALUE);
-                        }
-                        StepOutcome::Err(errno) => {
-                            return SyscallResult::error_from(Errno::from(errno));
-                        }
-                    }
+                    let _ = fs_ops.destroy_inode(displaced.rnode().fs_object_id(), &guard);
                 }
             }
             SyscallResult::Return(0)
