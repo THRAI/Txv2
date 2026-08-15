@@ -628,7 +628,7 @@ pub async fn run_thread<P: TxPlatform>(
         match ast_outcome {
             AstOutcome::DeliverHandler { sig, action } => {
                 if matches!(
-                    deliver_entry_signal_handler::<P>(&thread, &payload, sig, action),
+                    deliver_entry_signal_handler::<P>(&thread, &payload, sig, action).await,
                     ThreadLoopControl::Exit
                 ) {
                     return state.take_task_result();
@@ -792,7 +792,7 @@ fn drain_signal_timer_events(mailbox: &boot_runtime::TaskMailbox) {
     {}
 }
 
-fn deliver_entry_signal_handler<P: TxPlatform>(
+async fn deliver_entry_signal_handler<P: TxPlatform>(
     thread: &Cap<ThreadIdentity>,
     payload: &PayloadCap<ThreadPayload>,
     sig: Signum,
@@ -887,10 +887,12 @@ fn deliver_entry_signal_handler<P: TxPlatform>(
     match prepared {
         Ok((handler_ctx, frame_bytes)) => {
             let frame_addr = user_sp_from_context::<P>(&handler_ctx);
-            if !reserve_signal_frame_storage(&aspace, frame_addr, frame_bytes.as_slice().len()) {
+            if !reserve_signal_frame_storage(&aspace, frame_addr, frame_bytes.as_slice().len())
+                .await
+            {
                 return fatal_signal_teardown_from_current_hart::<P>(&process, thread, sig);
             }
-            if !copy_signal_frame_to_user(&aspace, frame_addr, frame_bytes.as_slice()) {
+            if !copy_signal_frame_to_user(&aspace, frame_addr, frame_bytes.as_slice()).await {
                 return fatal_signal_teardown_from_current_hart::<P>(&process, thread, sig);
             }
             if restorer_pc == 0 {
@@ -918,16 +920,33 @@ fn deliver_entry_signal_handler<P: TxPlatform>(
     }
 }
 
-fn copy_signal_frame_to_user(aspace: &Cap<AddressSpace>, frame_addr: usize, bytes: &[u8]) -> bool {
+async fn copy_signal_frame_to_user(
+    aspace: &Cap<AddressSpace>,
+    frame_addr: usize,
+    bytes: &[u8],
+) -> bool {
     use crate::adapter::step_engine::StepOutcome as V3;
 
-    let copy_outcome = {
-        let guard = crate::adapter::step_engine::guard();
-        aspace.copy_to_user(tx_hal::UserPtr::<u8>::new(frame_addr), bytes, &guard)
-    };
-    match copy_outcome {
-        V3::Done(n) => n == bytes.len(),
-        _ => false,
+    loop {
+        let copy_outcome = {
+            let guard = crate::adapter::step_engine::guard();
+            aspace.copy_to_user(tx_hal::UserPtr::<u8>::new(frame_addr), bytes, &guard)
+        };
+        match copy_outcome {
+            V3::Done(n) => return n == bytes.len(),
+            V3::Continue { .. } => continue,
+            V3::Err(_) => return false,
+            V3::Yield { .. } => {
+                // The immutable frame buffer makes replaying an already-copied
+                // prefix safe. Yield without an epoch guard, then re-prefault
+                // the whole declared range so either RangeLock or page-cache
+                // contention is awaited through its registered source.
+                tx_reactor::yield_now().await;
+                if !reserve_signal_frame_storage(aspace, frame_addr, bytes.len()).await {
+                    return false;
+                }
+            }
+        }
     }
 }
 
@@ -1197,9 +1216,37 @@ async fn dispatch_full_syscall<P: TxPlatform>(
             fut.await
                 .expect("writev hot dispatch prefilter covers writev")
         } else if matches!(req.nr, NR_MMAP | NR_MPROTECT | NR_MUNMAP) {
-            Box::pin(tx_shims::linux_syscall::dispatch_vm_hot(req, ctx))
-                .await
-                .expect("VM hot dispatch prefilter covers mmap/mprotect/munmap")
+            let mut vm_future = Box::pin(tx_shims::linux_syscall::dispatch_vm_hot(req, ctx));
+            let mut pending_reported = false;
+            core::future::poll_fn(|cx| match vm_future.as_mut().poll(cx) {
+                Poll::Ready(result) => Poll::Ready(
+                    result.expect("VM hot dispatch prefilter covers mmap/mprotect/munmap"),
+                ),
+                Poll::Pending => {
+                    if req.nr == NR_MUNMAP && !pending_reported {
+                        pending_reported = true;
+                        let range_lock = ctx.aspace.range_lock().diagnostic_snapshot();
+                        tx_hal::console_write_str::<P>("txkernel:vm-hot:munmap-pending:a0=0x");
+                        write_hex_u64::<P>(req.args[0]);
+                        tx_hal::console_write_str::<P>(":a1=0x");
+                        write_hex_u64::<P>(req.args[1]);
+                        tx_hal::console_write_str::<P>(":active=0x");
+                        write_hex_u64::<P>(range_lock.active as u64);
+                        tx_hal::console_write_str::<P>(":pending-writers=0x");
+                        write_hex_u64::<P>(range_lock.pending_writers as u64);
+                        tx_hal::console_write_str::<P>(":release-mask=0x");
+                        write_hex_u64::<P>(
+                            ctx.aspace
+                                .range_lock()
+                                .release_endpoint()
+                                .pending_mask_snapshot(),
+                        );
+                        tx_hal::console_write_str::<P>("\n");
+                    }
+                    Poll::Pending
+                }
+            })
+            .await
         } else {
             Box::pin(tx_shims::linux_syscall::dispatch::<P>(req, ctx)).await
         };
@@ -1909,7 +1956,7 @@ fn make_signal_frame_executable(aspace: &AddressSpace, frame_addr: usize, frame_
     let _ = aspace.try_mprotect(range, Prot::new(true, true, true));
 }
 
-fn reserve_signal_frame_storage(
+async fn reserve_signal_frame_storage(
     aspace: &AddressSpace,
     frame_addr: usize,
     frame_len: usize,
@@ -1927,11 +1974,10 @@ fn reserve_signal_frame_storage(
     let Ok(range) = UserRange::new_aligned(UserVirtAddr(start), len) else {
         return false;
     };
-    use crate::adapter::step_engine::StepOutcome as V3;
-    !matches!(
-        aspace.reserve_user_range_for_access(range, UserAccessKind::Write),
-        V3::Err(_) | V3::Yield { .. }
-    )
+    aspace
+        .reserve_user_range_for_access_wait(range, UserAccessKind::Write)
+        .await
+        .is_ok()
 }
 
 /// PROBE(proxy-push segv hunt): dump the last syscalls (nr=ret, hex) recorded

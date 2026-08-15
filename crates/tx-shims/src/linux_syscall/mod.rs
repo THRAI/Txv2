@@ -437,15 +437,17 @@ pub(super) fn next_stdio_fd_below_nofile(
     }
 }
 
-/// Required sigsetsize per Linux RV64 generic ABI: 8 bytes (a single
-/// `u64` bitset matching `tx_subsystems::signal::SignalMask`'s
-/// internal representation). `rt_sigprocmask` / `rt_sigaction`
-/// reject any other value with `-EINVAL`.
+/// Native sigset width for the Linux generic 64-bit ABI: one `u64` matching
+/// `tx_subsystems::signal::SignalMask`'s internal representation.
+///
+/// LoongArch old-world compatibility accepts a 16-byte userspace sigset at
+/// the syscall boundary, retains the supported low word, and clears the high
+/// word on output. Other targets continue to require this native 8-byte size.
 pub(super) const SIGSETSIZE_BYTES: u64 = 8;
 /// Minimum alternate signal stack size (Linux: MINSIGSTKSZ = 2048).
 pub(super) const MINSIGSTKSZ: u64 = 2048;
-/// Size of the kernel `struct sigaction` exchanged via `rt_sigaction`
-/// on the RV64/LA64 generic ABI.
+/// Size of the native kernel `struct sigaction` exchanged via `rt_sigaction`
+/// on the RV64/LoongArch new-world generic ABI.
 ///
 /// Both architectures include `asm-generic/signal.h` without defining
 /// `SA_RESTORER`, so the kernel ABI contains exactly three 64-bit words:
@@ -458,7 +460,9 @@ pub(super) const MINSIGSTKSZ: u64 = 2048;
 /// };
 /// ```
 ///
-/// In particular this is **not** libc's public 152-byte `struct sigaction`.
+/// LoongArch old-world uses a separate 32-byte wire image with a 16-byte
+/// sigset; that compatibility layout is selected and encoded in `signal.rs`.
+/// This constant is **not** libc's public 152-byte `struct sigaction`.
 /// Glibc translates that public object to this 24-byte kernel image before
 /// issuing syscall 134. Writing a fourth word here corrupts the wrapper's
 /// stack and makes concurrent signal delivery fail nondeterministically.

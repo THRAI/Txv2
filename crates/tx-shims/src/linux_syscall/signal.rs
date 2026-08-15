@@ -157,10 +157,10 @@ fn emit_sigprocmask_detail_value(_name: &[u8], _value: i64) {}
 
 /// `rt_sigprocmask(how, set, oldset, sigsetsize)` per `SIGNAL_v1` §3.
 ///
-/// `sigsetsize` is rejected with `-EINVAL` for any value other than
-/// `8` (the kernel's only supported sigset width on RV64 — a single
-/// `u64` bitset). `set_ptr == 0` means "query only"; `oldset_ptr == 0`
-/// means "don't return the previous mask".
+/// The generic ABI uses an 8-byte signal set. LoongArch old-world userspace
+/// uses a 16-byte set; txKernel consumes the full image while retaining only
+/// its supported low 64 signals. `set_ptr == 0` means "query only";
+/// `oldset_ptr == 0` means "don't return the previous mask".
 pub(super) fn sys_rt_sigprocmask<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     sys_rt_sigprocmask_thread_aspace(args, &ctx.thread, &ctx.aspace)
 }
@@ -217,7 +217,8 @@ fn sys_rt_sigprocmask_impl(
         );
     }
 
-    if sigsetsize != SIGSETSIZE_BYTES {
+    let Some(wire_abi) = classify_rt_signal_set_abi(sigsetsize, CURRENT_RT_SIGNAL_TARGET_ABI)
+    else {
         if let Some(seq) = trace_seq {
             emit_sigprocmask_debug(b"debug.sigprocmask.bad_size", seq);
         }
@@ -227,7 +228,7 @@ fn sys_rt_sigprocmask_impl(
             emit_sigprocmask_detail_duration(b"debug.sigprocmask.detail.total_ns", total_start);
         }
         return SyscallResult::Error(EINVAL_VALUE);
-    }
+    };
 
     // Decode `how` per Linux generic ABI: 0 = SIG_BLOCK, 1 = SIG_UNBLOCK,
     // 2 = SIG_SETMASK. `set_ptr == 0` short-circuits to a query-only
@@ -257,7 +258,7 @@ fn sys_rt_sigprocmask_impl(
         SignalMask::EMPTY
     } else {
         let read_start = sigprocmask_detail_now();
-        match bootstrap_read_user::<u64>(aspace, set_ptr as u64) {
+        match read_rt_signal_set(aspace, set_ptr as u64, wire_abi) {
             Ok(bits) => {
                 emit_sigprocmask_detail_duration(
                     b"debug.sigprocmask.detail.read_user_ns",
@@ -369,7 +370,7 @@ fn sys_rt_sigprocmask_impl(
     if oldset_ptr != 0 {
         let write_start = sigprocmask_detail_now();
         if let Err(errno) =
-            bootstrap_write_user::<u64>(aspace, oldset_ptr as u64, prev_mask.raw_bits())
+            write_rt_signal_set(aspace, oldset_ptr as u64, wire_abi, prev_mask.raw_bits())
         {
             if let Some(seq) = trace_seq {
                 emit_sigprocmask_debug(b"debug.sigprocmask.write.err", seq);
@@ -424,11 +425,12 @@ where
     if mask_ptr == 0 {
         return SyscallResult::Error(EFAULT_VALUE);
     }
-    if sigset_size != core::mem::size_of::<u64>() as u64 {
+    let Some(wire_abi) = classify_rt_signal_set_abi(sigset_size, CURRENT_RT_SIGNAL_TARGET_ABI)
+    else {
         return SyscallResult::Error(EINVAL_VALUE);
-    }
+    };
 
-    let mask_bits = match bootstrap_read_user::<u64>(&ctx.aspace, mask_ptr) {
+    let mask_bits = match read_rt_signal_set(&ctx.aspace, mask_ptr, wire_abi) {
         Ok(bits) => bits,
         Err(errno) => return SyscallResult::error_from(errno),
     };
@@ -719,8 +721,7 @@ async fn park_sigtimedwait_tick<P: tx_hal::TimeIf>(
     }
 }
 
-/// `rt_sigtimedwait(set, info, timeout, sigsetsize)` — Linux RV64
-/// ABI `__NR_rt_sigtimedwait = 137`.
+/// `rt_sigtimedwait(set, info, timeout, sigsetsize)` — Linux LP64 signal ABI.
 ///
 /// Consumes a pending signal named by `set`, optionally waits until
 /// `timeout` expires, and writes the leading Linux `siginfo_t` fields.
@@ -739,14 +740,15 @@ where
     let timeout_ptr = args[2];
     let sigsetsize = args[3];
 
-    if sigsetsize != SIGSETSIZE_BYTES {
+    let Some(wire_abi) = classify_rt_signal_set_abi(sigsetsize, CURRENT_RT_SIGNAL_TARGET_ABI)
+    else {
         return SyscallResult::Error(EINVAL_VALUE);
-    }
+    };
     if set_ptr == 0 {
         return SyscallResult::Error(EFAULT_VALUE);
     }
 
-    let wait_bits = match bootstrap_read_user::<u64>(&ctx.aspace, set_ptr) {
+    let wait_bits = match read_rt_signal_set(&ctx.aspace, set_ptr, wire_abi) {
         Ok(bits) => bits,
         Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
     };
@@ -904,22 +906,145 @@ pub(super) fn sys_pidfd_send_signal(args: [u64; 6], ctx: &SyscallCtx) -> Syscall
     )
 }
 
+const LA64_OLDWORLD_SIGSETSIZE_BYTES: u64 = 16;
+const LA64_OLDWORLD_SIGACTION_BYTES: usize = 32;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RtSignalTargetAbi {
+    Generic64,
+    LoongArch64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RtSignalSetAbi {
+    Generic64,
+    LoongArchOldWorld,
+}
+
+impl RtSignalSetAbi {
+    const fn sigset_bytes(self) -> usize {
+        match self {
+            Self::Generic64 => SIGSETSIZE_BYTES as usize,
+            Self::LoongArchOldWorld => LA64_OLDWORLD_SIGSETSIZE_BYTES as usize,
+        }
+    }
+
+    const fn action_bytes(self) -> usize {
+        match self {
+            Self::Generic64 => SIGACTION_BYTES,
+            Self::LoongArchOldWorld => 16 + self.sigset_bytes(),
+        }
+    }
+}
+
+const CURRENT_RT_SIGNAL_TARGET_ABI: RtSignalTargetAbi = if cfg!(target_arch = "loongarch64") {
+    RtSignalTargetAbi::LoongArch64
+} else {
+    RtSignalTargetAbi::Generic64
+};
+
+const fn classify_rt_signal_set_abi(
+    sigsetsize: u64,
+    target: RtSignalTargetAbi,
+) -> Option<RtSignalSetAbi> {
+    match (target, sigsetsize) {
+        (_, SIGSETSIZE_BYTES) => Some(RtSignalSetAbi::Generic64),
+        (RtSignalTargetAbi::LoongArch64, LA64_OLDWORLD_SIGSETSIZE_BYTES) => {
+            Some(RtSignalSetAbi::LoongArchOldWorld)
+        }
+        _ => None,
+    }
+}
+
+fn decode_rt_signal_set(wire_abi: RtSignalSetAbi, image: &[u8]) -> u64 {
+    debug_assert!(image.len() >= wire_abi.sigset_bytes());
+    let low = read_u64_le(&image[0..8]);
+    if wire_abi == RtSignalSetAbi::LoongArchOldWorld {
+        // Old-world LA64 defines signals 1..=128. Consume the second word at
+        // the ABI boundary even though txKernel currently models only 1..=64.
+        let _unsupported_high = read_u64_le(&image[8..16]);
+    }
+    low
+}
+
+fn encode_rt_signal_set(wire_abi: RtSignalSetAbi, low: u64, image: &mut [u8]) {
+    debug_assert!(image.len() >= wire_abi.sigset_bytes());
+    image[..wire_abi.sigset_bytes()].fill(0);
+    image[0..8].copy_from_slice(&low.to_le_bytes());
+}
+
+fn read_rt_signal_set(
+    aspace: &AddressSpace,
+    user_ptr: u64,
+    wire_abi: RtSignalSetAbi,
+) -> Result<u64, Errno> {
+    let mut image = [0u8; LA64_OLDWORLD_SIGSETSIZE_BYTES as usize];
+    bootstrap_copy_from_user(aspace, &mut image[..wire_abi.sigset_bytes()], user_ptr)?;
+    Ok(decode_rt_signal_set(wire_abi, &image))
+}
+
+fn write_rt_signal_set(
+    aspace: &AddressSpace,
+    user_ptr: u64,
+    wire_abi: RtSignalSetAbi,
+    low: u64,
+) -> Result<(), Errno> {
+    let mut image = [0u8; LA64_OLDWORLD_SIGSETSIZE_BYTES as usize];
+    encode_rt_signal_set(wire_abi, low, &mut image);
+    bootstrap_copy_to_user(aspace, user_ptr, &image[..wire_abi.sigset_bytes()])
+}
+
+fn decode_rt_sigaction_entry(wire_abi: RtSignalSetAbi, image: &[u8]) -> SigActionEntry {
+    debug_assert!(image.len() >= wire_abi.action_bytes());
+    let handler = read_u64_le(&image[0..8]);
+    let flags = SaFlags::new(read_u64_le(&image[8..16]));
+    let mask = SignalMask::new(decode_rt_signal_set(
+        wire_abi,
+        &image[16..wire_abi.action_bytes()],
+    ));
+    let disposition = match handler {
+        0 => SigDisposition::Default,
+        1 => SigDisposition::Ignore,
+        other => SigDisposition::Handler(other as usize),
+    };
+    SigActionEntry::new(disposition, flags, mask, 0)
+}
+
+fn encode_rt_sigaction_entry(wire_abi: RtSignalSetAbi, entry: SigActionEntry, image: &mut [u8]) {
+    debug_assert!(image.len() >= wire_abi.action_bytes());
+    image[..wire_abi.action_bytes()].fill(0);
+    let handler = match entry.disposition {
+        SigDisposition::Default => 0,
+        SigDisposition::Ignore => 1,
+        SigDisposition::Handler(addr) => addr as u64,
+    };
+    image[0..8].copy_from_slice(&handler.to_le_bytes());
+    image[8..16].copy_from_slice(&entry.flags.bits().to_le_bytes());
+    encode_rt_signal_set(
+        wire_abi,
+        entry.sa_mask.raw_bits(),
+        &mut image[16..wire_abi.action_bytes()],
+    );
+}
+
 /// `rt_sigaction(signum, act, oldact, sigsetsize)` per `SIGNAL_v1`
 /// §15.1.
 ///
-/// Decodes a 24-byte kernel `struct sigaction` (see `SIGACTION_BYTES`
-/// for the layout citation). `act_ptr == 0` queries the current
-/// disposition without changing it; `oldact_ptr == 0` discards the
-/// previous disposition.
+/// The new-world generic ABI uses an 8-byte signal set and a 24-byte action
+/// image (`handler`, `flags`, one mask word). LoongArch old-world userspace
+/// uses a 16-byte signal set and a 32-byte action image with a second mask
+/// word. `act_ptr == 0` queries the current disposition without changing it;
+/// `oldact_ptr == 0` discards the previous disposition.
 pub(super) fn sys_rt_sigaction<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let signum_raw = args[0] as u32;
     let act_ptr = args[1] as usize;
     let oldact_ptr = args[2] as usize;
     let sigsetsize = args[3];
 
-    if sigsetsize != SIGSETSIZE_BYTES {
+    let Some(wire_abi) = classify_rt_signal_set_abi(sigsetsize, CURRENT_RT_SIGNAL_TARGET_ABI)
+    else {
         return SyscallResult::Error(EINVAL_VALUE);
-    }
+    };
 
     let Some(sig) = (if signum_raw <= u8::MAX as u32 {
         Signum::new(signum_raw as u8)
@@ -935,34 +1060,15 @@ pub(super) fn sys_rt_sigaction<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     let new_entry: Option<SigActionEntry> = if act_ptr == 0 {
         None
     } else {
-        let mut bytes = [0u8; SIGACTION_BYTES];
-        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes[..24], act_ptr as u64)
-        {
+        let mut bytes = [0u8; LA64_OLDWORLD_SIGACTION_BYTES];
+        if let Err(errno) = bootstrap_copy_from_user(
+            &ctx.aspace,
+            &mut bytes[..wire_abi.action_bytes()],
+            act_ptr as u64,
+        ) {
             return SyscallResult::error_from(errno);
         }
-        let handler = read_u64_le(&bytes[0..8]);
-        let flags = SaFlags::new(read_u64_le(&bytes[8..16]));
-        // RV64 and LA64 use asm-generic without SA_RESTORER:
-        // handler, flags, mask. Signal return uses our frame trampoline.
-        let mask = SignalMask::new(read_u64_le(&bytes[16..24]));
-        // The RV64/LA64 kernel sigaction ABI has NO sa_restorer — the user
-        // struct is 24 bytes (handler, flags, mask). The previous code read
-        // bytes [24..32] as a "restorer", capturing the caller's stack
-        // garbage past the struct (musl leaves its trailing spare word
-        // uninitialised). The ITIMER SIGALRM lane then used that garbage as
-        // the handler's return address: on handler return the thread
-        // jumped into data and died on a fatal trap — observed as the
-        // git-clone progress-timer crash (pc=ra+3, odd ra, fixed in-page
-        // offset) and the long-standing netperf RR/CRR flaky segv. Signal
-        // return always goes through the kernel's own trampoline.
-        // SIG_DFL == 0, SIG_IGN == 1 per Linux generic ABI; everything
-        // else is a userspace function-pointer handler.
-        let disp = match handler {
-            0 => SigDisposition::Default,
-            1 => SigDisposition::Ignore,
-            other => SigDisposition::Handler(other as usize),
-        };
-        Some(SigActionEntry::new(disp, flags, mask, 0))
+        Some(decode_rt_sigaction_entry(wire_abi, &bytes))
     };
 
     // If the caller wants the previous disposition, snapshot it
@@ -1004,21 +1110,13 @@ pub(super) fn sys_rt_sigaction<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     };
 
     if oldact_ptr != 0 {
-        let handler_value: u64 = match prev_entry.disposition {
-            SigDisposition::Default => 0, // SIG_DFL
-            SigDisposition::Ignore => 1,  // SIG_IGN
-            SigDisposition::Handler(addr) => addr as u64,
-        };
-        // Build the RV64/LA64 generic kernel `struct sigaction` image:
-        // handler, flags, mask. There is no restorer word on either ABI.
-        // Copy out only the 24 ABI bytes (handler, flags, mask): RV64/LA64
-        // have no sa_restorer, and writing a 4th word sprayed 8 bytes past
-        // the caller's struct onto their stack.
-        let mut image = [0u8; SIGACTION_BYTES];
-        image[0..8].copy_from_slice(&handler_value.to_le_bytes());
-        image[8..16].copy_from_slice(&prev_entry.flags.bits().to_le_bytes());
-        image[16..24].copy_from_slice(&prev_entry.sa_mask.raw_bits().to_le_bytes());
-        if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, oldact_ptr as u64, &image[..24]) {
+        let mut image = [0u8; LA64_OLDWORLD_SIGACTION_BYTES];
+        encode_rt_sigaction_entry(wire_abi, prev_entry, &mut image);
+        if let Err(errno) = bootstrap_copy_to_user(
+            &ctx.aspace,
+            oldact_ptr as u64,
+            &image[..wire_abi.action_bytes()],
+        ) {
             return SyscallResult::error_from(errno);
         }
     }
@@ -1377,8 +1475,7 @@ pub(super) fn sys_rt_sigreturn(ctx: &SyscallCtx) -> SyscallResult {
     SyscallResult::SigreturnRestored
 }
 
-/// `rt_sigpending(set, sigsetsize)` — Linux RV64 generic ABI
-/// `__NR_rt_sigpending = 136`.
+/// `rt_sigpending(set, sigsetsize)` — Linux LP64 signal ABI.
 ///
 /// Phase F: reads the calling thread's pending signal bitset
 /// (thread_pending merged with the owning process's group_pending)
@@ -1387,17 +1484,111 @@ pub(super) fn sys_rt_sigpending(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResu
     let set_ptr = args[0] as usize;
     let sigsetsize = args[1];
 
-    if sigsetsize != SIGSETSIZE_BYTES {
+    let Some(wire_abi) = classify_rt_signal_set_abi(sigsetsize, CURRENT_RT_SIGNAL_TARGET_ABI)
+    else {
         return SyscallResult::Error(EINVAL_VALUE);
-    }
+    };
 
     let Some(payload) = ctx.thread.payload_cap() else {
         return SyscallResult::Error(ESRCH_VALUE);
     };
     let pending = payload.pending().snapshot() | ctx.process.group_pending_snapshot();
-    if let Err(errno) = bootstrap_write_user::<u64>(&ctx.aspace, set_ptr as u64, pending) {
+    if let Err(errno) = write_rt_signal_set(&ctx.aspace, set_ptr as u64, wire_abi, pending) {
         return SyscallResult::error_from(errno);
     }
 
     SyscallResult::Return(0)
+}
+
+#[cfg(test)]
+mod rt_sigaction_wire_abi_tests {
+    use super::*;
+
+    #[test]
+    fn loongarch_old_world_classifies_16_byte_sigsets() {
+        assert_eq!(
+            classify_rt_signal_set_abi(16, RtSignalTargetAbi::LoongArch64),
+            Some(RtSignalSetAbi::LoongArchOldWorld)
+        );
+    }
+
+    #[test]
+    fn generic_64_bit_targets_keep_rejecting_16_byte_sigsets() {
+        assert_eq!(
+            classify_rt_signal_set_abi(8, RtSignalTargetAbi::Generic64),
+            Some(RtSignalSetAbi::Generic64)
+        );
+        assert_eq!(
+            classify_rt_signal_set_abi(16, RtSignalTargetAbi::Generic64),
+            None
+        );
+    }
+
+    #[test]
+    fn loongarch_old_world_action_ignores_high_mask_on_input_and_zeros_it_on_output() {
+        const FLAGS: u64 = 0x1000_0004;
+        const LOW_MASK: u64 = 0xa5a5_5a5a_ffff_0000;
+        const HIGH_MASK: u64 = 0xfeed_face_dead_beef;
+
+        let mut input = [0u8; LA64_OLDWORLD_SIGACTION_BYTES];
+        input[0..8].copy_from_slice(&1u64.to_le_bytes());
+        input[8..16].copy_from_slice(&FLAGS.to_le_bytes());
+        input[16..24].copy_from_slice(&LOW_MASK.to_le_bytes());
+        input[24..32].copy_from_slice(&HIGH_MASK.to_le_bytes());
+
+        let entry = decode_rt_sigaction_entry(RtSignalSetAbi::LoongArchOldWorld, &input);
+        assert_eq!(entry.disposition, SigDisposition::Ignore);
+        assert_eq!(entry.flags.bits(), FLAGS);
+        assert_eq!(
+            entry.sa_mask.raw_bits(),
+            SignalMask::new(LOW_MASK).raw_bits()
+        );
+
+        let mut output = [0xaau8; LA64_OLDWORLD_SIGACTION_BYTES];
+        encode_rt_sigaction_entry(RtSignalSetAbi::LoongArchOldWorld, entry, &mut output);
+        assert_eq!(read_u64_le(&output[0..8]), 1);
+        assert_eq!(read_u64_le(&output[8..16]), FLAGS);
+        assert_eq!(read_u64_le(&output[16..24]), entry.sa_mask.raw_bits());
+        assert_eq!(read_u64_le(&output[24..32]), 0);
+    }
+
+    #[test]
+    fn loongarch_old_world_sigset_codec_reads_16_bytes_and_zero_extends_output() {
+        const LOW: u64 = 0x0123_4567_89ab_cdef;
+        const UNSUPPORTED_HIGH: u64 = 0xfedc_ba98_7654_3210;
+
+        let mut input = [0u8; LA64_OLDWORLD_SIGSETSIZE_BYTES as usize];
+        input[0..8].copy_from_slice(&LOW.to_le_bytes());
+        input[8..16].copy_from_slice(&UNSUPPORTED_HIGH.to_le_bytes());
+        assert_eq!(
+            decode_rt_signal_set(RtSignalSetAbi::LoongArchOldWorld, &input),
+            LOW
+        );
+
+        let mut output = [0xaau8; LA64_OLDWORLD_SIGSETSIZE_BYTES as usize];
+        encode_rt_signal_set(RtSignalSetAbi::LoongArchOldWorld, LOW, &mut output);
+        assert_eq!(read_u64_le(&output[0..8]), LOW);
+        assert_eq!(read_u64_le(&output[8..16]), 0);
+    }
+
+    #[test]
+    fn generic_sigset_codec_keeps_the_8_byte_wire_width() {
+        const LOW: u64 = 0x0123_4567_89ab_cdef;
+        let mut output = [0xaau8; LA64_OLDWORLD_SIGSETSIZE_BYTES as usize];
+
+        encode_rt_signal_set(RtSignalSetAbi::Generic64, LOW, &mut output);
+
+        assert_eq!(read_u64_le(&output[0..8]), LOW);
+        assert_eq!(read_u64_le(&output[8..16]), u64::from_le_bytes([0xaa; 8]));
+    }
+
+    #[test]
+    fn rt_sigaction_wire_classifier_rejects_zero_and_other_sizes() {
+        for target in [RtSignalTargetAbi::Generic64, RtSignalTargetAbi::LoongArch64] {
+            assert_eq!(classify_rt_signal_set_abi(0, target), None);
+            assert_eq!(classify_rt_signal_set_abi(1, target), None);
+            assert_eq!(classify_rt_signal_set_abi(24, target), None);
+            assert_eq!(classify_rt_signal_set_abi(128, target), None);
+        }
+    }
 }

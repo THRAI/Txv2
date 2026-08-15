@@ -619,7 +619,7 @@ fn render_status(pid: Pid) -> String {
             }
         }
     }
-    format!(
+    let mut out = format!(
         "Name:\t{}\nState:\t{} ({})\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nThreads:\t{}\n\
 VmData:\t{:8} kB\nVmLck:\t{:8} kB\n",
         name,
@@ -631,7 +631,28 @@ VmData:\t{:8} kB\nVmLck:\t{:8} kB\n",
         proc.live_thread_count(),
         0,
         vm_lck_kb,
-    )
+    );
+    if let Some((tid, (nr, arg0, arg1))) = proc.threads_snapshot().and_then(|threads| {
+        threads.into_iter().find_map(|thread| {
+            thread
+                .payload_cap()
+                .and_then(|payload| payload.active_syscall_diagnostic())
+                .map(|syscall| (thread.tid.0, syscall))
+        })
+    }) {
+        out.push_str(&format!(
+            "TxSyscallTid:\t{}\nTxSyscallNr:\t{}\nTxSyscallArg0:\t{:#x}\nTxSyscallArg1:\t{:#x}\n",
+            tid, nr, arg0, arg1
+        ));
+    }
+    if let Some(aspace) = proc.aspace_cap() {
+        let range_lock = aspace.range_lock().diagnostic_snapshot();
+        out.push_str(&format!(
+            "TxRangeActive:\t{}\nTxRangePendingWriters:\t{}\nTxRangeWaitSource:\t{:#x}\n",
+            range_lock.active, range_lock.pending_writers, range_lock.wait_source_id
+        ));
+    }
+    out
 }
 
 /// `/proc/<pid>/{uid_map,gid_map}` — one `inside outside length` row per entry,

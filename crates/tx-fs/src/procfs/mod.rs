@@ -2134,6 +2134,30 @@ mod tests {
     }
 
     #[test]
+    fn procfs_status_reports_active_syscall_diagnostic() {
+        let _setup = setup();
+        bootstrap_procfs_test_init_process();
+        let process = process::process_by_pid(Pid(1)).expect("init process");
+        let thread = process.nth_thread(0).expect("init leader");
+        let payload = thread.payload_cap().expect("live thread payload");
+
+        payload.begin_syscall_diagnostic(215, 0x3e3f_600000, 0x1_0000);
+        let status = read::render(pid_status_id(Pid(1)));
+        payload.end_syscall_diagnostic();
+
+        assert!(status.contains("TxSyscallTid:\t1\n"), "{status}");
+        assert!(status.contains("TxSyscallNr:\t215\n"), "{status}");
+        assert!(
+            status.contains("TxSyscallArg0:\t0x3e3f600000\n"),
+            "{status}"
+        );
+        assert!(status.contains("TxSyscallArg1:\t0x10000\n"), "{status}");
+        assert!(status.contains("TxRangeActive:\t0\n"), "{status}");
+        assert!(status.contains("TxRangePendingWriters:\t0\n"), "{status}");
+        assert!(status.contains("TxRangeWaitSource:\t0x"), "{status}");
+    }
+
+    #[test]
     fn procfs_sysvipc_files_render_live_sysv_ipc_rows() {
         let _setup = setup();
         let fs = Procfs::new();
