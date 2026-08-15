@@ -11,7 +11,9 @@ pub mod ondisk;
 pub mod pager;
 
 pub use journal_replay::{
-    clean_replayed_journal, recover_if_required, replay_journal, JournalReplayReport,
+    clean_replayed_journal, diagnose_recovery_preflight,
+    diagnose_recovery_preflight_linux_uuid_semantics, preflight_recovery, recover_if_required,
+    replay_journal, JournalPreflightError, JournalPreflightUnsupported, JournalReplayReport,
     RecoveryReport,
 };
 

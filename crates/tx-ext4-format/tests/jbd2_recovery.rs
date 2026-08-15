@@ -2,10 +2,12 @@ use tx_ext4_format::journal::{
     Jbd2Commit, Jbd2Features, Jbd2Header, Jbd2MetadataUpdate, Jbd2Revoke, Jbd2Superblock,
     Jbd2TransactionImage, JBD2_BLOCK_SIZE, JBD2_BLOCK_SUPERBLOCK_V2, JBD2_MAGIC,
 };
-use tx_ext4_format::ondisk::Superblock;
+use tx_ext4_format::ondisk::{crc32c_append, Superblock};
 use tx_ext4_format::pager::{BlockImage, JournalGeometry, Page4K};
 use tx_ext4_format::{
-    clean_replayed_journal, recover_if_required, replay_journal, Ext4FormatError, RecoveryReport,
+    clean_replayed_journal, diagnose_recovery_preflight,
+    diagnose_recovery_preflight_linux_uuid_semantics, preflight_recovery, recover_if_required,
+    replay_journal, Ext4FormatError, JournalPreflightUnsupported, RecoveryReport,
 };
 
 #[derive(Clone)]
@@ -121,6 +123,121 @@ fn geometry_with_superblock_page() -> JournalGeometry {
     page[48..64].copy_from_slice(&superblock.uuid);
     geometry.superblock_page = Some(page);
     geometry
+}
+
+fn checksum_v3_geometry_with_superblock_page() -> JournalGeometry {
+    let mut geometry = geometry();
+    geometry.features = Jbd2Features::REVOKE_64BIT_CSUM_V3;
+    let superblock = &geometry.superblock;
+    let mut page = [0; JBD2_BLOCK_SIZE];
+    page[..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
+    page[4..8].copy_from_slice(&superblock.block_type.to_be_bytes());
+    page[12..16].copy_from_slice(&superblock.block_size.to_be_bytes());
+    page[16..20].copy_from_slice(&superblock.max_len.to_be_bytes());
+    page[20..24].copy_from_slice(&superblock.first.to_be_bytes());
+    page[24..28].copy_from_slice(&superblock.sequence.to_be_bytes());
+    page[28..32].copy_from_slice(&superblock.start.to_be_bytes());
+    page[40..44].copy_from_slice(&geometry.features.feature_incompat().to_be_bytes());
+    page[48..64].copy_from_slice(&superblock.uuid);
+    page[0x50] = 4;
+    let checksum = crc32c_append(u32::MAX, &page[..1024]);
+    page[0xFC..0x100].copy_from_slice(&checksum.to_be_bytes());
+    geometry.superblock_page = Some(page);
+    geometry
+}
+
+fn checksum_v3_recovery_fixture() -> (JournalGeometry, MemImage, Superblock, Page4K) {
+    let geometry = checksum_v3_geometry_with_superblock_page();
+    let mut image = MemImage::new(80);
+    *image.block_mut(40) = geometry.superblock_page.unwrap();
+    *image.block_mut(9) = [0x11; JBD2_BLOCK_SIZE];
+    let mut after = [0x5A; JBD2_BLOCK_SIZE];
+    after[..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
+    let record = Jbd2TransactionImage::encode_with_features_and_revokes(
+        geometry.superblock.sequence,
+        geometry.superblock.uuid,
+        vec![Jbd2MetadataUpdate::new(9, after)],
+        vec![10],
+        geometry.features,
+    )
+    .unwrap();
+    assert_eq!(&record.metadata_blocks[0][..4], &[0; 4]);
+    *image.block_mut(44) = record.descriptor;
+    *image.block_mut(48) = record.metadata_blocks[0];
+    *image.block_mut(52) = record.revokes[0];
+    *image.block_mut(56) = record.commit;
+    let mut superblock = Superblock::default();
+    superblock.feature_incompat |= Superblock::FEATURE_INCOMPAT_RECOVER;
+    (geometry, image, superblock, after)
+}
+
+#[test]
+fn checksum_v3_recovery_replays_escaped_committed_transaction() {
+    let (geometry, mut image, superblock, after) = checksum_v3_recovery_fixture();
+    let blocks_before = image.blocks.clone();
+
+    assert_eq!(
+        preflight_recovery(&image, &superblock, &geometry),
+        Ok(RecoveryReport::Replayed(
+            tx_ext4_format::JournalReplayReport {
+                transactions: 1,
+                blocks_replayed: 1,
+                next_sequence: 43,
+            }
+        ))
+    );
+    assert!(image.writes.is_empty());
+    assert_eq!(image.barriers, 0);
+    assert_eq!(image.blocks, blocks_before);
+
+    let report = recover_if_required(&mut image, &superblock, &geometry).unwrap();
+
+    assert_eq!(
+        report,
+        RecoveryReport::Replayed(tx_ext4_format::JournalReplayReport {
+            transactions: 1,
+            blocks_replayed: 1,
+            next_sequence: 43,
+        })
+    );
+    assert_eq!(image.block(9), &after);
+    assert_eq!(image.writes, vec![9, 40]);
+    assert_eq!(image.barriers, 2);
+    let (clean, features) = Jbd2Superblock::parse_with_features(image.block(40)).unwrap();
+    assert_eq!(features, Jbd2Features::REVOKE_64BIT_CSUM_V3);
+    assert_eq!(clean.sequence, 43);
+    assert_eq!(clean.start, 0);
+}
+
+#[test]
+fn checksum_v3_corruption_fails_preflight_without_writes_or_cleaning() {
+    for (record, block, offset) in [
+        ("descriptor tail", 44, 4095),
+        ("tag payload", 48, 100),
+        ("revoke tail", 52, 4095),
+        ("commit", 56, 100),
+    ] {
+        let (geometry, mut image, superblock, _after) = checksum_v3_recovery_fixture();
+        image.block_mut(block)[offset] ^= 1;
+        let blocks_before = image.blocks.clone();
+
+        assert_eq!(
+            preflight_recovery(&image, &superblock, &geometry),
+            Err(Ext4FormatError::Corrupt),
+            "{record} corruption"
+        );
+        assert!(image.writes.is_empty());
+        assert_eq!(image.barriers, 0);
+        assert_eq!(image.blocks, blocks_before);
+        assert_eq!(
+            recover_if_required(&mut image, &superblock, &geometry),
+            Err(Ext4FormatError::Corrupt),
+            "{record} corruption"
+        );
+        assert!(image.writes.is_empty());
+        assert_eq!(image.barriers, 0);
+        assert_eq!(image.blocks, blocks_before);
+    }
 }
 
 #[test]
@@ -342,6 +459,16 @@ fn stale_journal_is_not_replayed_when_ext4_is_clean() {
 }
 
 #[test]
+fn preflight_clean_ext4_does_not_read_or_validate_journal_geometry() {
+    let image = MemImage::new(0);
+    let report = preflight_recovery(&image, &Superblock::default(), &geometry()).unwrap();
+
+    assert_eq!(report, RecoveryReport::NotRequired);
+    assert!(image.writes.is_empty());
+    assert_eq!(image.barriers, 0);
+}
+
+#[test]
 fn recovery_required_replays_and_cleans_the_discovered_journal() {
     let geometry = geometry_with_superblock_page();
     let mut image = MemImage::new(80);
@@ -386,7 +513,7 @@ fn checksummed_journal_superblock_rejects_csum_v2() {
 }
 
 #[test]
-fn checksummed_journal_superblock_rejects_csum_v3() {
+fn checksummed_journal_superblock_rejects_csum_v3_without_type_and_checksum() {
     let mut page = geometry_with_superblock_page().superblock_page.unwrap();
     page[40..44].copy_from_slice(&0x0000_0010u32.to_be_bytes());
 
@@ -460,6 +587,51 @@ fn recovery_discards_an_incomplete_transaction_and_cleans_the_journal() {
 }
 
 #[test]
+fn preflight_reports_a_committed_prefix_without_mutating_the_image() {
+    let geometry = geometry_with_superblock_page();
+    let mut image = MemImage::new(80);
+    *image.block_mut(40) = geometry.superblock_page.unwrap();
+    let committed_after = [0x51; JBD2_BLOCK_SIZE];
+    let incomplete_before = [0x12; JBD2_BLOCK_SIZE];
+    let committed = Jbd2TransactionImage::encode_legacy(
+        42,
+        geometry.superblock.uuid,
+        vec![Jbd2MetadataUpdate::new(9, committed_after)],
+    )
+    .unwrap();
+    let incomplete = Jbd2TransactionImage::encode_legacy(
+        43,
+        geometry.superblock.uuid,
+        vec![Jbd2MetadataUpdate::new(10, [0x52; JBD2_BLOCK_SIZE])],
+    )
+    .unwrap();
+    *image.block_mut(9) = [0x11; JBD2_BLOCK_SIZE];
+    *image.block_mut(10) = incomplete_before;
+    *image.block_mut(44) = committed.descriptor;
+    *image.block_mut(48) = committed.metadata_blocks[0];
+    *image.block_mut(52) = committed.commit;
+    *image.block_mut(56) = incomplete.descriptor;
+    *image.block_mut(60) = incomplete.metadata_blocks[0];
+    let blocks_before = image.blocks.clone();
+
+    let mut superblock = Superblock::default();
+    superblock.feature_incompat |= Superblock::FEATURE_INCOMPAT_RECOVER;
+    let report = preflight_recovery(&image, &superblock, &geometry).unwrap();
+
+    assert_eq!(
+        report,
+        RecoveryReport::Replayed(tx_ext4_format::JournalReplayReport {
+            transactions: 1,
+            blocks_replayed: 1,
+            next_sequence: 44,
+        })
+    );
+    assert!(image.writes.is_empty());
+    assert_eq!(image.barriers, 0);
+    assert_eq!(image.blocks, blocks_before);
+}
+
+#[test]
 fn recovery_replays_a_committed_prefix_and_skips_the_incomplete_tail_sequence() {
     let geometry = geometry_with_superblock_page();
     let mut image = MemImage::new(80);
@@ -530,6 +702,23 @@ fn recovery_rejects_an_unsupported_second_descriptor_before_writing_or_cleaning(
 
     let mut superblock = Superblock::default();
     superblock.feature_incompat |= Superblock::FEATURE_INCOMPAT_RECOVER;
+    let blocks_before = image.blocks.clone();
+    let diagnostic = diagnose_recovery_preflight(&image, &superblock, &geometry).unwrap_err();
+    assert_eq!(diagnostic.error, Ext4FormatError::Unsupported);
+    assert_eq!(
+        diagnostic.unsupported,
+        Some(JournalPreflightUnsupported::DescriptorTagFlags)
+    );
+    assert!(image.writes.is_empty());
+    assert_eq!(image.barriers, 0);
+    assert_eq!(image.blocks, blocks_before);
+    assert_eq!(
+        preflight_recovery(&image, &superblock, &geometry),
+        Err(Ext4FormatError::Unsupported)
+    );
+    assert!(image.writes.is_empty());
+    assert_eq!(image.barriers, 0);
+    assert_eq!(image.blocks, blocks_before);
     assert_eq!(
         recover_if_required(&mut image, &superblock, &geometry),
         Err(Ext4FormatError::Unsupported)
@@ -537,6 +726,73 @@ fn recovery_rejects_an_unsupported_second_descriptor_before_writing_or_cleaning(
     assert!(image.writes.is_empty());
     assert_eq!(image.barriers, 0);
     assert_eq!(Jbd2Superblock::parse(image.block(40)).unwrap().start, 1);
+}
+
+#[test]
+fn recovery_treats_descriptor_uuid_as_informational_like_linux_jbd2() {
+    let geometry = geometry_with_superblock_page();
+    let mut image = MemImage::new(80);
+    *image.block_mut(40) = geometry.superblock_page.unwrap();
+    let after = [0x7A; JBD2_BLOCK_SIZE];
+    let record = Jbd2TransactionImage::encode_legacy(
+        42,
+        [0xB6; 16],
+        vec![Jbd2MetadataUpdate::new(9, after)],
+    )
+    .unwrap();
+    *image.block_mut(44) = record.descriptor;
+    *image.block_mut(48) = record.metadata_blocks[0];
+    *image.block_mut(52) = record.commit;
+
+    let mut superblock = Superblock::default();
+    superblock.feature_incompat |= Superblock::FEATURE_INCOMPAT_RECOVER;
+    let blocks_before = image.blocks.clone();
+
+    assert_eq!(
+        diagnose_recovery_preflight(&image, &superblock, &geometry),
+        Err(tx_ext4_format::JournalPreflightError {
+            error: Ext4FormatError::Unsupported,
+            unsupported: Some(JournalPreflightUnsupported::DescriptorUuidMismatch),
+        })
+    );
+    assert_eq!(
+        preflight_recovery(&image, &superblock, &geometry),
+        Ok(RecoveryReport::Replayed(
+            tx_ext4_format::JournalReplayReport {
+                transactions: 1,
+                blocks_replayed: 1,
+                next_sequence: 43,
+            }
+        ))
+    );
+    assert_eq!(
+        diagnose_recovery_preflight_linux_uuid_semantics(&image, &superblock, &geometry),
+        Ok(RecoveryReport::Replayed(
+            tx_ext4_format::JournalReplayReport {
+                transactions: 1,
+                blocks_replayed: 1,
+                next_sequence: 43,
+            }
+        ))
+    );
+    assert!(image.writes.is_empty());
+    assert_eq!(image.barriers, 0);
+    assert_eq!(image.blocks, blocks_before);
+
+    assert_eq!(
+        recover_if_required(&mut image, &superblock, &geometry),
+        Ok(RecoveryReport::Replayed(
+            tx_ext4_format::JournalReplayReport {
+                transactions: 1,
+                blocks_replayed: 1,
+                next_sequence: 43,
+            }
+        ))
+    );
+    assert_eq!(image.block(9), &after);
+    let clean_superblock = Jbd2Superblock::parse(image.block(40)).unwrap();
+    assert_eq!(clean_superblock.sequence, 43);
+    assert_eq!(clean_superblock.start, 0);
 }
 
 #[test]
@@ -565,6 +821,14 @@ fn recovery_rejects_a_corrupt_second_descriptor_before_writing_or_cleaning() {
 
     let mut superblock = Superblock::default();
     superblock.feature_incompat |= Superblock::FEATURE_INCOMPAT_RECOVER;
+    let blocks_before = image.blocks.clone();
+    assert_eq!(
+        preflight_recovery(&image, &superblock, &geometry),
+        Err(Ext4FormatError::Corrupt)
+    );
+    assert!(image.writes.is_empty());
+    assert_eq!(image.barriers, 0);
+    assert_eq!(image.blocks, blocks_before);
     assert_eq!(
         recover_if_required(&mut image, &superblock, &geometry),
         Err(Ext4FormatError::Corrupt)

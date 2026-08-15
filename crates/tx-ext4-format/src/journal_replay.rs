@@ -11,7 +11,7 @@ use crate::journal::{
     Jbd2Commit, Jbd2Descriptor, Jbd2Header, Jbd2Revoke, Jbd2Tag, JBD2_BLOCK_COMMIT,
     JBD2_BLOCK_DESCRIPTOR, JBD2_BLOCK_REVOKE, JBD2_MAGIC,
 };
-use crate::ondisk::Superblock;
+use crate::ondisk::{crc32c_append, Superblock};
 use crate::pager::{BlockImage, JournalGeometry, Page4K};
 use crate::{Ext4FormatError, Result};
 
@@ -33,6 +33,46 @@ pub enum RecoveryReport {
     Replayed(JournalReplayReport),
 }
 
+/// Narrow reason for a format that the bounded recovery scanner deliberately
+/// refuses to interpret.
+///
+/// These values are diagnostic only. They do not widen the accepted JBD2
+/// profile or change replay behavior.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JournalPreflightUnsupported {
+    DescriptorTagFlags,
+    DescriptorDeletedTag,
+    DescriptorUuidMismatch,
+    RevokeRecord,
+    CommitChecksum,
+    UnknownBlockType(u32),
+}
+
+/// Read-only preflight failure with an optional unsupported-record reason.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JournalPreflightError {
+    pub error: Ext4FormatError,
+    pub unsupported: Option<JournalPreflightUnsupported>,
+}
+
+impl JournalPreflightError {
+    const fn unsupported(reason: JournalPreflightUnsupported) -> Self {
+        Self {
+            error: Ext4FormatError::Unsupported,
+            unsupported: Some(reason),
+        }
+    }
+}
+
+impl From<Ext4FormatError> for JournalPreflightError {
+    fn from(error: Ext4FormatError) -> Self {
+        Self {
+            error,
+            unsupported: None,
+        }
+    }
+}
+
 struct PlannedUpdate {
     sequence: u32,
     tag: Jbd2Tag,
@@ -44,6 +84,84 @@ struct JournalScan {
     latest_revokes: BTreeMap<u64, u32>,
     transactions: u32,
     next_sequence: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DescriptorUuidPolicy {
+    RequireJournalMatch,
+    InformationalLikeLinux,
+}
+
+/// Validate the recovery that a read-write mount would perform without
+/// modifying the image.
+///
+/// The preflight performs the same bounded journal scan as
+/// [`recover_if_required`], validates that the journal can be published clean,
+/// and checks every replayable home-block target and report count. It never
+/// calls [`BlockImage::write_block`], [`BlockImage::barrier`], or an image-cache
+/// invalidation hook.
+pub fn preflight_recovery<I: BlockImage>(
+    image: &I,
+    superblock: &Superblock,
+    geometry: &JournalGeometry,
+) -> Result<RecoveryReport> {
+    diagnose_recovery_preflight_linux_uuid_semantics(image, superblock, geometry)
+        .map_err(|failure| failure.error)
+}
+
+/// Perform a deliberately stricter diagnostic preflight that also requires
+/// every descriptor UUID field to match the journal superblock UUID.
+///
+/// Linux treats descriptor UUID bytes as informational and only uses the
+/// `SAME_UUID` flag to determine whether the field is present. Consequently,
+/// this diagnostic must not gate mounting or recovery; production callers use
+/// [`preflight_recovery`] instead.
+pub fn diagnose_recovery_preflight<I: BlockImage>(
+    image: &I,
+    superblock: &Superblock,
+    geometry: &JournalGeometry,
+) -> core::result::Result<RecoveryReport, JournalPreflightError> {
+    diagnose_recovery_preflight_with_uuid_policy(
+        image,
+        superblock,
+        geometry,
+        DescriptorUuidPolicy::RequireJournalMatch,
+    )
+}
+
+/// Repeat the shared-reference preflight using Linux JBD2's descriptor-UUID
+/// semantics.
+///
+/// Linux uses `SAME_UUID` to determine whether the 16-byte descriptor field is
+/// present, but recovery does not compare its contents with the journal
+/// superblock. This function exists only to classify a strict-preflight UUID
+/// rejection. It cannot replay, clean, flush, invalidate, or write the image.
+pub fn diagnose_recovery_preflight_linux_uuid_semantics<I: BlockImage>(
+    image: &I,
+    superblock: &Superblock,
+    geometry: &JournalGeometry,
+) -> core::result::Result<RecoveryReport, JournalPreflightError> {
+    diagnose_recovery_preflight_with_uuid_policy(
+        image,
+        superblock,
+        geometry,
+        DescriptorUuidPolicy::InformationalLikeLinux,
+    )
+}
+
+fn diagnose_recovery_preflight_with_uuid_policy<I: BlockImage>(
+    image: &I,
+    superblock: &Superblock,
+    geometry: &JournalGeometry,
+    uuid_policy: DescriptorUuidPolicy,
+) -> core::result::Result<RecoveryReport, JournalPreflightError> {
+    if !superblock.needs_recovery() {
+        return Ok(RecoveryReport::NotRequired);
+    }
+    let scan = scan_journal_with_uuid_policy(image, geometry, uuid_policy)?;
+    let _clean_page = prepare_clean_page(geometry, scan.next_sequence)?;
+    let replay = report_for_scan(image, &scan)?;
+    Ok(RecoveryReport::Replayed(replay))
 }
 
 /// Replay and clean a discovered journal only when ext4's recovery-required
@@ -93,6 +211,19 @@ pub fn replay_journal<I: BlockImage>(
 /// the final revoke table across every committed transaction in the ring. All
 /// decoded payload storage is bounded by the number of pages in that ring.
 fn scan_journal<I: BlockImage>(image: &I, geometry: &JournalGeometry) -> Result<JournalScan> {
+    scan_journal_with_uuid_policy(
+        image,
+        geometry,
+        DescriptorUuidPolicy::InformationalLikeLinux,
+    )
+    .map_err(|failure| failure.error)
+}
+
+fn scan_journal_with_uuid_policy<I: BlockImage>(
+    image: &I,
+    geometry: &JournalGeometry,
+    uuid_policy: DescriptorUuidPolicy,
+) -> core::result::Result<JournalScan, JournalPreflightError> {
     validate_geometry(image, geometry)?;
     let mut expected_sequence = geometry.superblock.sequence;
     if geometry.superblock.start == 0 {
@@ -123,7 +254,7 @@ fn scan_journal<I: BlockImage>(image: &I, geometry: &JournalGeometry) -> Result<
                     next_sequence: expected_sequence,
                 });
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.into()),
         };
         if first_header.sequence != expected_sequence {
             break;
@@ -145,7 +276,7 @@ fn scan_journal<I: BlockImage>(image: &I, geometry: &JournalGeometry) -> Result<
                 let header = match Jbd2Header::parse(&page) {
                     Ok(header) => header,
                     Err(Ext4FormatError::BadMagic) => break false,
-                    Err(error) => return Err(error),
+                    Err(error) => return Err(error.into()),
                 };
                 (page, header)
             };
@@ -155,16 +286,23 @@ fn scan_journal<I: BlockImage>(image: &I, geometry: &JournalGeometry) -> Result<
 
             match header.block_type {
                 JBD2_BLOCK_DESCRIPTOR => {
-                    let descriptor = match Jbd2Descriptor::parse_with_features(
+                    let descriptor = match Jbd2Descriptor::parse_with_features_and_uuid(
                         &record_page,
                         geometry.features,
+                        geometry.superblock.uuid,
                     ) {
                         Err(Ext4FormatError::Truncated) => {
-                            return Err(Ext4FormatError::Corrupt);
+                            return Err(Ext4FormatError::Corrupt.into());
                         }
-                        result => result?,
+                        Err(Ext4FormatError::Unsupported) => {
+                            return Err(JournalPreflightError::unsupported(
+                                JournalPreflightUnsupported::DescriptorTagFlags,
+                            ));
+                        }
+                        Err(error) => return Err(error.into()),
+                        Ok(descriptor) => descriptor,
                     };
-                    validate_tags(&descriptor, geometry)?;
+                    validate_tags_diagnostic(&descriptor, geometry, uuid_policy)?;
                     transaction_blocks = transaction_blocks
                         .checked_add(1)
                         .ok_or(Ext4FormatError::OutOfBounds)?;
@@ -174,6 +312,13 @@ fn scan_journal<I: BlockImage>(image: &I, geometry: &JournalGeometry) -> Result<
                     }
                     for tag in descriptor.tags {
                         let payload = read_log_page(image, geometry, transaction_cursor)?;
+                        validate_tag_checksum(
+                            &tag,
+                            expected_sequence,
+                            geometry.superblock.uuid,
+                            &payload,
+                            geometry.features,
+                        )?;
                         transaction_updates.push(PlannedUpdate {
                             sequence: expected_sequence,
                             tag,
@@ -184,7 +329,17 @@ fn scan_journal<I: BlockImage>(image: &I, geometry: &JournalGeometry) -> Result<
                     }
                 }
                 JBD2_BLOCK_REVOKE => {
-                    let revoke = Jbd2Revoke::parse_with_features(&record_page, geometry.features)?;
+                    let revoke = Jbd2Revoke::parse_with_features_and_uuid(
+                        &record_page,
+                        geometry.features,
+                        geometry.superblock.uuid,
+                    )
+                    .map_err(|error| match error {
+                        Ext4FormatError::Unsupported => JournalPreflightError::unsupported(
+                            JournalPreflightUnsupported::RevokeRecord,
+                        ),
+                        error => error.into(),
+                    })?;
                     transaction_revokes.extend(revoke.blocks);
                     transaction_blocks = transaction_blocks
                         .checked_add(1)
@@ -192,15 +347,30 @@ fn scan_journal<I: BlockImage>(image: &I, geometry: &JournalGeometry) -> Result<
                     transaction_cursor = advance(geometry, transaction_cursor);
                 }
                 JBD2_BLOCK_COMMIT => {
-                    let commit = Jbd2Commit::parse(&record_page)?;
-                    validate_commit_checksum(&commit)?;
+                    let commit = Jbd2Commit::parse_with_features(
+                        &record_page,
+                        geometry.features,
+                        geometry.superblock.uuid,
+                    )?;
+                    validate_commit_checksum(&commit, geometry.features).map_err(|error| {
+                        match error {
+                            Ext4FormatError::Unsupported => JournalPreflightError::unsupported(
+                                JournalPreflightUnsupported::CommitChecksum,
+                            ),
+                            error => error.into(),
+                        }
+                    })?;
                     transaction_blocks = transaction_blocks
                         .checked_add(1)
                         .ok_or(Ext4FormatError::OutOfBounds)?;
                     transaction_cursor = advance(geometry, transaction_cursor);
                     break true;
                 }
-                _ => return Err(Ext4FormatError::Unsupported),
+                block_type => {
+                    return Err(JournalPreflightError::unsupported(
+                        JournalPreflightUnsupported::UnknownBlockType(block_type),
+                    ));
+                }
             }
         };
 
@@ -240,17 +410,7 @@ fn scan_journal<I: BlockImage>(image: &I, geometry: &JournalGeometry) -> Result<
 }
 
 fn apply_scan<I: BlockImage>(image: &mut I, scan: &JournalScan) -> Result<JournalReplayReport> {
-    let replayable = scan
-        .updates
-        .iter()
-        .filter(|update| !is_revoked(update, &scan.latest_revokes));
-    for update in replayable.clone() {
-        if update.tag.target_block >= image.total_blocks() {
-            return Err(Ext4FormatError::OutOfBounds);
-        }
-    }
-    let blocks_replayed =
-        u32::try_from(replayable.count()).map_err(|_| Ext4FormatError::OutOfBounds)?;
+    let report = report_for_scan(image, scan)?;
 
     for update in scan
         .updates
@@ -267,6 +427,22 @@ fn apply_scan<I: BlockImage>(image: &mut I, scan: &JournalScan) -> Result<Journa
     if scan.transactions != 0 {
         image.barrier()?;
     }
+
+    Ok(report)
+}
+
+fn report_for_scan<I: BlockImage>(image: &I, scan: &JournalScan) -> Result<JournalReplayReport> {
+    let replayable = scan
+        .updates
+        .iter()
+        .filter(|update| !is_revoked(update, &scan.latest_revokes));
+    for update in replayable.clone() {
+        if update.tag.target_block >= image.total_blocks() {
+            return Err(Ext4FormatError::OutOfBounds);
+        }
+    }
+    let blocks_replayed =
+        u32::try_from(replayable.count()).map_err(|_| Ext4FormatError::OutOfBounds)?;
 
     Ok(JournalReplayReport {
         transactions: scan.transactions,
@@ -287,10 +463,34 @@ fn sequence_geq(candidate: u32, reference: u32) -> bool {
     candidate.wrapping_sub(reference) as i32 >= 0
 }
 
-/// The bounded legacy journal profile has no transaction checksum fields. A
-/// journal that declares checksums uses a different record layout and cannot
-/// be accepted until that format and its CRC contract are implemented.
-fn validate_commit_checksum(commit: &Jbd2Commit) -> Result<()> {
+fn validate_tag_checksum(
+    tag: &Jbd2Tag,
+    sequence: u32,
+    journal_uuid: [u8; 16],
+    payload: &Page4K,
+    features: crate::journal::Jbd2Features,
+) -> Result<()> {
+    if !features.checksum_v3 {
+        return Ok(());
+    }
+    let checksum = crc32c_append(u32::MAX, &journal_uuid);
+    let checksum = crc32c_append(checksum, &sequence.to_be_bytes());
+    if tag.checksum != crc32c_append(checksum, payload) {
+        return Err(Ext4FormatError::Corrupt);
+    }
+    Ok(())
+}
+
+/// Legacy journals in the supported profile leave every commit checksum field
+/// zero. Checksum-v3 commit blocks were already verified over the full journal
+/// block by `Jbd2Commit::parse_with_features`.
+fn validate_commit_checksum(
+    commit: &Jbd2Commit,
+    features: crate::journal::Jbd2Features,
+) -> Result<()> {
+    if features.checksum_v3 {
+        return Ok(());
+    }
     if commit.checksum_type == 0
         && commit.checksum_size == 0
         && commit.checksums.iter().all(|checksum| *checksum == 0)
@@ -359,14 +559,25 @@ fn validate_geometry<I: BlockImage>(image: &I, geometry: &JournalGeometry) -> Re
     Ok(())
 }
 
-fn validate_tags(descriptor: &Jbd2Descriptor, geometry: &JournalGeometry) -> Result<()> {
+fn validate_tags_diagnostic(
+    descriptor: &Jbd2Descriptor,
+    geometry: &JournalGeometry,
+    uuid_policy: DescriptorUuidPolicy,
+) -> core::result::Result<(), JournalPreflightError> {
     for tag in &descriptor.tags {
-        if tag.deleted
-            || tag
+        if tag.deleted {
+            return Err(JournalPreflightError::unsupported(
+                JournalPreflightUnsupported::DescriptorDeletedTag,
+            ));
+        }
+        if uuid_policy == DescriptorUuidPolicy::RequireJournalMatch
+            && tag
                 .uuid
                 .is_some_and(|uuid| uuid != geometry.superblock.uuid)
         {
-            return Err(Ext4FormatError::Unsupported);
+            return Err(JournalPreflightError::unsupported(
+                JournalPreflightUnsupported::DescriptorUuidMismatch,
+            ));
         }
     }
     Ok(())

@@ -5,6 +5,7 @@
 
 use alloc::vec::Vec;
 
+use crate::ondisk::crc32c_append;
 use crate::{Ext4FormatError, Result};
 
 pub const JBD2_MAGIC: u32 = 0xC03B_3998;
@@ -22,37 +23,59 @@ pub const JBD2_FEATURE_INCOMPAT_CSUM_V2: u32 = 0x0000_0008;
 pub const JBD2_FEATURE_INCOMPAT_CSUM_V3: u32 = 0x0000_0010;
 pub const JBD2_FEATURE_INCOMPAT_FAST_COMMIT: u32 = 0x0000_0020;
 
+const JBD2_CHECKSUM_TYPE_CRC32C: u8 = 4;
+const JBD2_SUPERBLOCK_BYTES: usize = 1024;
+const JBD2_SUPERBLOCK_CHECKSUM_OFFSET: usize = 0xFC;
+const JBD2_BLOCK_CHECKSUM_BYTES: usize = 4;
+const JBD2_COMMIT_CHECKSUM_OFFSET: usize = 16;
+
 /// Strictly supported JBD2 on-disk feature profile.
 ///
-/// The codec accepts only legacy records plus the standard revoke and 64-bit
-/// block-number extensions. Checksum-v2/v3, async commit, fast commit, and
-/// unknown feature bits require different record-validation contracts and are
-/// rejected rather than being silently masked off.
+/// The codec accepts legacy records plus the standard revoke and 64-bit
+/// block-number extensions, and the checksum-v3 profile. Checksum-v2, async
+/// commit, fast commit, and unknown feature bits require different validation
+/// contracts and are rejected rather than being silently masked off.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Jbd2Features {
     pub revoke: bool,
     pub block_64bit: bool,
+    pub checksum_v3: bool,
 }
 
 impl Jbd2Features {
     pub const NONE: Self = Self {
         revoke: false,
         block_64bit: false,
+        checksum_v3: false,
     };
     pub const REVOKE: Self = Self {
         revoke: true,
         block_64bit: false,
+        checksum_v3: false,
     };
     pub const BLOCK_64BIT: Self = Self {
         revoke: false,
         block_64bit: true,
+        checksum_v3: false,
     };
     pub const REVOKE_64BIT: Self = Self {
         revoke: true,
         block_64bit: true,
+        checksum_v3: false,
+    };
+    pub const CSUM_V3: Self = Self {
+        revoke: false,
+        block_64bit: false,
+        checksum_v3: true,
+    };
+    pub const REVOKE_64BIT_CSUM_V3: Self = Self {
+        revoke: true,
+        block_64bit: true,
+        checksum_v3: true,
     };
 
-    const SUPPORTED_INCOMPAT: u32 = JBD2_FEATURE_INCOMPAT_REVOKE | JBD2_FEATURE_INCOMPAT_64BIT;
+    const SUPPORTED_INCOMPAT: u32 =
+        JBD2_FEATURE_INCOMPAT_REVOKE | JBD2_FEATURE_INCOMPAT_64BIT | JBD2_FEATURE_INCOMPAT_CSUM_V3;
 
     pub fn from_raw(
         feature_compat: u32,
@@ -68,6 +91,7 @@ impl Jbd2Features {
         Ok(Self {
             revoke: feature_incompat & JBD2_FEATURE_INCOMPAT_REVOKE != 0,
             block_64bit: feature_incompat & JBD2_FEATURE_INCOMPAT_64BIT != 0,
+            checksum_v3: feature_incompat & JBD2_FEATURE_INCOMPAT_CSUM_V3 != 0,
         })
     }
 
@@ -80,15 +104,19 @@ impl Jbd2Features {
             JBD2_FEATURE_INCOMPAT_64BIT
         } else {
             0
+        }) | (if self.checksum_v3 {
+            JBD2_FEATURE_INCOMPAT_CSUM_V3
+        } else {
+            0
         })
     }
 }
 
-const TAG_ESCAPE: u16 = 0x0001;
-const TAG_SAME_UUID: u16 = 0x0002;
-const TAG_DELETED: u16 = 0x0004;
-const TAG_LAST: u16 = 0x0008;
-const TAG_UNSUPPORTED: u16 = !(TAG_ESCAPE | TAG_SAME_UUID | TAG_DELETED | TAG_LAST);
+const TAG_ESCAPE: u32 = 0x0001;
+const TAG_SAME_UUID: u32 = 0x0002;
+const TAG_DELETED: u32 = 0x0004;
+const TAG_LAST: u32 = 0x0008;
+const TAG_UNSUPPORTED: u32 = !(TAG_ESCAPE | TAG_SAME_UUID | TAG_DELETED | TAG_LAST);
 
 /// One metadata home block copied into a JBD2 transaction.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -199,6 +227,9 @@ impl Jbd2TransactionImage {
             );
             tag.escaped = escaped;
             tag.last = index + 1 == update_count;
+            if features.checksum_v3 {
+                tag.checksum = tag_checksum_v3(journal_uuid, sequence, &bytes);
+            }
             tags.push(tag);
             metadata_blocks.push(bytes);
         }
@@ -208,7 +239,7 @@ impl Jbd2TransactionImage {
             header: Jbd2Header::descriptor(sequence),
             tags,
         }
-        .encode_with_features(&mut descriptor, features)?;
+        .encode_with_features_and_uuid(&mut descriptor, features, journal_uuid)?;
 
         revoked_blocks.sort_unstable();
         revoked_blocks.dedup();
@@ -220,7 +251,7 @@ impl Jbd2TransactionImage {
                 header: Jbd2Header::revoke(sequence),
                 blocks: blocks.to_vec(),
             }
-            .encode_with_features(&mut page, features)?;
+            .encode_with_features_and_uuid(&mut page, features, journal_uuid)?;
             revokes.push(page);
         }
 
@@ -233,7 +264,7 @@ impl Jbd2TransactionImage {
             seconds: 0,
             nanoseconds: 0,
         }
-        .encode(&mut commit)?;
+        .encode_with_features(&mut commit, features, journal_uuid)?;
 
         Ok(Self {
             descriptor,
@@ -349,14 +380,25 @@ impl Jbd2Superblock {
                 }
                 (Jbd2Features::NONE, [0; 16])
             }
-            JBD2_BLOCK_SUPERBLOCK_V2 => (
-                Jbd2Features::from_raw(
+            JBD2_BLOCK_SUPERBLOCK_V2 => {
+                let features = Jbd2Features::from_raw(
                     read_u32(bytes, 36)?,
                     read_u32(bytes, 40)?,
                     read_u32(bytes, 44)?,
-                )?,
-                bytes[48..64].try_into().unwrap(),
-            ),
+                )?;
+                if features.checksum_v3 {
+                    require_len(bytes, JBD2_SUPERBLOCK_BYTES)?;
+                    if bytes[0x50] != JBD2_CHECKSUM_TYPE_CRC32C {
+                        return Err(Ext4FormatError::Unsupported);
+                    }
+                    verify_checksum_at(
+                        u32::MAX,
+                        &bytes[..JBD2_SUPERBLOCK_BYTES],
+                        JBD2_SUPERBLOCK_CHECKSUM_OFFSET,
+                    )?;
+                }
+                (features, bytes[48..64].try_into().unwrap())
+            }
             _ => unreachable!("superblock type was checked above"),
         };
         Ok((
@@ -385,7 +427,7 @@ impl Jbd2Superblock {
         sequence: u32,
         start: u32,
     ) -> Result<()> {
-        let observed = Self::parse(page)?;
+        let (observed, features) = Self::parse_with_features(page)?;
         if observed.block_type != self.block_type
             || observed.block_size != self.block_size
             || observed.max_len != self.max_len
@@ -400,6 +442,13 @@ impl Jbd2Superblock {
 
         write_u32(page, 24, sequence)?;
         write_u32(page, 28, start)?;
+        if features.checksum_v3 {
+            write_checksum_at(
+                u32::MAX,
+                &mut page[..JBD2_SUPERBLOCK_BYTES],
+                JBD2_SUPERBLOCK_CHECKSUM_OFFSET,
+            )?;
+        }
 
         Ok(())
     }
@@ -408,7 +457,7 @@ impl Jbd2Superblock {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Jbd2Tag {
     pub target_block: u64,
-    pub checksum: u16,
+    pub checksum: u32,
     pub uuid: Option<[u8; 16]>,
     pub escaped: bool,
     pub deleted: bool,
@@ -419,10 +468,11 @@ pub struct Jbd2Tag {
 impl Jbd2Tag {
     const LEGACY_BASE_LEN: usize = 8;
     const BLOCK_64BIT_BASE_LEN: usize = 12;
+    const CHECKSUM_V3_BASE_LEN: usize = 16;
 
     pub const fn new(
         target_block: u32,
-        checksum: u16,
+        checksum: u32,
         uuid: Option<[u8; 16]>,
         same_uuid: bool,
     ) -> Self {
@@ -431,7 +481,7 @@ impl Jbd2Tag {
 
     pub const fn new64(
         target_block: u64,
-        checksum: u16,
+        checksum: u32,
         uuid: Option<[u8; 16]>,
         same_uuid: bool,
     ) -> Self {
@@ -451,7 +501,9 @@ impl Jbd2Tag {
     }
 
     pub fn encoded_len_with_features(&self, features: Jbd2Features) -> usize {
-        let base_len = if features.block_64bit {
+        let base_len = if features.checksum_v3 {
+            Self::CHECKSUM_V3_BASE_LEN
+        } else if features.block_64bit {
             Self::BLOCK_64BIT_BASE_LEN
         } else {
             Self::LEGACY_BASE_LEN
@@ -470,7 +522,12 @@ impl Jbd2Tag {
         if !features.block_64bit && self.target_block > u32::MAX as u64 {
             return Err(Ext4FormatError::OutOfBounds);
         }
-        let base_len = if features.block_64bit {
+        if !features.checksum_v3 && self.checksum > u16::MAX as u32 {
+            return Err(Ext4FormatError::OutOfBounds);
+        }
+        let base_len = if features.checksum_v3 {
+            Self::CHECKSUM_V3_BASE_LEN
+        } else if features.block_64bit {
             Self::BLOCK_64BIT_BASE_LEN
         } else {
             Self::LEGACY_BASE_LEN
@@ -491,9 +548,15 @@ impl Jbd2Tag {
             flags |= TAG_LAST;
         }
         write_u32(bytes, 0, self.target_block as u32)?;
-        write_u16(bytes, 4, self.checksum)?;
-        write_u16(bytes, 6, flags)?;
-        if features.block_64bit {
+        if features.checksum_v3 {
+            write_u32(bytes, 4, flags)?;
+            write_u32(bytes, 8, (self.target_block >> 32) as u32)?;
+            write_u32(bytes, 12, self.checksum)?;
+        } else {
+            write_u16(bytes, 4, self.checksum as u16)?;
+            write_u16(bytes, 6, flags as u16)?;
+        }
+        if features.block_64bit && !features.checksum_v3 {
             write_u32(
                 bytes,
                 Self::LEGACY_BASE_LEN,
@@ -507,13 +570,19 @@ impl Jbd2Tag {
     }
 
     fn parse_with_features(bytes: &[u8], features: Jbd2Features) -> Result<(Self, usize)> {
-        let base_len = if features.block_64bit {
+        let base_len = if features.checksum_v3 {
+            Self::CHECKSUM_V3_BASE_LEN
+        } else if features.block_64bit {
             Self::BLOCK_64BIT_BASE_LEN
         } else {
             Self::LEGACY_BASE_LEN
         };
         require_len(bytes, base_len)?;
-        let flags = read_u16(bytes, 6)?;
+        let flags = if features.checksum_v3 {
+            read_u32(bytes, 4)?
+        } else {
+            u32::from(read_u16(bytes, 6)?)
+        };
         if flags & TAG_UNSUPPORTED != 0 {
             return Err(Ext4FormatError::Unsupported);
         }
@@ -521,16 +590,23 @@ impl Jbd2Tag {
         let len = base_len + usize::from(!same_uuid) * 16;
         require_len(bytes, len)?;
         let uuid = (!same_uuid).then(|| bytes[base_len..len].try_into().unwrap());
-        let target_block = u64::from(read_u32(bytes, 0)?)
-            | if features.block_64bit {
-                u64::from(read_u32(bytes, Self::LEGACY_BASE_LEN)?) << 32
-            } else {
-                0
-            };
+        let high = if features.checksum_v3 || features.block_64bit {
+            read_u32(bytes, Self::LEGACY_BASE_LEN)?
+        } else {
+            0
+        };
+        if !features.block_64bit && high != 0 {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        let target_block = u64::from(read_u32(bytes, 0)?) | (u64::from(high) << 32);
         Ok((
             Self {
                 target_block,
-                checksum: read_u16(bytes, 4)?,
+                checksum: if features.checksum_v3 {
+                    read_u32(bytes, 12)?
+                } else {
+                    u32::from(read_u16(bytes, 4)?)
+                },
                 uuid,
                 escaped: flags & TAG_ESCAPE != 0,
                 deleted: flags & TAG_DELETED != 0,
@@ -554,6 +630,32 @@ impl Jbd2Descriptor {
     }
 
     pub fn parse_with_features(bytes: &[u8], features: Jbd2Features) -> Result<Self> {
+        if features.checksum_v3 {
+            return Err(Ext4FormatError::Unsupported);
+        }
+        Self::parse_records(bytes, features, bytes.len())
+    }
+
+    pub fn parse_with_features_and_uuid(
+        bytes: &[u8],
+        features: Jbd2Features,
+        journal_uuid: [u8; 16],
+    ) -> Result<Self> {
+        let records_end = if features.checksum_v3 {
+            require_len(bytes, JBD2_BLOCK_SIZE)?;
+            verify_checksum_at(
+                journal_checksum_seed(journal_uuid),
+                &bytes[..JBD2_BLOCK_SIZE],
+                JBD2_BLOCK_SIZE - JBD2_BLOCK_CHECKSUM_BYTES,
+            )?;
+            JBD2_BLOCK_SIZE - JBD2_BLOCK_CHECKSUM_BYTES
+        } else {
+            bytes.len()
+        };
+        Self::parse_records(bytes, features, records_end)
+    }
+
+    fn parse_records(bytes: &[u8], features: Jbd2Features, records_end: usize) -> Result<Self> {
         let header = Jbd2Header::parse(bytes)?;
         if header.block_type != JBD2_BLOCK_DESCRIPTOR {
             return Err(Ext4FormatError::Corrupt);
@@ -561,11 +663,13 @@ impl Jbd2Descriptor {
         let mut tags = Vec::new();
         let mut offset = Jbd2Header::ENCODED_LEN;
         loop {
-            if offset == bytes.len() {
+            if offset >= records_end {
                 return Err(Ext4FormatError::Corrupt);
             }
             let (tag, consumed) = Jbd2Tag::parse_with_features(
-                bytes.get(offset..).ok_or(Ext4FormatError::Corrupt)?,
+                bytes
+                    .get(offset..records_end)
+                    .ok_or(Ext4FormatError::Corrupt)?,
                 features,
             )?;
             offset = offset
@@ -584,6 +688,41 @@ impl Jbd2Descriptor {
     }
 
     pub fn encode_with_features(&self, bytes: &mut [u8], features: Jbd2Features) -> Result<()> {
+        if features.checksum_v3 {
+            return Err(Ext4FormatError::Unsupported);
+        }
+        self.encode_records(bytes, features, bytes.len())
+    }
+
+    pub fn encode_with_features_and_uuid(
+        &self,
+        bytes: &mut [u8],
+        features: Jbd2Features,
+        journal_uuid: [u8; 16],
+    ) -> Result<()> {
+        let records_end = if features.checksum_v3 {
+            require_len(bytes, JBD2_BLOCK_SIZE)?;
+            JBD2_BLOCK_SIZE - JBD2_BLOCK_CHECKSUM_BYTES
+        } else {
+            bytes.len()
+        };
+        self.encode_records(bytes, features, records_end)?;
+        if features.checksum_v3 {
+            write_checksum_at(
+                journal_checksum_seed(journal_uuid),
+                &mut bytes[..JBD2_BLOCK_SIZE],
+                JBD2_BLOCK_SIZE - JBD2_BLOCK_CHECKSUM_BYTES,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn encode_records(
+        &self,
+        bytes: &mut [u8],
+        features: Jbd2Features,
+        records_end: usize,
+    ) -> Result<()> {
         if self.header.block_type != JBD2_BLOCK_DESCRIPTOR || self.tags.is_empty() {
             return Err(Ext4FormatError::Corrupt);
         }
@@ -595,7 +734,9 @@ impl Jbd2Descriptor {
                 return Err(Ext4FormatError::Corrupt);
             }
             let written = tag.encode_with_features(
-                bytes.get_mut(offset..).ok_or(Ext4FormatError::Truncated)?,
+                bytes
+                    .get_mut(offset..records_end)
+                    .ok_or(Ext4FormatError::Truncated)?,
                 features,
             )?;
             offset = offset
@@ -639,6 +780,22 @@ impl Jbd2Commit {
         })
     }
 
+    pub fn parse_with_features(
+        bytes: &[u8],
+        features: Jbd2Features,
+        journal_uuid: [u8; 16],
+    ) -> Result<Self> {
+        if features.checksum_v3 {
+            require_len(bytes, JBD2_BLOCK_SIZE)?;
+            verify_checksum_at(
+                journal_checksum_seed(journal_uuid),
+                &bytes[..JBD2_BLOCK_SIZE],
+                JBD2_COMMIT_CHECKSUM_OFFSET,
+            )?;
+        }
+        Self::parse(bytes)
+    }
+
     pub fn encode(&self, bytes: &mut [u8]) -> Result<()> {
         if self.header.block_type != JBD2_BLOCK_COMMIT {
             return Err(Ext4FormatError::Corrupt);
@@ -653,6 +810,30 @@ impl Jbd2Commit {
         }
         write_u64(bytes, 48, self.seconds)?;
         write_u32(bytes, 56, self.nanoseconds)
+    }
+
+    pub fn encode_with_features(
+        &self,
+        bytes: &mut [u8],
+        features: Jbd2Features,
+        journal_uuid: [u8; 16],
+    ) -> Result<()> {
+        if !features.checksum_v3 {
+            return self.encode(bytes);
+        }
+        require_len(bytes, JBD2_BLOCK_SIZE)?;
+        if self.header.block_type != JBD2_BLOCK_COMMIT {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        bytes.fill(0);
+        self.header.encode(bytes)?;
+        write_u64(bytes, 48, self.seconds)?;
+        write_u32(bytes, 56, self.nanoseconds)?;
+        write_checksum_at(
+            journal_checksum_seed(journal_uuid),
+            &mut bytes[..JBD2_BLOCK_SIZE],
+            JBD2_COMMIT_CHECKSUM_OFFSET,
+        )
     }
 }
 
@@ -671,7 +852,14 @@ impl Jbd2Revoke {
     }
 
     pub const fn max_blocks_per_page(features: Jbd2Features) -> usize {
-        (JBD2_BLOCK_SIZE - Self::HEADER_LEN) / Self::entry_len(features)
+        (JBD2_BLOCK_SIZE
+            - Self::HEADER_LEN
+            - if features.checksum_v3 {
+                JBD2_BLOCK_CHECKSUM_BYTES
+            } else {
+                0
+            })
+            / Self::entry_len(features)
     }
 
     pub const fn page_count_with_features(block_count: usize, features: Jbd2Features) -> usize {
@@ -691,6 +879,32 @@ impl Jbd2Revoke {
     }
 
     pub fn parse_with_features(bytes: &[u8], features: Jbd2Features) -> Result<Self> {
+        if features.checksum_v3 {
+            return Err(Ext4FormatError::Unsupported);
+        }
+        Self::parse_records(bytes, features, bytes.len())
+    }
+
+    pub fn parse_with_features_and_uuid(
+        bytes: &[u8],
+        features: Jbd2Features,
+        journal_uuid: [u8; 16],
+    ) -> Result<Self> {
+        let records_end = if features.checksum_v3 {
+            require_len(bytes, JBD2_BLOCK_SIZE)?;
+            verify_checksum_at(
+                journal_checksum_seed(journal_uuid),
+                &bytes[..JBD2_BLOCK_SIZE],
+                JBD2_BLOCK_SIZE - JBD2_BLOCK_CHECKSUM_BYTES,
+            )?;
+            JBD2_BLOCK_SIZE - JBD2_BLOCK_CHECKSUM_BYTES
+        } else {
+            bytes.len()
+        };
+        Self::parse_records(bytes, features, records_end)
+    }
+
+    fn parse_records(bytes: &[u8], features: Jbd2Features, records_end: usize) -> Result<Self> {
         if !features.revoke {
             return Err(Ext4FormatError::Unsupported);
         }
@@ -700,7 +914,7 @@ impl Jbd2Revoke {
             return Err(Ext4FormatError::Corrupt);
         }
         let count = read_u32(bytes, Jbd2Header::ENCODED_LEN)? as usize;
-        if count < Self::HEADER_LEN || count > bytes.len() {
+        if count < Self::HEADER_LEN || count > records_end {
             return Err(Ext4FormatError::Corrupt);
         }
         let entry_len = Self::entry_len(features);
@@ -723,6 +937,33 @@ impl Jbd2Revoke {
     }
 
     pub fn encode_with_features(&self, bytes: &mut [u8], features: Jbd2Features) -> Result<()> {
+        if features.checksum_v3 {
+            return Err(Ext4FormatError::Unsupported);
+        }
+        self.encode_records(bytes, features)
+    }
+
+    pub fn encode_with_features_and_uuid(
+        &self,
+        bytes: &mut [u8],
+        features: Jbd2Features,
+        journal_uuid: [u8; 16],
+    ) -> Result<()> {
+        if features.checksum_v3 {
+            require_len(bytes, JBD2_BLOCK_SIZE)?;
+        }
+        self.encode_records(bytes, features)?;
+        if features.checksum_v3 {
+            write_checksum_at(
+                journal_checksum_seed(journal_uuid),
+                &mut bytes[..JBD2_BLOCK_SIZE],
+                JBD2_BLOCK_SIZE - JBD2_BLOCK_CHECKSUM_BYTES,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn encode_records(&self, bytes: &mut [u8], features: Jbd2Features) -> Result<()> {
         if !features.revoke {
             return Err(Ext4FormatError::Unsupported);
         }
@@ -758,6 +999,41 @@ impl Jbd2Revoke {
         }
         Ok(())
     }
+}
+
+fn journal_checksum_seed(journal_uuid: [u8; 16]) -> u32 {
+    crc32c_append(u32::MAX, &journal_uuid)
+}
+
+fn tag_checksum_v3(journal_uuid: [u8; 16], sequence: u32, payload: &[u8; JBD2_BLOCK_SIZE]) -> u32 {
+    let checksum = crc32c_append(journal_checksum_seed(journal_uuid), &sequence.to_be_bytes());
+    crc32c_append(checksum, payload)
+}
+
+fn checksum_with_zeroed_u32(seed: u32, bytes: &[u8], offset: usize) -> Result<u32> {
+    let suffix_offset = offset
+        .checked_add(core::mem::size_of::<u32>())
+        .ok_or(Ext4FormatError::OutOfBounds)?;
+    let prefix = bytes.get(..offset).ok_or(Ext4FormatError::Truncated)?;
+    let suffix = bytes
+        .get(suffix_offset..)
+        .ok_or(Ext4FormatError::Truncated)?;
+    let checksum = crc32c_append(seed, prefix);
+    let checksum = crc32c_append(checksum, &[0; core::mem::size_of::<u32>()]);
+    Ok(crc32c_append(checksum, suffix))
+}
+
+fn verify_checksum_at(seed: u32, bytes: &[u8], offset: usize) -> Result<()> {
+    let provided = read_u32(bytes, offset)?;
+    if provided != checksum_with_zeroed_u32(seed, bytes, offset)? {
+        return Err(Ext4FormatError::Corrupt);
+    }
+    Ok(())
+}
+
+fn write_checksum_at(seed: u32, bytes: &mut [u8], offset: usize) -> Result<()> {
+    let checksum = checksum_with_zeroed_u32(seed, bytes, offset)?;
+    write_u32(bytes, offset, checksum)
 }
 
 fn require_len(bytes: &[u8], len: usize) -> Result<()> {

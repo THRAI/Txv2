@@ -5,9 +5,24 @@ use tx_ext4_format::journal::{
     JBD2_FEATURE_INCOMPAT_CSUM_V3, JBD2_FEATURE_INCOMPAT_FAST_COMMIT, JBD2_FEATURE_INCOMPAT_REVOKE,
     JBD2_MAGIC,
 };
+use tx_ext4_format::ondisk::crc32c_append;
 use tx_ext4_format::Ext4FormatError;
 
 const BLOCK_SIZE: usize = 4096;
+
+fn journal_seed(uuid: &[u8; 16]) -> u32 {
+    crc32c_append(u32::MAX, uuid)
+}
+
+fn journal_block_checksum(uuid: &[u8; 16], block: &[u8]) -> u32 {
+    crc32c_append(journal_seed(uuid), block)
+}
+
+fn install_superblock_v3_checksum(block: &mut [u8; BLOCK_SIZE]) {
+    block[0xFC..0x100].fill(0);
+    let checksum = crc32c_append(u32::MAX, &block[..1024]);
+    block[0xFC..0x100].copy_from_slice(&checksum.to_be_bytes());
+}
 
 #[test]
 fn descriptor_round_trip_preserves_multiple_legacy_tags() {
@@ -66,6 +81,46 @@ fn descriptor_64bit_tag_golden_layout_has_high_block_word() {
     assert_eq!(
         descriptor.encode_legacy(&mut block),
         Err(Ext4FormatError::OutOfBounds)
+    );
+}
+
+#[test]
+fn descriptor_v3_tag_has_fixed_16_byte_layout_and_crc32c_tail() {
+    let uuid = [0xA5; 16];
+    let features = Jbd2Features::REVOKE_64BIT_CSUM_V3;
+    let mut tag = Jbd2Tag::new64(0x0102_0304_0506_0708, 0x1112_1314, Some(uuid), false);
+    tag.last = true;
+    let descriptor = Jbd2Descriptor {
+        header: Jbd2Header::descriptor(0x2122_2324),
+        tags: vec![tag],
+    };
+    let mut block = [0u8; BLOCK_SIZE];
+
+    descriptor
+        .encode_with_features_and_uuid(&mut block, features, uuid)
+        .unwrap();
+
+    assert_eq!(
+        &block[12..28],
+        &[
+            0x05, 0x06, 0x07, 0x08, 0x00, 0x00, 0x00, 0x08, 0x01, 0x02, 0x03, 0x04, 0x11, 0x12,
+            0x13, 0x14,
+        ]
+    );
+    assert_eq!(&block[28..44], &uuid);
+    let stored = u32::from_be_bytes(block[BLOCK_SIZE - 4..].try_into().unwrap());
+    let mut zeroed = block;
+    zeroed[BLOCK_SIZE - 4..].fill(0);
+    assert_eq!(stored, journal_block_checksum(&uuid, &zeroed));
+    assert_eq!(
+        Jbd2Descriptor::parse_with_features_and_uuid(&block, features, uuid).unwrap(),
+        descriptor
+    );
+
+    block[40] ^= 1;
+    assert_eq!(
+        Jbd2Descriptor::parse_with_features_and_uuid(&block, features, uuid),
+        Err(Ext4FormatError::Corrupt)
     );
 }
 
@@ -149,6 +204,77 @@ fn revoke_64bit_entry_golden_layout_uses_eight_bytes() {
 }
 
 #[test]
+fn revoke_v3_reserves_and_verifies_checksum_tail() {
+    let uuid = [0x4D; 16];
+    let features = Jbd2Features::REVOKE_64BIT_CSUM_V3;
+    let revoke = Jbd2Revoke {
+        header: Jbd2Header::revoke(123),
+        blocks: vec![0x0102_0304_0506_0708, 0x1112_1314_1516_1718],
+    };
+    let mut block = [0u8; BLOCK_SIZE];
+
+    revoke
+        .encode_with_features_and_uuid(&mut block, features, uuid)
+        .unwrap();
+
+    assert_eq!(&block[12..16], &32u32.to_be_bytes());
+    let stored = u32::from_be_bytes(block[BLOCK_SIZE - 4..].try_into().unwrap());
+    let mut zeroed = block;
+    zeroed[BLOCK_SIZE - 4..].fill(0);
+    assert_eq!(stored, journal_block_checksum(&uuid, &zeroed));
+    assert_eq!(
+        Jbd2Revoke::parse_with_features_and_uuid(&block, features, uuid).unwrap(),
+        revoke
+    );
+    assert_eq!(Jbd2Revoke::max_blocks_per_page(features), 509);
+
+    block[20] ^= 1;
+    assert_eq!(
+        Jbd2Revoke::parse_with_features_and_uuid(&block, features, uuid),
+        Err(Ext4FormatError::Corrupt)
+    );
+}
+
+#[test]
+fn commit_v3_uses_uuid_seeded_full_block_checksum() {
+    let uuid = [0x71; 16];
+    let features = Jbd2Features::CSUM_V3;
+    let commit = Jbd2Commit {
+        header: Jbd2Header::commit(88),
+        checksum_type: 7,
+        checksum_size: 9,
+        checksums: [0xDEAD_BEEF; 8],
+        seconds: 0x0102_0304_0506_0708,
+        nanoseconds: 99,
+    };
+    let mut block = [0u8; BLOCK_SIZE];
+
+    commit
+        .encode_with_features(&mut block, features, uuid)
+        .unwrap();
+
+    assert_eq!(block[12], 0);
+    assert_eq!(block[13], 0);
+    assert!(block[20..48].iter().all(|byte| *byte == 0));
+    let stored = u32::from_be_bytes(block[16..20].try_into().unwrap());
+    let mut zeroed = block;
+    zeroed[16..20].fill(0);
+    assert_eq!(stored, journal_block_checksum(&uuid, &zeroed));
+    assert_eq!(
+        Jbd2Commit::parse_with_features(&block, features, uuid)
+            .unwrap()
+            .header,
+        commit.header
+    );
+
+    block[100] ^= 1;
+    assert_eq!(
+        Jbd2Commit::parse_with_features(&block, features, uuid),
+        Err(Ext4FormatError::Corrupt)
+    );
+}
+
+#[test]
 fn header_rejects_wrong_magic() {
     let mut bytes = [0u8; Jbd2Header::ENCODED_LEN];
     bytes[..4].copy_from_slice(&(JBD2_MAGIC ^ 1).to_be_bytes());
@@ -218,7 +344,6 @@ fn superblock_strictly_accepts_only_revoke_and_64bit_features() {
     for unsupported in [
         JBD2_FEATURE_INCOMPAT_ASYNC_COMMIT,
         JBD2_FEATURE_INCOMPAT_CSUM_V2,
-        JBD2_FEATURE_INCOMPAT_CSUM_V3,
         JBD2_FEATURE_INCOMPAT_FAST_COMMIT,
         0x8000_0000,
     ] {
@@ -240,6 +365,78 @@ fn superblock_strictly_accepts_only_revoke_and_64bit_features() {
     assert_eq!(
         Jbd2Superblock::parse(&bytes),
         Err(Ext4FormatError::Unsupported)
+    );
+}
+
+#[test]
+fn superblock_v3_validates_type_crc_and_recomputes_crc_on_state_update() {
+    let uuid = [0x5A; 16];
+    let mut bytes = [0u8; BLOCK_SIZE];
+    bytes[..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
+    bytes[4..8].copy_from_slice(&4u32.to_be_bytes());
+    bytes[8..12].copy_from_slice(&17u32.to_be_bytes());
+    bytes[12..16].copy_from_slice(&(BLOCK_SIZE as u32).to_be_bytes());
+    bytes[16..20].copy_from_slice(&128u32.to_be_bytes());
+    bytes[20..24].copy_from_slice(&1u32.to_be_bytes());
+    bytes[24..28].copy_from_slice(&18u32.to_be_bytes());
+    bytes[28..32].copy_from_slice(&7u32.to_be_bytes());
+    bytes[40..44].copy_from_slice(
+        &(JBD2_FEATURE_INCOMPAT_REVOKE
+            | JBD2_FEATURE_INCOMPAT_64BIT
+            | JBD2_FEATURE_INCOMPAT_CSUM_V3)
+            .to_be_bytes(),
+    );
+    bytes[48..64].copy_from_slice(&uuid);
+    bytes[0x50] = 4;
+    bytes[0x100..].fill(0xC3);
+    install_superblock_v3_checksum(&mut bytes);
+
+    let (superblock, features) = Jbd2Superblock::parse_with_features(&bytes).unwrap();
+    assert_eq!(features, Jbd2Features::REVOKE_64BIT_CSUM_V3);
+    let before_tail = bytes[0x100..].to_vec();
+    let old_checksum = bytes[0xFC..0x100].to_vec();
+
+    superblock.write_state(&mut bytes, 19, 0).unwrap();
+
+    assert_ne!(&bytes[0xFC..0x100], old_checksum.as_slice());
+    assert_eq!(&bytes[0x100..], before_tail.as_slice());
+    let stored = u32::from_be_bytes(bytes[0xFC..0x100].try_into().unwrap());
+    let mut zeroed = bytes;
+    zeroed[0xFC..0x100].fill(0);
+    assert_eq!(stored, crc32c_append(u32::MAX, &zeroed[..1024]));
+    assert_eq!(Jbd2Superblock::parse(&bytes).unwrap().start, 0);
+
+    let mut mixed_v2_v3 = bytes;
+    mixed_v2_v3[40..44].copy_from_slice(
+        &(JBD2_FEATURE_INCOMPAT_REVOKE
+            | JBD2_FEATURE_INCOMPAT_64BIT
+            | JBD2_FEATURE_INCOMPAT_CSUM_V2
+            | JBD2_FEATURE_INCOMPAT_CSUM_V3)
+            .to_be_bytes(),
+    );
+    install_superblock_v3_checksum(&mut mixed_v2_v3);
+    assert_eq!(
+        Jbd2Superblock::parse(&mixed_v2_v3),
+        Err(Ext4FormatError::Unsupported)
+    );
+
+    let mut wrong_type = bytes;
+    wrong_type[0x50] = 1;
+    install_superblock_v3_checksum(&mut wrong_type);
+    assert_eq!(
+        Jbd2Superblock::parse(&wrong_type),
+        Err(Ext4FormatError::Unsupported)
+    );
+
+    let mut corrupt = bytes;
+    corrupt[100] ^= 1;
+    assert_eq!(
+        Jbd2Superblock::parse(&corrupt),
+        Err(Ext4FormatError::Corrupt)
+    );
+    assert_eq!(
+        Jbd2Superblock::parse(&bytes[..1023]),
+        Err(Ext4FormatError::Truncated)
     );
 }
 
