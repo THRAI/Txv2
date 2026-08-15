@@ -3786,6 +3786,8 @@ impl<P: TxPlatform> CoreInit<P> {
         // case; make those children visible before the AP decides to WFI.
         let submitted_child = Self::drain_pending_child_submits();
         let drained_terminal_after_poll = Self::drain_terminal_thread_reactor_tasks();
+        let resubmitted_file_io = step.as_ref().is_some_and(|step| step.should_idle())
+            && tx_subsystems::device::submit_pending_file_io_service_runtimes() != 0;
         let woke_unowned_file_io = step.as_ref().is_some_and(|step| step.should_idle())
             && tx_subsystems::device::wake_unowned_file_io_service_runtimes() != 0;
 
@@ -3794,6 +3796,7 @@ impl<P: TxPlatform> CoreInit<P> {
             || drained_terminal_before_submit
             || submitted_child
             || drained_terminal_after_poll
+            || resubmitted_file_io
             || woke_unowned_file_io
             || step.is_some_and(|step| !step.should_idle())
     }
