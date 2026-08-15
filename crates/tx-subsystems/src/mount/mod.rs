@@ -3,7 +3,7 @@
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak as ArcWeak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 pub mod adapter;
 pub mod settlement;
@@ -12,7 +12,7 @@ pub use settlement::{MountSettlementOp, MountTransactionFrontier, SettlementScop
 
 use adapter::runtime::{
     self, Cap, Dead, Entity, IdentitySlot, PayloadBinding, PayloadCap, PayloadPolicy, SlotKey,
-    SpinMutex, Zone, ZoneAllocated, ZoneError,
+    SpinMutex, Weak, Zone, ZoneAllocated, ZoneError,
 };
 
 use crate::device::BlockDevice;
@@ -26,7 +26,7 @@ use crate::io_manager::page::{service::PageServiceBackendContext, PageIoRequest}
 use crate::page_backed::{ErrorCursor, FsPageBacking, PageContainer};
 use crate::vfs::{
     adapter::step_engine::{Guard, NoProgress, StepOutcome},
-    render_dentry_path, DEntry, FsObjectId, FsOps, InlineName, InodeMeta, RNode,
+    render_dentry_path, DEntry, DEntryRetireToken, FsObjectId, FsOps, InlineName, InodeMeta, RNode,
 };
 
 static MOUNT_IDENTITY_ZONE: Zone<MountIdentity> = Zone::const_new();
@@ -35,6 +35,93 @@ static MOUNT_NAMESPACE_ZONE: Zone<MountNamespace> = Zone::const_new();
 static MOUNT_API_FILE_ZONE: Zone<MountApiFile> = Zone::const_new();
 static BACKGROUND_MOUNT_SETTLEMENT_QUEUE: SpinMutex<Vec<MountSettlementOp>> =
     SpinMutex::new(Vec::new());
+static PENDING_FS_OBJECT_DESTROY_QUEUE: SpinMutex<Vec<PendingFsObjectDestroy>> =
+    SpinMutex::new(Vec::new());
+
+struct PendingFsObjectDestroy {
+    mount: MountPayloadPin,
+    fs_object_id: FsObjectId,
+    destroy_token: FsObjectDestroyToken,
+    verify_zero_links: bool,
+    wait_for_liveness: Vec<PendingFsObjectLiveness>,
+}
+
+const FS_OBJECT_DESTROY_LIVE: u8 = 0;
+const FS_OBJECT_DESTROY_CLAIMED: u8 = 1;
+const FS_OBJECT_DESTROYED: u8 = 2;
+
+struct FsObjectDestroyState {
+    state: AtomicU8,
+}
+
+/// Generation-shaped completion token shared by an inode lifetime and any
+/// post-namespace destroy ticket created for that same lifetime.
+#[derive(Clone)]
+pub struct FsObjectDestroyToken(Arc<FsObjectDestroyState>);
+
+impl FsObjectDestroyToken {
+    fn new() -> Self {
+        Self(Arc::new(FsObjectDestroyState {
+            state: AtomicU8::new(FS_OBJECT_DESTROY_LIVE),
+        }))
+    }
+
+    fn same_lifetime(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    fn is_destroyed(&self) -> bool {
+        self.0.state.load(Ordering::Acquire) == FS_OBJECT_DESTROYED
+    }
+
+    fn try_claim(&self) -> bool {
+        self.0
+            .state
+            .compare_exchange(
+                FS_OBJECT_DESTROY_LIVE,
+                FS_OBJECT_DESTROY_CLAIMED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn release_claim(&self) {
+        let _ = self.0.state.compare_exchange(
+            FS_OBJECT_DESTROY_CLAIMED,
+            FS_OBJECT_DESTROY_LIVE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn complete(&self) {
+        self.0.state.store(FS_OBJECT_DESTROYED, Ordering::Release);
+    }
+}
+
+struct PendingFsObjectLiveness {
+    dentry: Weak<DEntry>,
+    rnode: Weak<RNode>,
+    dentry_retired: DEntryRetireToken,
+}
+
+impl PendingFsObjectLiveness {
+    fn is_dead(&self, guard: &Guard<'_>) -> bool {
+        if self.dentry.observe(guard).is_some() {
+            return false;
+        }
+        if self.dentry_retired.retired() {
+            return self.rnode.observe(guard).is_none();
+        }
+        match self.rnode.upgrade(guard) {
+            // The probe Cap plus the EBR-delayed DEntry-owned Cap are the only
+            // retains when no open file/cwd still owns this RNode.
+            Some(rnode) => rnode.retain_count() == 2,
+            None => true,
+        }
+    }
+}
 
 unsafe impl ZoneAllocated for MountIdentity {
     fn zone() -> &'static Zone<Self> {
@@ -472,6 +559,7 @@ impl MountPayload {
         let lifetime = Arc::new(FsObjectLifetime {
             mount,
             fs_object_id,
+            destroy_token: FsObjectDestroyToken::new(),
         });
         objects.insert(fs_object_id, Arc::downgrade(&lifetime));
         FsObjectPin(lifetime)
@@ -647,6 +735,211 @@ pub fn drive_background_mount_settlement_once(guard: &Guard<'_>) -> StepOutcome<
     }
 }
 
+fn queue_pending_fs_object_destroy(
+    mount: &MountPayloadPin,
+    fs_object_id: FsObjectId,
+    destroy_token: FsObjectDestroyToken,
+) {
+    if destroy_token.is_destroyed() {
+        return;
+    }
+    let pending = PendingFsObjectDestroy {
+        mount: mount.clone(),
+        fs_object_id,
+        destroy_token: destroy_token.clone(),
+        verify_zero_links: true,
+        wait_for_liveness: Vec::new(),
+    };
+    let mut queue = PENDING_FS_OBJECT_DESTROY_QUEUE.lock();
+    if let Some(candidate) = queue.iter_mut().find(|candidate| {
+        candidate.mount.payload().key() == mount.payload().key()
+            && candidate.fs_object_id == fs_object_id
+            && candidate.destroy_token.same_lifetime(&destroy_token)
+    }) {
+        candidate.wait_for_liveness.clear();
+        drop(queue);
+        drop(pending);
+        return;
+    }
+    queue.push(pending);
+}
+
+/// Retain a post-namespace destroy ticket until its dentry is no longer live
+/// and no open/cwd RNode retain remains. This closes the gap between the last
+/// logical `Cap` drop and EBR-delayed physical destruction.
+pub fn queue_fs_object_destroy_after_dentry_retire(
+    mount: &Cap<MountPayload>,
+    fs_object_id: FsObjectId,
+    destroy_token: Option<FsObjectDestroyToken>,
+    dentry: Weak<DEntry>,
+    rnode: Weak<RNode>,
+    dentry_retired: DEntryRetireToken,
+) {
+    let destroy_token = destroy_token.unwrap_or_else(FsObjectDestroyToken::new);
+    if destroy_token.is_destroyed() {
+        return;
+    }
+    let pending = PendingFsObjectDestroy {
+        mount: MountPayloadPin::acquire_cap(mount),
+        fs_object_id,
+        destroy_token: destroy_token.clone(),
+        verify_zero_links: false,
+        wait_for_liveness: alloc::vec![PendingFsObjectLiveness {
+            dentry,
+            rnode,
+            dentry_retired,
+        }],
+    };
+    let mut queue = PENDING_FS_OBJECT_DESTROY_QUEUE.lock();
+    if let Some(candidate) = queue.iter_mut().find(|candidate| {
+        candidate.mount.payload().key() == mount.key()
+            && candidate.fs_object_id == fs_object_id
+            && candidate.destroy_token.same_lifetime(&destroy_token)
+    }) {
+        candidate.verify_zero_links = false;
+        if !candidate.wait_for_liveness.is_empty()
+            && !candidate.wait_for_liveness.iter().any(|existing| {
+                existing.dentry.key() == dentry.key()
+                    && existing.dentry.generation() == dentry.generation()
+            })
+        {
+            candidate.wait_for_liveness.push(PendingFsObjectLiveness {
+                dentry,
+                rnode,
+                dentry_retired: pending.wait_for_liveness[0].dentry_retired.clone(),
+            });
+        }
+        drop(queue);
+        drop(pending);
+        return;
+    }
+    queue.push(pending);
+}
+
+fn pending_fs_object_destroy_for_mount(mount: &MountPayloadPin, guard: &Guard<'_>) -> bool {
+    PENDING_FS_OBJECT_DESTROY_QUEUE
+        .lock()
+        .iter()
+        .any(|candidate| {
+            candidate.mount.payload().key() == mount.payload().key()
+                && (candidate.destroy_token.is_destroyed()
+                    || candidate
+                        .wait_for_liveness
+                        .iter()
+                        .all(|liveness| liveness.is_dead(guard)))
+        })
+}
+
+fn drive_pending_fs_object_destroy_once(
+    mount: &MountPayloadPin,
+    guard: &Guard<'_>,
+) -> StepOutcome<(), NoProgress> {
+    let pending = {
+        let mut queue = PENDING_FS_OBJECT_DESTROY_QUEUE.lock();
+        let Some(index) = queue.iter().position(|candidate| {
+            candidate.mount.payload().key() == mount.payload().key()
+                && (candidate.destroy_token.is_destroyed()
+                    || candidate
+                        .wait_for_liveness
+                        .iter()
+                        .all(|liveness| liveness.is_dead(guard)))
+        }) else {
+            return StepOutcome::done(());
+        };
+        queue.swap_remove(index)
+    };
+
+    if pending.destroy_token.is_destroyed() {
+        drop(pending);
+        return if pending_fs_object_destroy_for_mount(mount, guard) {
+            StepOutcome::continue_with(NoProgress)
+        } else {
+            StepOutcome::done(())
+        };
+    }
+    if pending.verify_zero_links {
+        match pending
+            .mount
+            .payload()
+            .fs_ops()
+            .load_inode_meta(pending.fs_object_id, guard)
+        {
+            StepOutcome::Done(meta) if meta.nlinks != 0 => {
+                pending.destroy_token.complete();
+                drop(pending);
+                return if pending_fs_object_destroy_for_mount(mount, guard) {
+                    StepOutcome::continue_with(NoProgress)
+                } else {
+                    StepOutcome::done(())
+                };
+            }
+            StepOutcome::Done(_) => {}
+            StepOutcome::Continue { progress } => {
+                PENDING_FS_OBJECT_DESTROY_QUEUE.lock().push(pending);
+                return StepOutcome::Continue { progress };
+            }
+            StepOutcome::Yield { progress, shape } => {
+                PENDING_FS_OBJECT_DESTROY_QUEUE.lock().push(pending);
+                return StepOutcome::Yield { progress, shape };
+            }
+            StepOutcome::Err(errno) if Errno::from(errno) == Errno::ENOENT => {
+                pending.destroy_token.complete();
+                drop(pending);
+                return if pending_fs_object_destroy_for_mount(mount, guard) {
+                    StepOutcome::continue_with(NoProgress)
+                } else {
+                    StepOutcome::done(())
+                };
+            }
+            StepOutcome::Err(errno) => {
+                PENDING_FS_OBJECT_DESTROY_QUEUE.lock().push(pending);
+                return StepOutcome::err(errno);
+            }
+        }
+    }
+    if !pending.destroy_token.try_claim() {
+        PENDING_FS_OBJECT_DESTROY_QUEUE.lock().push(pending);
+        return StepOutcome::continue_with(NoProgress);
+    }
+
+    match pending
+        .mount
+        .payload()
+        .fs_ops()
+        .destroy_inode(pending.fs_object_id, guard)
+    {
+        StepOutcome::Done(()) => {
+            pending.destroy_token.complete();
+            drop(pending);
+            if pending_fs_object_destroy_for_mount(mount, guard) {
+                StepOutcome::continue_with(NoProgress)
+            } else {
+                StepOutcome::done(())
+            }
+        }
+        StepOutcome::Continue { progress } => {
+            pending.destroy_token.release_claim();
+            PENDING_FS_OBJECT_DESTROY_QUEUE.lock().push(pending);
+            StepOutcome::Continue { progress }
+        }
+        StepOutcome::Yield { progress, shape } => {
+            pending.destroy_token.release_claim();
+            PENDING_FS_OBJECT_DESTROY_QUEUE.lock().push(pending);
+            StepOutcome::Yield { progress, shape }
+        }
+        StepOutcome::Err(errno) if matches!(Errno::from(errno), Errno::EAGAIN | Errno::EBUSY) => {
+            pending.destroy_token.release_claim();
+            PENDING_FS_OBJECT_DESTROY_QUEUE.lock().push(pending);
+            StepOutcome::continue_with(NoProgress)
+        }
+        StepOutcome::Err(errno) => {
+            pending.destroy_token.release_claim();
+            PENDING_FS_OBJECT_DESTROY_QUEUE.lock().push(pending);
+            StepOutcome::err(errno)
+        }
+    }
+}
+
 impl core::fmt::Debug for MountPayload {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("MountPayload")
@@ -713,17 +1006,76 @@ impl Drop for MountPayloadPin {
 pub struct FsObjectLifetime {
     mount: MountPayloadPin,
     fs_object_id: FsObjectId,
+    destroy_token: FsObjectDestroyToken,
 }
 
 impl Drop for FsObjectLifetime {
     fn drop(&mut self) {
+        if self.destroy_token.is_destroyed() {
+            return;
+        }
         let guard = crate::vfs::adapter::step_engine::borrow_current_guard()
             .unwrap_or_else(crate::vfs::adapter::step_engine::guard);
-        let _ = self
+        match self
+            .mount
+            .payload()
+            .fs_ops()
+            .load_inode_meta(self.fs_object_id, &guard)
+        {
+            StepOutcome::Done(meta) if meta.nlinks != 0 => {
+                self.destroy_token.complete();
+                return;
+            }
+            StepOutcome::Done(_) => {}
+            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+                queue_pending_fs_object_destroy(
+                    &self.mount,
+                    self.fs_object_id,
+                    self.destroy_token.clone(),
+                );
+                return;
+            }
+            StepOutcome::Err(errno) if Errno::from(errno) == Errno::ENOENT => {
+                self.destroy_token.complete();
+                return;
+            }
+            StepOutcome::Err(_) => return,
+        }
+        if !self.destroy_token.try_claim() {
+            queue_pending_fs_object_destroy(
+                &self.mount,
+                self.fs_object_id,
+                self.destroy_token.clone(),
+            );
+            return;
+        }
+        let outcome = self
             .mount
             .payload()
             .fs_ops()
             .destroy_inode(self.fs_object_id, &guard);
+        match outcome {
+            StepOutcome::Done(()) => self.destroy_token.complete(),
+            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+                self.destroy_token.release_claim();
+                queue_pending_fs_object_destroy(
+                    &self.mount,
+                    self.fs_object_id,
+                    self.destroy_token.clone(),
+                );
+            }
+            StepOutcome::Err(errno)
+                if matches!(Errno::from(errno), Errno::EAGAIN | Errno::EBUSY) =>
+            {
+                self.destroy_token.release_claim();
+                queue_pending_fs_object_destroy(
+                    &self.mount,
+                    self.fs_object_id,
+                    self.destroy_token.clone(),
+                );
+            }
+            StepOutcome::Err(_) => self.destroy_token.release_claim(),
+        }
     }
 }
 
@@ -743,6 +1095,10 @@ impl FsObjectPin {
 
     pub fn fs_object_id(&self) -> FsObjectId {
         self.0.fs_object_id
+    }
+
+    pub fn destroy_token(&self) -> FsObjectDestroyToken {
+        self.0.destroy_token.clone()
     }
 }
 
@@ -3296,7 +3652,7 @@ mod settlement_lifecycle_tests {
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-    use super::{DevId, MountOptions, MountPayload, MountPayloadPin, SourceLabel};
+    use super::{DevId, FsObjectPin, MountOptions, MountPayload, MountPayloadPin, SourceLabel};
     use crate::execution::{Errno, Guard};
     use crate::io_manager::page::PageGeneration;
     use crate::mount::settlement::{
@@ -3308,10 +3664,14 @@ mod settlement_lifecycle_tests {
     };
     use crate::sync::SpinMutex;
     use crate::vfs::adapter::step_engine::{Cap, NoProgress, PayloadCap, StepOutcome};
-    use crate::vfs::{Credential, DirCursor, DirEntry, FsObjectId, FsOps, InodeKind, InodeMeta};
+    use crate::vfs::{
+        Credential, DEntry, DirCursor, DirEntry, FsObjectId, FsOps, InlineName, InodeKind,
+        InodeMeta, RNode, RNodeBacking,
+    };
 
     struct SettlementFs {
         shutdown_count: AtomicU32,
+        destroy_count: AtomicU32,
         file_settlement_count: AtomicU32,
         mount_settlement_count: AtomicU32,
         last_file_settlement_object: AtomicU64,
@@ -3319,12 +3679,15 @@ mod settlement_lifecycle_tests {
         last_mount_settlement_frontier: SpinMutex<Option<MountTransactionFrontier>>,
         fail_shutdown: AtomicBool,
         eagain_before_done: AtomicU32,
+        destroy_yield_before_done: AtomicU32,
+        destroy_candidate_nlinks: AtomicU32,
     }
 
     impl SettlementFs {
         fn new(fail_shutdown: bool) -> Self {
             Self {
                 shutdown_count: AtomicU32::new(0),
+                destroy_count: AtomicU32::new(0),
                 file_settlement_count: AtomicU32::new(0),
                 mount_settlement_count: AtomicU32::new(0),
                 last_file_settlement_object: AtomicU64::new(0),
@@ -3332,11 +3695,17 @@ mod settlement_lifecycle_tests {
                 last_mount_settlement_frontier: SpinMutex::new(None),
                 fail_shutdown: AtomicBool::new(fail_shutdown),
                 eagain_before_done: AtomicU32::new(0),
+                destroy_yield_before_done: AtomicU32::new(0),
+                destroy_candidate_nlinks: AtomicU32::new(0),
             }
         }
 
         fn shutdown_count(&self) -> u32 {
             self.shutdown_count.load(Ordering::Acquire)
+        }
+
+        fn destroy_count(&self) -> u32 {
+            self.destroy_count.load(Ordering::Acquire)
         }
 
         fn file_settlement_count(&self) -> u32 {
@@ -3362,6 +3731,16 @@ mod settlement_lifecycle_tests {
         fn set_eagain_before_done(&self, count: u32) {
             self.eagain_before_done.store(count, Ordering::Release);
         }
+
+        fn set_destroy_yield_before_done(&self, count: u32) {
+            self.destroy_yield_before_done
+                .store(count, Ordering::Release);
+        }
+
+        fn set_destroy_candidate_nlinks(&self, nlinks: u32) {
+            self.destroy_candidate_nlinks
+                .store(nlinks, Ordering::Release);
+        }
     }
 
     impl FsOps for SettlementFs {
@@ -3379,7 +3758,9 @@ mod settlement_lifecycle_tests {
             _fs_object_id: FsObjectId,
             _guard: &Guard<'_>,
         ) -> StepOutcome<InodeMeta, NoProgress> {
-            StepOutcome::done(InodeMeta::new(InodeKind::Directory, 0o040755))
+            let mut meta = InodeMeta::new(InodeKind::Directory, 0o040755);
+            meta.nlinks = self.destroy_candidate_nlinks.load(Ordering::Acquire);
+            StepOutcome::done(meta)
         }
 
         fn serialize_inode_meta(
@@ -3479,6 +3860,21 @@ mod settlement_lifecycle_tests {
             _fs_object_id: FsObjectId,
             _guard: &Guard<'_>,
         ) -> StepOutcome<(), NoProgress> {
+            self.destroy_count.fetch_add(1, Ordering::AcqRel);
+            let mut remaining = self.destroy_yield_before_done.load(Ordering::Acquire);
+            while remaining != 0 {
+                match self.destroy_yield_before_done.compare_exchange_weak(
+                    remaining,
+                    remaining - 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        return StepOutcome::yield_on_wait_source(NoProgress, 13, 0x55);
+                    }
+                    Err(next) => remaining = next,
+                }
+            }
             StepOutcome::done(())
         }
 
@@ -3666,7 +4062,7 @@ mod settlement_lifecycle_tests {
         let guard = crate::vfs::adapter::step_engine::guard();
         assert_eq!(
             super::drive_background_mount_settlement_once(&guard),
-            StepOutcome::err(Errno::EAGAIN.into())
+            StepOutcome::continue_with(NoProgress)
         );
         assert_eq!(payload.runtime_state(), MountRuntimeState::Quiescing);
         assert_eq!(payload.payload_pin_count(), 1);
@@ -3680,6 +4076,220 @@ mod settlement_lifecycle_tests {
         assert_eq!(payload.runtime_state(), MountRuntimeState::Detached);
         assert_eq!(payload.payload_pin_count(), 0);
         assert_eq!(super::background_mount_settlement_queue_len(), 0);
+    }
+
+    #[test]
+    fn mount_settlement_retries_destroy_yielded_from_last_object_pin_drop() {
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        let (payload, fs) = settlement_payload(false);
+        fs.set_destroy_yield_before_done(1);
+
+        let object = FsObjectPin::acquire(&payload, FsObjectId::new(12));
+        drop(object);
+        assert_eq!(fs.destroy_count(), 1);
+
+        let pin = MountPayloadPin::acquire(&PayloadCap::from_cap(payload));
+        let mut op = MountSettlementOp::new(
+            pin,
+            SettlementScope::Mount {
+                transaction_frontier: MountTransactionFrontier::new(1),
+            },
+        )
+        .expect("claim mount settlement");
+        let guard = crate::vfs::adapter::step_engine::guard();
+        assert_eq!(op.drive(&guard), StepOutcome::done(()));
+        assert_eq!(fs.destroy_count(), 2);
+        assert_eq!(fs.mount_settlement_count(), 1);
+    }
+
+    #[test]
+    fn lifetime_drop_does_not_queue_linked_inode_when_destroy_would_yield() {
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        let (payload, fs) = settlement_payload(false);
+        fs.set_destroy_candidate_nlinks(1);
+        fs.set_destroy_yield_before_done(1);
+
+        let object = FsObjectPin::acquire(&payload, FsObjectId::new(16));
+        drop(object);
+        assert_eq!(
+            fs.destroy_count(),
+            0,
+            "a linked inode must be filtered before destroy admission can yield"
+        );
+
+        let pin = MountPayloadPin::acquire(&PayloadCap::from_cap(payload));
+        let mut op = MountSettlementOp::new(
+            pin,
+            SettlementScope::Mount {
+                transaction_frontier: MountTransactionFrontier::new(1),
+            },
+        )
+        .expect("claim mount settlement");
+        let guard = crate::vfs::adapter::step_engine::guard();
+        assert_eq!(op.drive(&guard), StepOutcome::done(()));
+        assert_eq!(fs.destroy_count(), 0);
+    }
+
+    #[test]
+    fn mount_settlement_does_not_repeat_destroy_after_lifetime_drop_succeeds() {
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        let (payload, fs) = settlement_payload(false);
+        let fs_object_id = FsObjectId::new(15);
+
+        let object = FsObjectPin::acquire(&payload, fs_object_id);
+        let destroy_token = object.destroy_token();
+        drop(object);
+        assert_eq!(fs.destroy_count(), 1);
+
+        let rnode = RNode::new_cap_in_mount(
+            fs_object_id,
+            InodeMeta::new(InodeKind::Directory, 0o040755),
+            RNodeBacking::Directory,
+            &payload,
+        )
+        .expect("mounted rnode");
+        let dentry = DEntry::new_cap(InlineName::ROOT, rnode.clone()).expect("dentry");
+        super::queue_fs_object_destroy_after_dentry_retire(
+            &payload,
+            fs_object_id,
+            Some(destroy_token),
+            dentry.downgrade(),
+            rnode.downgrade(),
+            dentry.retire_token(),
+        );
+        drop(rnode);
+        drop(dentry);
+
+        let pin = MountPayloadPin::acquire(&PayloadCap::from_cap(payload));
+        let mut op = MountSettlementOp::new(
+            pin,
+            SettlementScope::Mount {
+                transaction_frontier: MountTransactionFrontier::new(1),
+            },
+        )
+        .expect("claim mount settlement");
+        let guard = crate::vfs::adapter::step_engine::guard();
+        assert_eq!(op.drive(&guard), StepOutcome::done(()));
+        assert_eq!(
+            fs.destroy_count(),
+            1,
+            "a post-commit ticket must not repeat a successful lifetime destroy"
+        );
+    }
+
+    #[test]
+    fn mount_settlement_destroys_unlinked_rnode_before_ebr_reclaims_its_slot() {
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        let (payload, fs) = settlement_payload(false);
+        let fs_object_id = FsObjectId::new(13);
+        let rnode = RNode::new_cap_in_mount(
+            fs_object_id,
+            InodeMeta::new(InodeKind::Directory, 0o040755),
+            RNodeBacking::Directory,
+            &payload,
+        )
+        .expect("mounted rnode");
+        let dentry = DEntry::new_cap(InlineName::ROOT, rnode.clone()).expect("dentry");
+        super::queue_fs_object_destroy_after_dentry_retire(
+            &payload,
+            fs_object_id,
+            rnode.fs_object_destroy_token(),
+            dentry.downgrade(),
+            rnode.downgrade(),
+            dentry.retire_token(),
+        );
+        drop(rnode);
+        drop(dentry);
+        assert_eq!(fs.destroy_count(), 0);
+
+        let pin = MountPayloadPin::acquire(&PayloadCap::from_cap(payload));
+        let mut op = MountSettlementOp::new(
+            pin,
+            SettlementScope::Mount {
+                transaction_frontier: MountTransactionFrontier::new(1),
+            },
+        )
+        .expect("claim mount settlement");
+        let guard = crate::vfs::adapter::step_engine::guard();
+        assert_eq!(op.drive(&guard), StepOutcome::done(()));
+        assert_eq!(fs.destroy_count(), 1);
+        assert_eq!(fs.mount_settlement_count(), 1);
+        drop(guard);
+        drop(op);
+        for _ in 0..3 {
+            let _ = tx_substrate::epoch::drain_with_budget(usize::MAX);
+        }
+        assert_eq!(
+            fs.destroy_count(),
+            1,
+            "physical EBR reclaim must observe the completed destroy token"
+        );
+    }
+
+    #[test]
+    fn mount_settlement_leaves_destroy_ticket_pending_while_rnode_is_live() {
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        let (payload, fs) = settlement_payload(false);
+        let fs_object_id = FsObjectId::new(14);
+        let rnode = RNode::new_cap_in_mount(
+            fs_object_id,
+            InodeMeta::new(InodeKind::Directory, 0o040755),
+            RNodeBacking::Directory,
+            &payload,
+        )
+        .expect("mounted rnode");
+        let dentry = DEntry::new_cap(InlineName::ROOT, rnode.clone()).expect("dentry");
+        super::queue_fs_object_destroy_after_dentry_retire(
+            &payload,
+            fs_object_id,
+            rnode.fs_object_destroy_token(),
+            dentry.downgrade(),
+            rnode.downgrade(),
+            dentry.retire_token(),
+        );
+        drop(dentry);
+
+        let pin = MountPayloadPin::acquire(&PayloadCap::from_cap(payload.clone()));
+        let mut op = MountSettlementOp::new(
+            pin,
+            SettlementScope::Mount {
+                transaction_frontier: MountTransactionFrontier::new(1),
+            },
+        )
+        .expect("claim first mount settlement");
+        let guard = crate::vfs::adapter::step_engine::guard();
+        assert_eq!(op.drive(&guard), StepOutcome::done(()));
+        assert_eq!(fs.destroy_count(), 0);
+        assert_eq!(fs.mount_settlement_count(), 1);
+        drop(op);
+
+        drop(rnode);
+        let pin = MountPayloadPin::acquire(&PayloadCap::from_cap(payload));
+        let mut op = MountSettlementOp::new(
+            pin,
+            SettlementScope::Mount {
+                transaction_frontier: MountTransactionFrontier::new(2),
+            },
+        )
+        .expect("claim second mount settlement");
+        assert_eq!(op.drive(&guard), StepOutcome::done(()));
+        assert_eq!(fs.destroy_count(), 1);
+        assert_eq!(fs.mount_settlement_count(), 2);
     }
 
     #[test]

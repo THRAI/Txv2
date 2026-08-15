@@ -336,6 +336,10 @@ pub(super) async fn sys_unlinkat<'a, P: tx_hal::ConsoleIf>(
             }
         };
     let target_id = target_dentry.rnode().fs_object_id();
+    let target_dentry_weak = target_dentry.downgrade();
+    let target_rnode = target_dentry.rnode().downgrade();
+    let target_retire_token = target_dentry.retire_token();
+    let target_mount = mount_payload_for_dentry(&target_dentry);
     let child_meta = {
         let guard = step_engine::guard();
         match fs_ops.load_inode_meta(target_id, &guard) {
@@ -393,6 +397,16 @@ pub(super) async fn sys_unlinkat<'a, P: tx_hal::ConsoleIf>(
     {
         Ok(()) => {
             parent_dentry.remove_cached_child_by_name(basename);
+            if (want_rmdir || child_meta.nlinks == 1) && target_mount.is_some() {
+                mount::queue_fs_object_destroy_after_dentry_retire(
+                    target_mount.as_ref().expect("checked target mount"),
+                    target_id,
+                    target_dentry.rnode().fs_object_destroy_token(),
+                    target_dentry_weak,
+                    target_rnode,
+                    target_retire_token,
+                );
+            }
             drop(target_dentry);
             SyscallResult::Return(0)
         }
@@ -2000,18 +2014,28 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
             old_parent_dentry.remove_cached_child_by_name(b".tx_rename_exchange_tmp");
             old_parent_dentry.remove_cached_child_by_name(old_basename);
             new_parent_dentry.remove_cached_child_by_name(new_basename);
-            // Namespace mutation only drops the destination's link count. The
-            // backend owns the final lifetime decision: tmpfs reclaims a
-            // zero-link inode now, while ext4 defers it if a coherent page
-            // container/open file still holds the orphan alive. Rename has
-            // already linearized at this point, so orphan cleanup is
-            // best-effort: a backend-owned zero-link inode may remain for its
-            // normal lifetime/recovery path, but cleanup failure must not
-            // retroactively rewrite the committed namespace result.
+            // Namespace mutation only drops the destination's link count.
+            // Queue a mount-scoped liveness ticket rather than invoking the
+            // backend best-effort here: the displaced RNode may still be held
+            // by an open file, and its physical Drop is EBR-delayed after the
+            // last logical Cap retires. Mount settlement consumes the ticket
+            // once the weak RNode is no longer live.
             if (flags & RENAME_EXCHANGE) == 0 {
-                if let Some(displaced) = displaced_dentry.as_ref() {
-                    let guard = step_engine::guard();
-                    let _ = fs_ops.destroy_inode(displaced.rnode().fs_object_id(), &guard);
+                if let (Some(displaced), Some(meta)) =
+                    (displaced_dentry.as_ref(), displaced_meta.as_ref())
+                {
+                    if meta.kind() == InodeKind::Directory || meta.nlinks == 1 {
+                        if let Some(payload) = mount_payload_for_dentry(displaced) {
+                            mount::queue_fs_object_destroy_after_dentry_retire(
+                                &payload,
+                                displaced.rnode().fs_object_id(),
+                                displaced.rnode().fs_object_destroy_token(),
+                                displaced.downgrade(),
+                                displaced.rnode().downgrade(),
+                                displaced.retire_token(),
+                            );
+                        }
+                    }
                 }
             }
             SyscallResult::Return(0)

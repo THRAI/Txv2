@@ -24,6 +24,6 @@ pub mod runtime {
     pub(crate) use crate::sync::SpinMutex;
     pub use tx_substrate::zone::{
         register_zone_for, sign, Cap, Dead, Entity, IdentitySlot, PayloadBinding, PayloadCap,
-        PayloadPolicy, SlotKey, Zone, ZoneAllocated, ZoneError,
+        PayloadPolicy, SlotKey, Weak, Zone, ZoneAllocated, ZoneError,
     };
 }

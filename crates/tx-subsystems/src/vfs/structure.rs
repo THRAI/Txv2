@@ -10,7 +10,8 @@
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicI8, AtomicU64, Ordering};
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicI8, AtomicU64, Ordering};
 
 use crate::vfs::adapter::step_engine::{
     self, Cap, PayloadCap, SpinMutex, Weak, Zone, ZoneAllocated, ZoneError,
@@ -27,7 +28,7 @@ use crate::eventfd::EventFd;
 use crate::execution::Errno;
 use crate::io_uring::IoUring;
 use crate::ipc::posix_mq::structure::PosixMqInstance;
-use crate::mount::{FsObjectPin, MountApiFile, MountIdentity, MountPayload};
+use crate::mount::{FsObjectDestroyToken, FsObjectPin, MountApiFile, MountIdentity, MountPayload};
 use crate::net::{NetNamespacePayload, SocketIdentity};
 use crate::page_backed::PageContainer;
 use crate::process::{ProcessGroup, ProcessIdentity};
@@ -733,6 +734,10 @@ impl RNode {
         self
     }
 
+    pub fn fs_object_destroy_token(&self) -> Option<FsObjectDestroyToken> {
+        self.object_pin.as_ref().map(FsObjectPin::destroy_token)
+    }
+
     /// Snapshot the containing-mount `Weak<MountPayload>`. Used by the
     /// VFS walker (`crate::vfs::walker::step_walk`) to resolve the
     /// in-scope `FsOps` for a dentry's RNode, and by the page cache
@@ -877,6 +882,48 @@ pub struct DEntry {
     rnode: Cap<RNode>,
     mounted: Option<Weak<MountIdentity>>,
     children: SpinMutex<BTreeMap<InlineName, Weak<DEntry>>>,
+    // Keep this field after `rnode`: Rust drops fields in declaration order,
+    // so observers are marked only after the EBR callback has released the
+    // DEntry-owned RNode Cap.
+    retire_notifier: DEntryRetireNotifier,
+}
+
+#[derive(Clone, Debug)]
+pub struct DEntryRetireToken {
+    retired: Arc<AtomicBool>,
+}
+
+impl DEntryRetireToken {
+    pub(crate) fn retired(&self) -> bool {
+        self.retired.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Debug)]
+struct DEntryRetireNotifier {
+    observers: SpinMutex<Vec<Arc<AtomicBool>>>,
+}
+
+impl DEntryRetireNotifier {
+    const fn new() -> Self {
+        Self {
+            observers: SpinMutex::new(Vec::new()),
+        }
+    }
+
+    fn token(&self) -> DEntryRetireToken {
+        let retired = Arc::new(AtomicBool::new(false));
+        self.observers.lock().push(retired.clone());
+        DEntryRetireToken { retired }
+    }
+}
+
+impl Drop for DEntryRetireNotifier {
+    fn drop(&mut self) {
+        for observer in self.observers.lock().drain(..) {
+            observer.store(true, Ordering::Release);
+        }
+    }
 }
 
 impl DEntry {
@@ -887,6 +934,7 @@ impl DEntry {
             rnode,
             mounted: None,
             children: SpinMutex::new(BTreeMap::new()),
+            retire_notifier: DEntryRetireNotifier::new(),
         }
     }
 
@@ -900,6 +948,10 @@ impl DEntry {
 
     pub fn rnode(&self) -> &Cap<RNode> {
         &self.rnode
+    }
+
+    pub fn retire_token(&self) -> DEntryRetireToken {
+        self.retire_notifier.token()
     }
 
     pub fn set_parent_hint(&mut self, parent: &Cap<DEntry>) {

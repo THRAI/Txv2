@@ -1,3 +1,26 @@
+- 2026-08-16 (**RV64 ext4 零 dtime inode 泄漏已定位并修复；最小洁净门禁转绿，LA64
+  QEMU 等待执行授权**). **Changed**：从保留的 RV31 原副本确认 journal replay 后残余
+  inode 7193/7197/7199 均为无目录项、link=0、dtime=0 的已分配目录；最小并发目录
+  witness 进一步把责任边界定位到 `FsObjectLifetime::drop` 丢弃非终态
+  `destroy_inode`、namespace post-commit 销毁与 EBR 物理回收之间缺少可等待结算，以及
+  linked inode 在 ext4 mutation admission 处先 Yield 后被误排为销毁候选。Mount 现以
+  generation-shaped destroy token 合并 lifetime 与 namespace ticket，在 DEntry/RNode
+  生命周期允许后于 mount settlement 有界重试；`syncfs` 只以 canonical
+  `MountSettlementOp` 为耐久边界，不再成功结算后调用旧 PageBacked fallback。
+  **Verification**：新增回归曾分别稳定观察到重复 destroy、linked inode 被排队和
+  `syncfs` 返回 ENOSYS，修复后 mount settlement 16/16、精确 syncfs 1/1 通过；RV64
+  release 构建通过。全新 SMP4 direct-root case14 的 64 次并发 mkdir/rmdir 与直接
+  `syncfs(2)` 返回 0，宿主原副本 `e2fsck -fn=0`；随后 case15--18 的
+  create/fsync、close/unlink、unlink-while-open/close、rename-over 四个独立副本也均为
+  guest 全步骤 rc=0、宿主 `e2fsck -fn=0`。所有 RV 母盘前后 SHA-256 均保持
+  `d547220c...eb4`。LA64 release 构建通过，全新 case19 已扩容且运行前
+  `e2fsck -fn=0`，母盘保持 `57c64d68...25ca`。**Next**：获准后仅启动已准备但未
+  运行的 LA case19，要求 guest syncfs 与宿主 e2fsck 同时为 0；再生成双架构
+  Vim→GCC→Rust→Git、同盘 RW→RO 与最终 fsck 的干净评分日志，并产出 LA2K1000
+  kernel-only release uImage。**Blocker**：LA QEMU 的沙箱提权审批流中断后被环境
+  拒绝，且明确禁止自动重试；无遗留 QEMU 进程，case19 只有 prepare 文件、尚无串口
+  或 qemu.result。已知 bridge/progress-schema/tx-substrate 漂移仍按既有范围排除。
+
 - 2026-08-16 (**双 worktree 汇合成果已按语义冻结为九笔代码提交；orphan 洁净问题继续单独追踪**).
   **Changed**：在 `/tmp/txv2-precommit-freeze-s9nMZS` 保存提交前 status、完整
   binary tracked/index patch 与 untracked 清单后，将共同基线 `460152ced` 上的

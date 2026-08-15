@@ -1,6 +1,8 @@
 use crate::execution::{Errno, Guard};
 use crate::page_backed::{ErrorCursor, ErrorSeq, FileFsyncFrontier};
-use crate::vfs::adapter::step_engine::{NoProgress, StepOutcome};
+use crate::vfs::adapter::step_engine::{
+    NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
+};
 use crate::vfs::FsObjectId;
 
 use super::MountPayloadPin;
@@ -189,12 +191,36 @@ impl MountSettlementOp {
             return StepOutcome::done(());
         }
 
+        if matches!(
+            self.scope,
+            SettlementScope::Mount { .. } | SettlementScope::Detach
+        ) {
+            match super::drive_pending_fs_object_destroy_once(&self.payload, guard) {
+                StepOutcome::Done(()) => {}
+                StepOutcome::Continue { progress } => {
+                    return StepOutcome::Continue { progress };
+                }
+                StepOutcome::Yield { progress, shape } => {
+                    return StepOutcome::Yield { progress, shape };
+                }
+                StepOutcome::Err(errno) => {
+                    let error = Errno::from(errno);
+                    self.payload.payload().complete_settlement(Err(error));
+                    self.phase = MountSettlementPhase::Complete;
+                    return StepOutcome::err(errno);
+                }
+            }
+        }
+
         let result = match self.scope {
             SettlementScope::Detach => match self.payload.payload().fs_ops().shutdown(guard) {
                 StepOutcome::Done(()) => Ok(()),
                 StepOutcome::Err(errno) => Err(errno.into()),
-                StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
-                    return StepOutcome::err(Errno::EAGAIN.into());
+                StepOutcome::Continue { progress } => {
+                    return StepOutcome::Continue { progress };
+                }
+                StepOutcome::Yield { progress, shape } => {
+                    return StepOutcome::Yield { progress, shape };
                 }
             },
             SettlementScope::File {
@@ -207,8 +233,11 @@ impl MountSettlementOp {
             ) {
                 StepOutcome::Done(()) => Ok(()),
                 StepOutcome::Err(errno) => Err(errno.into()),
-                StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
-                    return StepOutcome::err(Errno::EAGAIN.into());
+                StepOutcome::Continue { progress } => {
+                    return StepOutcome::Continue { progress };
+                }
+                StepOutcome::Yield { progress, shape } => {
+                    return StepOutcome::Yield { progress, shape };
                 }
             },
             SettlementScope::Mount {
@@ -221,8 +250,11 @@ impl MountSettlementOp {
             {
                 StepOutcome::Done(()) => Ok(()),
                 StepOutcome::Err(errno) => Err(errno.into()),
-                StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
-                    return StepOutcome::err(Errno::EAGAIN.into());
+                StepOutcome::Continue { progress } => {
+                    return StepOutcome::Continue { progress };
+                }
+                StepOutcome::Yield { progress, shape } => {
+                    return StepOutcome::Yield { progress, shape };
                 }
             },
         };
@@ -233,6 +265,16 @@ impl MountSettlementOp {
             Ok(()) => StepOutcome::done(()),
             Err(errno) => StepOutcome::err(errno.into()),
         }
+    }
+}
+
+impl<I: SubjectIdentity> StepOp<I> for MountSettlementOp {
+    type Output = ();
+    type Progress = NoProgress;
+
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let guard = crate::vfs::adapter::step_engine::guard();
+        self.drive(&guard)
     }
 }
 

@@ -326,18 +326,40 @@ pub(in crate::linux_syscall) async fn sys_syncfs<P: PmapIf>(
         None => return SyscallResult::Error(EBADF_VALUE),
     };
     let rnode = open_file.rnode();
-    let page_backing = match MountedNode::from_rnode_direct(rnode) {
-        Some(mounted) => mounted.fs_page_backing(),
+    let mounted = match MountedNode::from_rnode_direct(rnode) {
+        Some(mounted) => mounted,
         None => return SyscallResult::Error(ENODEV_VALUE),
     };
-    let guard = step_engine::guard();
-    // syncfs: flush the entire filesystem. The default impl falls back
-    // to `fsync_file(ROOT)`; journaling filesystems can override.
-    match page_backing.sync_filesystem(&guard) {
-        StepOutcome::Done(()) => SyscallResult::Return(0),
-        StepOutcome::Err(e) => SyscallResult::error_from(Errno::from(e)),
-        _ => SyscallResult::Error(EIO_VALUE),
+    let payload = mounted.into_payload();
+    let transaction_frontier = payload.snapshot_transaction_frontier();
+    let pin = tx_subsystems::mount::MountPayloadPin::acquire_cap(&payload);
+    let op = match tx_subsystems::mount::MountSettlementOp::new(
+        pin,
+        tx_subsystems::mount::SettlementScope::Mount {
+            transaction_frontier,
+        },
+    ) {
+        Ok(op) => op,
+        Err(errno) => return SyscallResult::error_from(errno),
+    };
+    use step_engine::DriveMode;
+    use tx_scripts::drive;
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
+    if let Err(errno) = drive(
+        op,
+        &mut script_ctx,
+        DriveMode::Waiting,
+        mailbox_arc.as_ref(),
+        None,
+        timer_registrar_handle.as_ref(),
+    )
+    .await
+    {
+        return SyscallResult::error_from(Errno::from(errno));
     }
+    SyscallResult::Return(0)
 }
 
 /// `fsync(fd)`. Linux RV64 ABI `__NR_fsync = 82`.
