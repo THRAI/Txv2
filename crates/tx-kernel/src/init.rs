@@ -56,9 +56,9 @@ const BSP_REACTOR_TIMER_WAIT_SPINS: usize = 20_000;
 pub(crate) const IDLE_TIMER_PERIOD_NS: u64 = 5_000_000; // 5 ms
 const POLLING_IDLE_SPINS: usize = 256;
 /// Emit one wait-chain snapshot after the whole SMP reactor has made no task
-/// progress for this long. The snapshot is globally one-shot, so a real hang
-/// produces useful evidence without turning normal BuildStorm output into a
-/// periodic diagnostic stream.
+/// progress for this long when `tx.smp.stall-diag=1` was requested. Automatic
+/// snapshots are opt-in and globally one-shot; the debugger-requested path is
+/// independent and remains available on a normal quiet boot.
 const SMP_STALL_DIAG_NS: u64 = 15_000_000_000;
 /// Return from the reactor after each future poll so task-context device IRQ
 /// work runs promptly on the hart that claimed the interrupt.
@@ -143,8 +143,38 @@ static OWNER_WAKE_SMP_DELEGATE_REGISTRY: SpinMutex<Option<Arc<boot_runtime::Dele
     spin_mutex(None, b"debug.lock.kernel.owner_wake_registry");
 static RCU_SMP_STAGE: AtomicU64 = AtomicU64::new(0);
 static LA64_MASKED_SHOOTDOWN_STAGE: AtomicU64 = AtomicU64::new(0);
-static FILE_IO_SERVICE_REACTOR_TASKS: SpinMutex<Vec<boot_runtime::TaskId>> =
+static FILE_IO_SERVICE_REACTOR_TASKS: SpinMutex<Vec<boot_runtime::TaskKey>> =
     spin_mutex(Vec::new(), b"debug.lock.kernel.file_io_service_tasks");
+
+fn register_file_io_service_reactor_task(task: boot_runtime::TaskKey) {
+    FILE_IO_SERVICE_REACTOR_TASKS.lock().push(task);
+}
+
+fn unregister_file_io_service_reactor_tasks(drained: &[boot_runtime::TaskKey]) -> usize {
+    let mut tasks = FILE_IO_SERVICE_REACTOR_TASKS.lock();
+    let before = tasks.len();
+    tasks.retain(|task| !drained.iter().any(|drained_task| drained_task == task));
+    before.saturating_sub(tasks.len())
+}
+
+fn is_file_io_service_reactor_task(
+    service_tasks: &[boot_runtime::TaskKey],
+    task: &tx_reactor::TaskRuntimeDiagnostic,
+) -> bool {
+    service_tasks.iter().any(|service_task| {
+        service_task.id() == task.id && service_task.generation() == task.generation
+    })
+}
+
+fn automatic_smp_stall_diagnostic_enabled_from_boot(cmdline: &str) -> bool {
+    let mut value = None;
+    for token in cmdline.split_ascii_whitespace() {
+        if let Some(candidate) = token.strip_prefix("tx.smp.stall-diag=") {
+            value = Some(candidate);
+        }
+    }
+    value == Some("1")
+}
 
 struct FileIoRuntimeTaskSpawner<P: TxPlatform>(PhantomData<fn() -> P>);
 
@@ -168,7 +198,7 @@ impl<P: TxPlatform> tx_subsystems::device::FileIoServiceRuntimeSpawner
                             meta,
                         )
                     });
-                submitted_task = result.map(|key| key.id());
+                submitted_task = result;
                 submitted_task.is_some()
             },
         );
@@ -177,7 +207,7 @@ impl<P: TxPlatform> tx_subsystems::device::FileIoServiceRuntimeSpawner
             "file I/O runtime spawner requires an initialized reactor"
         );
         if let Some(task) = submitted_task {
-            FILE_IO_SERVICE_REACTOR_TASKS.lock().push(task);
+            register_file_io_service_reactor_task(task);
         }
     }
 }
@@ -718,6 +748,7 @@ pub fn reset_boot_state_for_test() {
     PRELIMINARY_OSCOMP_MEDIA.store(false, Ordering::Release);
     *CONSOLE_TTY.lock() = None;
     *ROOT_DENTRY.lock() = None;
+    FILE_IO_SERVICE_REACTOR_TASKS.lock().clear();
 }
 
 /// Static `CharDeviceOps` impl that forwards `write` to
@@ -3755,12 +3786,15 @@ impl<P: TxPlatform> CoreInit<P> {
         // case; make those children visible before the AP decides to WFI.
         let submitted_child = Self::drain_pending_child_submits();
         let drained_terminal_after_poll = Self::drain_terminal_thread_reactor_tasks();
+        let woke_unowned_file_io = step.as_ref().is_some_and(|step| step.should_idle())
+            && tx_subsystems::device::wake_unowned_file_io_service_runtimes() != 0;
 
         drained_device_before_poll
             || drained_device_after_poll
             || drained_terminal_before_submit
             || submitted_child
             || drained_terminal_after_poll
+            || woke_unowned_file_io
             || step.is_some_and(|step| !step.should_idle())
     }
 
@@ -3834,7 +3868,11 @@ impl<P: TxPlatform> CoreInit<P> {
     pub(super) fn reset_smp_stall_diagnostic() {
         REACTOR_IDLE_CPUS.store(0, Ordering::Release);
         REACTOR_LAST_PROGRESS_NS.store(P::read_ns(), Ordering::Release);
-        REACTOR_STALL_DUMPED.store(false, Ordering::Release);
+        let cmdline = <P as tx_hal::BootInfoIf>::boot_info().cmdline.unwrap_or("");
+        REACTOR_STALL_DUMPED.store(
+            !automatic_smp_stall_diagnostic_enabled_from_boot(cmdline),
+            Ordering::Release,
+        );
     }
 
     fn note_reactor_progress(cpu_id: CpuId, now_ns: u64) {
@@ -3852,6 +3890,10 @@ impl<P: TxPlatform> CoreInit<P> {
             tx_subsystems::zones::dump_smp_wait_diagnostics::<P>();
             Self::dump_reactor_task_diagnostics();
             tx_hal::console_write_str::<P>("txkernel:smp-stall:end\n");
+        }
+        let cmdline = <P as tx_hal::BootInfoIf>::boot_info().cmdline.unwrap_or("");
+        if !automatic_smp_stall_diagnostic_enabled_from_boot(cmdline) {
+            return;
         }
         let online = P::online_cpus().bits();
         if online.count_ones() <= 1 {
@@ -3906,7 +3948,7 @@ impl<P: TxPlatform> CoreInit<P> {
                 tx_hal::console_write_str::<P>("txkernel:smp-stall:all-task:id=");
                 Self::write_u64(task.id.0 as u64);
                 tx_hal::console_write_str::<P>(":file_io=");
-                Self::write_u64(service_tasks.contains(&task.id) as u64);
+                Self::write_u64(is_file_io_service_reactor_task(&service_tasks, &task) as u64);
                 tx_hal::console_write_str::<P>(":status=");
                 Self::write_u64(match task.status {
                     boot_runtime::TaskStatus::Runnable => 1,

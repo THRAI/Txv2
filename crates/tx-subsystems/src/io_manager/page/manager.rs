@@ -9,7 +9,8 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 #[cfg(test)]
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::fs_iface::{IoDataSource, IoDataTarget};
 use crate::io_manager::runtime::{IoServiceKind, ServiceKick, ServiceWakeSource};
@@ -40,6 +41,13 @@ use crate::io_manager::backend::PageCompletion;
 #[derive(Debug)]
 pub(crate) struct PageIoSubmissionManager {
     state: SpinMutex<PageIoSubmissionState>,
+    /// Level-triggered lifetime edge for the reactor-owned service task.
+    ///
+    /// A wake notification alone is insufficient because PageContainer
+    /// retirement can race the task's wait-source subscription. Keeping the
+    /// retirement state latched lets the waiter re-check it after installing
+    /// the subscription and close that lost-wake window.
+    owner_retired: AtomicBool,
 }
 
 #[cfg(test)]
@@ -95,6 +103,7 @@ impl PageIoSubmissionHandle {
                 background_graphs: BTreeSet::new(),
                 wake_source: None,
             }),
+            owner_retired: AtomicBool::new(false),
         }))
     }
 
@@ -267,11 +276,36 @@ impl PageIoSubmissionHandle {
 
     pub(crate) fn attach_wake_source(&self, wake_source: Arc<ServiceWakeSource>) -> bool {
         let mut state = self.0.lock_state();
-        if state.wake_source.is_some() {
+        if self.0.owner_retired.load(Ordering::Acquire) || state.wake_source.is_some() {
             return false;
         }
         state.wake_source = Some(wake_source);
         true
+    }
+
+    /// Publish PageContainer owner retirement and wake a parked service task.
+    ///
+    /// The atomic flag is the level predicate; the wake-source notification is
+    /// only the scheduling edge. A waiter installs its subscription before
+    /// re-checking this flag, so retirement cannot be lost between observation
+    /// and parking. Repeated retirement is intentionally idempotent.
+    pub(crate) fn retire_owner(&self) -> bool {
+        if self.0.owner_retired.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+
+        let wake_source = self.0.lock_state().wake_source.clone();
+        if let Some(wake_source) = wake_source {
+            let _ = wake_source
+                .kick_with_post(ServiceKick::new(IoServiceKind::Page), |mailbox, event| {
+                    mailbox.post(event)
+                });
+        }
+        true
+    }
+
+    pub(crate) fn owner_retired(&self) -> bool {
+        self.0.owner_retired.load(Ordering::Acquire)
     }
 
     pub(crate) fn kick(&self, service: IoServiceKind) {

@@ -917,6 +917,16 @@ impl core::fmt::Debug for PageContainer {
 unsafe impl Send for PageContainer {}
 unsafe impl Sync for PageContainer {}
 
+impl Drop for PageContainer {
+    fn drop(&mut self) {
+        // The reactor runtime retains only typed manager handles plus a weak
+        // PageContainer endpoint. Publish a level-triggered retirement edge
+        // before those fields are destroyed so a parked run-forever service
+        // wakes, observes that its Weak can no longer upgrade, and exits.
+        let _ = self.page_submission.retire_owner();
+    }
+}
+
 #[derive(Debug)]
 struct PageContainerState {
     pages: PageCacheIndex,

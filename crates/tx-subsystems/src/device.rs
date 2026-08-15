@@ -4,7 +4,9 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
+use core::future::{poll_fn, Future};
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::task::Poll;
 use tx_substrate::wake::{MailboxEvent, TaskMailbox};
 
 use crate::adapter::step_engine::{
@@ -1052,9 +1054,14 @@ impl FileIoManagerRuntimeClaim {
     }
 
     /// End this claim's reactor ownership and release its typed manager
-    /// handles. The registration removal is idempotent against test cleanup.
-    pub fn retire(self) -> bool {
-        retire_file_io_manager_runtime(self.registration)
+    /// handles. Drop performs the same idempotent cleanup if the future exits
+    /// early or is cancelled.
+    pub fn retire(mut self) -> bool {
+        let registration = core::mem::replace(
+            &mut self.registration,
+            FileIoManagerRuntimeRegistrationId(0),
+        );
+        retire_file_io_manager_runtime(registration)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -1075,11 +1082,20 @@ impl FileIoManagerRuntimeClaim {
     }
 }
 
+impl Drop for FileIoManagerRuntimeClaim {
+    fn drop(&mut self) {
+        let registration = core::mem::replace(
+            &mut self.registration,
+            FileIoManagerRuntimeRegistrationId(0),
+        );
+        let _ = retire_file_io_manager_runtime(registration);
+    }
+}
+
 struct FileIoManagerRuntimePayload {
     page_submission: PageIoSubmissionHandle,
     block_submission: BlockSubmissionHandle,
     handle: BlockDeviceHandle,
-    wake_source: Arc<ServiceWakeSource>,
 }
 
 enum FileIoManagerRuntimeState {
@@ -1092,6 +1108,7 @@ struct RegisteredFileIoServiceRuntime {
     container: Weak<PageContainer>,
     handle: BlockDeviceHandle,
     source_id: u64,
+    wake_source: Arc<ServiceWakeSource>,
     state: FileIoManagerRuntimeState,
 }
 
@@ -1152,7 +1169,21 @@ pub fn register_page_container_file_io_service(
 ) -> FileIoManagerRuntimeRegistrationId {
     let source_id = NEXT_FILE_IO_SERVICE_SOURCE_ID.fetch_add(1, Ordering::AcqRel);
     let wake_source = Arc::new(ServiceWakeSource::new(source_id));
-    let _ = container.attach_file_io_wake_source(Arc::clone(&wake_source));
+    let container_weak = container.downgrade();
+    if !container.attach_file_io_wake_source(Arc::clone(&wake_source)) {
+        // The PageContainer owns exactly one L4/L6 wake attachment. A second
+        // registration must reuse its existing runtime metadata instead of
+        // spawning a task on an unattached source that can never be kicked.
+        return FILE_IO_SERVICE_RUNTIMES
+            .lock()
+            .iter()
+            .find(|entry| {
+                entry.container.raw() == container_weak.raw()
+                    && entry.container.generation() == container_weak.generation()
+            })
+            .map(|entry| entry.id)
+            .unwrap_or(FileIoManagerRuntimeRegistrationId(0));
+    }
     let (page_submission, block_submission) = container.file_io_runtime_handles();
     let id = FileIoManagerRuntimeRegistrationId(
         NEXT_FILE_IO_SERVICE_RUNTIME_ID.fetch_add(1, Ordering::AcqRel),
@@ -1161,18 +1192,49 @@ pub fn register_page_container_file_io_service(
         .lock()
         .push(RegisteredFileIoServiceRuntime {
             id,
-            container: container.downgrade(),
+            container: container_weak,
             handle,
             source_id,
+            wake_source: Arc::clone(&wake_source),
             state: FileIoManagerRuntimeState::Pending(FileIoManagerRuntimePayload {
                 page_submission,
                 block_submission,
                 handle,
-                wake_source,
             }),
         });
     let _ = submit_pending_file_io_service_runtimes();
     id
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FileIoServiceWait {
+    Ready,
+    OwnerRetired,
+    Failed,
+}
+
+/// Install the edge subscription first, then re-check the manager's latched
+/// owner-retired predicate. This closes both sides of the lost-wake race:
+/// retirement before subscription is observed through the latch, while
+/// retirement after subscription posts the normal wake edge.
+async fn wait_for_file_io_service(claim: &FileIoManagerRuntimeClaim) -> FileIoServiceWait {
+    let wait = crate::wait_source::wait_on_registered_endpoint(
+        claim.wake_source.wake_endpoint(),
+        file_io_service_interest_mask(),
+    );
+    let mut wait = core::pin::pin!(wait);
+    poll_fn(|cx| {
+        let outcome = wait.as_mut().poll(cx);
+        if claim.page_submission.owner_retired() {
+            return Poll::Ready(FileIoServiceWait::OwnerRetired);
+        }
+        match outcome {
+            Poll::Ready(WaitOutcome::Ready) => Poll::Ready(FileIoServiceWait::Ready),
+            Poll::Ready(_) => Poll::Ready(FileIoServiceWait::Failed),
+            Poll::Pending => Poll::Pending,
+        }
+    })
+    .await
 }
 
 /// Install the single kernel-owned spawner and drain every runtime registered
@@ -1230,7 +1292,7 @@ fn claim_pending_file_io_service_runtimes() -> Vec<FileIoManagerRuntimeClaim> {
                     page_submission: payload.page_submission,
                     block_submission: payload.block_submission,
                     handle: payload.handle,
-                    wake_source: payload.wake_source,
+                    wake_source: Arc::clone(&entry.wake_source),
                 });
             }
             true
@@ -1260,6 +1322,38 @@ pub fn page_container_file_io_service_runtimes_snapshot(
 
 pub fn page_container_file_io_service_runtime_count() -> usize {
     FILE_IO_SERVICE_RUNTIMES.lock().len()
+}
+
+/// Wake claimed service tasks whose semantic `PageContainer` owner has
+/// crossed the Zone no-upgrade barrier.
+///
+/// `Weak<PageContainer>` becomes stale at the final `Cap` transition, while
+/// the payload destructor runs only after a later EBR grace period. A task
+/// already parked on its service source therefore cannot rely on
+/// `PageContainer::drop` as its only lifetime edge. Reactor idle maintenance
+/// calls this bounded registry scan; the posted Page kick is latched by the
+/// wake source and lets the task observe the stale Weak and retire itself.
+pub fn wake_unowned_file_io_service_runtimes() -> usize {
+    let guard = tx_substrate::epoch::borrow_current_guard().unwrap_or_else(step_engine::guard);
+    let wake_sources = FILE_IO_SERVICE_RUNTIMES
+        .lock()
+        .iter()
+        .filter(|entry| {
+            matches!(entry.state, FileIoManagerRuntimeState::Claimed)
+                && entry.container.upgrade(&guard).is_none()
+        })
+        .map(|entry| Arc::clone(&entry.wake_source))
+        .collect::<Vec<_>>();
+    drop(guard);
+
+    let mut posted = 0;
+    for wake_source in wake_sources {
+        posted += usize::from(post_file_io_service_kick(
+            &wake_source,
+            ServiceKick::new(IoServiceKind::Page),
+        ));
+    }
+    posted
 }
 
 fn retire_file_io_manager_runtime(id: FileIoManagerRuntimeRegistrationId) -> bool {
@@ -1295,15 +1389,14 @@ async fn page_container_file_io_service_task_loop_claim(
         // its mailbox registration. Honor the returned runnable state before
         // registering again; the yield below remains the fairness boundary.
         if next != PageContainerFileIoServiceNext::Runnable {
-            let wait = crate::wait_source::wait_on_registered_endpoint(
-                claim.wake_source.wake_endpoint(),
-                file_io_service_interest_mask(),
-            );
-            if wait.await != WaitOutcome::Ready {
-                report.waits_failed += 1;
-                break;
+            match wait_for_file_io_service(claim).await {
+                FileIoServiceWait::Ready => report.waits_ready += 1,
+                FileIoServiceWait::OwnerRetired => break,
+                FileIoServiceWait::Failed => {
+                    report.waits_failed += 1;
+                    break;
+                }
             }
-            report.waits_ready += 1;
         }
 
         report.ready_turns += 1;
@@ -1312,7 +1405,6 @@ async fn page_container_file_io_service_task_loop_claim(
             claim.container.upgrade(&guard)
         };
         let Some(container) = container else {
-            report.waits_failed += 1;
             break;
         };
         // The Cap now retains the container. Do not pin one epoch across a
@@ -2190,6 +2282,194 @@ mod tests {
         );
         drop(guard);
         reset_page_container_file_io_service_registry_for_test();
+    }
+
+    #[test]
+    fn page_container_drop_publishes_file_io_owner_retirement_wake() {
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        let container = PageContainer::new(
+            PageContainerKind::Anon {
+                swap_policy: AnonSwapPolicy::Reclaimable,
+            },
+            1,
+        );
+        let wake_source = Arc::new(ServiceWakeSource::new(0x72f0));
+        assert!(container.attach_file_io_wake_source(Arc::clone(&wake_source)));
+        let mailbox = Arc::new(TaskMailbox::new());
+        let generation = mailbox.next_generation();
+        let _subscription =
+            wake_source.subscribe(IoServiceKind::Page, Arc::downgrade(&mailbox), generation);
+
+        drop(container);
+
+        assert!(matches!(
+            mailbox.poll(),
+            Some(MailboxEvent::SourceFired {
+                generation: seen_generation,
+                source,
+                interests,
+            }) if seen_generation == generation
+                && source.raw() == 0x72f0
+                && interests.raw() == IoServiceKind::Page.mask_bits()
+        ));
+    }
+
+    #[test]
+    fn idle_maintenance_wakes_claim_after_final_cap_before_payload_drop() {
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        crate::zones::register_all().expect("kernel zones");
+        reset_page_container_file_io_service_registry_for_test();
+        let pc = PageContainer::new_cap(
+            PageContainerKind::Anon {
+                swap_policy: AnonSwapPolicy::Reclaimable,
+            },
+            1,
+        )
+        .expect("page container cap");
+        register_page_container_file_io_service(pc.clone(), BlockDeviceHandle::whole(&BLOCK_REG));
+        let mut claims = claim_pending_file_io_service_runtimes_for_test();
+        let claim = claims.pop().expect("claimed runtime");
+        let mailbox = Arc::new(TaskMailbox::new());
+        let generation = mailbox.next_generation();
+        let _subscription =
+            claim
+                .wake_source
+                .subscribe(IoServiceKind::Page, Arc::downgrade(&mailbox), generation);
+
+        // Keep an epoch guard live so the PageContainer destructor cannot be
+        // the source of this wake. The final Cap still installs Retiring
+        // immediately, which is the liveness predicate maintenance observes.
+        let guard = step_engine::guard();
+        drop(pc);
+        assert!(!claim.page_submission.owner_retired());
+        assert_eq!(wake_unowned_file_io_service_runtimes(), 1);
+        assert!(matches!(
+            mailbox.poll(),
+            Some(MailboxEvent::SourceFired {
+                generation: seen_generation,
+                interests,
+                ..
+            }) if seen_generation == generation
+                && interests.raw() == IoServiceKind::Page.mask_bits()
+        ));
+        drop(guard);
+        drop(claim);
+        reset_page_container_file_io_service_registry_for_test();
+    }
+
+    #[test]
+    fn repeated_file_io_runtime_registration_reuses_attached_runtime() {
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        crate::zones::register_all().expect("kernel zones");
+        reset_page_container_file_io_service_registry_for_test();
+        let pc = PageContainer::new_cap(
+            PageContainerKind::Anon {
+                swap_policy: AnonSwapPolicy::Reclaimable,
+            },
+            1,
+        )
+        .expect("page container cap");
+
+        let first = register_page_container_file_io_service(
+            pc.clone(),
+            BlockDeviceHandle::whole(&BLOCK_REG),
+        );
+        let first_source = page_container_file_io_service_runtimes_snapshot()[0].source_id();
+        let second = register_page_container_file_io_service(
+            pc.clone(),
+            BlockDeviceHandle::whole(&BLOCK_REG),
+        );
+
+        assert_eq!(second, first);
+        assert_eq!(page_container_file_io_service_runtime_count(), 1);
+        assert_eq!(
+            page_container_file_io_service_runtimes_snapshot()[0].source_id(),
+            first_source,
+            "duplicate attachment must not publish an unreachable wake source",
+        );
+
+        reset_page_container_file_io_service_registry_for_test();
+    }
+
+    #[test]
+    fn dropping_file_io_runtime_claim_retires_registry_entry() {
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        crate::zones::register_all().expect("kernel zones");
+        reset_page_container_file_io_service_registry_for_test();
+        let pc = PageContainer::new_cap(
+            PageContainerKind::Anon {
+                swap_policy: AnonSwapPolicy::Reclaimable,
+            },
+            1,
+        )
+        .expect("page container cap");
+        register_page_container_file_io_service(pc.clone(), BlockDeviceHandle::whole(&BLOCK_REG));
+        let mut claims = claim_pending_file_io_service_runtimes_for_test();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(page_container_file_io_service_runtime_count(), 1);
+
+        drop(claims.pop().expect("claimed runtime"));
+
+        assert_eq!(page_container_file_io_service_runtime_count(), 0);
+        reset_page_container_file_io_service_registry_for_test();
+    }
+
+    #[test]
+    fn retired_owner_latch_closes_wake_before_subscription_race() {
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        crate::zones::register_all().expect("kernel zones");
+        let pc = PageContainer::new_cap(
+            PageContainerKind::Anon {
+                swap_policy: AnonSwapPolicy::Reclaimable,
+            },
+            1,
+        )
+        .expect("page container cap");
+        let wake_source = Arc::new(ServiceWakeSource::new(0x72f1));
+        assert!(pc.attach_file_io_wake_source(Arc::clone(&wake_source)));
+        let claim = FileIoManagerRuntimeClaim::detached_for_test(
+            pc.clone(),
+            BlockDeviceHandle::whole(&BLOCK_REG),
+            wake_source,
+        );
+        let page_submission = claim.page_submission.clone();
+
+        // Retirement happens before the task creates its wait subscription, so
+        // there is deliberately no mailbox edge for the first poll to consume.
+        assert!(page_submission.retire_owner());
+        drop(pc);
+        let mut task = core::pin::pin!(page_container_file_io_service_task_loop_owned(
+            claim,
+            PageContainerFileIoServiceTaskConfig::run_forever(
+                ServiceBudget::new(1),
+                ServiceBudget::new(1),
+            ),
+        ));
+        let waker = core::task::Waker::noop();
+        let mut cx = core::task::Context::from_waker(waker);
+
+        let report = match task.as_mut().poll(&mut cx) {
+            Poll::Ready(report) => report,
+            Poll::Pending => panic!("latched owner retirement must stop the parked runtime"),
+        };
+        assert_eq!(report.waits_ready, 0);
+        assert_eq!(report.waits_failed, 0);
+        assert_eq!(report.ready_turns, 0);
     }
 
     #[test]
