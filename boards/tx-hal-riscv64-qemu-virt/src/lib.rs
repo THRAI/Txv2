@@ -5,7 +5,7 @@ extern crate alloc;
 extern crate std;
 
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 mod boot_static;
 mod boot_trampoline;
@@ -99,8 +99,10 @@ const GOLDFISH_RTC_ALARM_STATUS: usize = 0x18;
 const GOLDFISH_RTC_CLEAR_INTERRUPT: usize = 0x1c;
 static ONLINE_CPUS: AtomicU64 = AtomicU64::new(0);
 const IPI_KIND_COUNT: usize = 5;
-static IPI_STATE_LOCKS: [AtomicBool; MAX_BOOT_CPUS] =
-    [const { AtomicBool::new(false) }; MAX_BOOT_CPUS];
+// Each target owns one atomic level bitmap. Publication and acknowledgement
+// deliberately remain lock-free: an IPI handler must never spin on state held
+// by an interrupted sender. Repeated events of one kind coalesce in the bit,
+// while distinct kinds remain independently observable until acknowledged.
 static IPI_PENDING: [AtomicU8; MAX_BOOT_CPUS] = [const { AtomicU8::new(0) }; MAX_BOOT_CPUS];
 static IPI_ACKED_CPUS: [AtomicU64; IPI_KIND_COUNT] = [const { AtomicU64::new(0) }; IPI_KIND_COUNT];
 #[cfg(test)]
@@ -1155,15 +1157,12 @@ impl SmpIf for Platform {
         if target.0 >= IPI_PENDING.len() {
             return;
         }
-        let locked = lock_ipi_targets(CpuMask::single(target));
         IPI_PENDING[target.0].fetch_or(ipi_kind_bit(kind), Ordering::AcqRel);
         send_sbi_ipi(CpuMask::single(target));
-        unlock_ipi_targets(locked);
     }
 
     fn broadcast_ipi(mask: CpuMask, kind: IpiKind) {
         let targets = remote_ipi_targets_from(mask, current_cpu_id());
-        let locked = lock_ipi_targets(targets);
         let mut bits = targets.bits();
         while bits != 0 {
             let cpu = bits.trailing_zeros() as usize;
@@ -1173,7 +1172,6 @@ impl SmpIf for Platform {
             bits &= bits - 1;
         }
         send_sbi_ipi(targets);
-        unlock_ipi_targets(locked);
     }
 
     fn ack_ipi(kind: IpiKind) {
@@ -1181,13 +1179,11 @@ impl SmpIf for Platform {
         if cpu.0 >= IPI_PENDING.len() {
             return;
         }
-        let locked = lock_ipi_targets(CpuMask::single(cpu));
         IPI_PENDING[cpu.0].fetch_and(!ipi_kind_bit(kind), Ordering::AcqRel);
         mark_ipi_ack(cpu, kind);
         if IPI_PENDING[cpu.0].load(Ordering::Acquire) == 0 {
             clear_supervisor_software_interrupt();
         }
-        unlock_ipi_targets(locked);
     }
 
     fn clear_ipi_ack_cpus(kind: IpiKind, mask: CpuMask) {
@@ -2253,32 +2249,6 @@ const fn ipi_kind_index(kind: IpiKind) -> usize {
 
 const fn ipi_kind_bit(kind: IpiKind) -> u8 {
     1u8 << ipi_kind_index(kind)
-}
-
-fn lock_ipi_targets(mask: CpuMask) -> u64 {
-    let mut bits = mask.bits() & CpuMask::first(MAX_BOOT_CPUS).bits();
-    let mut locked = 0;
-    while bits != 0 {
-        let cpu = bits.trailing_zeros() as usize;
-        while IPI_STATE_LOCKS[cpu]
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
-        let bit = 1u64 << cpu;
-        locked |= bit;
-        bits &= bits - 1;
-    }
-    locked
-}
-
-fn unlock_ipi_targets(mut bits: u64) {
-    while bits != 0 {
-        let cpu = bits.trailing_zeros() as usize;
-        IPI_STATE_LOCKS[cpu].store(false, Ordering::Release);
-        bits &= bits - 1;
-    }
 }
 
 fn mark_ipi_ack(cpu_id: CpuId, kind: IpiKind) {
