@@ -1,3 +1,26 @@
+- 2026-08-16 (**LA stall/File-I/O 修复已整理提交；VF2 工具与复位持久化交接已冻结**).
+  **Changed**：只在 `/tmp/txv2-la-full-clone.Nt4BdE/worktree` 将分支移到已审计的
+  `3df096b94` 干净历史，再恢复并提交 7 个 runtime 文件为 `905746018`；自动
+  `smp-stall` 改为 `tx.smp.stall-diag=1` opt-in，File-I/O task 追踪改用完整
+  `TaskKey` 并在 terminal drain 清理，stale `Weak<PageContainer>` runtime 获得
+  lost-wake-safe 退休路径。硬编码 `exec-git`/`linkat-error` 诊断未提交，缺失的
+  checksum-v3 集成测试已由干净历史恢复。新增 VF2 handoff，要求 Git/Vim/GCC/
+  Rust、非 shallow HTTPS clone、本地 commit、物理 reset 与同盘 RO 复验完整闭环，
+  明确禁止 push/pull、PAT、破坏性存储命令和修改主工作区。
+  **Verification**：fmt/diff check、两条 kernel 回归、final-Cap lifecycle 与四条
+  File-I/O runtime 测试通过；最终源码可构建 LA release/uImage（8,949,424 bytes，
+  SHA-256 `9bf21606...e45d77`）。LA 实板核心修复已通过双核/ext4 RW、70+ 秒静默、
+  96 文件创建/读取/删除/`sync`、再空闲 42 秒及真实仓库 `git status`；标准 unit
+  仍只有既有 37 条 tx-shims 与两条 kernel libc 断言失败。
+  **Next**：下一代理从该隔离工作树最终 tip 执行
+  `docs/progress/handoffs/2026-08-16-vf2-tools-persistence-verification.json`，所有
+  RV 真板项目和 reset/RO 证据完成前不让用户尝试 push/pull。
+  **Blocker**：当前代码整理无 blocker；VF2 现场 SD 空间、网络/UTC/CA 与物理 reset
+  尚需按 handoff 逐项确认。新 handoff 通过 `jq empty`，但全局
+  `cargo xtask progress validate` 仍先被既有
+  `2026-07-24-network-time-integration.json` 的旧枚举 `completed` 阻断；docs lint
+  仍报告 17 个未由本次引入的断链/anchor 缺口。
+
 - 2026-08-16 (**双 worktree 汇合成果已按语义冻结为九笔代码提交；orphan 洁净问题继续单独追踪**).
   **Changed**：在 `/tmp/txv2-precommit-freeze-s9nMZS` 保存提交前 status、完整
   binary tracked/index patch 与 untracked 清单后，将共同基线 `460152ced` 上的

@@ -1,0 +1,115 @@
+{
+  "schema": "tx.progress.handoff.v1",
+  "id": "2026-08-16-vf2-tools-persistence-verification",
+  "title": "Verify Git, Vim, GCC, Rust and reset durability on the VisionFive 2",
+  "created": "2026-08-16",
+  "from": "codex",
+  "status": "open",
+  "plan": null,
+  "current_state": [
+    "The only writable starting worktree is /tmp/txv2-la-full-clone.Nt4BdE/worktree on codex/la-full-clone-cap-fix at 90574601866783685f5ff6e8413a71aa61b514b4; /home/msp/learning/Txv2 is the user's dirty main worktree and must remain read-only.",
+    "Commit 905746018 makes automatic SMP-stall snapshots opt-in, tracks File-I/O tasks by generation-safe TaskKey, and retires stale PageContainer service runtimes. It is based on the reconciled persistence chain through 3df096b94 and has not been pushed.",
+    "The physical RV board is the VisionFive 2. It uses the shared rv64-qemu release ELF wrapped by cargo xtask image vf2-uimage --release; rv64-m1dock-mock is not the physical VF2 target.",
+    "Existing VF2 evidence proves four harts, MMC/ext4 direct root, DWMAC, public HTTPS, git help, and a real shallow clone, but that clone was under /dev/shm and did not prove reset persistence. Physical VF2 Vim/GCC/rustc evidence is still missing.",
+    "The user does not want push or pull attempted yet. Complete clone, local mutation/commit, tool execution, and physical reset durability before reporting readiness for any push/pull exercise."
+  ],
+  "changed_files": [
+    {
+      "path": "crates/tx-kernel/src/init.rs",
+      "reason": "Gate automatic stall snapshots behind tx.smp.stall-diag=1 and run bounded File-I/O retirement maintenance from idle reactors."
+    },
+    {
+      "path": "crates/tx-kernel/src/init/reactor_submit.rs",
+      "reason": "Remove exact generation-safe File-I/O task keys when terminal reactor tasks drain."
+    },
+    {
+      "path": "crates/tx-subsystems/src/device.rs",
+      "reason": "Provide lost-wake-safe owner retirement, claim RAII cleanup, duplicate-registration reuse, and stale-Weak idle wakeup."
+    },
+    {
+      "path": "crates/tx-subsystems/src/io_manager/page/manager.rs",
+      "reason": "Own the persistent owner-retired latch and service wake edge."
+    },
+    {
+      "path": "crates/tx-subsystems/src/page_backed/mod.rs",
+      "reason": "Publish destructor-side PageContainer owner retirement as a safety net."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo fmt --all -- --check && git diff --check",
+      "status": "passed",
+      "notes": "The final seven-file code commit shape is formatted and whitespace-clean."
+    },
+    {
+      "command": "cargo test -p tx-kernel reactor_stall_snapshot_is_opt_in_and_progress_does_not_rearm_it; cargo test -p tx-kernel file_io_service_task_tracking_is_generation_safe_and_terminal_drained",
+      "status": "passed",
+      "notes": "Both focused kernel regressions passed on the final commit base."
+    },
+    {
+      "command": "cargo test -p tx-subsystems idle_maintenance_wakes_claim_after_final_cap_before_payload_drop; cargo test -p tx-subsystems file_io_runtime",
+      "status": "passed",
+      "notes": "Final-Cap retirement and all four focused runtime registry tests passed."
+    },
+    {
+      "command": "cargo xtask build --target la64-2k1000 --kernel-only --release && cargo xtask image la2k1000-uimage --kernel-only --release",
+      "status": "passed",
+      "notes": "Final source shape produced an 8,949,424-byte uImage with SHA-256 9bf216066de4de3dae4e6303b30756e667c29acb750726de853677b869e45d77."
+    },
+    {
+      "command": "LA physical v2 idle, 96-file create/read/delete/sync, idle, and repository git status",
+      "status": "passed",
+      "notes": "The core seven-file lifecycle/stall fix passed on LA2K1000; the physically booted candidate additionally contained temporary Git/linkat diagnostics that were deliberately excluded from commit 905746018."
+    },
+    {
+      "command": "cargo -q xtask unit",
+      "status": "failed",
+      "notes": "Known baseline remains: 37 tx-shims shared-state dispatch failures and two tx-kernel libc command-string assertions. tx-ext4 95 passed and tx-scripts 168 passed."
+    }
+  ],
+  "next_actions": [
+    {
+      "id": "vf2-1",
+      "title": "Preflight the clean handoff worktree and build a uniquely named VF2 uImage",
+      "paths": [
+        "xtask/src/image.rs",
+        "target/images"
+      ],
+      "notes": "Confirm branch, exact HEAD, clean status, RV target availability, source image hash, serial device, TFTP root, NIC and free SD-ext4 space before changing external state. Never overwrite an existing TFTP artifact."
+    },
+    {
+      "id": "vf2-2",
+      "title": "Boot VF2 direct-root RW and verify all local scoring tools",
+      "paths": [],
+      "notes": "Use tx.root=mmcblk0 rw and a fresh add-only SD-ext4 directory, never /dev/shm. Capture git help, init/add/commit/log; real interactive vim -h and edit/Esc/:wq; gcc --help plus C Hello World compile/run; rustc -h plus Rust Hello World compile/run. Record source and binary hashes."
+    },
+    {
+      "id": "vf2-3",
+      "title": "Complete an unshallowed HTTPS clone and local commit",
+      "paths": [],
+      "notes": "Clone https://github.com/LLLPPPS/tx-push-test.git without --depth into a new SD-ext4 path. Prove --is-shallow-repository=false, remote HEAD equals clone HEAD, git fsck --full passes, modify an add-only evidence file and make a local commit. Do not push and do not pull."
+    },
+    {
+      "id": "vf2-4",
+      "title": "Prove persistence across physical reset and read-only remount",
+      "paths": [],
+      "notes": "After fsync/sync and recorded hashes, request the user's physical reset only at the exact checkpoint. Reboot the same artifact with tx.root=mmcblk0 ro, then re-run both Hello World binaries and verify sources, hashes, local commits, non-shallow clone state, HEAD and git fsck --full. Report only after the complete matrix passes or a concrete blocker is preserved."
+    }
+  ],
+  "caveats": [
+    "Do not modify, stage, commit, clean, stash, or switch /home/msp/learning/Txv2. All writable work starts at /tmp/txv2-la-full-clone.Nt4BdE/worktree and should use another isolated worktree only if parallel writes become necessary.",
+    "Do not run git push or git pull, do not request a PAT, and do not put credentials in a remote URL. The current goal stops at full clone plus local commit and reset durability.",
+    "Do not run dd, mkfs, partitioning, repair fsck, raw block writes, saveenv, flash writes, or deletion of existing evidence. Use add-only paths and unique TFTP filenames.",
+    "Check df before the full clone. An older VF2 root had only about 24 MiB free; if space is insufficient, stop with evidence rather than using --depth, deleting prior results, or resizing media.",
+    "The VF2 MMC barrier currently reports success without issuing a hardware flush. sync success is not durability proof; the physical reset and read-only reboot are mandatory.",
+    "VF2 has no persistent trusted RTC. Restore credible UTC and verify the CA bundle before HTTPS. U-Boot and txKernel network state do not inherit each other, so discover the live serial, NIC, route, DNS and host forwarding rather than assuming LA values.",
+    "Long clone or compiler silence must be bounded and logged. Classify the current phase from serial progress before rerunning or editing the kernel."
+  ],
+  "links": [
+    "docs/progress/STATUS.md",
+    "docs/progress/handoffs/2026-08-14-la2k1000-persistent-git-after-fchown-fix.json",
+    "xtask/src/image.rs",
+    "xtask/src/target.rs",
+    "crates/tx-drivers/src/mmc/mod.rs"
+  ]
+}
