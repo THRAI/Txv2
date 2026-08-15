@@ -1,3 +1,203 @@
+- 2026-08-16 (**双 worktree 汇合成果已按语义冻结为九笔代码提交；orphan 洁净问题继续单独追踪**).
+  **Changed**：在 `/tmp/txv2-precommit-freeze-s9nMZS` 保存提交前 status、完整
+  binary tracked/index patch 与 untracked 清单后，将共同基线 `460152ced` 上的
+  56 个 tracked 文件和 `checksum_v3_rw.rs` 拆为可独立审查的提交：Zone/EBR
+  generation-safe reclaim `0f3889304`、RV64 lock-free IPI `dfb1e7dae`、JBD2
+  checksum-v3 codec/replay `4dc86c962`、ext4/PageBacked writeback+fsync settlement
+  `3e0deefd7`、direct-root journal preflight `006e35f45`、可等待 VFS metadata
+  mutation `4df2d45ae`、LA old-world signal/frame materialization `aaae033f8`、exec
+  PageContainer lifetime `faaf2ff0a` 和 network fixture persistence-scope warnings
+  `d62bef191`。每笔提交正文均记录修复对象、原因、验证命令和已知限制；没有
+  stage `.codex/`、`target-partition-io/` 或构建产物，也没有 push。
+  **Verification**：epoch 23/23、zone 23/23、tx-substrate lib 61/61、RV64 HAL
+  119/119、tx-ext4-format 全部 enabled tests、tx-ext4 lib 95 passed/2 ignored、
+  checksum-v3 RW 1/1、rename/fchmod/fchown/link 聚焦测试 9/9、9/9、7/7、3/3，
+  signal codec 3/3、thread_future 35/35、procfs diagnostic 1/1 和 exec retention
+  1/1 均通过；聚焦 PageBacked settlement 通过。`tx-subsystems --lib` 的既有
+  bridge forwarding 计数用例单独运行仍失败，未混入本轮修复。
+  **Next**：先用全新 ext4 副本执行最小 create→unlink→close→sync→硬退出矩阵，
+  区分 rename-over post-commit `destroy_inode`、orphan-list removal 与 journal
+  safe-tail/checkpoint 的责任边界，再重新生成双架构评分日志。
+  **Blocker**：RV64/LA64 工具与 RW→RO 内容/哈希已通过，但宿主 `e2fsck -fn`
+  仍为 exit 4；日志可回放而残余 inode/bitmap/count 未收口，因此完整文件系统
+  洁净门禁保持红灯。
+
+- 2026-08-16 (**QEMU 工具原始串口噪声已分类；双架构 ext4 orphan/fsck 红灯可修复但不是
+  假告警**). **Changed**：逐字复核 RV31/LA4 RW/RO 串口，确认 `vim -h` 两边均
+  RC=0；其后的大量 `ESC [` 是真实全屏 Vim 的终端控制流，`errorfile` 是帮助文本，
+  `smp-stall` 是人工操作空闲超过 15 秒触发的睡眠态诊断。RV 的 `file: not found`
+  则是无关可选命令产生的真实 harness 错误，后续评分记录应剔除；原始 forensic log
+  保持不改。**Verification**：对两份原实验副本重跑只读 `e2fsck -fn` 仍为 exit 4，
+  检查前后 SHA 不变；在全新 `/tmp/txv2-fsck-recovery-audit-GBX1Lg` 复制品上执行
+  journal recovery/repair 后，两架构第二次 `e2fsck -fn` 均 exit 0。journal 回放清掉
+  大部分 orphan，但 RV 仍需修复 3 个 deleted inode，LA 仍需修复 2 个及对应 bitmap/
+  count，因此不是单纯 `-n` 跳过回放，也没有证据表明评分文件内容损坏。**Next**：用
+  最小 create/unlink/close 工作负载隔离 `sync_filesystem`、orphan removal 与 safe-tail
+  checkpoint 的 settlement 缺口，并为评委另产生命令级干净 transcript。**Blocker**：
+  题目 2--4 功能与 RO 哈希复验仍通过，但 canonical `e2fsck -fn` 洁净门禁保持失败。
+  详见 `msp/debug-logs/2026-08-16-qemu-tools-log-noise-and-ext4-orphan-audit.md`。
+
+- 2026-08-16 (**RV64/LA64 QEMU 的 Vim、GCC、rustc 评分项与同盘 RO 持久化均通过；宿主
+  fsck 洁净门禁仍为红**). **Changed**：只在唯一目标目录使用当前 release ELF，分别从
+  两个只读母盘制作全新唯一 4 GiB ext4 副本；按用户指定顺序在四核 direct-root RW
+  guest 中逐项运行 Vim→GCC→rustc。两架构均完成 `vim -h`，并在真实全屏 Vim 中进入
+  insert mode 输入 C Hello World、Escape、`:wq` 保存；`gcc --h`、`gcc --help`、
+  `gcc hello.c`/`./a.out` 和 `rustc -h`、`rustc helloworld.rs`/`./helloworld` 均 exit 0，
+  两个程序均输出 `Hello, World!`。随后对同一副本以 ext4 RO 重启，关键源文件、帮助
+  输出、二进制和运行输出的 SHA-256 全部一致，二进制可再次运行，写入尝试返回
+  `EROFS`。**Verification**：RV 证据在
+  `target/qemu-persist-accept/run-20260816-rv31-tools-2vpVW0/`，LA 证据在
+  `target/qemu-persist-accept/run-20260816-la4-tools-lzH0v0/`；两边 RW/RO marker、
+  `critical.sha256`、C/Rust 输出全部通过，母盘运行前后 SHA 分别保持
+  `d547220c...eb4` 与 `57c64d68...25ca`。**Next**：把两次宿主 `e2fsck -fn` exit 4
+  的 orphan/journal after-image 作为独立 ext4 洁净问题调查；保留且不复用当前副本。
+  **Blocker**：不影响题目 2–4 六个功能项及 RW→RO 数据持久化判定，但完整文件系统
+  洁净验收不能标绿。未操作物理板/U-Boot，未 stage/commit/push/pull。
+
+- 2026-08-15 (**双 dirty worktree 已安全三方汇合到唯一目标目录**).
+  **Changed**：从共同基线 `460152ced` 分别冻结 target/source 的 status、binary
+  tracked/index patch 与 untracked 清单，在全新的
+  `/tmp/txv2-reconcile-2i1C1DgE` detached 临时 worktree 中提交两侧快照并执行
+  真正三方 merge；逐项联合解决 JBD2 replay、ext4 v3 import、signal ABI 与
+  `STATUS.md` 四个文本冲突，再以 target→merged 增量 patch 经两轮目录不变性
+  比对和 `git apply --check` 后应用。Zone/EBR 14 个 source-only 文件、RV64 IPI
+  修复、checksum-v3 codec/tests、非 direct-root fixture 警告及 untracked
+  `checksum_v3_rw.rs` 均已进入 `/home/msp/learning/Txv2`；target 的
+  `linux_syscall/mod.rs`、LA2K1000 教程和较新的 handoff 原样保留，`.codex/`、
+  `target-partition-io/`、构建产物及共同 untracked 研究文档未复制/覆盖。正式
+  分支、HEAD 与 index 未移动，旧 Codex 工作树经 post-apply 复核仍等于冻结快照。
+  **Verification**：`cargo fmt --all -- --check`、`git diff --check`、epoch 23/23、
+  zone 23/23、tx-substrate lib 61/61 通过；普通 dev target 的首次
+  `cargo check -p tx-substrate` 命中旧 `tx-hal` rmeta，改用全新
+  `CARGO_TARGET_DIR=/tmp/txv2-reconcile-2i1C1DgE/cargo-check-clean-target` 后从
+  `tx-hal` 起重编并通过，证明不是源码/API 缺口。**Next**：只在唯一目标目录
+  提取 RV7 clone 阶段证据、解码 monitor PC，并把验收 runner 调整为
+  Vim→GCC→Rust→Git 后再启动新的有界实验。**Blocker**：当前无代码 blocker；
+  Git clone 卡点仍待现有日志与失败 ext4 副本归因。
+
+- 2026-08-15 (**LA2K1000 实板快速启动教程已补齐**).
+  **Changed**：新增
+  `docs/tutorials/la2k1000-real-board-quick-start.md`，用固定、可复制的最短流程
+  说明 kernel-only release 构建、带逐行注释的 add-only TFTP 传输、picocom
+  手动连续按 `c` 截停及退出按键、
+  U-Boot/FDT 单参数 `bootm`、`sda1` ext4 RO 启动门禁、板端静态网络、宿主机
+  转发/NAT、600 包 ping、tmpfs Git clone/fsck，以及独立的 add-only ext4
+  写入—物理复位—RO 读回持久化闭环。教程默认 RO，并显式禁止 `saveenv`、
+  raw block/flash write、格式化、修复和 BusyBox `reboot`；没有引入 shell 环境变量
+  前置配置。实板复走时发现原教程在 LAN/NAT 后直接调用 `nslookup`，漏写板端
+  resolver 与 TLS 的 UTC/CA 门禁；现已补入宿主机上游 DNS 发现、板端 RW
+  resolver 备份/配置、RO 分流、公网/DNS 分层检查、每次复位后的可信 UTC 恢复、
+  CA bundle 检查及“禁止关闭证书校验”。**Verification**：`git diff --check`
+  通过；教程引用的实板总账存在；构建、镜像、串口、bootargs/profile、DNS
+  `10.248.98.30`、UTC/CA 命令已与既有实板闭环记录
+  逐项核对。`cargo xtask lint docs` 仍被未触碰的 25 个既有断链与 active docs
+  细粒度 anchor 缺口阻断，新教程没有出现在失败列表中。**Next**：后续 LA
+  启动优先按该教程走 RO 流程，只有所有网络门禁通过后才进入可选持久化步骤。
+  **Blocker**：教程本身无阻塞；仓库全局旧文档 lint 债务仍在。
+
+- 2026-08-15 (**RV QEMU 四核 direct-root ext4 RW/JBD2、文件 fsync 与重启
+  持久化已闭环；旧 Git 网络脚本的验证边界已显式标注**). **Changed**：七个 legacy
+  Git/DHCP fixture/wrapper 现明确声明其 `tx.runsh` 启动使用 tmpfs 根，比赛 ext4
+  仅作为只读 `/musl` sidecar，因而通过结果只能证明网络、DNS、TLS、IRQ 与 Git
+  协议路径，不能再作为 direct-root ext4 RW、JBD2、重启持久化证据。比赛 RV
+  ext4 的 `rw-discovered:EIO` 根因是 Linux JBD2 checksum-v3 事务尚未被正确
+  admit/校验/编码/回放；现实现严格的 v3 superblock、descriptor tag、revoke、
+  commit CRC32C 语义，并在任何损坏回放写 home block 前失败。PageBacked 的
+  stable fsync wait、close 后后台 commit/checkpoint 与 service wake/lifetime 修复
+  保留；此外修正 `JournalFsyncSource::plan_fsync`：后台已完成全部 settlement、
+  当前无 mutation 时，重复文件 fsync 返回 terminal Noop success，不再把合法
+  clean state 泄漏为 `EAGAIN`；尚未 data-durable 的事务仍失败，未被伪装成功。
+  四核现场另定位并修复一个独立的 main 合并错配：一侧 RV64 IPI 实现使用带锁的
+  per-kind CPU 位图，另一侧已切换到无锁 per-CPU `AtomicU8` pending bitmap；合并
+  结果错误地把新 pending 状态与旧 `IPI_STATE_LOCKS` 同时保留。超时 monitor 中
+  CPU1/2/3 均停在 `ack_ipi` 的锁自旋，另一次 CPU0 停在 `send_ipi` 同一锁路径。
+  现恢复已验证的原子 publish/ack 语义：同种 IPI 以 level bit 合并，不同种类独立，
+  handler 不再等待可能由被中断 sender 持有的自旋锁。
+  **Verification**：checksum-v3 host oracle 1/1，tx-ext4 lib 95/95（另 2 ignored）、
+  mutation lifecycle 7/7、PageBacked fsync 31/31、非零 boot-hart console 1/1、
+  TCP PollContext HAS_DATA 重发 1/1、RV64 HAL 119/119；RV64 release build、全仓
+  fmt/diff check 通过。使用只读 mother image 的全新 `/tmp` 副本，以 RV QEMU `-smp 1`
+  direct-root RW 创建 `/root/tx-csumv3-fsync-qemu-20260815-c/marker`，文件 fsync
+  与 `sync -f /` 成功，退出 QEMU 后对同一副本 direct-root RO 重启读回相同内容；
+  串口见 `/tmp/txv2-rv-persist4-Sfo7d4/{write,read}.serial.log`，标记分别为
+  `TXPERSIST:WRITE:OK`/`TXPERSIST:READ:OK`。随后 `e2fsck -fn` exit 0；原 mother
+  image SHA-256 仍为 `d547220c...eb4`，仅副本发生预期变化。
+  修复 IPI 锁错配后的 kernel SHA-256 为 `ef6976f2...554e`；使用三个互不复用的
+  新 `/tmp` ext4 副本连续完成 3/3 轮 `-smp 4 -accel tcg,thread=multi` direct-root
+  RW→文件 fsync→`sync -f /`→同盘 RO 重启读回。六次启动均报告 online=4、
+  `userspace:submitted` 并到达 shell；三轮 RO 前后镜像 SHA 不变、source SHA
+  始终不变、`e2fsck -fn` 均 exit 0，且无 timeout/panic/trap。完整证据位于
+  `/tmp/txv2-rv-smp4-per-target-YcjHHl/{result.txt,host.log,sha256.tsv,commands.txt}`
+  及 `round{1,2,3}.{rw,ro}.serial.log`。
+  **Remaining / Next**：目录 fsync 仍返回 `ENOSYS`，本轮判据因此只依赖文件
+  fsync、filesystem sync 与同盘 RO 重启读回；LA/RV 实板持久 Git与多核网络压力
+  仍按各自独立实板账本验收。`cargo xtask progress validate` 仍被未触碰的
+  `2026-07-24-network-time-integration.json` 旧状态值 `completed` 阻断。未
+  stage/commit/push，未修改
+  `/home/msp/learning/Txv2`、`.codex/` 或用户研究文档。
+
+- 2026-08-15 (**main 合并后的 LA sda1 持久 Git、双向网络压力与实板
+  old-world SIGALRM 已闭环**).
+  **Changed**：当前 PR 工作树仍位于
+  `feature/portable-net-vf2-dwmac@460152ced`，无 `MERGE_HEAD`、索引冲突、
+  暂存 diff 或冲突标记；console BootHandoff CPU 与 TCP PollContext readable
+  重发修复及其回归均仍在，main 的 FS/Process/VM、LA QEMU TLB、Loongson 与 VF2
+  平台代码未回退。合并后新增的 legacy ext4/JBD2、PageBacked fsync/close
+  settlement、chmod/chown Waiting、rename Waiting/cleanup 修复使 LA 实板能在
+  `/dev/sda1` ext4 RW 上完成 add-only HTTPS shallow clone；物理复位后同镜像
+  以 RO root 重新打开相同仓库，HEAD
+  `0c8e312f82c34335d78073334c40c253c70df23c` 与
+  `git fsck --full` 均通过。板端 RO root 上 host→LA TCP 5 路 52.6 MiB/
+  29.1 Mbit/s、LA→host TCP 5 路 98.2 MiB/55.2 Mbit/s/0 retrans、UDP 5 路
+  8,560/8,560 数据报/0% loss 均通过。高频 BusyBox ping 首包后
+  `Alarm clock` 先暴露 caught-signal frame 的合法 VM Yield 被误作 fatal；handler
+  交付已改为 async 并安全重试。该修复在 QEMU 通过后，实板仍失败，最终由
+  factory glibc 2.28/Python 的 `rt_sigaction`、`rt_sigprocmask`、
+  `rt_sigpending` 全部 `EINVAL` 锁定为 LoongArch old-world 16-byte sigset 与
+  new-world 8-byte sigset 的 ABI 差异。signal syscall 边界现仅在 LA 接受
+  8/16-byte 双 ABI，16-byte 输入消费并忽略不支持的高 64 位，输出高 64 位清零；
+  RV/其他目标继续只接受 8-byte。**Verification**：ABI codec 6/6、
+  `rt_sigprocmask` 4/4、LA/RV target check、fmt/diff check 均通过；实板以
+  `/dev/sda1` ext4 RO 启动新 artifact 后，Python `SIG_IGN` 自发 SIGALRM、
+  `pthread_sigmask`/`sigpending`、Bash handler/return 全通过；BusyBox 周期 ping
+  3/3 和 600/600 均 0% loss。最终 add-only TFTP artifact 是
+  `txv2-la2k1000-pr-460152ced-oldworldsig-3fd30c0d.uimage`，SHA-256
+  `3fd30c0d96dffc9ffcc65b4ec2aa332de467185342c6ee433e5c5f912c535914`，
+  source/TFTP `cmp` 一致。两次人工串口截停未命中零秒 U-Boot 窗口，厂商 Linux
+  自行以 RW 启动并写入 systemd journal；本代理未在厂商 Linux 执行命令。最终
+  使用 5 ms 自动截停和逐门禁原子流程，以已验证 `ro` bootargs 启动 txKernel。
+  **Remaining / Next**：RV 实板 post-merge clone 仍是 RAM-only，必须另做 ext4
+  写入—复位—RO fsck 持久闭环。`cargo -q xtask unit` 仍被
+  main 现存 tx-shims dispatch 回归与两个 tx-kernel libctest 命令串断言阻断，
+  tx-ext4 95/95、tx-scripts 167/167 通过。未 stage/commit/push/改写历史。
+  详见
+  `msp/debug-logs/2026-08-15-main-merge-la-persistent-git-network-sigalrm.md`。
+
+- 2026-08-14 (**当前 PR 工作树已接回 main 合并成果，并修复 LA 持久 ext4 tar 的
+  `fchownat` one-shot panic；新实板镜像待复位验收**).
+  **Changed**：`feature/portable-net-vf2-dwmac` 在保留 tracked stash、`.codex/`
+  与未跟踪研究文档的前提下安全快进到 `460152ced`；没有改写历史，也没有继续
+  修改 main 工作树。`ChownOp`/`ChmodOp` 会在 ext4 metadata admission 竞争时
+  合法 Yield，却被错误标为 `OneShotStepOp` 并由 `drive_oneshot` 执行，BusyBox
+  tar 每个条目的 `fchownat` 因此稳定触发 STEP-11 panic。两个 syscall 现改走
+  full `drive(..., Waiting)`，并在恢复时保留预解析 dentry。Linux-informational
+  JBD2 descriptor UUID 回放和 RO-only journal preflight 也已移植到当前 PR 树。
+  **Verification**：chmod/chown contention 恢复 2/2、tx-shims 两条成功路径各
+  1/1、Waiting driver 1/1、非零 boot-hart console 1/1、TCP readable 重发 1/1、
+  tx-ext4-format 116 pass/1 ignored、kernel preflight 4/4、fresh-target kernel
+  check、fmt 与 diff check 均通过。LA kernel-only release/image 构建通过；新
+  immutable TFTP 镜像为
+  `txv2-la2k1000-pr-460152ced-fchown-d28e88be.uimage`，SHA-256
+  `d28e88beaf35247582a0aed618d55724abf2f141e75c4d3f213be41d51732801`，
+  source/TFTP `cmp` 一致。`cargo -q xtask unit` 仍是既有 tx-shims shared-state
+  群与两个 kernel libctest 命令断言失败；全局 step/no-adhoc lint 也仍由既有
+  ratchet 超限阻断。**Next / Blocker**：板子因一次漏抢 U-Boot 当前在厂商 Linux；
+  未向其 root shell 发送命令。等待用户明确复位后先做 SCSI identity 与 RO journal
+  preflight，成功后才用全新 `-b` 路径重跑 add-only extraction/Git/fsck/复位读回；
+  绝不复用或清理部分创建的 `-a/toolroot`。详见
+  `msp/debug-logs/2026-08-14-la2k1000-tar-fchown-step-panic.md` 与
+  `docs/progress/handoffs/2026-08-14-la2k1000-persistent-git-after-fchown-fix.json`。
+
 - 2026-08-13 (**`main@4f14845d` 与 portable-net/VF2 分支 `c62e8824` 的语义合并、
   QEMU 网络压力/Git 与 post-merge VF2 实板验收已闭合**).
   **Changed**：全部 merge marker 已清零。合并以 main 的新 FS/PageBacked、进程退出/
@@ -63,6 +263,56 @@
   validation; one earlier long TLS connection closed with `SSL_ERROR_SYSCALL`,
   but short TLS and the clean full retry passed. Detailed evidence is in
   `msp/debug-logs/2026-08-13-la2k1000-2g-network-validation.md` and the LA handoff.
+
+- 2026-08-14 (**网络栈模拟评委题库 Q005–Q022 已完成**). **Changed**：从
+  往届答辩题提炼时间/责任、原创性与量化、端到端、平台差异、机制效果、容量
+  边界、现实应用、调试归因和设计取舍九类问法；逐题核对当前代码、`main`
+  比赛锚点、最新合并代码和 QEMU/两块物理板证据，将 18 道模拟题、标准口答、
+  追问陷阱和代码锚点追加到 `msp/docsss/网络栈代码研究问答.typ`，PDF 从 9 页
+  扩展为 18 页。详细口径见
+  `docs/progress/research/2026-08-14-network-judge-question-bank.md`。
+  **Verification**：CodeGraph 后做定点源码/历史复核；核对提交数、diff、物理
+  行数、smoltcp fork 差异、平台 bundles、IRQ/收发路径与容量常量；Typst 编译
+  通过，18 页 A4 全量渲染并抽检第 1、8、10、14–18 页，无裁切或表格溢出；
+  本轮未重跑 kernel/QEMU/实板测试，运行结果引用保存总账。**Next**：按题目
+  进行口头模拟，再对照 PDF 答案；新增问题从 Q023 继续。**Blocker**：首次
+  smoltcp vendor 缺上游 source commit，初赛/决赛缺同环境性能 A/B；物理行数
+  只能证明仓库边界，不能单独证明个人作者归属。
+
+- 2026-08-13 (**网络栈代码研究问答已整理为 Typst，并校正初赛基线**).
+  **Changed**：基于当前网络代码与 Git 历史，整理了六层职责、smoltcp 边界及
+  本地 fork 改动、初赛到决赛的优化、Listener Table 实际复杂度，以及八类
+  调试案例；按用户口径将初赛基线校正为 `main` 在 2026-06-15 00:00 +08:00
+  前的最后提交 `09bbbad7`，决赛代表锚点为同在 `main` 的 `1ba1dc28`；新增
+  `msp/docsss/网络栈代码研究问答.typ` 和编译后的 9 页 A4 PDF，并将证据边界
+  记录在 `docs/progress/research/2026-08-13-network-stack-code-qa-typst.md`。
+  **Verification**：`git log main --before` 确认 `09bbbad7` 的提交时间为 6 月
+  14 日 16:10，下一个 `main` 提交已是 6 月 15 日 12:41；旧锚点 `fafc4065`
+  与新基线之间相关网络路径 diff 为空，TCP/UDP/Listener Table 源码哈希一致；
+  Typst 0.14.2 编译、字体/PDF 元信息和页面抽检通过；本轮未运行内核或 QEMU
+  gate。**Next**：后续问题按 Q005 起追加；若需量化性能提升，固定
+  `09bbbad7`/`1ba1dc28` 同环境 A/B。**Blocker**：首次 smoltcp vendor 未保留
+  上游 source commit，且尚无这两个比赛锚点的受控性能对照。
+
+- 2026-08-11 (**决赛网络功能改进 Typst 稿已按当前代码完成审计与排版**).
+  **Changed**：在 `feature/portable-net-vf2-dwmac@85a6fcc00cbd` 上核对
+  `SocketPayload`/`RawTcpSocket`/`RawUdpSocket` 字段收敛、分组与网卡边界、
+  IPv6 实际网卡数据面、VisionFive 2/Loongson 2K1000 实板驱动以及
+  socket 的 `OpenFile`/fd/VFS 接入，新增
+  `msp/docsss/决赛网络功能改进.typ`，并将“文件套接字”校正为统一文件对象模型，
+  不与 `AF_UNIX` 混用。TCP 小节进一步补入当前 `TcpInner` 完整字段，并按提交历史说明单锁收敛、
+  `connect_attempt` 的连接代次关联以及 `pending_immediate_reply` 对乱序包即时 ACK 的反压保留；代码框内已为
+  `TcpInner` 和展示的 `RawTcpSocket` 字段逐项加入简短中文注释，并为 `PacketSource`/
+  `PacketTxSink`/`NetDeviceOps` 的展示方法标明入站分流、IP 分组发送与链路帧收发职责。开发板小节已删除 DWMAC/MMIO/IRQ/DMA 适配细节，改为
+  RISC-V/LoongArch 的 `ping`、DNS、HTTP/HTTPS 与 Git `clone`/`push`/`pull` 功能验证，并明确区分双架构完整 push/pull 闭环与实板 ping/HTTPS/clone 记录。全部五处代码展示已统一改为普通 fenced raw block，删除 `code-figure` 封装、图注与“代码”自动编号。首轮直接编译暴露韩文 CJK 字体回退与字号混用，现已在片段内显式对齐模板的
+  Times New Roman/Noto Serif CJK SC 正文、Noto Sans CJK SC 标题与 DejaVu Sans Mono/Noto Sans CJK SC 代码字体。
+  **Verification**：Typst A4 直接编译通过，渲染图逐页目视无乱码，`pdffonts` 仅见预期字体，`pdfinfo`
+  确认正文片段为 4 页，`git diff --check -- msp/docsss/决赛网络功能改进.typ`
+  通过；`cargo xtask progress validate` 仅被未触碰的 07-24 plan 旧 `completed`
+  状态阻断，`cargo xtask lint docs` 仍为既有 31 个断链/6 个旧词警告，均未命中新文件。
+  **Next**：用户审阅后在网络章末 `#include` 该片段，或将内容迁入最终报告源。
+  **Blocker**：无功能阻塞；当前自动编号下网络栈为第 11 章而非第 10 章，最终章号由用户定稿顺序决定。
+  详细证据见 `docs/progress/research/2026-08-11-final-network-report-code-audit.md`。
 
 - 2026-08-11 (**Loongson 2K1000 AHCI 可写传输、板载持久化与完整 Git/TLS 负载均已实板闭合**).
   **Changed**：以 `42cd4396` 为实现基线，先新增
