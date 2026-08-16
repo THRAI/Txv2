@@ -397,16 +397,31 @@ impl WaitSource {
         mask: InterestMask,
         limit: usize,
         hint: MailboxSchedulerHint,
-        mut post: F,
+        post: F,
     ) -> usize
     where
         F: FnMut(&TaskMailbox, MailboxEvent, MailboxSchedulerHint) -> bool,
+    {
+        self.notify_limit_emit_with_owner_post_inner(mask, limit, hint, post, || {})
+    }
+
+    fn notify_limit_emit_with_owner_post_inner<F, H>(
+        &self,
+        mask: InterestMask,
+        limit: usize,
+        hint: MailboxSchedulerHint,
+        mut post: F,
+        after_snapshot: H,
+    ) -> usize
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent, MailboxSchedulerHint) -> bool,
+        H: FnOnce(),
     {
         if limit == 0 || mask.raw() == 0 {
             return 0;
         }
 
-        let deliveries = {
+        let (deliveries, pending_latched) = {
             let mut subs = self.subscribers.lock();
             let mut deliveries = Vec::new();
             subs.retain(|sub| {
@@ -419,8 +434,16 @@ impl WaitSource {
                 }
                 true
             });
-            deliveries
+            let pending_latched = deliveries.is_empty();
+            if pending_latched {
+                // Registration uses this same lock as its publication point.
+                // Latch before releasing it so a waiter can neither appear
+                // after the empty snapshot nor miss the fallback pending bit.
+                self.pending_mask.fetch_or(mask.raw(), Ordering::AcqRel);
+            }
+            (deliveries, pending_latched)
         };
+        after_snapshot();
 
         let mut posted = 0usize;
         for (mailbox, generation, interests) in deliveries {
@@ -444,7 +467,7 @@ impl WaitSource {
                 }
             }
         }
-        if posted == 0 {
+        if posted == 0 && !pending_latched {
             self.pending_mask.fetch_or(mask.raw(), Ordering::AcqRel);
         }
         posted
@@ -1041,6 +1064,55 @@ mod tests {
             }
             other => panic!("expected SourceFired, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn owner_post_empty_snapshot_cannot_miss_a_concurrent_registration() {
+        let src = Arc::new(WaitSource::new(WaitSourceId::new(43)));
+        let snapshot_taken = Arc::new(std::sync::Barrier::new(2));
+        let registration_done = Arc::new(std::sync::Barrier::new(2));
+
+        let notifier = {
+            let src = Arc::clone(&src);
+            let snapshot_taken = Arc::clone(&snapshot_taken);
+            let registration_done = Arc::clone(&registration_done);
+            std::thread::spawn(move || {
+                src.notify_limit_emit_with_owner_post_inner(
+                    InterestMask::new(0b1),
+                    1,
+                    MailboxSchedulerHint::LifecycleWake,
+                    |_mailbox, _event, _hint| true,
+                    || {
+                        snapshot_taken.wait();
+                        registration_done.wait();
+                    },
+                )
+            })
+        };
+
+        snapshot_taken.wait();
+        let mailbox = mb();
+        let generation = WaitGeneration::new(9);
+        let guard = src
+            .prepare(Arc::downgrade(&mailbox), generation, InterestMask::new(0b1))
+            .install();
+        registration_done.wait();
+
+        assert_eq!(notifier.join().expect("notifier thread"), 0);
+        assert!(
+            matches!(
+                mailbox.poll(),
+                Some(MailboxEvent::SourceFired {
+                    generation: event_generation,
+                    source,
+                    interests,
+                }) if event_generation == generation
+                    && source == WaitSourceId::new(43)
+                    && interests == InterestMask::new(0b1)
+            ),
+            "notification must survive the empty-snapshot/register interleaving"
+        );
+        drop(guard);
     }
 
     #[test]
