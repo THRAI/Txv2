@@ -1,3 +1,41 @@
+- 2026-08-16 (**VF2 物理验收止于 Git post-commit 挂起与复位后 MMC ext4 RW
+  拒绝；完整矩阵保持失败**). **Changed**：在 app 隔离工作树从
+  `a91f0807d` 新建 `codex/vf2-file-io-runtime-rebind-fix`。首轮物理 RW 的
+  `git help` 后，`execve`/`newfstatat` 持续 EIO；提交 `3d6b65223` 使仍有 live
+  `PageContainer` 的 File-I/O claim Drop 复用原 registry/wake source，并由 AP/BSP
+  convergence 重提 replacement。新镜像
+  `txv2-vf2-3d6b6522-ea831da8.uimage`（5,362,144 bytes，SHA-256
+  `ea831da84c8a7ad220805618374f3fb4728af4c360619b5b2d893a472e5dbf43`）在 VF2
+  同盘 direct-root RW 上通过 write/stat/read/chmod/exec 探针和 `git help`。正式 Git
+  baseline 的 init、repo-local config、README、add 均完成，但 commit 命令在不输出
+  摘要/提示符的情况下挂起。只读 syscall 重放表明同版 Git 会在 refs 发布后启动
+  `git maintenance --auto --detach` 并 wait4；RO 复位后现场 commit
+  `b574dba3b66bdd0e4cb2a3327ea2f5163b3752e3`、README、clean status 和
+  `git fsck --full=0` 均存在，故挂点位于 commit 已线性化后的阶段，但本次没有有效
+  stall 快照，不能把 wait4 当作已确诊的唯一根因。另提交 `f11ad1076`，让真实
+  `ProcessIdentity::thread_signal_interrupts_wait` 委托已有 disposition-aware 判定，
+  修复 wait4 收到 SIGINT/SIGCANCEL 后消费事件却重新停车的确定 wiring 缺口。
+  **Verification**：runtime 聚焦测试 5/5、两条 owner-retirement 竞态、kernel
+  generation-safe drain、fmt/diff check 通过；`tx-scripts --test drive` 24/24 通过。
+  最终源码 `f11ad1076` 的 RV64 release build 通过，ELF 9,375,568 bytes、SHA-256
+  `4dfdf1f9ff7250e52d5d4782fccfdc5bbc80d200e71f43daa90d932a61b8e421`；该 ELF 未包装或
+  物理启动，避免在 RW blocker 后产生未经验证的新镜像。
+  `cargo -q xtask unit` 仍只有既有 37 个 tx-shims shared-state 失败与两个 kernel
+  libc 命令断言失败，tx-ext4 95/95、tx-scripts 168/168 通过。release ELF SHA-256
+  `d7be94e1...52e96`，板端 TFTP 5,362,144 bytes 与 `iminfo` CRC OK。完整串口见
+  `target/vf2-acceptance/run-20260816-vf2-a91f0807-190020Z/serial-full.log`。新 handoff
+  通过 `jq empty`；全局 `cargo xtask progress validate` 仍被既有
+  `2026-07-24-network-time-integration.json` 的旧枚举 `completed` 阻断，docs lint
+  仍报告 17 个未由本次引入的旧断链/anchor 缺口。
+  **Next**：保留当前 MMC 与所有 add-only 证据；只有获得无需 repair/raw write 即可
+  安全 RW 的新介质或外部恢复结果后，才从最终源码重新构建唯一 VF2 镜像，并从全新
+  目录重跑 Git/Vim/GCC/Rust/full non-shallow clone、sync、物理 reset、同盘 RO
+  哈希/commit/fsck 全矩阵。**Blocker**：post-commit 物理复位后，同一 MMC 的
+  txKernel RW mount 在 `rw-discovered` 聚合阶段返回 EIO；该路径可能已尝试 journal
+  replay/home-block/barrier，不能声称失败前零写入。随后同盘 RO mount 和 Git fsck
+  成功，但硬边界禁止 repair fsck、raw write 或盲试 RW。因此 Vim、GCC、Rust、full
+  clone 与最终 RW→reset→RO 验收均未执行/未通过，不得让用户继续 push/pull 验证。
+
 - 2026-08-16 (**LA stall/File-I/O 修复已整理提交；VF2 工具与复位持久化交接已冻结**).
   **Changed**：只在 `/tmp/txv2-la-full-clone.Nt4BdE/worktree` 将分支移到已审计的
   `3df096b94` 干净历史，再恢复并提交 7 个 runtime 文件为 `905746018`；自动
