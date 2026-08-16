@@ -672,18 +672,33 @@ pub fn select_next_signal(
 pub fn thread_pending_signal_interrupts(
     thread: &Cap<crate::thread_runtime::ThreadIdentity>,
 ) -> bool {
-    let Some((sig, _)) = select_next_signal(thread) else {
+    let Ok(thread_payload) = thread.upgrade_operational() else {
         return false;
     };
-    let guard = step_engine::guard();
-    let Some(proc) = thread.owner_proc.upgrade(&guard) else {
+    let Some(process) = thread.upgrade_owner_proc() else {
         return false;
     };
-    drop(guard);
-    let Ok(payload) = proc.upgrade_operational() else {
+    let Ok(process_payload) = process.upgrade_operational() else {
         return false;
     };
-    let entry = payload.sig_actions().get_entry(sig);
+
+    // This is a read-only predicate: inspect every currently deliverable bit
+    // without dequeuing it. A lower-numbered ignored or restartable signal must
+    // not hide a later signal that should abort the wait.
+    let mask = thread_payload.signal_mask();
+    let mut pending = thread_payload.pending().deliverable_bits(mask)
+        | process_payload.group_pending().deliverable_bits(mask);
+    while let Some(sig) = lowest_signum_bit(pending) {
+        pending &= !sig.bit();
+        let entry = process_payload.sig_actions().get_entry(sig);
+        if signal_action_interrupts_wait(sig, entry) {
+            return true;
+        }
+    }
+    false
+}
+
+fn signal_action_interrupts_wait(sig: Signum, entry: SigActionEntry) -> bool {
     match entry.disposition {
         SigDisposition::Ignore => false,
         SigDisposition::Default => !matches!(default_action(sig), DefaultAction::Ignore),

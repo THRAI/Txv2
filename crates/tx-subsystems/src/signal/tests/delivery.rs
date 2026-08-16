@@ -6,8 +6,9 @@ use crate::process::{bootstrap_init_process, ExitStatus, ProcessIdentity};
 use crate::signal::adapter::step_engine::{Cap, SignalRouting};
 use crate::signal::{
     ast_check, default_action, post_group_pending_signal, select_next_signal,
-    step_kill_process_with_post, step_sigaction, AstOutcome, DefaultAction, InterruptSummary,
-    KillOutcome, PendingSource, SaFlags, SigActionEntry, SigDisposition, SignalTarget,
+    step_kill_process_with_post, step_sigaction, thread_pending_signal_interrupts, AstOutcome,
+    DefaultAction, InterruptSummary, KillOutcome, PendingSource, SaFlags, SigActionEntry,
+    SigDisposition, SignalTarget,
 };
 use crate::thread_runtime::execution::{post_signal_with_post, step_sigprocmask, SigmaskHow};
 use crate::thread_runtime::structure::ThreadIdentity;
@@ -228,6 +229,121 @@ fn select_falls_through_to_group_pending_when_thread_empty() {
         select_next_signal(&leader),
         Some((Signum::SIGTERM, PendingSource::Group))
     );
+}
+
+// ----- blocking-wait interrupt classification -----
+
+#[test]
+fn wait_interrupt_scan_skips_explicit_ignore_before_interrupting_signal() {
+    let _g = setup();
+    let proc_cap = fresh_init();
+    let leader = leader(&proc_cap);
+
+    let _ = step_sigaction(&proc_cap, Signum::SIGINT, SigDisposition::Ignore);
+    deliver_signal_with_direct_post_for_test(
+        &leader,
+        Signum::SIGINT,
+        SignalRouting::ProcessDirected,
+        None,
+    );
+    deliver_signal_with_direct_post_for_test(
+        &leader,
+        Signum::SIGTERM,
+        SignalRouting::ProcessDirected,
+        None,
+    );
+
+    assert!(thread_pending_signal_interrupts(&leader));
+}
+
+#[test]
+fn wait_interrupt_scan_skips_default_ignore_before_interrupting_signal() {
+    let _g = setup();
+    let proc_cap = fresh_init();
+    let leader = leader(&proc_cap);
+
+    deliver_signal_with_direct_post_for_test(
+        &leader,
+        Signum::SIGCHLD,
+        SignalRouting::ProcessDirected,
+        None,
+    );
+    deliver_signal_with_direct_post_for_test(
+        &leader,
+        Signum::SIGTSTP,
+        SignalRouting::ProcessDirected,
+        None,
+    );
+
+    assert!(thread_pending_signal_interrupts(&leader));
+}
+
+#[test]
+fn wait_interrupt_scan_skips_restart_handler_before_nonrestart_handler() {
+    let _g = setup();
+    let proc_cap = fresh_init();
+    let leader = leader(&proc_cap);
+    let sigusr1 = Signum::new(10).expect("SIGUSR1");
+
+    let mut restart = SigActionEntry::handler(0x1111);
+    restart.flags = SaFlags::RESTART;
+    let _ = crate::signal::step_sigaction_entry(&proc_cap, sigusr1, restart);
+    let _ = step_sigaction(&proc_cap, Signum::SIGTERM, SigDisposition::Handler(0x2222));
+    deliver_signal_with_direct_post_for_test(
+        &leader,
+        sigusr1,
+        SignalRouting::ProcessDirected,
+        None,
+    );
+    deliver_signal_with_direct_post_for_test(
+        &leader,
+        Signum::SIGTERM,
+        SignalRouting::ProcessDirected,
+        None,
+    );
+
+    assert!(thread_pending_signal_interrupts(&leader));
+}
+
+#[test]
+fn wait_interrupt_scan_returns_false_when_all_deliverable_signals_are_noninterrupting() {
+    let _g = setup();
+    let proc_cap = fresh_init();
+    let leader = leader(&proc_cap);
+    let sigusr1 = Signum::new(10).expect("SIGUSR1");
+
+    let _ = step_sigaction(&proc_cap, Signum::SIGINT, SigDisposition::Ignore);
+    let mut restart = SigActionEntry::handler(0x1111);
+    restart.flags = SaFlags::RESTART;
+    let _ = crate::signal::step_sigaction_entry(&proc_cap, sigusr1, restart);
+    for sig in [Signum::SIGINT, sigusr1, Signum::SIGCHLD] {
+        deliver_signal_with_direct_post_for_test(
+            &leader,
+            sig,
+            SignalRouting::ProcessDirected,
+            None,
+        );
+    }
+
+    assert!(!thread_pending_signal_interrupts(&leader));
+}
+
+#[test]
+fn wait_interrupt_scan_checks_group_after_noninterrupting_thread_signal() {
+    let _g = setup();
+    let proc_cap = fresh_init();
+    let leader = leader(&proc_cap);
+
+    let _ = step_sigaction(&proc_cap, Signum::SIGINT, SigDisposition::Ignore);
+    deliver_signal_with_direct_post_for_test(
+        &leader,
+        Signum::SIGINT,
+        SignalRouting::ProcessDirected,
+        None,
+    );
+    assert!(post_group_pending_signal(&proc_cap, Signum::SIGTERM));
+
+    assert!(thread_pending_signal_interrupts(&leader));
 }
 
 // ----- ast_check matrix -----
