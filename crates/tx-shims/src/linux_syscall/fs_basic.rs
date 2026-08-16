@@ -2758,7 +2758,7 @@ pub(super) async fn sys_newfstatat<'a, P: tx_hal::ConsoleIf>(
     let path = match read_user_cstr_wait(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX).await {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
-        Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
+        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
 
     let walker_cred = ctx.walker_cred();

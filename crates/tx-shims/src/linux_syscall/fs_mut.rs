@@ -666,7 +666,7 @@ pub(super) async fn sys_truncate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     let path = match read_user_cstr_wait(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX).await {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
-        Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
+        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
     if path.is_empty() {
         return SyscallResult::Error(ENOENT_VALUE);
@@ -1166,7 +1166,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
     let target = match read_user_cstr_wait(&ctx.aspace, target_uaddr, EXECVE_PATH_MAX).await {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
-        Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
+        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
 
     let cwd = match ctx.process.cwd() {
@@ -1212,7 +1212,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
         let source = match read_user_cstr_wait(&ctx.aspace, source_uaddr, EXECVE_PATH_MAX).await {
             Ok(p) => p,
             Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
-            Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
+            Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
         };
         let source_dentry = match walk_from_process(cwd, &source, &cred, &ctx.process) {
             Ok(d) => d,
@@ -1242,7 +1242,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
         let source = match read_user_cstr_wait(&ctx.aspace, source_uaddr, EXECVE_PATH_MAX).await {
             Ok(p) => p,
             Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
-            Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
+            Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
         };
         let source_dentry = match walk_from_process(cwd, &source, &cred, &ctx.process) {
             Ok(d) => d,
@@ -1283,7 +1283,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
     let fstype = match read_user_cstr_wait(&ctx.aspace, fstype_uaddr, 64).await {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
-        Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
+        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
     let fstype_str = match core::str::from_utf8(&fstype) {
         Ok(s) => s,
@@ -1303,7 +1303,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
         let source = match read_user_cstr_wait(&ctx.aspace, source_uaddr, EXECVE_PATH_MAX).await {
             Ok(p) => p,
             Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
-            Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
+            Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
         };
         Some(source)
     } else {
@@ -1512,7 +1512,7 @@ pub(super) async fn sys_umount2<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>)
     let target = match read_user_cstr_wait(&ctx.aspace, target_uaddr, EXECVE_PATH_MAX).await {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
-        Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
+        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
 
     let cwd = match ctx.process.cwd() {

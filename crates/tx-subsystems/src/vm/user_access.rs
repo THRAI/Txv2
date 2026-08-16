@@ -118,7 +118,8 @@ impl AddressSpace {
     /// inner copy's byte-progress accumulator is summarised away here
     /// because a partial-`T` read is not a meaningful intermediate
     /// state for the caller). The inner v3 `copy_from_user` is bridged
-    /// per-variant: `Done`/`Continue` → `Done(value)`,
+    /// per-variant: a full-length `Done` → `Done(value)`, a short
+    /// `Done` → `Err(EFAULT)`, `Continue` → `Continue { NoProgress }`,
     /// `Yield { shape, .. }` → `Yield { progress: NoProgress, shape }`,
     /// `Err` → `Err(errno)` (errno already in `step_v3::Errno`).
     pub fn read_user<T: Copy>(
@@ -138,12 +139,17 @@ impl AddressSpace {
             )
         };
         let src_bytes = UserPtr::<u8>::new(src.addr());
+        let expected = core::mem::size_of::<T>();
         match self.copy_from_user(dst_bytes, src_bytes, guard) {
-            V3::Done(_) | V3::Continue { .. } => {
+            V3::Done(copied) if copied == expected => {
                 // SAFETY: copy_from_user wrote `size_of::<T>()` bytes
                 // before returning Done.
                 V3::Done(unsafe { value.assume_init() })
             }
+            V3::Done(_) => V3::Err(Errno::EFAULT.into()),
+            V3::Continue { .. } => V3::Continue {
+                progress: NoProgress,
+            },
             V3::Yield { shape, .. } => V3::Yield {
                 progress: NoProgress,
                 shape,
@@ -171,8 +177,13 @@ impl AddressSpace {
             )
         };
         let dst_bytes = UserPtr::<u8>::new(dst.addr());
+        let expected = core::mem::size_of::<T>();
         match self.copy_to_user(dst_bytes, src_bytes, guard) {
-            V3::Done(_) | V3::Continue { .. } => V3::Done(()),
+            V3::Done(copied) if copied == expected => V3::Done(()),
+            V3::Done(_) => V3::Err(Errno::EFAULT.into()),
+            V3::Continue { .. } => V3::Continue {
+                progress: NoProgress,
+            },
             V3::Yield { shape, .. } => V3::Yield {
                 progress: NoProgress,
                 shape,
@@ -204,6 +215,9 @@ impl AddressSpace {
     ///   shapes; the user-VA contract collapses every one to EFAULT).
     /// - `Yield(OnWaitSource)` if a page-cache fetch or RangeLock needs to
     ///   await; the caller awaits the exact wait source and retries.
+    /// - `Continue { .. }` for PageBacked resident-publication pressure that
+    ///   has no wait source yet. The synchronous helper returns that retry to
+    ///   its driver instead of spinning; the async wrapper yields once first.
     ///
     /// Per VM_v1_2 §"No rmap": private anon frames are tracked only
     /// via published PTEs, so the pmap is the canonical authoritative
@@ -222,13 +236,11 @@ impl AddressSpace {
     ) -> StepOutcome<(), NoProgress> {
         for page in range.iter_pages() {
             let mut pending = None;
-            loop {
-                match self.reserve_user_page_for_access_step(page, kind, &mut pending) {
-                    StepOutcome::Done(()) => break,
-                    StepOutcome::Continue { .. } => continue,
-                    wait @ StepOutcome::Yield { .. } => return wait,
-                    error @ StepOutcome::Err(_) => return error,
-                }
+            match self.reserve_user_page_for_access_step(page, kind, &mut pending) {
+                StepOutcome::Done(()) => {}
+                retry @ StepOutcome::Continue { .. } => return retry,
+                wait @ StepOutcome::Yield { .. } => return wait,
+                error @ StepOutcome::Err(_) => return error,
             }
         }
         StepOutcome::Done(())
@@ -247,7 +259,10 @@ impl AddressSpace {
             match self.reserve_user_range_for_access(range, kind) {
                 V3::Done(()) => return Ok(()),
                 V3::Err(error) => return Err(error.into()),
-                V3::Continue { .. } => continue,
+                V3::Continue { .. } => {
+                    tx_reactor::yield_now().await;
+                    continue;
+                }
                 V3::Yield { shape, .. } => {
                     let token =
                         crate::vm::notification::wait_token_from_shape(&shape).ok_or(Errno::EIO)?;
@@ -323,6 +338,12 @@ impl AddressSpace {
         let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
         let materialization = match outcome.materialize_pagebacked_step(&guard) {
             VmFaultMaterializationStep::Done(materialization) => materialization,
+            VmFaultMaterializationStep::Retry => {
+                drop(guard);
+                return StepOutcome::Continue {
+                    progress: NoProgress,
+                };
+            }
             VmFaultMaterializationStep::Blocked(token) => {
                 drop(guard);
                 return crate::vm::notification::yield_wait_token(NoProgress, token);
@@ -391,6 +412,11 @@ impl AddressSpace {
                 match resolve_user_page_addr(self, page_addr, UserAccessKind::Read, guard) {
                     ResolveOutcome::Done(addr) => addr,
                     ResolveOutcome::Err(e) => return V3::Err(e.into()),
+                    ResolveOutcome::Retry => {
+                        return V3::Continue {
+                            progress: NoProgress,
+                        };
+                    }
                     ResolveOutcome::Blocked(t) => {
                         return crate::vm::notification::yield_wait_token(NoProgress, t);
                     }
@@ -484,6 +510,12 @@ fn copy_in(
                 }
                 return V3::Err(e.into());
             }
+            ResolveOutcome::Retry => {
+                emit_vm_user_trace(b"debug.vm.user.copy_in.retry", 1);
+                return V3::Continue {
+                    progress: ByteProgress::new(copied),
+                };
+            }
             ResolveOutcome::Blocked(t) => {
                 emit_vm_user_trace(b"debug.vm.user.copy_in.blocked", 1);
                 return crate::vm::notification::yield_wait_token(ByteProgress::new(copied), t);
@@ -541,6 +573,11 @@ fn copy_out(
                 }
                 return V3::Err(e.into());
             }
+            ResolveOutcome::Retry => {
+                return V3::Continue {
+                    progress: ByteProgress::new(copied),
+                };
+            }
             ResolveOutcome::Blocked(t) => {
                 return crate::vm::notification::yield_wait_token(ByteProgress::new(copied), t);
             }
@@ -560,6 +597,7 @@ enum ResolveOutcome {
     /// it; `read_user_cstr` re-resolves per page.
     Done(*mut u8),
     Err(Errno),
+    Retry,
     Blocked(WaitToken),
 }
 
@@ -681,6 +719,10 @@ fn resolve_user_page_addr(
             emit_vm_user_trace(b"debug.vm.user.resolve.err", 4);
             return ResolveOutcome::Err(e);
         }
+        ResolvePageOutcome::Retry => {
+            emit_vm_user_trace(b"debug.vm.user.resolve.retry", 1);
+            return ResolveOutcome::Retry;
+        }
         ResolvePageOutcome::Blocked(t) => {
             emit_vm_user_trace(b"debug.vm.user.resolve.blocked", 1);
             return ResolveOutcome::Blocked(t);
@@ -781,6 +823,7 @@ fn emit_vm_user_trace(name: &[u8], value: i64) {
 enum ResolvePageOutcome {
     Done(MaterializedPage),
     Err(Errno),
+    Retry,
     Blocked(WaitToken),
 }
 
@@ -874,9 +917,9 @@ fn resolve_user_page(
             // (`StepOutcome<MaterializedPage, NoProgress>`); translate
             // per outcome variant onto the v4 `ResolvePageOutcome`:
             // - v3 `Done(m)` → `ResolvePageOutcome::Done(m)`.
-            // - v3 `Continue { .. }` (NoProgress) → `Err(EFAULT)` —
-            //   page allocation rarely emits this; treating it as a
-            //   fault keeps the user-access path conservative.
+            // - v3 `Continue { .. }` (NoProgress) →
+            //   `ResolvePageOutcome::Retry`; this is the resident-root
+            //   publication window and must remain a retry, not EFAULT.
             // - v3 `Yield { OnWaitSource { c, i } }` →
             //   `ResolvePageOutcome::Blocked(WaitToken(c, i))`.
             // - v3 `Yield { OnAgent .. }` → `Err(EFAULT)`.
@@ -888,8 +931,8 @@ fn resolve_user_page(
                     ResolvePageOutcome::Done(m)
                 }
                 V3::Continue { .. } => {
-                    emit_vm_user_trace(b"debug.vm.user.pagebacked.err", 1);
-                    ResolvePageOutcome::Err(Errno::EFAULT)
+                    emit_vm_user_trace(b"debug.vm.user.pagebacked.retry", 1);
+                    ResolvePageOutcome::Retry
                 }
                 V3::Yield { shape, .. } => {
                     if let Some(token) = crate::vm::notification::wait_token_from_shape(&shape) {
@@ -900,9 +943,9 @@ fn resolve_user_page(
                         ResolvePageOutcome::Err(Errno::EFAULT)
                     }
                 }
-                V3::Err(_) => {
+                V3::Err(errno) => {
                     emit_vm_user_trace(b"debug.vm.user.pagebacked.err", 3);
-                    ResolvePageOutcome::Err(Errno::EFAULT)
+                    ResolvePageOutcome::Err(errno.into())
                 }
             }
         }

@@ -114,6 +114,18 @@ fn bootstrap_copy_to_user_reuses_active_epoch_guard() {
     assert_eq!(result, Ok(()));
 }
 
+#[test]
+fn bootstrap_copy_completion_rejects_short_done() {
+    assert_eq!(
+        crate::linux_syscall::user_copy::complete_user_copy(7, 8),
+        Err(tx_subsystems::execution::Errno::EFAULT)
+    );
+    assert_eq!(
+        crate::linux_syscall::user_copy::complete_user_copy(8, 8),
+        Ok(())
+    );
+}
+
 /// `mmap(0, PAGE, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS,
 /// -1, 0)` returns a page-aligned user VA on success.
 #[test]

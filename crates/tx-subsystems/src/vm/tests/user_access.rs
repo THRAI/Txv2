@@ -87,6 +87,40 @@ fn vm_copy_to_user_rejects_read_only_recipe() {
 }
 
 #[test]
+fn vm_read_user_rejects_a_short_cross_page_copy() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("vm user-access test lock");
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let page_addr = 0x18_000;
+    let user_addr = page_addr + USER_PAGE_SIZE - 4;
+    map_private(&aspace, page_addr, USER_PAGE_SIZE, Prot::READ_WRITE);
+    let guard = crate::vm::adapter::step_engine::guard();
+    assert_eq!(
+        aspace.copy_to_user(UserPtr::new(user_addr), &[1, 2, 3, 4], &guard),
+        StepOutcome::Done(4)
+    );
+
+    let result = aspace.read_user::<[u8; 8]>(UserPtr::new(user_addr), &guard);
+
+    assert_eq!(result, StepOutcome::Err(Errno::EFAULT.into()));
+}
+
+#[test]
+fn vm_write_user_rejects_a_short_cross_page_copy() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("vm user-access test lock");
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let page_addr = 0x1c_000;
+    let user_addr = page_addr + USER_PAGE_SIZE - 4;
+    map_private(&aspace, page_addr, USER_PAGE_SIZE, Prot::READ_WRITE);
+    let guard = crate::vm::adapter::step_engine::guard();
+
+    let result = aspace.write_user(UserPtr::new(user_addr), [0x5a; 8], &guard);
+
+    assert_eq!(result, StepOutcome::Err(Errno::EFAULT.into()));
+}
+
+#[test]
 fn vm_read_user_cstr_grows_past_initial_capacity() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("vm user-access test lock");
     setup_host_substrate();

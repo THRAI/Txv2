@@ -1063,6 +1063,7 @@ impl VmFaultOutcome {
         let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
         match self.materialize_pagebacked_step(&guard) {
             VmFaultMaterializationStep::Done(materialization) => Ok(materialization),
+            VmFaultMaterializationStep::Retry => Err(VmFaultError::WouldBlock),
             VmFaultMaterializationStep::Blocked(_) => Err(VmFaultError::WouldBlock),
             VmFaultMaterializationStep::Err(error) => Err(error),
         }
@@ -1167,12 +1168,10 @@ impl VmFaultOutcome {
                     ))
                 }
             }
+            step_engine::StepOutcome::Continue { .. } => VmFaultMaterializationStep::Retry,
             step_engine::StepOutcome::Err(errno) => VmFaultMaterializationStep::Err(
                 VmFaultError::PageCache(PageCacheError::Backend(errno.into())),
             ),
-            _ => VmFaultMaterializationStep::Err(VmFaultError::PageCache(PageCacheError::Backend(
-                crate::execution::Errno::EAGAIN,
-            ))),
         }
     }
 
@@ -1363,16 +1362,14 @@ impl VmFaultOutcome {
                             PageCacheError::Backend(crate::execution::Errno::EAGAIN),
                         ));
                     }
+                    step_engine::StepOutcome::Continue { .. } => {
+                        emit_vm_materialize_trace(b"debug.vm.private_read_miss.retry", 1);
+                        return VmFaultMaterializationStep::Retry;
+                    }
                     step_engine::StepOutcome::Err(errno) => {
                         emit_vm_materialize_trace(b"debug.vm.private_read_miss.err", 1);
                         return VmFaultMaterializationStep::Err(VmFaultError::PageCache(
                             PageCacheError::Backend(errno.into()),
-                        ));
-                    }
-                    _ => {
-                        emit_vm_materialize_trace(b"debug.vm.private_read_miss.err", 2);
-                        return VmFaultMaterializationStep::Err(VmFaultError::PageCache(
-                            PageCacheError::Backend(crate::execution::Errno::EAGAIN),
                         ));
                     }
                 }
@@ -1438,14 +1435,12 @@ impl VmFaultOutcome {
                             PageCacheError::Backend(crate::execution::Errno::EAGAIN),
                         ));
                     }
+                    step_engine::StepOutcome::Continue { .. } => {
+                        return VmFaultMaterializationStep::Retry;
+                    }
                     step_engine::StepOutcome::Err(errno) => {
                         return VmFaultMaterializationStep::Err(VmFaultError::PageCache(
                             PageCacheError::Backend(errno.into()),
-                        ));
-                    }
-                    _ => {
-                        return VmFaultMaterializationStep::Err(VmFaultError::PageCache(
-                            PageCacheError::Backend(crate::execution::Errno::EAGAIN),
                         ));
                     }
                 };
@@ -1622,6 +1617,10 @@ pub struct VmFaultMaterialization {
 #[derive(Debug)]
 pub enum VmFaultMaterializationStep {
     Done(VmFaultMaterialization),
+    /// PageBacked reported protocol-level `Continue`: no terminal errno and
+    /// no wait source exists yet, so the caller must retry at a scheduling
+    /// boundary while retaining its higher-level progress.
+    Retry,
     Blocked(WaitToken),
     Err(VmFaultError),
 }

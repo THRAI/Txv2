@@ -934,13 +934,13 @@ async fn copy_signal_frame_to_user(
         };
         match copy_outcome {
             V3::Done(n) => return n == bytes.len(),
-            V3::Continue { .. } => continue,
             V3::Err(_) => return false,
-            V3::Yield { .. } => {
+            V3::Continue { .. } | V3::Yield { .. } => {
                 // The immutable frame buffer makes replaying an already-copied
-                // prefix safe. Yield without an epoch guard, then re-prefault
-                // the whole declared range so either RangeLock or page-cache
-                // contention is awaited through its registered source.
+                // prefix safe. The copy guard was scoped to `copy_outcome` and
+                // is gone here: yield cooperatively, then re-prefault the whole
+                // declared range before replaying. This keeps `Continue` from
+                // becoming an in-place busy loop and lets publication complete.
                 tx_reactor::yield_now().await;
                 if !reserve_signal_frame_storage(aspace, frame_addr, bytes.len()).await {
                     return false;

@@ -374,22 +374,15 @@ impl AddressSpace {
                         await_fault_wait(self, token).await;
                         continue;
                     }
-                    Err(VmFaultError::StaleRecipe) => continue 'resolve,
-                    // Resident-root publication is deliberately fallible
-                    // under transient writer/retire-credit contention. The
-                    // PageContainer reports that condition as EAGAIN; it is
-                    // not a backing I/O failure and must not become SIGSEGV.
-                    // Drop the materialization guard at the call boundary,
-                    // service EBR once, and yield so the competing publisher
-                    // or file-I/O task can make progress before retrying the
-                    // same resolved recipe.
-                    Err(VmFaultError::PageCache(crate::page_backed::PageCacheError::Backend(
-                        crate::execution::Errno::EAGAIN,
-                    ))) => {
+                    Ok(FaultScriptPublish::Retry) => {
+                        // PageBacked `Continue` is transient publication
+                        // pressure, not a backend errno. Service bounded EBR
+                        // work, yield once, then retry this resolved recipe.
                         let _ = tx_substrate::epoch::drain_with_budget(64);
                         tx_reactor::yield_now().await;
                         continue;
                     }
+                    Err(VmFaultError::StaleRecipe) => continue 'resolve,
                     // A private-page CAS loser also asks the fault script to
                     // restart after yielding; the recipe may have changed.
                     Err(VmFaultError::WouldBlock) => {
@@ -514,6 +507,11 @@ impl AddressSpace {
                         emit_vm_trace(b"debug.vm.fault.materialize.wait", 1);
                         return Ok(FaultScriptPublish::Wait(token));
                     }
+                    VmFaultMaterializationStep::Retry => {
+                        drop(guard);
+                        emit_vm_trace(b"debug.vm.fault.materialize.retry", 1);
+                        return Ok(FaultScriptPublish::Retry);
+                    }
                     VmFaultMaterializationStep::Err(error) => {
                         emit_vm_trace(b"debug.vm.fault.materialize.err", 1);
                         return Err(error);
@@ -615,6 +613,7 @@ impl AddressSpace {
             emit_vm_trace(b"debug.vm.fault.prefault.phase", 3);
             let materialization = match outcome.materialize_pagebacked_step(&guard) {
                 VmFaultMaterializationStep::Done(materialization) => materialization,
+                VmFaultMaterializationStep::Retry => break,
                 VmFaultMaterializationStep::Blocked(_) | VmFaultMaterializationStep::Err(_) => {
                     break;
                 }
@@ -1348,6 +1347,7 @@ enum FaultScriptResolve {
 
 enum FaultScriptPublish {
     Done(PmapPublishOutcome),
+    Retry,
     Wait(WaitToken),
 }
 

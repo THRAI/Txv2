@@ -90,6 +90,16 @@ pub(super) fn try_reserve_user_copy_items<T>(
     items.try_reserve_exact(additional).map_err(|_| ())
 }
 
+/// Convert the byte count from a completed VM copy into the all-or-error
+/// contract used by syscall argument/result copying.
+pub(super) fn complete_user_copy(copied: usize, expected: usize) -> Result<(), Errno> {
+    if copied == expected {
+        Ok(())
+    } else {
+        Err(Errno::EFAULT)
+    }
+}
+
 fn user_access_guard() -> step_engine::Guard<'static> {
     step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard)
 }
@@ -305,7 +315,7 @@ fn read_user_exec_cstr(
 /// `aspace.read_user` lane, falling back to the bootstrap
 /// kernel-pointer dance on `EFAULT`.
 pub(super) fn bootstrap_read_user<T: Copy>(aspace: &AddressSpace, uaddr: u64) -> Result<T, Errno> {
-    use step_engine::{Errno as V3Errno, StepOutcome as V3};
+    use step_engine::StepOutcome as V3;
     let guard = user_access_guard();
     match aspace.read_user(UserPtr::<T>::new(uaddr as usize), &guard) {
         V3::Done(v) => Ok(v),
@@ -344,7 +354,6 @@ pub(super) fn bootstrap_read_user<T: Copy>(aspace: &AddressSpace, uaddr: u64) ->
                 Ok(unsafe { core::ptr::read_volatile(uaddr as *const T) })
             }
         }
-        V3::Err(e) => Err(e.into()),
         V3::Yield { .. } | V3::Continue { .. } => Err(Errno::EIO),
     }
 }
@@ -360,7 +369,7 @@ pub(super) fn bootstrap_write_user<T: Copy>(
     use StepOutcome as V3;
     let guard = user_access_guard();
     match aspace.write_user(UserPtr::<T>::new(uaddr as usize), value, &guard) {
-        V3::Done(()) | V3::Continue { .. } => Ok(()),
+        V3::Done(()) => Ok(()),
         V3::Err(e) if Errno::from(e) == Errno::EFAULT => {
             drop(guard);
             #[cfg(target_os = "none")]
@@ -384,7 +393,7 @@ pub(super) fn bootstrap_write_user<T: Copy>(
             }
         }
         V3::Err(e) => Err(Errno::from(e)),
-        V3::Yield { .. } => Err(Errno::EIO),
+        V3::Yield { .. } | V3::Continue { .. } => Err(Errno::EIO),
     }
 }
 
@@ -433,9 +442,9 @@ pub(super) fn bootstrap_copy_from_user(
 
         let guard = user_access_guard();
         match aspace.copy_from_user(dst, UserPtr::<u8>::new(uaddr as usize), &guard) {
-            V3::Done(_) | V3::Continue { .. } => Ok(()),
+            V3::Done(copied) => complete_user_copy(copied, dst.len()),
             V3::Err(e) => Err(Errno::from(e)),
-            V3::Yield { .. } => Err(Errno::EIO),
+            V3::Yield { .. } | V3::Continue { .. } => Err(Errno::EIO),
         }
     }
 
@@ -470,7 +479,7 @@ pub(super) fn bootstrap_copy_from_user(
 
         let guard = user_access_guard();
         match aspace.copy_from_user(dst, UserPtr::<u8>::new(uaddr as usize), &guard) {
-            V3::Done(_) | V3::Continue { .. } => Ok(()),
+            V3::Done(copied) => complete_user_copy(copied, dst.len()),
             V3::Err(e) if Errno::from(e) == Errno::EFAULT => {
                 drop(guard);
                 let limit = if cfg!(any(test, feature = "test-support")) {
@@ -487,7 +496,7 @@ pub(super) fn bootstrap_copy_from_user(
                 Ok(())
             }
             V3::Err(e) => Err(Errno::from(e)),
-            V3::Yield { .. } => Err(Errno::EIO),
+            V3::Yield { .. } | V3::Continue { .. } => Err(Errno::EIO),
         }
     }
 }
@@ -527,9 +536,9 @@ pub(super) async fn bootstrap_copy_from_user_wait(
                 aspace.copy_from_user(dst, UserPtr::<u8>::new(uaddr as usize), &guard)
             };
             match outcome {
-                V3::Done(_) | V3::Continue { .. } => return Ok(()),
+                V3::Done(copied) => return complete_user_copy(copied, dst.len()),
                 V3::Err(error) => return Err(error.into()),
-                V3::Yield { .. } => {
+                V3::Yield { .. } | V3::Continue { .. } => {
                     tx_reactor::yield_now().await;
                     aspace
                         .reserve_user_range_for_access_wait(range, UserAccessKind::Read)
@@ -565,9 +574,9 @@ pub(super) fn bootstrap_copy_to_user(
 
         let guard = user_access_guard();
         match aspace.copy_to_user(UserPtr::<u8>::new(uaddr as usize), src, &guard) {
-            V3::Done(_) | V3::Continue { .. } => Ok(()),
+            V3::Done(copied) => complete_user_copy(copied, src.len()),
             V3::Err(e) => Err(Errno::from(e)),
-            V3::Yield { .. } => Err(Errno::EIO),
+            V3::Yield { .. } | V3::Continue { .. } => Err(Errno::EIO),
         }
     }
 
@@ -602,7 +611,7 @@ pub(super) fn bootstrap_copy_to_user(
 
         let guard = user_access_guard();
         match aspace.copy_to_user(UserPtr::<u8>::new(uaddr as usize), src, &guard) {
-            V3::Done(_) | V3::Continue { .. } => Ok(()),
+            V3::Done(copied) => complete_user_copy(copied, src.len()),
             V3::Err(e) if Errno::from(e) == Errno::EFAULT => {
                 drop(guard);
                 let limit = if cfg!(any(test, feature = "test-support")) {
@@ -619,7 +628,7 @@ pub(super) fn bootstrap_copy_to_user(
                 Ok(())
             }
             V3::Err(e) => Err(Errno::from(e)),
-            V3::Yield { .. } => Err(Errno::EIO),
+            V3::Yield { .. } | V3::Continue { .. } => Err(Errno::EIO),
         }
     }
 }
@@ -705,7 +714,15 @@ pub(super) async fn bootstrap_copy_to_user_wait_diagnosed(
                 aspace.copy_to_user(UserPtr::<u8>::new(uaddr as usize), src, &guard)
             };
             match outcome {
-                V3::Done(_) | V3::Continue { .. } => return Ok(()),
+                V3::Done(copied) => {
+                    return complete_user_copy(copied, src.len()).map_err(|errno| {
+                        UserCopyWaitFailure {
+                            errno,
+                            stage: UserCopyWaitStage::Copy,
+                            retries,
+                        }
+                    });
+                }
                 V3::Err(error) => {
                     return Err(UserCopyWaitFailure {
                         errno: error.into(),
@@ -713,7 +730,7 @@ pub(super) async fn bootstrap_copy_to_user_wait_diagnosed(
                         retries,
                     });
                 }
-                V3::Yield { .. } => {
+                V3::Yield { .. } | V3::Continue { .. } => {
                     retries = retries.saturating_add(1);
                     tx_reactor::yield_now().await;
                     if let Err(errno) = aspace

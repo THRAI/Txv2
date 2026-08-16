@@ -152,9 +152,16 @@ enum UserChunkOutcome {
     Copied,
     /// Fatal error (EFAULT, EIO, etc.).
     Fault(Errno),
+    /// User-space materialisation asked the enclosing step to be polled
+    /// again. `bytes` is the prefix already copied by this chunk.
+    Continue { bytes: usize },
     /// User-space page needs async materialisation; yield so the
     /// reactor can re-poll after wake.
-    Blocked { source: u64, interests: u64 },
+    Blocked {
+        bytes: usize,
+        source: u64,
+        interests: u64,
+    },
 }
 
 fn step_range_with_user_buffer(
@@ -184,8 +191,10 @@ fn step_range_with_user_buffer(
 
         // `materialize_page` is now v3
         // `StepOutcome<MaterializedPage, NoProgress>`. Map per variant:
-        // - `Done` / `Continue { .. }` → run the user-side copy, then
-        //   either continue the loop (on success) or terminate.
+        // - `Done` → run the user-side copy, then either continue the loop
+        //   (on success) or propagate the copy outcome.
+        // - `Continue { .. }` → propagate cooperative retry without
+        //   advancing the current page.
         // - `Yield { OnWaitSource .. }` with `advanced == 0` → v3 `Yield`
         //   with `ByteProgress::EMPTY`. Otherwise propagate the yield
         //   carrying the accumulated bytes.
@@ -220,20 +229,31 @@ fn step_range_with_user_buffer(
                         of.set_offset(offset);
                         return V3::done(advanced);
                     }
-                    UserChunkOutcome::Blocked { source, interests } => {
+                    UserChunkOutcome::Continue { bytes } => {
+                        let copied = bytes.min(chunk);
+                        advanced += copied;
+                        offset += copied as u64;
+                        if advanced > 0 {
+                            of.set_offset(offset);
+                        }
+                        return V3::continue_with(ByteProgress::new(advanced));
+                    }
+                    UserChunkOutcome::Blocked {
+                        bytes,
+                        source,
+                        interests,
+                    } => {
                         emit_pagebacked_trace(
                             b"debug.pagebacked.user_range.blocked",
                             source as i64,
                         );
-                        if advanced == 0 {
-                            return crate::page_backed::notification::yield_on_wait_source(
-                                ByteProgress::EMPTY,
-                                source,
-                                interests,
-                            );
+                        let copied = bytes.min(chunk);
+                        advanced += copied;
+                        offset += copied as u64;
+                        if advanced > 0 {
+                            emit_pagebacked_trace(b"debug.pagebacked.user_range.phase", 4);
+                            of.set_offset(offset);
                         }
-                        emit_pagebacked_trace(b"debug.pagebacked.user_range.phase", 4);
-                        of.set_offset(offset);
                         return crate::page_backed::notification::yield_on_wait_source(
                             ByteProgress::new(advanced),
                             source,
@@ -243,16 +263,14 @@ fn step_range_with_user_buffer(
                 }
             }
             StepOutcome::Continue { .. } => {
-                // NoProgress wait source: no materialized frame; treat as
-                // EAGAIN-like and surface partial progress (or EIO if
-                // none) — page allocation rarely emits this.
-                emit_pagebacked_trace(b"debug.pagebacked.user_range.err", 2);
-                if advanced == 0 {
-                    return V3::err(step_engine::Errno::EAGAIN);
+                // The current page has no frame yet. Preserve only chunks
+                // that actually completed before propagating the retry.
+                emit_pagebacked_trace(b"debug.pagebacked.user_range.continue", 1);
+                if advanced > 0 {
+                    emit_pagebacked_trace(b"debug.pagebacked.user_range.phase", 4);
+                    of.set_offset(offset);
                 }
-                emit_pagebacked_trace(b"debug.pagebacked.user_range.phase", 4);
-                of.set_offset(offset);
-                return V3::done(advanced);
+                return V3::continue_with(ByteProgress::new(advanced));
             }
             StepOutcome::Yield { shape, .. } => {
                 emit_pagebacked_trace(b"debug.pagebacked.user_range.err", 3);
@@ -339,20 +357,27 @@ fn copy_chunk_user(
                     emit_pagebacked_trace(b"debug.pagebacked.user_copy.phase", 3);
                     UserChunkOutcome::Copied
                 }
-                V3::Done(_) | V3::Continue { .. } => {
+                V3::Done(_) => {
                     emit_pagebacked_trace(b"debug.pagebacked.user_copy.err", 2);
                     UserChunkOutcome::Fault(Errno::EFAULT)
                 }
+                V3::Continue { progress } => UserChunkOutcome::Continue {
+                    bytes: progress.bytes(),
+                },
                 V3::Err(e) => {
                     emit_pagebacked_trace(b"debug.pagebacked.user_copy.err", 3);
                     UserChunkOutcome::Fault(Errno::from(e))
                 }
-                V3::Yield { shape, .. } => {
+                V3::Yield { progress, shape } => {
                     if let Some((source, interests)) =
                         crate::page_backed::notification::wait_source_parts(&shape)
                     {
                         emit_pagebacked_trace(b"debug.pagebacked.user_copy.blocked", source as i64);
-                        UserChunkOutcome::Blocked { source, interests }
+                        UserChunkOutcome::Blocked {
+                            bytes: progress.bytes(),
+                            source,
+                            interests,
+                        }
                     } else {
                         emit_pagebacked_trace(b"debug.pagebacked.user_copy.err", 4);
                         UserChunkOutcome::Fault(Errno::EFAULT)
@@ -376,20 +401,27 @@ fn copy_chunk_user(
                     emit_pagebacked_trace(b"debug.pagebacked.user_copy.phase", 3);
                     UserChunkOutcome::Copied
                 }
-                V3::Done(_) | V3::Continue { .. } => {
+                V3::Done(_) => {
                     emit_pagebacked_trace(b"debug.pagebacked.user_copy.err", 5);
                     UserChunkOutcome::Fault(Errno::EFAULT)
                 }
+                V3::Continue { progress } => UserChunkOutcome::Continue {
+                    bytes: progress.bytes(),
+                },
                 V3::Err(e) => {
                     emit_pagebacked_trace(b"debug.pagebacked.user_copy.err", 6);
                     UserChunkOutcome::Fault(Errno::from(e))
                 }
-                V3::Yield { shape, .. } => {
+                V3::Yield { progress, shape } => {
                     if let Some((source, interests)) =
                         crate::page_backed::notification::wait_source_parts(&shape)
                     {
                         emit_pagebacked_trace(b"debug.pagebacked.user_copy.blocked", source as i64);
-                        UserChunkOutcome::Blocked { source, interests }
+                        UserChunkOutcome::Blocked {
+                            bytes: progress.bytes(),
+                            source,
+                            interests,
+                        }
                     } else {
                         emit_pagebacked_trace(b"debug.pagebacked.user_copy.err", 7);
                         UserChunkOutcome::Fault(Errno::EFAULT)
@@ -558,11 +590,10 @@ fn step_range_with_kernel_buffer(
                 }
             }
             V3::Continue { .. } => {
-                if advanced == 0 {
-                    return V3::err(step_engine::Errno::EAGAIN);
+                if advanced > 0 {
+                    of.set_offset(offset);
                 }
-                of.set_offset(offset);
-                return V3::done(advanced);
+                return V3::continue_with(ByteProgress::new(advanced));
             }
             V3::Yield { shape, .. } => {
                 let Some((carrier, interests)) =

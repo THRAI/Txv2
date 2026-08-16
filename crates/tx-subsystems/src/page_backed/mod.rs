@@ -5688,9 +5688,9 @@ fn step_range(
         // `StepOutcome<MaterializedPage, NoProgress>`. Map per variant:
         // - `Done` → continue the loop, advancing `offset` and
         //   accumulating `advanced` bytes.
-        // - `Continue { .. }` (NoProgress wait source) — page-level retry
-        //   without a frame. Treat as a no-op and continue, advancing
-        //   the chunk; one-shot page allocation rarely emits this.
+        // - `Continue { .. }` — page-level retry without a frame. Propagate
+        //   it without advancing the current chunk, retaining only progress
+        //   from pages that actually materialized.
         // - `Yield { .. }` with `advanced == 0` → propagate yield with
         //   `ByteProgress::EMPTY`. Otherwise propagate yield with
         //   accumulated bytes (`ByteProgress::new(advanced)`).
@@ -5700,9 +5700,15 @@ fn step_range(
         //   were swallowed into a successful partial step).
         use adapter::step_engine::Errno as V3Errno;
         match pc.materialize_page(page_index, access, guard) {
-            StepOutcome::Done(_) | StepOutcome::Continue { .. } => {
+            StepOutcome::Done(_) => {
                 advanced += chunk;
                 offset += chunk as u64;
+            }
+            StepOutcome::Continue { .. } => {
+                if advanced > 0 {
+                    of.set_offset(offset);
+                }
+                return StepOutcome::continue_with(ByteProgress::new(advanced));
             }
             StepOutcome::Yield { shape, .. } => {
                 let Some((carrier, interests)) = notification::wait_source_parts(&shape) else {
