@@ -16,7 +16,7 @@
     "A qemu-riscv64 syscall replay of the same Git 2.49.1 showed refs are published before git maintenance run --auto --no-quiet --detach and a parent wait4. This makes post-commit process lifecycle the leading hypothesis, but the hung physical run had no valid stall snapshot, so wait4 is not claimed as the sole proven root cause.",
     "Commit f11ad1076 fixes a separate proven wait interruption bug: ProcessIdentity now delegates thread_signal_interrupts_wait to the existing disposition-aware pending-signal predicate. This explains why a wait could consume SIGINT or SIGCANCEL and park again; the previously failing focused drive test and the full 24-test drive integration suite pass. This source change has not been built or physically booted because the MMC RW blocker appeared first.",
     "After the hung commit was physically reset, the same fixed image with tx.root=mmcblk0 rw failed at mount:rootfs:ext4:mmcblk0:stage=rw-discovered:errno=EIO, fell back to tmpfs, and panicked when /bin/sh was absent. The aggregate RW path can include journal replay, home-block writes, barriers, orphan recovery, recovery-bit writes, and runtime construction, so the sentinel does not prove zero device writes before failure.",
-    "The same MMC still mounts and reads successfully with tx.root=mmcblk0 ro. README and recovery-probe hashes, Git HEAD/log/status, and git fsck are readable. The hard boundary forbids repair fsck, raw writes, or blind RW retries, so Vim, GCC, Rust, full non-shallow clone, the final synced reset, and complete RO durability verification remain unexecuted and failed as a matrix. Do not invite push or pull verification."
+    "The same MMC still mounts and reads successfully with plain tx.root=mmcblk0 ro. README and recovery-probe hashes, Git HEAD/log/status, and git fsck are readable. A later exact-opt-in, final-ro tx.ext4.journal-preflight=1 boot returned recovery-required=1:stage=scan:error=corrupt before refusing the root mount and falling back to tmpfs/panic. This strictly read-only shadow scan confirms the RECOVER bit is set and the bounded journal scan is corrupt; the current MMC must be preserved, not repaired, replayed, or retried RW under this hard boundary. Vim, GCC, Rust, full non-shallow clone, the final synced reset, and complete RO durability verification remain unexecuted and failed as a matrix. Do not invite push or pull verification."
   ],
   "changed_files": [
     {
@@ -89,6 +89,11 @@
       "command": "Physical same-image, same-MMC boot with tx.root=mmcblk0 ro",
       "status": "passed",
       "notes": "Root was ext4 ro; recovery-probe and README were readable; HEAD/ref/log matched b574dba3b66bdd0e4cb2a3327ea2f5163b3752e3; git status was clean and git fsck --full returned zero."
+    },
+    {
+      "command": "Physical same-image boot with tx.root=mmcblk0 tx.ext4.journal-preflight=1 ro",
+      "status": "passed",
+      "notes": "The strictly read-only classifier returned recovery-required=1:stage=scan:error=corrupt, refused the root mount, and fell back to tmpfs/panic. It did not invoke the RW mount path or repair the disk."
     },
     {
       "command": "cargo -q xtask unit",

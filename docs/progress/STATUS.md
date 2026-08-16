@@ -33,7 +33,10 @@
   哈希/commit/fsck 全矩阵。**Blocker**：post-commit 物理复位后，同一 MMC 的
   txKernel RW mount 在 `rw-discovered` 聚合阶段返回 EIO；该路径可能已尝试 journal
   replay/home-block/barrier，不能声称失败前零写入。随后同盘 RO mount 和 Git fsck
-  成功，但硬边界禁止 repair fsck、raw write 或盲试 RW。因此 Vim、GCC、Rust、full
+  成功；额外以同一镜像、最终 `ro` 和 `tx.ext4.journal-preflight=1` 执行严格只读
+  shadow scan，明确返回 `recovery-required=1:stage=scan:error=corrupt`，随后拒绝挂载并
+  落入 tmpfs/panic。当前 MMC 必须封存，不能 repair/replay/再试 RW。硬边界禁止
+  repair fsck、raw write 或盲试 RW。因此 Vim、GCC、Rust、full
   clone 与最终 RW→reset→RO 验收均未执行/未通过，不得让用户继续 push/pull 验证。
 
 - 2026-08-16 (**LA stall/File-I/O 修复已整理提交；VF2 工具与复位持久化交接已冻结**).
