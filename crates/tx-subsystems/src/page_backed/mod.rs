@@ -5387,8 +5387,6 @@ impl PageContainer {
         frame: Frame,
         fetch_id: FilePageFetchId,
     ) -> StepOutcome<MaterializedPage, NoProgress> {
-        use adapter::step_engine::Errno as V3Errno;
-
         let frame = match cached_frame_from_frame(frame) {
             Ok(frame) => frame,
             Err(error) => {
@@ -5407,10 +5405,14 @@ impl PageContainer {
         let (fetch_generation, notify_ready) = {
             let mut state = self.state.lock();
             let Some(fetch) = state.in_flight_file_pages.get(&page) else {
-                return StepOutcome::Err(V3Errno::EAGAIN);
+                return StepOutcome::Continue {
+                    progress: NoProgress,
+                };
             };
             if fetch.id != fetch_id {
-                return StepOutcome::Err(V3Errno::EAGAIN);
+                return StepOutcome::Continue {
+                    progress: NoProgress,
+                };
             }
             let fetch = state
                 .in_flight_file_pages

@@ -7872,15 +7872,105 @@ fn file_page_stale_owner_after_truncate_cannot_publish_page() {
         fetch_id,
     );
 
-    match stale {
-        V3Out::Err(errno) => assert_eq!(errno, V3Errno::EAGAIN),
-        other => panic!("expected stale owner publish to return EAGAIN, got {other:?}"),
-    }
+    assert!(matches!(
+        stale,
+        V3Out::Continue {
+            progress: NoProgress
+        }
+    ));
     assert_eq!(pc.resident_pages(), 0);
     assert_eq!(pc.lookup(page), None);
     assert!(
         pc.state.lock().file_page_waits.contains_key(&page),
         "truncate must keep the PageBacked retry source live for late waiter registration"
+    );
+}
+
+#[test]
+fn file_page_stale_fetch_id_cannot_disturb_replacement_owner() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let pc = file_page_container(fs.clone(), fs, FsObjectId::new(0x19e), 4);
+    let page = PageIndex::new(0);
+
+    let FilePageFetchStart::Owner(owner_a) =
+        pc.begin_file_page_fetch(page, MaterializeAccess::Read, true, false)
+    else {
+        panic!("first compatibility fetch should own the page");
+    };
+    pc.finish_file_page_fetch_without_install(page, owner_a);
+
+    let FilePageFetchStart::Owner(owner_b) =
+        pc.begin_file_page_fetch(page, MaterializeAccess::Read, true, false)
+    else {
+        panic!("replacement compatibility fetch should own the page");
+    };
+    assert_ne!(owner_a, owner_b);
+    assert!(matches!(
+        pc.yield_on_file_page_fetch(page, MaterializeAccess::Read, owner_b),
+        Some(V3Out::Yield { .. })
+    ));
+    let ready_source = {
+        let state = pc.state.lock();
+        Arc::clone(notification::page_ready_endpoint(
+            state.file_page_waits.get(&page).expect("page-ready wait"),
+        ))
+    };
+
+    let free_before_stale = page_allocator::free_count().expect("allocator free count");
+    let stale_owned = page_allocator::reserve_frame(ZeroPolicy::Zeroed)
+        .expect("stale owner frame")
+        .commit();
+    assert_eq!(
+        page_allocator::free_count().expect("allocator free count after stale allocation"),
+        free_before_stale.saturating_sub(1)
+    );
+    let stale = pc.install_fetched_file_page_from_owner(
+        page,
+        MaterializeAccess::Read,
+        Frame::from_owned(stale_owned),
+        owner_a,
+    );
+
+    assert!(matches!(
+        stale,
+        V3Out::Continue {
+            progress: NoProgress
+        }
+    ));
+    assert_eq!(
+        page_allocator::free_count().expect("stale owner frame released"),
+        free_before_stale
+    );
+    assert_eq!(
+        pc.state
+            .lock()
+            .in_flight_file_pages
+            .get(&page)
+            .map(|fetch| fetch.id),
+        Some(owner_b),
+        "stale completion must preserve the replacement owner"
+    );
+    assert_eq!(pc.lookup(page), None);
+    assert_eq!(ready_source.pending_mask_snapshot(), 0);
+
+    let completed = pc.install_fetched_file_page_from_owner(
+        page,
+        MaterializeAccess::Read,
+        Frame::new(page_allocator::zero_frame_ppn().expect("zero frame")),
+        owner_b,
+    );
+    let materialized = match completed {
+        V3Out::Done(materialized) => materialized,
+        other => panic!("replacement owner must complete, got {other:?}"),
+    };
+    assert_eq!(pc.lookup(page), Some(materialized.ppn));
+    assert!(!pc.file_page_fetch_in_flight_for_test(page));
+    assert_eq!(
+        ready_source.pending_mask_snapshot() & PageWaitInterest::READY.bits(),
+        PageWaitInterest::READY.bits(),
+        "replacement owner completion must wake its waiter"
     );
 }
 
