@@ -5124,7 +5124,11 @@ impl<I: BlockImage> Ext4Pager<I> {
         disk_inode: &Inode,
         parent_ino: InodeNo,
     ) -> Result<()> {
-        if !disk_inode.is_dir() || disk_inode.is_htree_indexed() {
+        // ext4 keeps EXT4_INDEX_FL and the HTree blocks after the last normal
+        // entry is removed. The linear dirent view remains valid for checking
+        // emptiness: index metadata lives inside the dot records or in
+        // inode-zero records, and `DirEntryIter` skips inode-zero records.
+        if !disk_inode.is_dir() {
             return Err(Ext4FormatError::Unsupported);
         }
         let mut seen_dot = false;

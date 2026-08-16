@@ -1021,7 +1021,7 @@ async fn sendto_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult 
     }
 }
 
-pub(super) fn sys_recvfrom<'a, P: 'a>(
+pub(super) fn sys_recvfrom<'a, P: tx_hal::ConsoleIf + 'a>(
     args: [u64; 6],
     ctx: &'a SyscallCtx<'a>,
 ) -> impl core::future::Future<Output = SyscallResult> + 'a
@@ -1031,7 +1031,10 @@ where
     recvfrom_impl::<P>(args, ctx)
 }
 
-async fn recvfrom_impl<'a, P>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
+async fn recvfrom_impl<'a, P: tx_hal::ConsoleIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult
 where
     TimekeeperClock<P>: ClockRead,
 {
@@ -1182,7 +1185,9 @@ where
                         return SyscallResult::Error(EINTR_VALUE);
                     }
                     SocketWaitWake::RecoveryProbe => {
-                        let _ = repair_orphaned_unix_stream(&socket);
+                        if repair_orphaned_unix_stream(&socket) {
+                            tx_hal::console_write_str::<P>("txkernel:unix-stream:close-recovery\n");
+                        }
                     }
                     SocketWaitWake::SocketReady => {}
                 }
@@ -1259,7 +1264,11 @@ where
                             return SyscallResult::Error(EINTR_VALUE);
                         }
                         SocketWaitWake::RecoveryProbe => {
-                            let _ = repair_orphaned_unix_stream(&socket);
+                            if repair_orphaned_unix_stream(&socket) {
+                                tx_hal::console_write_str::<P>(
+                                    "txkernel:unix-stream:close-recovery\n",
+                                );
+                            }
                         }
                         SocketWaitWake::SocketReady => {}
                     }

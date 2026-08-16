@@ -4079,12 +4079,17 @@ fn namespace_plan_rename_overwrites_regular_file_without_home_write() {
 }
 
 #[test]
-fn namespace_plan_rmdirs_empty_directory_without_home_write() {
+fn namespace_plan_rmdirs_empty_indexed_directory_without_home_write() {
     let mut image = mock_image();
     encode_directory(
         image.block_mut(17),
         &[(13, 2, b".".as_slice()), (2, 2, b"..".as_slice())],
     );
+    // ext4 retains INDEX_FL after the final ordinary entry is removed from
+    // an HTree directory. rmdir must still recognize this directory as empty.
+    let mut nested_inode = Inode::parse(&image.block(4)[12 * 256..13 * 256]).unwrap();
+    nested_inode.flags |= Inode::INDEX_FL;
+    write_inode(&mut image, 13, &nested_inode);
     let dir_before = *image.block(16);
     let nested_before = *image.block(17);
     let inode_before = *image.block(4);

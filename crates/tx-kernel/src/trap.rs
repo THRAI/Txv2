@@ -34,9 +34,10 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
         // mutation happens here.
         let info = trap_handoff::translate_user_pf::<P>(&view.view(), &fault);
         let hart = <P as PercpuIf>::current_cpu_id().0;
-        if try_direct_resident_file_page_fault(hart, info) {
-            return TrapAction::Resume;
-        }
+        // Keep VM/page-cache work out of this handler. Architecture trap
+        // entry runs on a 64 KiB per-hart stack; the resident-file fast path
+        // is retried by `thread_future` after this handoff on the ordinary
+        // 512 KiB kernel stack.
         let outcome = trap_handoff::hand_off_user_pf(hart, &view, info);
         let action = trap_handoff::outcome_to_trap_action(&outcome);
         if matches!(action, TrapAction::Terminate) {
@@ -216,44 +217,6 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
         }
         action
     }
-}
-
-/// Resolve the common warm executable/file-mapping fault without tearing down
-/// the current userspace run.  Only a resident, non-waiting VM operation may
-/// succeed here; every cold or contended case falls through to the canonical
-/// reactor-backed fault script.
-fn try_direct_resident_file_page_fault(hart: usize, info: trap_handoff::PageFaultInfo) -> bool {
-    let Some(payload) = tx_subsystems::thread_runtime::current_userspace_payload(hart) else {
-        return false;
-    };
-    if payload.active_userspace_request().is_none() {
-        return false;
-    }
-    let Some(thread) = tx_subsystems::thread_runtime::current_thread_identity(hart) else {
-        return false;
-    };
-    let Some(process) = thread.upgrade_owner_proc() else {
-        return false;
-    };
-    if payload.pending().snapshot() != 0
-        || process.group_pending_snapshot() != 0
-        || payload.interrupt_summary() != tx_subsystems::signal::InterruptSummary::EMPTY
-    {
-        return false;
-    }
-    let Some(aspace) = process.aspace_cap() else {
-        return false;
-    };
-    let access = match info.access {
-        trap_handoff::AccessKind::Read => tx_subsystems::vm::AccessMode::Read,
-        trap_handoff::AccessKind::Write => return false,
-        trap_handoff::AccessKind::Execute => tx_subsystems::vm::AccessMode::Execute,
-        trap_handoff::AccessKind::Unknown => return false,
-    };
-    aspace.try_resident_file_fault_oneshot(tx_subsystems::vm::VmFault::new(
-        tx_subsystems::vm::UserVirtAddr::new(info.addr.raw() as usize),
-        access,
-    ))
 }
 
 /// Temporary opt-in syscall mix profiler. Normal release builds do not carry
@@ -635,6 +598,9 @@ fn try_direct_trap_syscall<P: TxPlatform>(
         b"debug.trap.direct_sigprocmask.context_aspace_ns",
         aspace_start,
     );
+    if !direct_trap_user_buffers_are_resident(req, &aspace) {
+        return None;
+    }
     emit_direct_sigprocmask_detail_duration(
         req.nr,
         b"debug.trap.direct_sigprocmask.context_ns",
@@ -734,20 +700,21 @@ fn try_direct_trap_syscall<P: TxPlatform>(
 ///
 /// The shims-level direct dispatcher also exposes cached VFS/VM helpers for
 /// ordinary kernel-stack call sites. Do not confuse that synchronous property
-/// with trap-stack safety: pathname walking, page-backed I/O and VM mutation
-/// can form deep call chains even when they do not wait. BuildStorm has
-/// exercised those chains past an architecture trap-stack boundary and into
-/// the adjacent saved kernel-resume context.
+/// with trap-stack safety: pathname walking, page-backed I/O, VM mutation and
+/// futex wake publication can form deep or stateful call chains even when the
+/// one-shot helper does not wait. BuildStorm has exercised those chains past
+/// an architecture trap-stack boundary and into the adjacent saved
+/// kernel-resume context.
 ///
 /// Keep this as an allow-list so a newly added direct syscall falls back to
 /// the reactor until its maximum stack depth is reviewed explicitly.
-const fn direct_trap_syscall_is_stack_safe(arch: tx_hal::Arch, nr: u64) -> bool {
+const fn direct_trap_syscall_is_stack_safe(_arch: tx_hal::Arch, nr: u64) -> bool {
     use tx_shims::linux_syscall::numbers::{
-        NR_CLOCK_GETTIME, NR_FUTEX, NR_GETEGID, NR_GETEUID, NR_GETGID, NR_GETPID, NR_GETPPID,
-        NR_GETTID, NR_GETTIMEOFDAY, NR_GETUID, NR_OPENAT, NR_STATX,
+        NR_CLOCK_GETTIME, NR_GETEGID, NR_GETEUID, NR_GETGID, NR_GETPID, NR_GETPPID, NR_GETTID,
+        NR_GETTIMEOFDAY, NR_GETUID,
     };
 
-    let shallow = matches!(
+    matches!(
         nr,
         NR_GETPPID
             | NR_GETPID
@@ -758,25 +725,61 @@ const fn direct_trap_syscall_is_stack_safe(arch: tx_hal::Arch, nr: u64) -> bool 
             | NR_GETEGID
             | NR_CLOCK_GETTIME
             | NR_GETTIMEOFDAY
-            | NR_FUTEX
-            | NR_RT_SIGPROCMASK
             | NR_SET_TID_ADDRESS
-    );
-    if shallow {
+    )
+}
+
+/// Direct trap calls may only touch user buffers whose translations are
+/// already present. Calls with generic fault-capable copy helpers, including
+/// `rt_sigprocmask`, are not admitted by the trap-stack allow-list at all.
+fn direct_trap_user_buffers_are_resident(
+    req: &trap_handoff::SyscallRequest,
+    aspace: &tx_subsystems::vm::AddressSpace,
+) -> bool {
+    use tx_shims::linux_syscall::numbers::{NR_CLOCK_GETTIME, NR_GETTIMEOFDAY};
+    use tx_subsystems::vm::UserAccessKind;
+
+    match req.nr {
+        NR_CLOCK_GETTIME => direct_trap_user_range_is_ready(
+            aspace,
+            req.args[1] as usize,
+            2 * core::mem::size_of::<u64>(),
+            UserAccessKind::Write,
+        ),
+        NR_GETTIMEOFDAY => direct_trap_user_range_is_ready(
+            aspace,
+            req.args[0] as usize,
+            2 * core::mem::size_of::<u64>(),
+            UserAccessKind::Write,
+        ),
+        _ => true,
+    }
+}
+
+fn direct_trap_user_range_is_ready(
+    aspace: &tx_subsystems::vm::AddressSpace,
+    addr: usize,
+    len: usize,
+    access: tx_subsystems::vm::UserAccessKind,
+) -> bool {
+    use tx_subsystems::vm::{UserRange, UserVirtAddr, USER_PAGE_SIZE};
+
+    // Null retains the syscall's normal EFAULT/query semantics without
+    // entering a user-copy path. Every non-null buffer must be page-covered.
+    if addr == 0 || len == 0 {
         return true;
     }
-
-    // `openat` is the proven cross-architecture offender: even its cache-hit
-    // walker has enough nested VFS/zone state to overrun a trap stack under
-    // BuildStorm. RV64 keeps its already-validated cached data/metadata and VM
-    // lanes; LA64 continues to hand all of those deeper operations to the
-    // ordinary kernel stack.
-    matches!(arch, tx_hal::Arch::Riscv64)
-        && !matches!(nr, NR_OPENAT)
-        && matches!(
-            nr,
-            NR_READ | NR_WRITE | NR_FCNTL | NR_FSTAT | NR_LSEEK | NR_BRK | NR_MMAP | NR_STATX
-        )
+    let Some(last) = addr.checked_add(len - 1) else {
+        return false;
+    };
+    let start = addr & !(USER_PAGE_SIZE - 1);
+    let Some(end) = (last & !(USER_PAGE_SIZE - 1)).checked_add(USER_PAGE_SIZE) else {
+        return false;
+    };
+    let Ok(range) = UserRange::new_aligned(UserVirtAddr::new(start), end - start) else {
+        return false;
+    };
+    aspace.user_range_is_ready_for_access(range, access)
 }
 
 #[cfg(test)]
@@ -789,31 +792,29 @@ mod direct_trap_stack_safety_tests {
     };
 
     #[test]
-    fn openat_stays_off_every_trap_stack() {
+    fn blocking_and_deep_calls_stay_off_every_trap_stack() {
         for arch in [Arch::Riscv64, Arch::LoongArch64] {
-            assert!(!direct_trap_syscall_is_stack_safe(arch, NR_OPENAT));
-        }
-    }
-
-    #[test]
-    fn rv64_keeps_validated_cached_lanes() {
-        for nr in [
-            NR_READ, NR_WRITE, NR_FCNTL, NR_FSTAT, NR_LSEEK, NR_BRK, NR_MMAP, NR_STATX,
-        ] {
-            assert!(direct_trap_syscall_is_stack_safe(Arch::Riscv64, nr));
-            assert!(!direct_trap_syscall_is_stack_safe(Arch::LoongArch64, nr));
+            for nr in [
+                NR_OPENAT,
+                NR_READ,
+                NR_WRITE,
+                NR_FCNTL,
+                NR_FSTAT,
+                NR_LSEEK,
+                NR_BRK,
+                NR_MMAP,
+                NR_STATX,
+                NR_FUTEX,
+                NR_RT_SIGPROCMASK,
+            ] {
+                assert!(!direct_trap_syscall_is_stack_safe(arch, nr));
+            }
         }
     }
 
     #[test]
     fn shallow_direct_calls_are_portable() {
-        for nr in [
-            NR_GETPID,
-            NR_CLOCK_GETTIME,
-            NR_FUTEX,
-            NR_RT_SIGPROCMASK,
-            NR_SET_TID_ADDRESS,
-        ] {
+        for nr in [NR_GETPID, NR_CLOCK_GETTIME, NR_SET_TID_ADDRESS] {
             assert!(direct_trap_syscall_is_stack_safe(Arch::Riscv64, nr));
             assert!(direct_trap_syscall_is_stack_safe(Arch::LoongArch64, nr));
         }

@@ -1159,7 +1159,34 @@ where
             if fd >= 0 {
                 if let Some(file) = ctx.fd(fd as u32) {
                     let guard = tx_substrate::epoch::guard();
-                    if let Some(tfd) = file.timerfd() {
+                    if let Some(efd) = file.eventfd() {
+                        if events & POLLIN != 0 {
+                            if efd.counter() > 0 {
+                                revents |= POLLIN;
+                            } else {
+                                push_unique_wait_token(
+                                    &mut wait_tokens,
+                                    tx_subsystems::execution::WaitToken::new(
+                                        efd.reader_source_id(),
+                                        EVENTFD_POLL_READABLE,
+                                    ),
+                                );
+                            }
+                        }
+                        if events & POLLOUT != 0 {
+                            if efd.counter() < tx_subsystems::eventfd::EVENTFD_MAX {
+                                revents |= POLLOUT;
+                            } else {
+                                push_unique_wait_token(
+                                    &mut wait_tokens,
+                                    tx_subsystems::execution::WaitToken::new(
+                                        efd.writer_source_id(),
+                                        EVENTFD_POLL_WRITABLE,
+                                    ),
+                                );
+                            }
+                        }
+                    } else if let Some(tfd) = file.timerfd() {
                         if events & POLLIN != 0 {
                             if timerfd_readable_level::<P>(tfd) {
                                 revents |= POLLIN;
@@ -1278,6 +1305,53 @@ where
                                 );
                             }
                         }
+                    } else if !matches!(
+                        file.backing(),
+                        tx_subsystems::vfs::structure::OpenFileBacking::Rnode { .. }
+                    ) {
+                        // All non-VFS descriptor kinds must stay on the
+                        // fd-readiness facade. In particular QEMU polls an
+                        // array containing eventfd and signalfd descriptors;
+                        // neither object owns an RNode. Falling through to
+                        // the VFS branch below used to panic in
+                        // `OpenFile::rnode()` during the platform's nested
+                        // boot validation.
+                        let mut interest = FdReadyMask::empty();
+                        if events & POLLIN != 0 {
+                            interest |= FdReadyMask::READ;
+                        }
+                        if events & POLLOUT != 0 {
+                            interest |= FdReadyMask::WRITE;
+                        }
+                        let report = tx_subsystems::vfs::query_fd_ready(
+                            tx_subsystems::vfs::FdReadyQuery {
+                                file: &file,
+                                interest,
+                                now_monotonic_ns: Some(<P as tx_hal::TimeIf>::read_ns()),
+                            },
+                            &guard,
+                        );
+                        if report.ready.intersects(FdReadyMask::READ) {
+                            revents |= POLLIN;
+                        }
+                        if report.ready.intersects(FdReadyMask::WRITE) {
+                            revents |= POLLOUT;
+                        }
+                        if report.ready.intersects(FdReadyMask::ERR) {
+                            revents |= POLLERR;
+                        }
+                        if report.ready.intersects(FdReadyMask::HUP) {
+                            revents |= POLLHUP;
+                        }
+                        for wait in report.waits {
+                            push_unique_wait_token(
+                                &mut wait_tokens,
+                                tx_subsystems::execution::WaitToken::new(
+                                    wait.source.raw(),
+                                    wait.interests.raw(),
+                                ),
+                            );
+                        }
                     } else {
                         let mut handled = false;
                         match file.rnode().backing() {
@@ -1300,6 +1374,26 @@ where
                                 }
                                 if events & POLLOUT != 0 {
                                     revents |= POLLOUT;
+                                }
+                            }
+                            RNodeBacking::StructBacked {
+                                payload: StructPayload::CharDevice(binding),
+                            } if binding.ops.rtc_ops().is_some() => {
+                                handled = true;
+                                if events & POLLIN != 0 {
+                                    let readable = binding
+                                        .ops
+                                        .rtc_ops()
+                                        .and_then(|rtc| rtc.poll_events(&guard).ok())
+                                        .is_some_and(|pending| !pending.is_empty());
+                                    if readable {
+                                        revents |= POLLIN;
+                                    } else {
+                                        push_unique_wait_token(
+                                            &mut wait_tokens,
+                                            tx_fs::devfs::rtc_event_wait_token(),
+                                        );
+                                    }
                                 }
                             }
                             RNodeBacking::StructBacked {

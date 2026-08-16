@@ -49,11 +49,12 @@ impl AddressSpace {
     /// Complete a cached file read/execute fault without entering the async
     /// fault driver.
     ///
-    /// This is the trap-shell fast path: it is intentionally resident-only
-    /// and non-waiting.  A cold page, a contended range, userfaultfd, CoW, or
-    /// any publication race returns `false` without changing the canonical
-    /// fallback policy.  On success the faulting instruction may be retried
-    /// immediately because the PTE and its translation barrier are complete.
+    /// This is a synchronous fast path intended for the ordinary kernel
+    /// stack after trap handoff. It is resident-only and non-waiting. A cold
+    /// page, a contended range, userfaultfd, CoW, or any publication race
+    /// returns `false` without changing the canonical fallback policy. On
+    /// success the faulting instruction may be retried immediately because
+    /// the PTE and its translation barrier are complete.
     pub fn try_resident_file_fault_oneshot(&self, fault: VmFault) -> bool {
         if !matches!(fault.access, AccessMode::Read | AccessMode::Execute) {
             return false;

@@ -3,7 +3,7 @@ use super::*;
 use crate::linux_syscall::{
     NR_EPOLL_CREATE1, NR_EPOLL_CTL, NR_EPOLL_PWAIT2, NR_EVENTFD2, NR_FANOTIFY_INIT,
     NR_FANOTIFY_MARK, NR_INOTIFY_ADD_WATCH, NR_INOTIFY_INIT1, NR_INOTIFY_RM_WATCH, NR_PIPE2,
-    NR_READ, NR_WRITE,
+    NR_PPOLL, NR_READ, NR_SIGNALFD4, NR_WRITE,
 };
 use tx_substrate::wake::{MailboxEvent, MailboxSchedulerHint, TaskMailbox};
 
@@ -50,6 +50,14 @@ struct TestTimespec {
     tv_nsec: i64,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct TestPollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
 fn event_notify_setup() -> (TestSetup, Cap<ProcessIdentity>, Cap<ThreadIdentity>) {
     let setup = setup();
     let proc_cap = bootstrap();
@@ -77,6 +85,27 @@ fn create_eventfd(ctx: &SyscallCtx<'_>, init_val: u64) -> i64 {
     }
 }
 
+fn create_signalfd(ctx: &SyscallCtx<'_>) -> i64 {
+    let mask = 1u64 << (10 - 1); // SIGUSR1
+    match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_SIGNALFD4,
+            [
+                u64::MAX,
+                &mask as *const u64 as u64,
+                core::mem::size_of::<u64>() as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        ctx,
+    )) {
+        SyscallResult::Return(fd) => fd,
+        other => panic!("signalfd4: {other:?}"),
+    }
+}
+
 fn create_pipe(ctx: &SyscallCtx<'_>) -> [i32; 2] {
     let mut pipefd = [-1i32; 2];
     match block_on(dispatch::<ShimsTestPmap>(
@@ -86,6 +115,115 @@ fn create_pipe(ctx: &SyscallCtx<'_>) -> [i32; 2] {
         SyscallResult::Return(0) => pipefd,
         other => panic!("pipe2: {other:?}"),
     }
+}
+
+#[test]
+fn dispatch_ppoll_handles_qemu_eventfd_without_vfs_rnode_dispatch() {
+    const POLLIN: i16 = 0x0001;
+
+    let (_setup, proc_cap, thread) = event_notify_setup();
+    let ctx = make_ctx(proc_cap, thread).with_mailbox(alloc::sync::Arc::new(TaskMailbox::new()));
+    let eventfd = create_eventfd(&ctx, 0);
+    let signalfd = create_signalfd(&ctx);
+    let timeout = TestTimespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let mut pollfds = [
+        TestPollFd {
+            fd: eventfd as i32,
+            events: POLLIN,
+            revents: -1,
+        },
+        TestPollFd {
+            fd: signalfd as i32,
+            events: POLLIN,
+            revents: -1,
+        },
+    ];
+
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_PPOLL,
+                [
+                    pollfds.as_mut_ptr() as u64,
+                    pollfds.len() as u64,
+                    &timeout as *const TestTimespec as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(pollfds[0].revents, 0);
+    assert_eq!(pollfds[1].revents, 0);
+
+    let value = 3u64;
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_WRITE,
+                [
+                    eventfd as u64,
+                    &value as *const u64 as u64,
+                    core::mem::size_of::<u64>() as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(8)
+    );
+
+    pollfds[0].revents = 0;
+    pollfds[1].revents = 0;
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_PPOLL,
+                [
+                    pollfds.as_mut_ptr() as u64,
+                    pollfds.len() as u64,
+                    &timeout as *const TestTimespec as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(1)
+    );
+    assert_eq!(pollfds[0].revents & POLLIN, POLLIN);
+    assert_eq!(pollfds[1].revents, 0);
+
+    // QEMU drains eventfds with a buffer larger than eight bytes. Linux still
+    // returns exactly one u64, so cover the same shape as the platform trace.
+    let mut drain = [0u8; 512];
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_READ,
+                [
+                    eventfd as u64,
+                    drain.as_mut_ptr() as u64,
+                    drain.len() as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(8)
+    );
+    assert_eq!(u64::from_le_bytes(drain[..8].try_into().unwrap()), value);
 }
 
 #[test]

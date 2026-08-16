@@ -1553,6 +1553,22 @@ async fn handle_page_fault_trap<P: TxPlatform>(
         pf_access_to_vm_access(info.access),
     );
     dump_observe_threshold_if_ready::<P>();
+    // Keep the resident-file optimization, but execute it after the trap has
+    // handed control back to the ordinary per-hart kernel stack.  The helper
+    // can walk VM/page-cache state and prefault a bounded page batch; running
+    // that call chain on the 64 KiB architecture trap stack can overwrite the
+    // adjacent RV64 kernel-resume context under BuildStorm.
+    if aspace.try_resident_file_fault_oneshot(fault) {
+        #[cfg(feature = "syscall-profile")]
+        if let Some(start) = profile_start {
+            record_profiled_page_fault::<P>(
+                info.access,
+                <P as tx_hal::TimeIf>::read_ns().saturating_sub(start),
+            );
+        }
+        emit_thread_debug_value(b"debug.thread.page_fault.resident_oneshot", 1);
+        return ThreadLoopControl::Continue;
+    }
     let fault_result = if let Some(mailbox) = payload.mailbox_handle() {
         Box::pin(aspace.fault_script_for_process_with_post(
             fault,
