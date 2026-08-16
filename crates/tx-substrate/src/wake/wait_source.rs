@@ -100,6 +100,23 @@ pub struct WaitSource {
     subscribers: SpinMutex<Vec<Subscriber>>,
     next_subscriber_id: AtomicU64,
     pending_mask: AtomicU64,
+    last_notification_sequence: AtomicU64,
+}
+
+/// Global ordering point between a driver's semantic state observation and a
+/// later object notification.
+///
+/// The sequence is sampled immediately before `StepOp::step`.  A source stores
+/// the next value while holding the same lock that publishes subscribers, so
+/// registration can tell whether an edge landed in the otherwise invisible
+/// check-before-subscribe window.
+static NOTIFICATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot the global wait notification sequence before observing semantic
+/// object state.
+#[inline]
+pub fn notification_sequence() -> u64 {
+    NOTIFICATION_SEQUENCE.load(Ordering::Acquire)
 }
 
 impl WaitSource {
@@ -110,6 +127,7 @@ impl WaitSource {
             // 1-based; `SubscriberId(0)` is a never-issued sentinel.
             next_subscriber_id: AtomicU64::new(1),
             pending_mask: AtomicU64::new(0),
+            last_notification_sequence: AtomicU64::new(0),
         }
     }
 
@@ -175,6 +193,51 @@ impl WaitSource {
     ) -> SubscriberId {
         self.register_if(mailbox, generation, interests, || true)
             .expect("unconditional wait-source registration")
+    }
+
+    /// Register a waiter whose blocked-state observation began at
+    /// `observed_sequence`.
+    ///
+    /// Unlike [`Self::register`], this closes the generic `StepOp` window in
+    /// which an object can become ready after `step()` reports `Yield` but
+    /// before the driver publishes its subscriber row.  Registration and the
+    /// source-local notification sequence are compared under `subscribers`,
+    /// the same lock used by every notify path.  If an edge raced the
+    /// observation, a generation-correct mailbox event forces the operation
+    /// to re-read authoritative state instead of parking forever.
+    pub fn register_after_observation(
+        &self,
+        mailbox: Weak<TaskMailbox>,
+        generation: WaitGeneration,
+        interests: InterestMask,
+        observed_sequence: u64,
+    ) -> SubscriberId {
+        let id = SubscriberId(self.next_subscriber_id.fetch_add(1, Ordering::AcqRel));
+        let mailbox_for_pending = mailbox.clone();
+        let mailbox_for_race = mailbox.clone();
+        let notification_raced = {
+            let mut subscribers = self.subscribers.lock();
+            let raced = self.last_notification_sequence.load(Ordering::Acquire) > observed_sequence;
+            subscribers.push(Subscriber {
+                mailbox,
+                generation,
+                interests,
+                id,
+            });
+            raced
+        };
+
+        self.deliver_pending_to(mailbox_for_pending, generation, interests);
+        if notification_raced {
+            if let Some(mailbox) = mailbox_for_race.upgrade() {
+                let _ = mailbox.post(MailboxEvent::SourceFired {
+                    generation,
+                    source: self.id,
+                    interests,
+                });
+            }
+        }
+        id
     }
 
     /// Recheck the blocked predicate and publish the subscriber row under the
@@ -263,7 +326,11 @@ impl WaitSource {
 
     /// Fire `mask` with an explicit scheduler hint for delivered events.
     pub fn notify_with_hint(&self, mask: InterestMask, hint: MailboxSchedulerHint) -> usize {
+        if mask.raw() == 0 {
+            return 0;
+        }
         let mut subs = self.subscribers.lock();
+        self.record_notification();
         let mut posted = 0usize;
         let mut delivered_mask = 0u64;
         // Walk forward and use `retain_mut` semantics: drop dead
@@ -311,8 +378,12 @@ impl WaitSource {
     where
         F: FnMut(&TaskMailbox, MailboxEvent, MailboxSchedulerHint) -> bool,
     {
+        if mask.raw() == 0 {
+            return 0;
+        }
         let deliveries = {
             let mut subs = self.subscribers.lock();
+            self.record_notification();
             let mut deliveries = Vec::new();
             let mut delivered_mask = 0u64;
             subs.retain(|sub| {
@@ -371,6 +442,7 @@ impl WaitSource {
             return 0;
         }
         let mut subs = self.subscribers.lock();
+        self.record_notification();
         let mut posted = 0usize;
         let mut delivered_mask = 0u64;
         subs.retain(|sub| {
@@ -418,6 +490,7 @@ impl WaitSource {
             return 0;
         }
         let mut subs = self.subscribers.lock();
+        self.record_notification();
         let mut posted = 0usize;
         let mut delivered_mask = 0u64;
         subs.retain(|sub| {
@@ -477,6 +550,7 @@ impl WaitSource {
 
         let deliveries = {
             let mut subs = self.subscribers.lock();
+            self.record_notification();
             let mut deliveries = Vec::new();
             let mut delivered_mask = 0u64;
             subs.retain(|sub| {
@@ -546,7 +620,11 @@ impl WaitSource {
     /// Fire `mask` with an explicit scheduler hint and emit one
     /// `WaitSourceNotify` observation record per woken task.
     pub fn notify_emit_with_hint(&self, mask: InterestMask, hint: MailboxSchedulerHint) -> usize {
+        if mask.raw() == 0 {
+            return 0;
+        }
         let mut subs = self.subscribers.lock();
+        self.record_notification();
         let mut posted = 0usize;
         let mut delivered_mask = 0u64;
 
@@ -582,6 +660,18 @@ impl WaitSource {
             self.pending_mask.fetch_or(undelivered, Ordering::AcqRel);
         }
         posted
+    }
+
+    /// Publish this source's place in the global observation/notification
+    /// order.  Callers hold `subscribers`, making this update atomic with
+    /// subscriber selection and with `register_after_observation`.
+    #[inline]
+    fn record_notification(&self) {
+        let sequence = NOTIFICATION_SEQUENCE
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        self.last_notification_sequence
+            .store(sequence, Ordering::Release);
     }
 
     fn deliver_pending_to(
@@ -810,6 +900,7 @@ impl Drop for WaitRegistrationGuard<'_> {
 mod tests {
     use super::*;
     use alloc::sync::Arc;
+    extern crate std;
 
     fn mb() -> Arc<TaskMailbox> {
         Arc::new(TaskMailbox::new())
@@ -1134,6 +1225,125 @@ mod tests {
             }
             other => panic!("expected SourceFired, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn observation_sequence_replays_edge_hidden_by_an_existing_subscriber() {
+        let src = WaitSource::new(WaitSourceId::new(43));
+        let existing = mb();
+        let racing = mb();
+        let later = mb();
+        let interests = InterestMask::new(0b1);
+        let _ = src.register(Arc::downgrade(&existing), WaitGeneration::new(1), interests);
+
+        // The second waiter has observed "blocked" but has not published its
+        // subscriber row yet. The first waiter means the legacy pending-mask
+        // fallback is not armed for this edge.
+        let observed = notification_sequence();
+        assert_eq!(
+            src.notify_with_owner_post(
+                interests,
+                MailboxSchedulerHint::Normal,
+                |mailbox, event, _hint| mailbox.post(event),
+            ),
+            1
+        );
+        assert_eq!(src.pending_mask_snapshot(), 0);
+
+        let _ = src.register_after_observation(
+            Arc::downgrade(&racing),
+            WaitGeneration::new(2),
+            interests,
+            observed,
+        );
+        assert!(matches!(
+            racing.poll(),
+            Some(MailboxEvent::SourceFired {
+                generation,
+                source,
+                interests: fired,
+            }) if generation == WaitGeneration::new(2)
+                && source == WaitSourceId::new(43)
+                && fired == interests
+        ));
+
+        // A registration whose state observation started after the edge must
+        // not receive an unconditional stale replay.
+        let after = notification_sequence();
+        let _ = src.register_after_observation(
+            Arc::downgrade(&later),
+            WaitGeneration::new(3),
+            interests,
+            after,
+        );
+        assert!(later.is_empty());
+    }
+
+    #[test]
+    fn observation_sequence_survives_repeated_cross_thread_registration_races() {
+        const ROUNDS: u64 = 4_096;
+
+        let src = Arc::new(WaitSource::new(WaitSourceId::new(44)));
+        let existing = mb();
+        let racing = mb();
+        let interests = InterestMask::new(0b1);
+        let _existing_id =
+            src.register(Arc::downgrade(&existing), WaitGeneration::new(1), interests);
+        let (start_tx, start_rx) = std::sync::mpsc::sync_channel::<()>(0);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel::<()>(0);
+        let notifier_src = Arc::clone(&src);
+        let notifier = std::thread::spawn(move || {
+            for round in 0..ROUNDS {
+                start_rx.recv().expect("start channel remains live");
+                let posted = match round % 3 {
+                    0 => {
+                        notifier_src.notify_with_hint(interests, MailboxSchedulerHint::WakeHandoff)
+                    }
+                    1 => notifier_src.notify_limit_with_hint(
+                        interests,
+                        1,
+                        MailboxSchedulerHint::Normal,
+                    ),
+                    _ => notifier_src.notify_limit_emit_with_owner_post(
+                        interests,
+                        1,
+                        MailboxSchedulerHint::WakeHandoff,
+                        |mailbox, event, hint| mailbox.post_with_scheduler_hint(event, hint),
+                    ),
+                };
+                assert_eq!(posted, 1);
+                done_tx.send(()).expect("done channel remains live");
+            }
+        });
+
+        for round in 0..ROUNDS {
+            let observed = notification_sequence();
+            start_tx.send(()).expect("notifier remains live");
+            done_rx.recv().expect("notifier completes notification");
+
+            let generation = WaitGeneration::new(round + 2);
+            let id = src.register_after_observation(
+                Arc::downgrade(&racing),
+                generation,
+                interests,
+                observed,
+            );
+            assert!(matches!(
+                racing.poll(),
+                Some(MailboxEvent::SourceFired {
+                    generation: fired_generation,
+                    source,
+                    interests: fired,
+                }) if fired_generation == generation
+                    && source == WaitSourceId::new(44)
+                    && fired == interests
+            ));
+            src.unregister(id);
+
+            assert!(existing.poll().is_some());
+            assert_eq!(src.pending_mask_snapshot(), 0);
+        }
+        notifier.join().expect("notifier thread completes");
     }
 
     #[test]

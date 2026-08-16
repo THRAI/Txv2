@@ -584,6 +584,164 @@ fn drive_waiting_on_wait_source_wake_retries() {
 }
 
 #[test]
+fn drive_retries_when_notification_races_state_check_and_subscription() {
+    struct NotifyWhileSteppingOp {
+        source: Arc<WaitSource>,
+        interests: InterestMask,
+        yielded: bool,
+    }
+
+    impl StepOp<ProcessIdentity> for NotifyWhileSteppingOp {
+        type Output = u32;
+        type Progress = NoProgress;
+
+        fn step(
+            &mut self,
+            _ctx: &mut ScriptCtx<ProcessIdentity>,
+        ) -> StepOutcome<Self::Output, Self::Progress> {
+            if self.yielded {
+                return StepOutcome::Done(42);
+            }
+            self.yielded = true;
+
+            // Model an object becoming ready after `drive` starts the
+            // semantic state check but before it publishes this task's
+            // subscriber row.
+            assert_eq!(self.source.notify(self.interests), 1);
+            StepOutcome::Yield {
+                progress: NoProgress,
+                shape: YieldShape::OnWaitSource {
+                    source: self.source.id(),
+                    interests: self.interests,
+                },
+            }
+        }
+    }
+
+    let source_id = WaitSourceId::new(0xd12f);
+    let interests = InterestMask::new(0b1);
+    let source = Arc::new(WaitSource::new(source_id));
+    register_source(Arc::clone(&source));
+
+    // Keep an existing subscriber so the notification is delivered and the
+    // legacy pending-mask fallback is intentionally not armed.
+    let existing = Arc::new(TaskMailbox::new());
+    let _existing_id =
+        source.register(Arc::downgrade(&existing), WaitGeneration::new(1), interests);
+    let mailbox = Arc::new(TaskMailbox::new());
+    let op = NotifyWhileSteppingOp {
+        source: Arc::clone(&source),
+        interests,
+        yielded: false,
+    };
+    let mut ctx = ScriptCtx::new().with_mailbox(Arc::clone(&mailbox));
+
+    assert_eq!(
+        block_on(tx_scripts::drive(
+            op,
+            &mut ctx,
+            DriveMode::Waiting,
+            Some(&mailbox),
+            None,
+            None,
+        )),
+        Ok(42)
+    );
+    assert_eq!(source.pending_mask_snapshot(), 0);
+    unregister_source(source_id);
+}
+
+#[test]
+fn drive_survives_repeated_multi_source_lost_wake_windows() {
+    const SOURCE_COUNT: usize = 4;
+    const ROUNDS: usize = 4_096;
+
+    struct RepeatedRaceOp {
+        sources: Vec<(Arc<WaitSource>, Arc<TaskMailbox>)>,
+        interests: InterestMask,
+        remaining: usize,
+    }
+
+    impl StepOp<ProcessIdentity> for RepeatedRaceOp {
+        type Output = usize;
+        type Progress = NoProgress;
+
+        fn step(
+            &mut self,
+            _ctx: &mut ScriptCtx<ProcessIdentity>,
+        ) -> StepOutcome<Self::Output, Self::Progress> {
+            if self.remaining == 0 {
+                return StepOutcome::Done(ROUNDS);
+            }
+
+            let round = ROUNDS - self.remaining;
+            let (source, existing) = &self.sources[round % self.sources.len()];
+            while existing.poll().is_some() {}
+            let posted = match round % 4 {
+                0 => source.notify(self.interests),
+                1 => source.notify_limit(self.interests, 1),
+                2 => source.notify_with_owner_post(
+                    self.interests,
+                    tx_substrate::wake::MailboxSchedulerHint::WakeHandoff,
+                    |mailbox, event, hint| mailbox.post_with_scheduler_hint(event, hint),
+                ),
+                _ => source.notify_limit_emit_with_owner_post(
+                    self.interests,
+                    1,
+                    tx_substrate::wake::MailboxSchedulerHint::Normal,
+                    |mailbox, event, hint| mailbox.post_with_scheduler_hint(event, hint),
+                ),
+            };
+            assert_eq!(posted, 1);
+            assert_eq!(source.pending_mask_snapshot(), 0);
+            self.remaining -= 1;
+            StepOutcome::Yield {
+                progress: NoProgress,
+                shape: YieldShape::OnWaitSource {
+                    source: source.id(),
+                    interests: self.interests,
+                },
+            }
+        }
+    }
+
+    let interests = InterestMask::new(0b1);
+    let mut sources = Vec::with_capacity(SOURCE_COUNT);
+    for index in 0..SOURCE_COUNT {
+        let source = Arc::new(WaitSource::new(WaitSourceId::new(0xd130 + index as u64)));
+        let existing = Arc::new(TaskMailbox::new());
+        let _existing_id =
+            source.register(Arc::downgrade(&existing), WaitGeneration::new(1), interests);
+        register_source(Arc::clone(&source));
+        sources.push((source, existing));
+    }
+
+    let mailbox = Arc::new(TaskMailbox::new());
+    let op = RepeatedRaceOp {
+        sources: sources.clone(),
+        interests,
+        remaining: ROUNDS,
+    };
+    let mut ctx = ScriptCtx::new().with_mailbox(Arc::clone(&mailbox));
+    assert_eq!(
+        block_on(tx_scripts::drive(
+            op,
+            &mut ctx,
+            DriveMode::Waiting,
+            Some(&mailbox),
+            None,
+            None,
+        )),
+        Ok(ROUNDS)
+    );
+
+    for (source, _) in sources {
+        assert_eq!(source.pending_mask_snapshot(), 0);
+        unregister_source(source.id());
+    }
+}
+
+#[test]
 fn drive_wait_source_reactor_handoff_parks_and_completes_without_poll_loop() {
     let source_id = WaitSourceId::new(0xd12e);
     let interests = InterestMask::new(0b1);

@@ -257,6 +257,7 @@ async fn wait_for_mq_readiness(
     ctx: &SyscallCtx<'_>,
     mq: &ipc::posix_mq::structure::PosixMqInstance,
     write: bool,
+    observed_sequence: u64,
 ) {
     let Ok(info) = ipc::posix_mq::execution::step_mq_poll_info(mq) else {
         return;
@@ -266,7 +267,7 @@ async fn wait_for_mq_readiness(
     } else {
         &info.read_endpoint
     };
-    super::await_wait_endpoint(ctx, endpoint, InterestMask::new(1)).await;
+    super::await_wait_endpoint(ctx, endpoint, InterestMask::new(1), observed_sequence).await;
 }
 
 fn validate_sem_timeout(ctx: &SyscallCtx<'_>, timeout_ptr: u64) -> Result<(), SyscallResult> {
@@ -1019,6 +1020,7 @@ pub(super) async fn sys_mq_timedsend(args: [u64; 6], ctx: &SyscallCtx<'_>) -> Sy
     }
     let cred = ctx.cred_cap();
     loop {
+        let observed_sequence = super::wait_observation_sequence();
         match ipc::posix_mq::execution::step_mq_send_with_posts(
             mq,
             &msg,
@@ -1029,7 +1031,7 @@ pub(super) async fn sys_mq_timedsend(args: [u64; 6], ctx: &SyscallCtx<'_>) -> Sy
         ) {
             Ok(()) => return SyscallResult::Return(0),
             Err(Errno::EAGAIN) if args[4] == 0 && !file.flags().nonblocking => {
-                wait_for_mq_readiness(ctx, mq, true).await;
+                wait_for_mq_readiness(ctx, mq, true, observed_sequence).await;
             }
             Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
         }
@@ -1062,6 +1064,7 @@ pub(super) async fn sys_mq_timedreceive(args: [u64; 6], ctx: &SyscallCtx<'_>) ->
     }
     let cred = ctx.cred_cap();
     loop {
+        let observed_sequence = super::wait_observation_sequence();
         match ipc::posix_mq::execution::step_mq_receive_with_post(
             mq,
             msg_len,
@@ -1082,7 +1085,7 @@ pub(super) async fn sys_mq_timedreceive(args: [u64; 6], ctx: &SyscallCtx<'_>) ->
                 return SyscallResult::Return(msg.len() as i64);
             }
             Err(Errno::EAGAIN) if args[4] == 0 && !file.flags().nonblocking => {
-                wait_for_mq_readiness(ctx, mq, false).await;
+                wait_for_mq_readiness(ctx, mq, false, observed_sequence).await;
             }
             Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
         }

@@ -12,7 +12,8 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::adapter::reactor_entry::{
-    lookup_source, ActiveWait, MailboxEvent, SubscriberId, TaskMailbox, WaitSource,
+    lookup_source, notification_sequence, ActiveWait, MailboxEvent, SubscriberId, TaskMailbox,
+    WaitSource,
 };
 use crate::adapter::step_engine::{InterestMask, WaitSourceId};
 use tx_services::time::{
@@ -27,6 +28,13 @@ pub(super) enum WaitSourceDeadline {
     Source,
     Deadline,
     NotInstalled,
+}
+
+/// Snapshot the wait notification order before a syscall observes the
+/// authoritative object state that may cause it to park.
+#[inline]
+pub(super) fn wait_observation_sequence() -> u64 {
+    notification_sequence()
 }
 
 pub(super) fn deadline_timer(
@@ -97,6 +105,7 @@ pub(super) async fn await_wait_source(
     ctx: &SyscallCtx<'_>,
     source: WaitSourceId,
     interests: InterestMask,
+    observed_sequence: u64,
 ) {
     let Some(mailbox) = ctx.mailbox.as_ref() else {
         return;
@@ -104,13 +113,15 @@ pub(super) async fn await_wait_source(
     let Some(wait_source) = lookup_source(source) else {
         return;
     };
-    await_wait_source_handle_on_mailbox(mailbox, wait_source, source, interests).await;
+    await_wait_source_handle_on_mailbox(mailbox, wait_source, source, interests, observed_sequence)
+        .await;
 }
 
 pub(super) async fn await_wait_endpoint(
     ctx: &SyscallCtx<'_>,
     endpoint: &(impl tx_substrate::wake::WaitEndpoint + ?Sized),
     interests: InterestMask,
+    observed_sequence: u64,
 ) {
     let Some(mailbox) = ctx.mailbox.as_ref() else {
         return;
@@ -120,6 +131,7 @@ pub(super) async fn await_wait_endpoint(
         endpoint.source(),
         endpoint.source_id(),
         interests,
+        observed_sequence,
     )
     .await;
 }
@@ -203,6 +215,7 @@ pub(super) async fn await_any_wait_source(
     ctx: &SyscallCtx<'_>,
     sources: &[(WaitSourceId, InterestMask, Option<Arc<WaitSource>>)],
     deadline_ns: Option<u64>,
+    observed_sequence: u64,
 ) -> bool {
     let Some(mailbox) = ctx.mailbox.as_ref() else {
         return false;
@@ -224,7 +237,12 @@ pub(super) async fn await_any_wait_source(
         } else {
             continue;
         };
-        let subscriber = wait_source.register(Arc::downgrade(mailbox), generation, interests);
+        let subscriber = wait_source.register_after_observation(
+            Arc::downgrade(mailbox),
+            generation,
+            interests,
+            observed_sequence,
+        );
         registrations.push(SourceRegistration {
             source: wait_source,
             subscriber,
@@ -271,10 +289,16 @@ async fn await_wait_source_handle_on_mailbox(
     wait_source: Arc<WaitSource>,
     source: WaitSourceId,
     interests: InterestMask,
+    observed_sequence: u64,
 ) {
     let generation = mailbox.next_generation();
     let active = ActiveWait::new(generation, source, interests);
-    let subscriber = wait_source.register(Arc::downgrade(mailbox), generation, interests);
+    let subscriber = wait_source.register_after_observation(
+        Arc::downgrade(mailbox),
+        generation,
+        interests,
+        observed_sequence,
+    );
     MailboxSourceFuture { mailbox, active }.await;
     wait_source.unregister(subscriber);
 }

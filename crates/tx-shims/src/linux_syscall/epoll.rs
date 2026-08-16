@@ -272,8 +272,9 @@ async fn wait_for_epoll_wake(
     ctx: &SyscallCtx<'_>,
     sources: &[(WaitSourceId, InterestMask, Option<Arc<WaitSource>>)],
     deadline_ns: Option<u64>,
+    observed_sequence: u64,
 ) -> bool {
-    super::await_any_wait_source(ctx, sources, deadline_ns).await
+    super::await_any_wait_source(ctx, sources, deadline_ns, observed_sequence).await
 }
 
 fn epoll_timeout_ms_deadline<P>(timeout_ms: i32) -> Option<u64>
@@ -510,6 +511,7 @@ where
     };
 
     loop {
+        let observed_sequence = super::wait_observation_sequence();
         let ready = collect_ready_events::<P>(ctx, &ep_cap, maxevents as usize);
         if !ready.is_empty() {
             return copy_ready_events(ctx, events_ptr, &ready);
@@ -526,7 +528,7 @@ where
         if ctx.mailbox.is_none() || sources.is_empty() {
             return SyscallResult::Return(0);
         }
-        if !wait_for_epoll_wake(ctx, &sources, deadline_ns).await {
+        if !wait_for_epoll_wake(ctx, &sources, deadline_ns, observed_sequence).await {
             return SyscallResult::Return(0);
         }
     }

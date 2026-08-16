@@ -37,8 +37,8 @@ use crate::adapter::step_engine::{
 };
 use crate::adapter::wake::lookup_source;
 use crate::adapter::wake::{
-    agent_event_matches, ActiveWait, MailboxEvent, MailboxPollAction, SubscriberId, TaskMailbox,
-    WaitSource,
+    agent_event_matches, notification_sequence, ActiveWait, MailboxEvent, MailboxPollAction,
+    SubscriberId, TaskMailbox, WaitSource,
 };
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -111,6 +111,10 @@ where
     let mut iteration: u32 = 0;
 
     let result: Result<S::Output, Errno> = 'drive: loop {
+        // Pair a possible `Yield` with the notification order that existed
+        // before semantic state was observed. The source registration later
+        // uses this to close the check-before-subscribe lost-wake window.
+        let wait_observation_sequence = notification_sequence();
         // L4: step begin — opens a step span attached to the drive span.
         let step_span = emit_step_begin(iteration, drive_span);
         tx_observe::dump_registered_if_requested();
@@ -179,6 +183,7 @@ where
                             timer_registrar,
                             ctx.deadline(),
                             interrupt_state,
+                            wait_observation_sequence,
                         )
                         .await;
 
@@ -466,6 +471,7 @@ async fn resolve_yield<I: SubjectIdentity>(
     timer_registrar: Option<&DeadlineRegistrarHandle>,
     deadline: Option<Deadline>,
     interrupt_state: InterruptView<'_, I>,
+    wait_observation_sequence: u64,
 ) -> (ResumeOutcome, u64) {
     match shape {
         YieldShape::OnWaitSource { source, interests } => {
@@ -476,6 +482,7 @@ async fn resolve_yield<I: SubjectIdentity>(
                 timer_registrar,
                 deadline,
                 interrupt_state,
+                wait_observation_sequence,
             )
             .await
         }
@@ -488,6 +495,7 @@ async fn resolve_yield<I: SubjectIdentity>(
                 timer_registrar,
                 deadline,
                 interrupt_state,
+                wait_observation_sequence,
             )
             .await
         }
@@ -539,6 +547,7 @@ async fn resolve_on_wait_source<I: SubjectIdentity>(
     timer_registrar: Option<&DeadlineRegistrarHandle>,
     deadline: Option<Deadline>,
     interrupt_state: InterruptView<'_, I>,
+    wait_observation_sequence: u64,
 ) -> (ResumeOutcome, u64) {
     if let Some(mbox) = mailbox {
         let gen = mbox.next_generation();
@@ -565,7 +574,12 @@ async fn resolve_on_wait_source<I: SubjectIdentity>(
         let ws = lookup_source(source);
         let _subscription = ws.as_ref().map(|source| WaitSourceSubscription {
             source: Arc::clone(source),
-            id: source.register(Arc::downgrade(mbox), gen, interests),
+            id: source.register_after_observation(
+                Arc::downgrade(mbox),
+                gen,
+                interests,
+                wait_observation_sequence,
+            ),
         });
         let timeout_guard = match (timer_registrar, deadline) {
             (Some(registrar), Some(deadline)) if deadline != Deadline::NEVER => match registrar

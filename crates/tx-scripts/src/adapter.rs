@@ -41,7 +41,8 @@ pub mod wake {
     pub use tx_substrate::wake::deadline::TimerToken;
     pub use tx_substrate::wake::mailbox::MailboxPollAction;
     pub use tx_substrate::wake::wait_source::{
-        lookup_source, register_source, unregister_source, SubscriberId, WaitSource,
+        lookup_source, notification_sequence, register_source, unregister_source, SubscriberId,
+        WaitSource,
     };
     pub use tx_substrate::wake::{
         agent_event_matches, ActiveWait, MailboxEvent, SignalRouting, TaskMailbox, WaitGeneration,

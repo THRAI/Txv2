@@ -720,6 +720,7 @@ pub(super) async fn sys_io_getevents<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -
     let mut drained: alloc::vec::Vec<IoEvent> = alloc::vec::Vec::with_capacity(nr_usize);
     let mut iter_budget: u32 = 1024;
     loop {
+        let observed_sequence = super::wait_observation_sequence();
         let remaining = nr_usize - drained.len();
         if remaining > 0 {
             let mut batch = aio_cap.drain_completions(remaining);
@@ -736,6 +737,7 @@ pub(super) async fn sys_io_getevents<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -
             ctx,
             aio_cap.events_available_endpoint(),
             InterestMask::new(EVENTS_AVAILABLE_MASK),
+            observed_sequence,
         )
         .await;
         iter_budget = iter_budget.saturating_sub(1);
