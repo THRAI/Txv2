@@ -21,7 +21,8 @@
     "After the physical reset, the same uImage and same MMC booted with tx.root=mmcblk0 ro. The root was /dev/mmcblk0 ext4 ro. The manifest and four artifact hashes were unchanged; both binaries again printed Hello, World!; baseline commit a7bd5cbd remained and fsck passed; clone original HEAD 72be011c and local commit c88012db remained; shallow=false, evidence existence/hash, clean status, and full fsck over 7,824 objects all passed. Final marker: FINAL_RO_MATRIX_PASS_c45256ce_20260816.",
     "The append-only serial log is target/vf2-acceptance/run-20260816-vf2-a91f0807-190020Z/serial-ee6ad7aa-f9e43adc-20260816-0755Z.log with SHA-256 51cda4599658baae60f64275787061a2a04e62e0a42472cdb40a65cd0975be59. The detailed local ledger is msp/debug-logs/2026-08-16-vf2-full-tools-clone-reset-persistence.md.",
     "Three non-blocking harness defects remain recorded: an early grouped redirection hit sed write error and was replaced by independent files; a late wait on the successful background clone returned 127 because BusyBox had already reaped the Done job; and one RO cat used four incorrect relative summary names. Direct Git/hash/fsck evidence replaced all three, so no acceptance cell depends on them.",
-    "The scoped Git/Vim/GCC/Rust/full-clone RW-create, physical-reset, RO-verify matrix is complete. This agent did not push or pull. The user may now perform their own credentialed push/pull verification. Only about 6 MiB remains free, so any new persistent workload needs a capacity gate and must preserve the acceptance evidence."
+    "The scoped Git/Vim/GCC/Rust/full-clone RW-create, physical-reset, RO-verify matrix is complete. This agent did not push or pull. Only about 6 MiB remains free, so any new persistent workload needs a capacity gate and must preserve the acceptance evidence.",
+    "After closure, the same physically verified source/uImage and MMC were booted once with tx.root=mmcblk0 rw. The agent confirmed ext4 RW, current UTC, board network/default route/DNS, anonymous GitHub TLS/ls-remote, clean repository state, local main c88012db, and pre-push remote main 72be011c before releasing the serial port. The user then reported that their credentialed git push origin main succeeded. The credential-bearing serial output was deliberately not read, searched, copied, or cited; this final push result is user attestation rather than independent agent transcript evidence. Pull was not reported."
   ],
   "changed_files": [
     {
@@ -106,6 +107,11 @@
       "notes": "Root was ext4 ro; C/Rust hashes and execution, both Git commits, clone parent/original HEAD, shallow=false, evidence hash, clean statuses, and both fsck checks all survived."
     },
     {
+      "command": "User-owned credentialed git push origin main from the physical VF2 RW clone",
+      "status": "passed",
+      "notes": "Reported successful by the user after the agent verified the RW/network/repository preconditions and released serial control. The PAT-bearing output was intentionally not inspected or retained as agent evidence; no pull result was reported."
+    },
+    {
       "command": "jq empty docs/progress/handoffs/2026-08-16-vf2-tools-persistence-verification.json",
       "status": "passed",
       "notes": "The completed handoff is valid JSON."
@@ -128,12 +134,6 @@
   ],
   "next_actions": [
     {
-      "id": "vf2-followup-1",
-      "title": "Optional user-owned push and pull verification",
-      "paths": [],
-      "notes": "The local acceptance matrix is complete. Only the user should supply credentials and perform any desired push/pull verification; this agent did neither."
-    },
-    {
       "id": "vf2-followup-2",
       "title": "Protect evidence and recheck capacity before further writes",
       "paths": [],
@@ -142,7 +142,7 @@
   ],
   "caveats": [
     "Do not modify, stage, commit, clean, stash, switch, or otherwise mutate /home/msp/learning/Txv2 or /tmp/txv2-la-full-clone.Nt4BdE/worktree.",
-    "No push or pull was performed, no PAT was requested, and no credentials were stored in a remote URL.",
+    "The agent performed no push or pull, requested no PAT, and stored no credentials in a remote URL. The user later reported a successful push; pull was not reported and the credential-bearing serial output was deliberately not inspected.",
     "The one explicitly authorized SD restore is complete. Do not perform another raw write, mkfs, partitioning, repair fsck, saveenv, flash write, or evidence overwrite without new explicit authorization.",
     "The first clone transport attempt and all harness-recording defects remain preserved in the serial/debug logs; they are not silently converted to passes.",
     "The VF2 MMC barrier may report success without a hardware flush. Persistence is established by the physical reset and independent RO readback, not by sync alone.",

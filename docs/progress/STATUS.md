@@ -1,3 +1,16 @@
+- 2026-08-16 (**VF2 用户侧 credentialed Git push 报告成功；敏感串口输出未读取**).
+  **Changed**：完整验收关闭后，仍使用物理验收源码 `c45256ceb` 与同一 uImage，
+  以一次性 `tx.root=mmcblk0 rw` 重新启动同盘 MMC；确认根为 ext4 RW、校正 UTC、
+  恢复 `192.168.1.10/24`/默认路由/DNS，并在不认证的只读路径验证 GitHub TLS、
+  远端 `main=72be011c...`、本地待推送 `main=c88012db...` 与 clean status 后释放串口。
+  用户随后报告 `git push origin main` 验证成功。**Verification**：push 结果仅采用用户
+  明确确认；因其终端输出包含 PAT，本代理未读取、搜索、复制或引用该段串口输出，
+  也没有自行执行 push/pull。此前 Git/Vim/GCC/Rust/full non-shallow clone 的
+  RW→物理 reset→RO 全矩阵保持通过。**Next**：保留 MMC 验收目录与本分支原子提交，
+  后续可按项目合并流程审阅/合并；若项目还要求 pull，需由用户另行明确验证。
+  **Blocker**：比赛验收无 blocker；仅有既有全局 unit/progress/docs-lint 债务，且 MMC
+  仍仅余约 6 MiB。
+
 - 2026-08-16 (**VF2 Git/Vim/GCC/Rust、完整非 shallow clone 与物理复位后同盘 RO
   持久化全矩阵通过**). **Changed**：在隔离分支
   `codex/vf2-file-io-runtime-rebind-fix` 上完成此前 File-I/O、wait interruption、
