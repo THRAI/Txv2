@@ -4696,8 +4696,8 @@ impl PageContainer {
             return StepOutcome::Err(V3Errno::EINVAL);
         };
         // Routes through `FsPageBacking::fetch_page`. v3 outcome:
-        // Done→install + Done; Continue→ no frame, surface EAGAIN as
-        // a conservative choice; Yield{OnWaitSource{c,i}}→pass through
+        // Done→install + Done; Continue→clean up this owner and preserve
+        // typed retry; Yield{OnWaitSource{c,i}}→pass through
         // with `NoProgress`; Yield{OnAgent}→Err(EIO); Err→Err.
         match mount
             .payload()
@@ -4709,11 +4709,13 @@ impl PageContainer {
             }
             StepOutcome::Continue { progress: _ } => {
                 // `Continue` with `NoProgress` means "fs is asking us
-                // to retry"; there is no frame to install. Conservative
-                // choice: surface `Err(EAGAIN)` so callers that expect
-                // a frame don't observe a stale value.
+                // to retry"; there is no frame to install. Retire this owner
+                // before preserving the protocol-level retry so the next turn
+                // can acquire a fresh fetch generation.
                 self.finish_file_page_fetch_without_install(page, fetch_id);
-                StepOutcome::Err(V3Errno::EAGAIN)
+                StepOutcome::Continue {
+                    progress: NoProgress,
+                }
             }
             StepOutcome::Yield { progress: _, shape } => {
                 self.finish_file_page_fetch_without_install(page, fetch_id);

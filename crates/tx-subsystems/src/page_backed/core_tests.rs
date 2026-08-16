@@ -520,6 +520,7 @@ fn user_page_gift_for_test() -> (crate::vm::UserPageGift, Ppn) {
 struct RecordingFs {
     fetches: AtomicUsize,
     fetch_error: Option<V3Errno>,
+    fetch_continue_once: AtomicBool,
     fsyncs: AtomicUsize,
     fsync_returns_enosys: AtomicBool,
     last_object: AtomicU64,
@@ -539,6 +540,19 @@ impl RecordingFs {
         Self {
             fetches: AtomicUsize::new(0),
             fetch_error: Some(errno),
+            fetch_continue_once: AtomicBool::new(false),
+            fsyncs: AtomicUsize::new(0),
+            fsync_returns_enosys: AtomicBool::new(false),
+            last_object: AtomicU64::new(0),
+            last_offset: AtomicU64::new(0),
+        }
+    }
+
+    fn fetch_continue_once() -> Self {
+        Self {
+            fetches: AtomicUsize::new(0),
+            fetch_error: None,
+            fetch_continue_once: AtomicBool::new(true),
             fsyncs: AtomicUsize::new(0),
             fsync_returns_enosys: AtomicBool::new(false),
             last_object: AtomicU64::new(0),
@@ -550,6 +564,7 @@ impl RecordingFs {
         Self {
             fetches: AtomicUsize::new(0),
             fetch_error: None,
+            fetch_continue_once: AtomicBool::new(false),
             fsyncs: AtomicUsize::new(0),
             fsync_returns_enosys: AtomicBool::new(fsync_returns_enosys),
             last_object: AtomicU64::new(0),
@@ -692,6 +707,11 @@ impl FsPageBacking for RecordingFs {
         self.last_offset.store(offset, Ordering::Release);
         if let Some(errno) = self.fetch_error {
             return V3Out::err(errno);
+        }
+        if self.fetch_continue_once.swap(false, Ordering::AcqRel) {
+            return V3Out::Continue {
+                progress: NoProgress,
+            };
         }
         V3Out::done(Frame::new(
             page_allocator::zero_frame_ppn().expect("zero frame"),
@@ -1654,6 +1674,76 @@ fn vm_fault_script_does_not_treat_backend_eagain_as_retry() {
             PageCacheError::Backend(Errno::EAGAIN)
         )))
     ));
+}
+
+#[test]
+fn vm_file_fault_preserves_backend_continue_then_completes_all_mapping_paths() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+
+    for (object_id, base, flags, prot, access) in [
+        (
+            185,
+            0x79_000,
+            crate::vm::VmEntryFlags::SHARED,
+            crate::vm::Prot::READ,
+            crate::vm::AccessMode::Read,
+        ),
+        (
+            186,
+            0x7a_000,
+            crate::vm::VmEntryFlags::PRIVATE,
+            crate::vm::Prot::READ,
+            crate::vm::AccessMode::Read,
+        ),
+        (
+            187,
+            0x7b_000,
+            crate::vm::VmEntryFlags::PRIVATE,
+            crate::vm::Prot::READ_WRITE,
+            crate::vm::AccessMode::Write,
+        ),
+    ] {
+        let fs = Arc::new(RecordingFs::fetch_continue_once());
+        let pc = file_page_container_cap(fs.clone(), fs.clone(), FsObjectId::new(object_id), 1);
+        let aspace = crate::vm::AddressSpace::new();
+        let range = crate::vm::UserRange::new_aligned(
+            crate::vm::UserVirtAddr(base),
+            crate::vm::USER_PAGE_SIZE,
+        )
+        .expect("user range");
+        aspace
+            .try_mmap(crate::vm::VmMapRequest::fixed(
+                range,
+                crate::vm::MapPlacement::RequireFree,
+                prot,
+                flags,
+                crate::vm::VmBacking::Page {
+                    pc: pc.into(),
+                    offset: 0,
+                },
+            ))
+            .expect("file-backed VMA");
+
+        let outcome = aspace
+            .resolve_fault(crate::vm::VmFault::new(range.start(), access))
+            .expect("file-backed fault resolves");
+        let first_guard = step_engine::guard();
+        assert!(matches!(
+            outcome.materialize_pagebacked_step(&first_guard),
+            crate::vm::VmFaultMaterializationStep::Retry
+        ));
+        drop(first_guard);
+        assert_eq!(fs.fetches.load(Ordering::Acquire), 1);
+
+        let second_guard = step_engine::guard();
+        assert!(matches!(
+            outcome.materialize_pagebacked_step(&second_guard),
+            crate::vm::VmFaultMaterializationStep::Done(_)
+        ));
+        drop(second_guard);
+        assert_eq!(fs.fetches.load(Ordering::Acquire), 2);
+    }
 }
 
 #[test]
