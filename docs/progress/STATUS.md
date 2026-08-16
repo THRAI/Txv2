@@ -1,3 +1,25 @@
+- 2026-08-16 (**QEMU/VF2 双工作树合并已获准执行，验收扩展至 VF2 与 LA2K1000 两块实板**).
+  **Changed**：审计主工作树 `feature/portable-net-vf2-dwmac@37d38778f`、VF2 次工作树
+  `codex/vf2-file-io-runtime-rebind-fix@e619fe098` 与共同基线 `3df096b94`，并向两项
+  Codex 对话逐项确认提交边界、旧验收证据、交叉语义和重跑条件。计划采用独立
+  `codex/qemu-vf2-integration` 分支执行保留历史的普通 merge；两个来源分支在完整验收
+  前不移动。三方合并预测只有 `docs/progress/STATUS.md` 文本冲突；
+  `page_backed/mod.rs` 与 `process/structure.rs` 虽可自动合并，仍须同时保留 QEMU 的
+  append/writev、fd-ref/dup/last-close 语义和 VF2 的 owner-retirement、
+  disposition-aware wait interruption。**Verification**：两个工作树 tracked/index
+  均干净；主树仅保留既有 `.codex/`、`target-partition-io/` 未跟踪项；分叉计数为
+  QEMU 2 笔、VF2 14 笔；只读 merge-tree 与两项对话审计已完成。完整执行门禁见
+  `docs/progress/plans/2026-08-16-qemu-vf2-worktree-merge.json`；该 JSON 与 diff check
+  通过。全局 progress validate 仍只先报既有 07-24 计划的非法 `completed`，docs
+  lint 仍为既有 25 个断链与 7 项旧词警告，两个新改文件均未进入失败清单。
+  用户已授权开始合并并要求先完成 QEMU；guest 交互采用单条短命令、完整提示符、独立
+  `echo $?` 与低频发送。**Next**：创建集成分支、合并、跑 host 聚焦门禁，再以全新
+  副本完成 RV64/LA64 QEMU；之后才进入 VF2 容量处置和两块实板的人工 reset 验收。
+  VF2 首次写盘/扩容前必须先说明精确设备、源、操作、验证与回滚证据；LA2K1000 只通过
+  TFTP 加载新 kernel-only uImage，复用现有 SATA ext4 root。四项全部通过后才
+  fast-forward 主 QEMU 分支，不 push。**Blocker**：VF2 MMC 约 6 MiB 只阻塞后续实板
+  阶段，不阻塞当前合并与 QEMU；既有 unit/progress/docs-lint 红项只作基线对比。
+
 - 2026-08-16 (**双架构 ext4 持久化与洁净验收最终转绿；逐条短命令证据已重建**).
   **Changed**：在 `ed98cc0f5` 的 mount settlement 基础上补齐四个最小责任边界：
   ext4 非 orphan-head 的 zero-link inode 以 `WouldBlock` 等待而非报 ENOSYS，destroy

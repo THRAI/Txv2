@@ -1,0 +1,316 @@
+{
+  "schema": "tx.progress.plan.v1",
+  "id": "2026-08-16-qemu-vf2-worktree-merge",
+  "title": "Merge the QEMU and VF2 fixes with QEMU, VF2, and LA2K1000 reproduction",
+  "status": "in-progress",
+  "created": "2026-08-16",
+  "updated": "2026-08-16",
+  "owner": "codex-01a00a3b-f64c-7c43-9ee0-6512899dcc80",
+  "summary": "Merge QEMU commit 37d38778f and VF2 commit e619fe098 through an isolated integration branch, preserve both semantic fix sets, and advance the main QEMU branch only after fresh RV64/LA64 QEMU plus physical VF2 and LA2K1000 acceptance from the merge commit.",
+  "scope": {
+    "in": [
+      "All 2 commits unique to feature/portable-net-vf2-dwmac after merge-base 3df096b94",
+      "All 14 commits unique to codex/vf2-file-io-runtime-rebind-fix after merge-base 3df096b94",
+      "Semantic reconciliation of PageBacked owner retirement plus append/writev behavior and Process signal-wait interruption plus fd-reference linearization",
+      "Fresh host, RV64 QEMU, LA64 QEMU, physical VisionFive 2, and physical LA2K1000 validation",
+      "Progress/status and final merge-validation handoff records"
+    ],
+    "out": [
+      "Rewriting, squashing, or dropping either source branch's history",
+      "Pushing any repository branch or changing a remote",
+      "Fixing known unrelated tx-shims, tx-kernel libctest, bridge-forwarding, progress-schema, or docs-lint baseline debt",
+      "Inspecting or retaining PAT-bearing serial output",
+      "Deleting VF2 acceptance evidence or performing raw media writes, mkfs, partition changes, repair fsck, flash writes, or saveenv without separate explicit authorization"
+    ],
+    "write_sets": [
+      {
+        "owner": "merge-coordinator",
+        "paths": [
+          "crates/",
+          "docs/progress/"
+        ],
+        "notes": "Single-writer ownership for the merge and all conflict resolution. The QEMU and VF2 source worktrees remain read-only during integration."
+      }
+    ]
+  },
+  "context": {
+    "design_docs": [
+      "docs/design/INDEX.md",
+      "docs/design/00_meta-framework/CONCEPTS_v4.md",
+      "docs/design/00_meta-framework/INVARIANTS_v4.md",
+      "docs/design/00_meta-framework/object_model_v2.md",
+      "docs/design/00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md",
+      "docs/design/02_vfs-filesystem/VFS_CHECKS_V2.1.md",
+      "docs/design/02_vfs-filesystem/MOUNT_v1.md",
+      "docs/design/03_memory-vm/PAGE_BACKED_v1.md",
+      "docs/design/03_memory-vm/VM_v1_2.md"
+    ],
+    "progress_refs": [
+      "docs/progress/STATUS.md",
+      "docs/progress/handoffs/2026-08-16-vf2-tools-persistence-verification.json",
+      "docs/progress/handoffs/2026-08-14-la2k1000-persistent-git-after-fchown-fix.json",
+      "docs/progress/handoffs/2026-08-06-la2k1000-real-board-git.json",
+      "docs/tutorials/la2k1000-real-board-quick-start.md"
+    ],
+    "external_refs": [
+      "codex-task:01a006a8-617d-7a33-b9dc-01ef20c0ac9f",
+      "codex-task:01a006c1-fa3d-75c1-9b00-d1b1c2dd7316",
+      "qemu-source:feature/portable-net-vf2-dwmac@37d38778fd9d5bbf7fa9dfe3489206d0f54de66a",
+      "vf2-source:codex/vf2-file-io-runtime-rebind-fix@e619fe098df0b20f2edb2d30f78d63c8158d68ed",
+      "merge-base:3df096b940032a46211ff94a97d764d24d0acc88"
+    ]
+  },
+  "steps": [
+    {
+      "id": "step-1-freeze-source-tips",
+      "title": "Freeze both source tips and the pre-merge evidence baseline",
+      "status": "complete",
+      "depends_on": [],
+      "paths": [],
+      "verification": [
+        "Reconfirm both worktrees' exact branch, HEAD, merge-base, tracked/index cleanliness, and allowed untracked or ignored evidence paths",
+        "Record both QEMU mother-image hashes and verify no QEMU process is already using an acceptance disk"
+      ],
+      "notes": "The main worktree currently has only .codex/ and target-partition-io/ untracked plus this plan/status update; the VF2 worktree is tracked/index clean. The user directed QEMU validation to run before either physical-board phase."
+    },
+    {
+      "id": "step-2-create-integration-merge",
+      "title": "Create an isolated integration branch and perform a history-preserving merge",
+      "status": "in-progress",
+      "depends_on": [
+        "step-1-freeze-source-tips"
+      ],
+      "paths": [
+        "crates/",
+        "docs/progress/"
+      ],
+      "verification": [
+        "Create codex/qemu-vf2-integration at 37d38778fd9d5bbf7fa9dfe3489206d0f54de66a in /home/msp/learning/Txv2",
+        "Merge e619fe098df0b20f2edb2d30f78d63c8158d68ed with --no-ff and without history rewriting",
+        "Verify the resulting merge commit has both source tips as ancestors and contains all 16 unique commits"
+      ],
+      "notes": "Do not move either source branch at this stage. Resolve the sole expected text conflict in docs/progress/STATUS.md by preserving both QEMU and VF2 evidence blocks, then add a new merge-state entry rather than erasing historical failures or caveats."
+    },
+    {
+      "id": "step-3-semantic-overlap-audit",
+      "title": "Audit the auto-merged PageBacked and Process semantics",
+      "status": "pending",
+      "depends_on": [
+        "step-2-create-integration-merge"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/page_backed/mod.rs",
+        "crates/tx-subsystems/src/page_backed/user_buffer.rs",
+        "crates/tx-subsystems/src/process/structure.rs",
+        "crates/tx-subsystems/src/device.rs"
+      ],
+      "verification": [
+        "CodeGraph and focused diff review show PageContainer Drop still publishes retire_owner and the runtime retains only a weak owner endpoint",
+        "CodeGraph and focused diff review show step_write_from_user_at still preserves O_APPEND, partial-Yield, EFAULT, and shared-offset semantics",
+        "Focused diff review shows thread_signal_interrupts_wait remains disposition-aware while zero fd references cannot revive and dup/fork/last-close stay linearized"
+      ],
+      "notes": "These files are expected to auto-merge, but auto-merge is not acceptance. Keep the VF2 File-I/O claim chain 905746018 -> 3d6b65223 -> b13e6987d intact and keep both QEMU VFS commits in order ed98cc0f5 -> 37d38778f."
+    },
+    {
+      "id": "step-4-host-gates",
+      "title": "Run focused cross-feature tests followed by repository gates",
+      "status": "pending",
+      "depends_on": [
+        "step-3-semantic-overlap-audit"
+      ],
+      "paths": [
+        "crates/"
+      ],
+      "verification": [
+        "cargo fmt --all -- --check",
+        "cargo test -q -p tx-ext4-format --test pager_mock destroy_plan_defers_zero_link_inode_behind_orphan_head",
+        "cargo test -q -p tx-subsystems mount_settlement -- --test-threads=1",
+        "cargo test -p tx-subsystems --lib file_io_runtime -- --test-threads=1",
+        "cargo test -p tx-kernel file_io_service_task_tracking_is_generation_safe_and_terminal_drained -- --test-threads=1",
+        "cargo test -q -p tx-scripts --test drive",
+        "cargo test -q -p tx-drivers vf2_mmc_controller_transactions_are_exclusive -- --exact",
+        "cargo test -q -p tx-fs procfs_stat_exposes_linux_field_count_for_busybox_ps -- --exact --test-threads=1",
+        "cargo test -q -p tx-fs -- --test-threads=1",
+        "Run the serial fd-table, dup, F_DUPFD, writev PageBacked, rename-over, and stat-family filters named in the QEMU acceptance ledger",
+        "cargo -q xtask unit",
+        "cargo xtask progress validate",
+        "cargo xtask lint docs"
+      ],
+      "notes": "Targeted semantic tests must all pass. Global gates may retain only the precisely recorded pre-merge baseline failures: tx-shims shared-state tests, two tx-kernel libctest assertions, bridge forwarding, the legacy 2026-07-24 plan status value, and existing docs-link/vocabulary debt. Any new or changed failure is a merge regression and blocks progression."
+    },
+    {
+      "id": "step-5-rebuild-merge-artifacts",
+      "title": "Build and fingerprint every artifact from the merge commit",
+      "status": "pending",
+      "depends_on": [
+        "step-4-host-gates"
+      ],
+      "paths": [
+        "target/"
+      ],
+      "verification": [
+        "cargo xtask build --target rv64-qemu --release",
+        "cargo xtask build --target la64-qemu --release",
+        "cargo xtask build --target la64-2k1000 --release --kernel-only",
+        "cargo xtask image la2k1000-uimage --release --kernel-only",
+        "cargo xtask image vf2-uimage --release",
+        "Compute sha256sum directly for each produced ELF and uImage and bind each artifact to the merge HEAD"
+      ],
+      "notes": "Use unique artifact directories and TFTP names. Old QEMU/VF2 hashes are historical evidence only. Never trust the known-stale target/images/txv2-la2k1000.uimage.sha256 sidecar; compute the actual file hash after rebuilding."
+    },
+    {
+      "id": "step-6-rv64-qemu-acceptance",
+      "title": "Reproduce the RV64 QEMU persistence acceptance on fresh disk copies",
+      "status": "pending",
+      "depends_on": [
+        "step-5-rebuild-merge-artifacts"
+      ],
+      "paths": [
+        "target/qemu-persist-accept/"
+      ],
+      "verification": [
+        "On four independent fresh copies, pass create-plus-fsync, close-then-unlink, unlink-while-open-then-close, and rename-over; each guest run must reach syncfs and each untouched host-side run image must finish e2fsck -fn with exit 0",
+        "On another fresh SMP4 direct-root copy, pass the short-command Vim -> GCC -> Rust -> Git RW matrix, explicit fsync/syncfs, same-disk RO reboot, all 25 content hashes, EROFS checks, and final e2fsck -fn exit 0",
+        "Verify the RV64 read-only mother image hash is unchanged"
+      ],
+      "notes": "Never reuse a failed experiment image. Preserve command-level transcripts, result JSON, fsck logs, mother hashes, merge HEAD, and kernel SHA-256."
+    },
+    {
+      "id": "step-7-la64-qemu-acceptance",
+      "title": "Reproduce the LA64 QEMU persistence acceptance on fresh disk copies",
+      "status": "pending",
+      "depends_on": [
+        "step-6-rv64-qemu-acceptance"
+      ],
+      "paths": [
+        "target/qemu-persist-accept/"
+      ],
+      "verification": [
+        "On a fresh LA64 copy, pass the concurrent-directory settlement witness, syncfs, and host e2fsck -fn exit 0",
+        "On another fresh SMP4 direct-root copy, pass the short-command Vim -> GCC -> Rust -> Git RW matrix, explicit fsync/syncfs, same-disk RO reboot, all content hashes, EROFS checks, and final e2fsck -fn exit 0",
+        "Verify the LA64 read-only mother image hash is unchanged"
+      ],
+      "notes": "This mirrors the strongest successful LA64 evidence from the QEMU source task without inheriting its old kernel or disk artifacts."
+    },
+    {
+      "id": "step-8-vf2-capacity-gate",
+      "title": "Preserve the current VF2 evidence and provide space for a fresh matrix",
+      "status": "pending",
+      "depends_on": [
+        "step-7-la64-qemu-acceptance"
+      ],
+      "paths": [],
+      "verification": [
+        "Before the first media mutation, tell the user the exact source, target node, serial, capacity, operation, validation, and rollback evidence",
+        "Re-identify the removable USB device by serial 121220160204, 31719424000-byte capacity, USB transport, removable=1, whole-device ext4 layout, not mounted, and not the host root device",
+        "Set the block device read-only and create a complete verified backup of the current card before any resize or overwrite",
+        "Rehearse whole-device ext4 resize on a working copy, then verify the retained VF2 acceptance directory, hashes, commits, and e2fsck -fn before requesting final physical-media authorization",
+        "After authorized resize, return the block device to read-only, require e2fsck -fn exit 0, verify old evidence read-only, and power off the reader"
+      ],
+      "notes": "This gate does not block merge or QEMU. The card currently has about 6 MiB free. Preferred remediation is verified full-card backup plus rehearsed whole-device resize; rewriting the Alpine baseline is disaster recovery only because it erases current evidence. No first write occurs silently."
+    },
+    {
+      "id": "step-9-vf2-physical-acceptance",
+      "title": "Reproduce the full VF2 RW-reset-RO matrix with the merge artifact",
+      "status": "pending",
+      "depends_on": [
+        "step-8-vf2-capacity-gate"
+      ],
+      "paths": [],
+      "verification": [
+        "Boot the uniquely named merge uImage after host SHA/mkimage checks and U-Boot iminfo, using transient variables and tx.root=mmcblk0 rw",
+        "Confirm /dev/mmcblk0 whole-device ext4 RW, valid UTC/CA/network/default route/DNS, ps -ef, Git help/init/commit/log/fsck, a real full-screen Vim edit, and GCC/Rust Hello World compile and execution",
+        "Create a new full non-shallow clone directory, verify remote/original HEAD, object count, shallow=false, local evidence commit, clean status, and git fsck --full",
+        "Record manifests and hashes, call sync twice, stop userspace cleanly, request one physical reset, then boot the same uImage and same MMC with tx.root=mmcblk0 ro",
+        "On RO boot, recheck ext4 RO, all file hashes and binaries, both Git repositories and commits, non-shallow state, clean status, and git fsck --full",
+        "If credentialed push reproduction is required, the user performs it and supplies an attestation; the agent does not read, search, copy, or retain PAT-bearing output"
+      ],
+      "notes": "The capacity gate in step 8 is mandatory. Do not delete the previous acceptance evidence. Pull is not a prior verified requirement and remains outside the gate unless the user explicitly adds it. A sync return is not durability proof; only the physical reset plus independent RO readback closes this step."
+    },
+    {
+      "id": "step-10-la2k1000-physical-acceptance",
+      "title": "Reproduce the LA2K1000 RO-RW-reset-RO persistence matrix",
+      "status": "pending",
+      "depends_on": [
+        "step-9-vf2-physical-acceptance"
+      ],
+      "paths": [],
+      "verification": [
+        "Copy the freshly rebuilt kernel-only uImage to a unique TFTP name with cp --no-clobber, then require cmp, direct sha256sum on both files, and U-Boot iminfo CRC success",
+        "Intercept U-Boot, run scsi reset, verify the expected disk model and 62533296 by 512 geometry, and stop if the observed root layout differs from the current sda1 tutorial or the older raw-ext4 sda handoff",
+        "First boot read-only with the observed root token, tx.mount.sdcard=0, and no initrd; require AHCI, DWMAC, ext4 root, boot:ok, and an explicit RO mount",
+        "After RO and network gates pass, physically reset and boot RW with tx.ext4.rw-profile=legacy-nocsum, then run the fresh add-only Git/tool persistence workload with individual short commands and explicit fsync/syncfs/sync completion",
+        "Physically reset again, boot the same disk RO, and verify commits, hashes, executions, non-shallow state where exercised, and git fsck --full --no-progress"
+      ],
+      "notes": "LA2K1000 loads only the kernel uImage by TFTP and reuses the existing SATA ext4 root. Do not dd, mkfs, repartition, mmc write, sf write, saveenv, run repair fsck, or trust target/images/txv2-la2k1000.uimage.sha256. If the disk appears as raw-ext4 sda rather than sda1, stop and reconcile the active handoff before booting RW."
+    },
+    {
+      "id": "step-11-close-and-advance",
+      "title": "Record the merged evidence and advance the main QEMU branch only after all targets pass",
+      "status": "pending",
+      "depends_on": [
+        "step-10-la2k1000-physical-acceptance"
+      ],
+      "paths": [
+        "docs/progress/STATUS.md",
+        "docs/progress/plans/2026-08-16-qemu-vf2-worktree-merge.json",
+        "docs/progress/handoffs/2026-08-16-qemu-vf2-merge-validation.json"
+      ],
+      "verification": [
+        "Update STATUS and the final handoff with merge HEAD, changed semantics, every command/result, artifact SHA-256, evidence paths, next step, and blockers",
+        "jq empty docs/progress/plans/2026-08-16-qemu-vf2-worktree-merge.json docs/progress/handoffs/2026-08-16-qemu-vf2-merge-validation.json",
+        "cargo xtask progress validate",
+        "cargo xtask lint docs",
+        "Fast-forward feature/portable-net-vf2-dwmac to the validated integration merge; leave codex/vf2-file-io-runtime-rebind-fix unchanged"
+      ],
+      "notes": "If any host, QEMU, or physical-board acceptance cell fails, do not advance the source branch. Preserve the failed integration branch, artifacts, and logs for diagnosis; return to the original QEMU branch by switching branches, never by destructive reset. Do not push unless separately requested."
+    }
+  ],
+  "verification": [
+    {
+      "command": "Three-way merge-tree inspection at base 3df096b94",
+      "status": "passed",
+      "notes": "Only docs/progress/STATUS.md has a predicted text conflict. page_backed/mod.rs and process/structure.rs are changed by both sides and require semantic review despite auto-merge."
+    },
+    {
+      "command": "Audit codex tasks 01a006a8-617d-7a33-b9dc-01ef20c0ac9f and 01a006c1-fa3d-75c1-9b00-d1b1c2dd7316",
+      "status": "passed",
+      "notes": "Both tasks supplied exact source tips, unique commit sets, old verification evidence, overlap rules, post-merge matrices, and blockers."
+    },
+    {
+      "command": "jq empty docs/progress/plans/2026-08-16-qemu-vf2-worktree-merge.json; git diff --check -- docs/progress/STATUS.md docs/progress/plans/2026-08-16-qemu-vf2-worktree-merge.json",
+      "status": "passed",
+      "notes": "The proposed plan is valid JSON and the two planning edits have no whitespace errors."
+    },
+    {
+      "command": "cargo xtask progress validate",
+      "status": "failed",
+      "notes": "The global validator stops at the pre-existing docs/progress/plans/2026-07-24-network-time-integration.json status value completed; the new plan passes jq parsing and is not named by the failure."
+    },
+    {
+      "command": "cargo xtask lint docs",
+      "status": "failed",
+      "notes": "The existing baseline remains 25 broken links and 7 stale-vocabulary warnings. Neither changed planning file appears in the failure output."
+    },
+    {
+      "command": "Fresh host/QEMU/VF2/LA2K1000 validation from the merge commit",
+      "status": "not-run",
+      "notes": "The user approved merge execution and directed QEMU to run first. VF2 capacity remediation and both physical-board reset checkpoints remain later interactive gates."
+    }
+  ],
+  "risks": [
+    "A clean textual merge can still violate the PageBacked lifetime or Process fd/signal state machines; focused semantic audit and tests are mandatory.",
+    "Old QEMU result JSON and VF2 uImage hashes identify pre-merge kernels and cannot attest the merge commit.",
+    "Shared init/reactor changes from VF2 can regress QEMU boot even where there is no textual conflict.",
+    "The VF2 MMC barrier can report success without a physical flush, so sync alone is not an acceptance criterion.",
+    "Global gates are already red for documented unrelated reasons; comparison must distinguish an unchanged baseline from a new merge regression.",
+    "A stale LA2K1000 checksum sidecar can falsely identify a rebuilt image unless the artifact itself is hashed."
+  ],
+  "blockers": [
+    "The retained VF2 MMC acceptance filesystem has about 6 MiB free, below the space needed for a fresh add-only full clone and persistence matrix. This blocks only the later VF2 physical phase; it does not block merge or QEMU. Before the first media mutation, the exact target and evidence-preserving backup/resize procedure must be explained to the user."
+  ],
+  "handoff": {
+    "needed": true,
+    "path": "docs/progress/handoffs/2026-08-16-qemu-vf2-merge-validation.json"
+  }
+}
