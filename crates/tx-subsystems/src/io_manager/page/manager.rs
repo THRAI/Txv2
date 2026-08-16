@@ -27,14 +27,14 @@ use super::service::PageWaiter;
 use super::service::{
     PageService, PageServiceBackendOutcome, PageServiceBackendPrepared,
     PageServiceBackendSubmitError, PageServiceBlockCompletionPrepared, PageServiceL6Applied,
-    PageServiceTaggedBlockCompletionError,
-};
-use super::{
-    PageContainerKey, PageGeneration, PageIoFlags, PageIoOp, PageIoPriority, PageIoRange,
-    PageIoRequest, PageIoRequestId, PageL6Receipt,
+    PageServiceTaggedBlockCompletionError, PageServiceWake,
 };
 #[cfg(test)]
-use super::{PageIoCompletion, PageQueueError};
+use super::PageIoCompletion;
+use super::{
+    PageContainerKey, PageGeneration, PageIoFlags, PageIoOp, PageIoPriority, PageIoRange,
+    PageIoRequest, PageIoRequestId, PageL6Receipt, PageQueueError,
+};
 #[cfg(test)]
 use crate::io_manager::backend::PageCompletion;
 
@@ -185,6 +185,21 @@ impl PageIoSubmissionHandle {
             .map(|owner| owner.0);
         let waiters = state.service.retire_submission(request_id);
         (owner, waiters)
+    }
+
+    /// Requeue a popped initial submission only while its retained file owner
+    /// is still live. Cancellation removes the owner and any queued row under
+    /// this same lock, so `Ok(None)` is the cancel-before-requeue
+    /// linearization point.
+    pub(crate) fn requeue_submission_if_file_owner_present(
+        &self,
+        request: PageIoRequest,
+    ) -> Result<Option<PageServiceWake>, PageQueueError> {
+        let mut state = self.0.lock_state();
+        if !state.admitted_file_requests.contains_key(&request.id) {
+            return Ok(None);
+        }
+        state.service.requeue_submission(request).map(Some)
     }
 
     /// Register a waiter only while the matching request still has an L4

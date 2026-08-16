@@ -3841,6 +3841,256 @@ fn file_page_planner_terminal_error_does_not_fallback_to_compat_fetch() {
 }
 
 #[test]
+fn file_page_planner_backend_eagain_remains_terminal_and_settles_once() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let guard = step_engine::guard();
+
+    struct BackendEagainPlanner {
+        calls: AtomicUsize,
+    }
+
+    impl BackendPlanner for BackendEagainPlanner {
+        fn plan_page_io(&self, _request: BackendPageRequest) -> BackendPlan {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            BackendPlan::Err(Errno::EAGAIN)
+        }
+    }
+
+    let fs = Arc::new(RecordingFs::new());
+    let planner = Arc::new(BackendEagainPlanner {
+        calls: AtomicUsize::new(0),
+    });
+    let pc = file_page_container_with_planner(
+        fs.clone(),
+        fs.clone(),
+        FsObjectId::new(0x18a),
+        4,
+        planner.clone(),
+    );
+    let page = PageIndex::new(1);
+
+    match pc.materialize_page(page, MaterializeAccess::Read, &guard) {
+        V3Out::Err(errno) => assert_eq!(errno, V3Errno::EAGAIN),
+        other => panic!("expected planner EAGAIN to stay terminal, got {other:?}"),
+    }
+    assert_eq!(planner.calls.load(Ordering::Acquire), 1);
+    assert_eq!(fs.fetches.load(Ordering::Acquire), 0);
+    assert_eq!(pc.file_io_owner_count_for_test(), 0);
+    assert_eq!(pc.file_io_request_count_for_test(), 0);
+    assert!(!pc.file_page_fetch_in_flight_for_test(page));
+
+    let idle = pc
+        .drive_file_io_service_once_owned(ServiceBudget::new(1), |_| true)
+        .expect("terminal planner outcome leaves an idle service");
+    assert!(idle.work.is_empty());
+    assert_eq!(planner.calls.load(Ordering::Acquire), 1);
+    assert_eq!(pc.file_io_owner_count_for_test(), 0);
+}
+
+#[test]
+fn file_page_initial_zero_l6_admission_requeues_owned_read() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+
+    let fs = Arc::new(RecordingFs::new());
+    let planner = Arc::new(BioOnlyPlanner::new());
+    let pc = file_page_container_with_planner(
+        fs.clone(),
+        fs.clone(),
+        FsObjectId::new(0x185),
+        1,
+        planner.clone(),
+    );
+    for lba in 0..1024 {
+        pc.block_submission
+            .submit_untracked_for_test(BioPlan::new(
+                DeviceKey::new(99),
+                BlockOp::Read,
+                LbaRange::new(20_000 + lba * 2, 1),
+                alloc::vec![BioVec::new(0x800 + lba, 0, 512)],
+                BlockFlags::EMPTY,
+            ))
+            .expect("fill owned L6 queue");
+    }
+
+    let page = PageIndex::new(0);
+    let first_guard = step_engine::guard();
+    assert!(matches!(
+        pc.materialize_page_for_fault_step(page, MaterializeAccess::Read, &first_guard),
+        V3Out::Continue {
+            progress: NoProgress
+        }
+    ));
+    drop(first_guard);
+    assert_eq!(planner.calls.load(Ordering::Acquire), 1);
+    assert_eq!(fs.fetches.load(Ordering::Acquire), 0);
+    assert_eq!(pc.file_io_request_count_for_test(), 1);
+    assert_eq!(pc.file_io_owner_count_for_test(), 1);
+
+    struct CapacityExecutor;
+
+    impl BlockDispatchExecutor for CapacityExecutor {
+        fn submit(&mut self, _dispatch: &BlockDispatch) {}
+    }
+
+    impl BlockCompletionSource for CapacityExecutor {
+        fn poll_completion(&mut self) -> Option<BlockDeviceCompletion> {
+            None
+        }
+    }
+
+    pc.drive_file_block_io_service_once(
+        ServiceBudget::new(1),
+        &mut CapacityExecutor,
+        |_| None,
+        |_| true,
+    )
+    .expect("free one owned L6 queue slot");
+
+    let retry = pc
+        .drive_file_io_service_once_owned(ServiceBudget::new(1), |_| true)
+        .expect("replan the retained initial read");
+    assert!(matches!(
+        retry.work.as_slice(),
+        [PageServiceDrivenWork::BackendSubmission(
+            PageServiceBackendSubmitOutcome::BlockBiosQueued { request, submitted }
+        )] if request.range == PageIoRange::new(page.as_u64(), 1) && submitted.len() == 1
+    ));
+    assert_eq!(planner.calls.load(Ordering::Acquire), 2);
+    assert_eq!(pc.file_io_request_count_for_test(), 0);
+    assert_eq!(pc.file_io_owner_count_for_test(), 1);
+
+    let fetch_id = pc
+        .state
+        .lock()
+        .in_flight_file_pages
+        .get(&page)
+        .expect("retryable page fetch")
+        .id;
+    pc.finish_file_page_fetch_without_install(page, fetch_id);
+}
+
+#[test]
+fn file_page_cancel_before_zero_admission_requeue_does_not_orphan_request() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+
+    let fs = Arc::new(RecordingFs::new());
+    let pc = file_page_container_with_planner(
+        fs.clone(),
+        fs,
+        FsObjectId::new(0x18d),
+        1,
+        Arc::new(BioOnlyPlanner::new()),
+    );
+    let page = PageIndex::new(0);
+    let FilePageFetchStart::Owner(fetch_id) =
+        pc.begin_file_page_fetch(page, MaterializeAccess::Read, false, false)
+    else {
+        panic!("cold planner-backed page should own its initial fetch");
+    };
+    let request = pc.page_submission.with_service(|service| {
+        let crate::io_manager::page::service::PageServiceTurn::Work(mut work) =
+            service.drain_turn(ServiceBudget::new(1))
+        else {
+            panic!("initial submission should be runnable");
+        };
+        let crate::io_manager::page::service::PageServiceWork::Submission(request) = work.remove(0)
+        else {
+            panic!("expected the popped initial submission");
+        };
+        request
+    });
+
+    pc.finish_file_page_fetch_without_install(page, fetch_id);
+    assert_eq!(pc.file_io_owner_count_for_test(), 0);
+    assert_eq!(pc.file_io_request_count_for_test(), 0);
+    assert!(!pc.file_page_fetch_in_flight_for_test(page));
+
+    assert!(matches!(
+        pc.page_submission
+            .requeue_submission_if_file_owner_present(request),
+        Ok(None)
+    ));
+    assert_eq!(pc.file_io_owner_count_for_test(), 0);
+    assert_eq!(pc.file_io_request_count_for_test(), 0);
+}
+
+#[test]
+fn vm_private_exec_initial_zero_l6_admission_is_would_block() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+
+    let fs = Arc::new(RecordingFs::new());
+    let planner = Arc::new(BioOnlyPlanner::new());
+    let pc = file_page_container_cap_with_planner(
+        fs.clone(),
+        fs.clone(),
+        FsObjectId::new(0x18c),
+        FILE_READAHEAD_TRIGGER_PAGES,
+        planner.clone(),
+    );
+    for lba in 0..1024 {
+        pc.block_submission
+            .submit_untracked_for_test(BioPlan::new(
+                DeviceKey::new(99),
+                BlockOp::Read,
+                LbaRange::new(90_000 + lba * 2, 1),
+                alloc::vec![BioVec::new(0x6000 + lba, 0, 512)],
+                BlockFlags::EMPTY,
+            ))
+            .expect("fill owned L6 queue");
+    }
+
+    let aspace = crate::vm::AddressSpace::new();
+    let range = crate::vm::UserRange::new_aligned(
+        crate::vm::UserVirtAddr(0x7d_000),
+        crate::vm::USER_PAGE_SIZE,
+    )
+    .expect("user range");
+    aspace
+        .try_mmap(crate::vm::VmMapRequest::fixed(
+            range,
+            crate::vm::MapPlacement::RequireFree,
+            crate::vm::Prot::READ_EXECUTE,
+            crate::vm::VmEntryFlags::PRIVATE,
+            crate::vm::VmBacking::Page {
+                pc: pc.clone().into(),
+                offset: 0,
+            },
+        ))
+        .expect("private executable file-backed VMA");
+
+    let fault = aspace
+        .resolve_fault(crate::vm::VmFault::new(
+            range.start(),
+            crate::vm::AccessMode::Execute,
+        ))
+        .expect("private execute fault resolves");
+    assert!(matches!(
+        fault.materialize_pagebacked(),
+        Err(crate::vm::VmFaultError::WouldBlock)
+    ));
+    assert_eq!(planner.calls.load(Ordering::Acquire), 1);
+    assert_eq!(fs.fetches.load(Ordering::Acquire), 0);
+    assert!(
+        pc.file_io_request_count_for_test() > 1,
+        "the executable fault should admit demand plus speculative readahead"
+    );
+    assert_eq!(
+        pc.file_io_owner_count_for_test(),
+        pc.file_io_request_count_for_test()
+    );
+
+    let guard = step_engine::guard();
+    assert_eq!(step_truncate(&pc, 0, &guard), V3Out::Done(()));
+    assert_eq!(pc.file_io_request_count_for_test(), 0);
+    assert_eq!(pc.file_io_owner_count_for_test(), 0);
+    assert!(!pc.file_page_fetch_in_flight_for_test(PageIndex::new(0)));
+}
+
+#[test]
 fn file_page_planner_enosys_falls_back_to_compat_fetch() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
     setup_host_substrate();

@@ -32,12 +32,13 @@ use crate::io_manager::page::{
     service::{
         PageCompletionRoute, PageServiceBackendContext, PageServiceBackendDriven,
         PageServiceBackendOutcome, PageServiceBackendPrepared, PageServiceBackendSubmitError,
-        PageServiceBackendSubmitOutcome, PageServiceDrivenWork, PageServiceNext,
-        PageServiceTaggedBlockCompletionError, PageServiceTurn, PageServiceWake, PageServiceWork,
-        PageWaitInterest, PageWaiter,
+        PageServiceBackendSubmitOutcome, PageServiceDrivenWork, PageServiceL6Applied,
+        PageServiceNext, PageServiceTaggedBlockCompletionError, PageServiceTurn, PageServiceWake,
+        PageServiceWork, PageWaitInterest, PageWaiter,
     },
     PageContainerKey, PageGeneration, PageIoCompletion, PageIoCompletionKind, PageIoFlags,
     PageIoOp, PageIoPriority, PageIoRange, PageIoRequest, PageIoRequestId, PageIoResult,
+    PageL6SubmitFailure,
 };
 use crate::io_manager::runtime::{IoServiceKind, ServiceBudget, ServiceKick, ServiceWakeSource};
 use crate::mount::{MountPayloadBackendContext, MountPayloadPin};
@@ -2663,27 +2664,82 @@ impl PageContainer {
                                 // this PageContainer's private graph registry.
                                 let queued = match outcome {
                                     PageServiceBackendOutcome::BlockGraph(_) => {
-                                        Ok(PageServiceBackendSubmitOutcome::Err {
-                                            request: request.clone(),
-                                            errno: Errno::ENOSYS,
+                                        Ok(PageServiceL6Applied {
+                                            outcome: PageServiceBackendSubmitOutcome::Err {
+                                                request: request.clone(),
+                                                errno: Errno::ENOSYS,
+                                            },
+                                            failure: None,
                                         })
                                     }
                                     outcome => self.page_submission.with_service(|service| {
-                                        service.queue_backend_outcome(
-                                            outcome,
-                                            block_queue,
-                                            request.clone(),
-                                        )
+                                        service
+                                            .queue_backend_outcome(
+                                                outcome,
+                                                block_queue,
+                                                request.clone(),
+                                            )
+                                            .map(|outcome| PageServiceL6Applied {
+                                                outcome,
+                                                failure: None,
+                                            })
                                     }),
                                 };
-                                if let (Ok(outcome), Some(tracker)) = (&queued, tracker.as_mut()) {
-                                    record_file_service_block_submissions(tracker, outcome);
+                                if let (Ok(applied), Some(tracker)) = (&queued, tracker.as_mut()) {
+                                    record_file_service_block_submissions(
+                                        tracker,
+                                        &applied.outcome,
+                                    );
                                 }
                                 queued
                             }
                             FileBlockSubmissionTarget::Owned => {
                                 self.submit_owned_file_backend_outcome(outcome, request.clone())
                             }
+                        };
+                        let queued = match queued {
+                            Ok(applied)
+                                if file_service_initial_l6_admission_retry(
+                                    &rollback_request,
+                                    &applied,
+                                )
+                                .is_some() =>
+                            {
+                                let failure = file_service_initial_l6_admission_retry(
+                                    &rollback_request,
+                                    &applied,
+                                )
+                                .expect("retry predicate checked above");
+                                let requeued = self
+                                    .page_submission
+                                    .requeue_submission_if_file_owner_present(
+                                        rollback_request.clone(),
+                                    );
+                                if matches!(requeued, Ok(None)) {
+                                    continue;
+                                }
+                                if requeued.is_err() {
+                                    self.fail_unsubmitted_file_io_request(
+                                        &rollback_request,
+                                        Errno::EAGAIN,
+                                    );
+                                    if capture_work {
+                                        work.push(PageServiceDrivenWork::BackendSubmission(
+                                            applied.outcome,
+                                        ));
+                                    }
+                                    continue;
+                                }
+                                if capture_work {
+                                    work.push(PageServiceDrivenWork::BackendAdmissionRetry {
+                                        request: rollback_request,
+                                        failure,
+                                    });
+                                }
+                                continue;
+                            }
+                            Ok(applied) => Ok(applied.outcome),
+                            Err(error) => Err(error),
                         };
                         match queued {
                             Ok(outcome @ PageServiceBackendSubmitOutcome::Err { errno, .. }) => {
@@ -2768,7 +2824,8 @@ impl PageContainer {
                                 queued
                             }
                             FileBlockSubmissionTarget::Owned => self
-                                .submit_owned_file_backend_outcome(outcome, page_request.clone()),
+                                .submit_owned_file_backend_outcome(outcome, page_request.clone())
+                                .map(|applied| applied.outcome),
                         };
                         match queued {
                             Ok(outcome @ PageServiceBackendSubmitOutcome::Err { errno, .. }) => {
@@ -3047,7 +3104,10 @@ impl PageContainer {
                     PageServiceBackendOutcome::BlockGraph(graph),
                     request.clone(),
                 ) {
-                    Ok(PageServiceBackendSubmitOutcome::Err { errno, .. }) => Err(errno),
+                    Ok(PageServiceL6Applied {
+                        outcome: PageServiceBackendSubmitOutcome::Err { errno, .. },
+                        ..
+                    }) => Err(errno),
                     Ok(_) => {
                         let mut state = self.state.lock();
                         state.background_checkpoints_in_flight =
@@ -3079,17 +3139,20 @@ impl PageContainer {
         &self,
         outcome: PageServiceBackendOutcome,
         request: PageIoRequest,
-    ) -> Result<PageServiceBackendSubmitOutcome, PageServiceBackendSubmitError> {
+    ) -> Result<PageServiceL6Applied, PageServiceBackendSubmitError> {
         match self
             .page_submission
             .prepare_backend_outcome(outcome, request)
         {
-            Ok(PageServiceBackendPrepared::Local(outcome)) => Ok(outcome),
+            Ok(PageServiceBackendPrepared::Local(outcome)) => Ok(PageServiceL6Applied {
+                outcome,
+                failure: None,
+            }),
             Ok(PageServiceBackendPrepared::Submit(action)) => {
                 let receipt = self.block_submission.submit_page_action(action);
                 let applied = self.page_submission.apply_l6_receipt(receipt)?;
                 self.block_submission.record_page_outcome(&applied.outcome);
-                Ok(applied.outcome)
+                Ok(applied)
             }
             Err(error) => Err(error),
         }
@@ -4770,6 +4833,13 @@ impl PageContainer {
         if let Some(errno) = file_service_terminal_error_for_request(&first.work, request_id) {
             return Some(StepOutcome::Err(errno.into()));
         }
+        if file_service_admission_retry_for_request(&first.work, request_id) {
+            self.kick_file_io_service(IoServiceKind::Block);
+            self.kick_file_io_service(IoServiceKind::Page);
+            return Some(StepOutcome::Continue {
+                progress: NoProgress,
+            });
+        }
         let mut waits_for_async_completion =
             file_service_work_waits_for_async_completion(first.work.as_slice());
 
@@ -4781,6 +4851,13 @@ impl PageContainer {
                     file_service_terminal_error_for_request(&second.work, request_id)
                 {
                     return Some(StepOutcome::Err(errno.into()));
+                }
+                if file_service_admission_retry_for_request(&second.work, request_id) {
+                    self.kick_file_io_service(IoServiceKind::Block);
+                    self.kick_file_io_service(IoServiceKind::Page);
+                    return Some(StepOutcome::Continue {
+                        progress: NoProgress,
+                    });
                 }
                 waits_for_async_completion |=
                     file_service_work_waits_for_async_completion(second.work.as_slice());
@@ -6066,6 +6143,38 @@ fn file_service_terminal_error_for_request(
         }) if Some(request.id) == request_id => Some(*errno),
         _ => None,
     })
+}
+
+fn file_service_admission_retry_for_request(
+    work: &[PageServiceDrivenWork],
+    request_id: Option<PageIoRequestId>,
+) -> bool {
+    work.iter().any(|item| {
+        matches!(
+            item,
+            PageServiceDrivenWork::BackendAdmissionRetry { request, .. }
+                if Some(request.id) == request_id
+        )
+    })
+}
+
+fn file_service_initial_l6_admission_retry(
+    request: &PageIoRequest,
+    applied: &PageServiceL6Applied,
+) -> Option<PageL6SubmitFailure> {
+    if !matches!(request.op, PageIoOp::Read | PageIoOp::Readahead) {
+        return None;
+    }
+    let failure = applied.failure?;
+    if failure.failed_index != 0
+        || !matches!(
+            failure.error,
+            QueueError::Full | QueueError::DispatchDepthFull
+        )
+    {
+        return None;
+    }
+    Some(failure)
 }
 
 const fn page_cache_error_to_errno(error: PageCacheError) -> Errno {
