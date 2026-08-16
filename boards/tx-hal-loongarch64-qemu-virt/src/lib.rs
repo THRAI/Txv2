@@ -1230,7 +1230,16 @@ impl PlatformInfoIf for Platform {
 
 impl AuxvIf for Platform {
     fn arch_auxv_facts() -> ArchAuxvFacts {
-        ArchAuxvFacts::new(Self::PAGE_SIZE, 0, 0, "loongarch64")
+        // QEMU's native LoongArch TCG backend requires Linux's UAL bit. The
+        // platform supplies the corresponding semantics on both targets:
+        // QEMU handles unaligned accesses directly, while real LA264 traps are
+        // completed by `la64_unaligned::emulate_user_unaligned`.
+        ArchAuxvFacts::new(
+            Self::PAGE_SIZE,
+            tx_hal::LOONGARCH_HWCAP_UAL,
+            0,
+            "loongarch64",
+        )
     }
 }
 impl ConsoleIf for Platform {

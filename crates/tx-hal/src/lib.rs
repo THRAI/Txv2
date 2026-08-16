@@ -360,6 +360,11 @@ pub const RISCV_HWCAP_IMAFDC: u64 = RISCV_HWCAP_ISA_I
     | RISCV_HWCAP_ISA_D
     | RISCV_HWCAP_ISA_C;
 
+/// Linux LoongArch auxv bit advertising usable unaligned loads and stores.
+/// A platform may publish this when hardware accepts them directly or when
+/// its user-trap path provides transparent emulation.
+pub const LOONGARCH_HWCAP_UAL: u64 = 1 << 2;
+
 pub trait PlatformConfig {
     const ARCH: Arch; // 架构 Riscv64/LoongArch64，必填
     const BOARD: &'static str; // 板名字符串，必填

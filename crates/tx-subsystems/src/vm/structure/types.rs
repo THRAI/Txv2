@@ -1751,7 +1751,19 @@ impl From<VmPmapError> for VmFaultError {
 
 fn materialize_zero_frame() -> Result<MaterializedPage, VmFaultError> {
     let ppn = page_allocator::zero_frame_ppn().map_err(page_alloc_error)?;
-    let map_pin = page_allocator::acquire_map_pin(ppn).map_err(page_alloc_error)?;
+    let map_pin = match page_allocator::acquire_map_pin(ppn) {
+        Ok(map_pin) => map_pin,
+        // FrameMeta deliberately keeps the common map counter compact. A
+        // process such as QEMU can read-fault more than 1023 anonymous pages
+        // before writing any of them, exhausting that counter on the shared
+        // zero frame even though physical memory is plentiful. Preserve the
+        // zero-frame fast path for the normal case, but materialize a private
+        // zeroed page once the shared-frame counter is full.
+        Err(step_engine::page_allocator::AllocError::CounterOverflow) => {
+            return allocate_private_materialized_page(false);
+        }
+        Err(error) => return Err(page_alloc_error(error)),
+    };
     Ok(MaterializedPage {
         ppn,
         map_pin: MaterializedPagePin::Allocated(map_pin),

@@ -228,7 +228,7 @@ fn auxv_facts_publish_loongarch64_platform() {
     let facts = <Platform as AuxvIf>::arch_auxv_facts();
 
     assert_eq!(facts.page_size, <Platform as PlatformConfig>::PAGE_SIZE);
-    assert_eq!(facts.hwcap, 0);
+    assert_eq!(facts.hwcap, tx_hal::LOONGARCH_HWCAP_UAL);
     assert_eq!(facts.hwcap2, 0);
     assert_eq!(facts.platform, "loongarch64");
 }

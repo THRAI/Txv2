@@ -292,7 +292,7 @@ impl<T> PerHartCell<T> {
 static RV64_KERNEL_RESUME_CTX: [PerHartCell<KernelResumeCtx>; MAX_BOOT_CPUS] =
     [const { PerHartCell::new(KernelResumeCtx::zeroed()) }; MAX_BOOT_CPUS];
 
-/// Per-CPU trap-handler stack. Sized 64 KiB; the trap vector
+/// Per-CPU trap-handler stack. Sized 128 KiB; the trap vector
 /// `csrrw`-swaps onto its top via `sscratch` so trap-handler frames
 /// don't trample the BSP/AP runtime kernel stack (which holds the
 /// reactor + thread future frames at the moment a user trap fires).
@@ -305,8 +305,13 @@ static RV64_KERNEL_RESUME_CTX: [PerHartCell<KernelResumeCtx>; MAX_BOOT_CPUS] =
 /// `KERNEL_RO`); plain `static [u8; N]` lands in `.rodata` and
 /// the trap-vector's first store would fault.
 ///
-/// Total static cost is `MAX_BOOT_CPUS × 64 KiB = 512 KiB`.
-const RV64_TRAP_STACK_SIZE: usize = 64 * 1024;
+/// The extra headroom keeps the proven synchronous RV64 syscall lanes on the
+/// direct path without letting an unusually deep call chain reach the adjacent
+/// resume-context area. The stacks live in `.bss`, so this does not increase
+/// the submitted kernel image size.
+///
+/// Total static cost is `MAX_BOOT_CPUS × 128 KiB = 1 MiB`.
+const RV64_TRAP_STACK_SIZE: usize = 128 * 1024;
 
 #[repr(C, align(16))]
 pub struct Rv64TrapStack(pub [u8; RV64_TRAP_STACK_SIZE]);

@@ -700,21 +700,21 @@ fn try_direct_trap_syscall<P: TxPlatform>(
 ///
 /// The shims-level direct dispatcher also exposes cached VFS/VM helpers for
 /// ordinary kernel-stack call sites. Do not confuse that synchronous property
-/// with trap-stack safety: pathname walking, page-backed I/O, VM mutation and
-/// futex wake publication can form deep or stateful call chains even when the
-/// one-shot helper does not wait. BuildStorm has exercised those chains past
-/// an architecture trap-stack boundary and into the adjacent saved
-/// kernel-resume context.
+/// with trap-stack safety: pathname walking and resident file page faults can
+/// form deep call chains even when they do not wait. Keep those proven unsafe
+/// operations off the architecture stack. RV64 retains the already validated
+/// cached syscall lanes; LA64 continues to hand deeper operations to the
+/// ordinary kernel stack.
 ///
 /// Keep this as an allow-list so a newly added direct syscall falls back to
 /// the reactor until its maximum stack depth is reviewed explicitly.
-const fn direct_trap_syscall_is_stack_safe(_arch: tx_hal::Arch, nr: u64) -> bool {
+const fn direct_trap_syscall_is_stack_safe(arch: tx_hal::Arch, nr: u64) -> bool {
     use tx_shims::linux_syscall::numbers::{
-        NR_CLOCK_GETTIME, NR_GETEGID, NR_GETEUID, NR_GETGID, NR_GETPID, NR_GETPPID, NR_GETTID,
-        NR_GETTIMEOFDAY, NR_GETUID,
+        NR_CLOCK_GETTIME, NR_FUTEX, NR_GETEGID, NR_GETEUID, NR_GETGID, NR_GETPID, NR_GETPPID,
+        NR_GETTID, NR_GETTIMEOFDAY, NR_GETUID, NR_OPENAT, NR_STATX,
     };
 
-    matches!(
+    let shallow = matches!(
         nr,
         NR_GETPPID
             | NR_GETPID
@@ -725,13 +725,29 @@ const fn direct_trap_syscall_is_stack_safe(_arch: tx_hal::Arch, nr: u64) -> bool
             | NR_GETEGID
             | NR_CLOCK_GETTIME
             | NR_GETTIMEOFDAY
+            | NR_FUTEX
+            | NR_RT_SIGPROCMASK
             | NR_SET_TID_ADDRESS
-    )
+    );
+    if shallow {
+        return true;
+    }
+
+    // `openat` and resident file faults are the deep paths implicated by the
+    // platform failure. The latter is handled after handoff on the ordinary
+    // 512 KiB kernel stack. Keep the previously validated resident/cache-hit
+    // RV64 syscall lanes direct; LA64 retains its conservative policy.
+    matches!(arch, tx_hal::Arch::Riscv64)
+        && !matches!(nr, NR_OPENAT)
+        && matches!(
+            nr,
+            NR_READ | NR_WRITE | NR_FCNTL | NR_FSTAT | NR_LSEEK | NR_BRK | NR_MMAP | NR_STATX
+        )
 }
 
 /// Direct trap calls may only touch user buffers whose translations are
-/// already present. Calls with generic fault-capable copy helpers, including
-/// `rt_sigprocmask`, are not admitted by the trap-stack allow-list at all.
+/// already present when their direct implementation can otherwise enter a
+/// fault-capable copy path.
 fn direct_trap_user_buffers_are_resident(
     req: &trap_handoff::SyscallRequest,
     aspace: &tx_subsystems::vm::AddressSpace,
@@ -792,29 +808,31 @@ mod direct_trap_stack_safety_tests {
     };
 
     #[test]
-    fn blocking_and_deep_calls_stay_off_every_trap_stack() {
+    fn openat_stays_off_every_trap_stack() {
         for arch in [Arch::Riscv64, Arch::LoongArch64] {
-            for nr in [
-                NR_OPENAT,
-                NR_READ,
-                NR_WRITE,
-                NR_FCNTL,
-                NR_FSTAT,
-                NR_LSEEK,
-                NR_BRK,
-                NR_MMAP,
-                NR_STATX,
-                NR_FUTEX,
-                NR_RT_SIGPROCMASK,
-            ] {
-                assert!(!direct_trap_syscall_is_stack_safe(arch, nr));
-            }
+            assert!(!direct_trap_syscall_is_stack_safe(arch, NR_OPENAT));
+        }
+    }
+
+    #[test]
+    fn rv64_keeps_validated_cached_lanes() {
+        for nr in [
+            NR_READ, NR_WRITE, NR_FCNTL, NR_FSTAT, NR_LSEEK, NR_BRK, NR_MMAP, NR_STATX,
+        ] {
+            assert!(direct_trap_syscall_is_stack_safe(Arch::Riscv64, nr));
+            assert!(!direct_trap_syscall_is_stack_safe(Arch::LoongArch64, nr));
         }
     }
 
     #[test]
     fn shallow_direct_calls_are_portable() {
-        for nr in [NR_GETPID, NR_CLOCK_GETTIME, NR_SET_TID_ADDRESS] {
+        for nr in [
+            NR_GETPID,
+            NR_CLOCK_GETTIME,
+            NR_FUTEX,
+            NR_RT_SIGPROCMASK,
+            NR_SET_TID_ADDRESS,
+        ] {
             assert!(direct_trap_syscall_is_stack_safe(Arch::Riscv64, nr));
             assert!(direct_trap_syscall_is_stack_safe(Arch::LoongArch64, nr));
         }
