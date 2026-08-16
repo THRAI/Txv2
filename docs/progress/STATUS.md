@@ -27,9 +27,9 @@
   通过 `jq empty`；全局 `cargo xtask progress validate` 仍被既有
   `2026-07-24-network-time-integration.json` 的旧枚举 `completed` 阻断，docs lint
   仍报告 17 个未由本次引入的旧断链/anchor 缺口。
-  **Next**：保留当前 MMC 与所有 add-only 证据；只有获得无需 repair/raw write 即可
-  安全 RW 的新介质或外部恢复结果后，才从最终源码重新构建唯一 VF2 镜像，并从全新
-  目录重跑 Git/Vim/GCC/Rust/full non-shallow clone、sync、物理 reset、同盘 RO
+  **Next**：用户因只有这一张 SD 卡，随后明确授权以已知基线镜像覆盖损坏介质；卡已
+  重建并安全断电。待用户把卡装回 VF2 后，从最终源码重新构建唯一 VF2 镜像，并从
+  全新目录重跑 Git/Vim/GCC/Rust/full non-shallow clone、sync、物理 reset、同盘 RO
   哈希/commit/fsck 全矩阵。**Blocker**：post-commit 物理复位后，同一 MMC 的
   txKernel RW mount 在 `rw-discovered` 聚合阶段返回 EIO；该路径可能已尝试 journal
   replay/home-block/barrier，不能声称失败前零写入。随后同盘 RO mount 和 Git fsck
@@ -42,9 +42,18 @@
   操作不能作为零写入证据，介质也不再与拔卡前逐位等价。根目录读取随即以
   `inode #2: checksumming directory block 0` / `Directory block failed checksum`
   失败，`df` 同时显示 0 可用空间。发现后立即卸载并 power-off；复核时 `/dev/sda`
-  已消失且无残留挂载。当前 MMC 必须封存，不能 repair/replay/再试 RW，也不应再放回
-  板上写入。硬边界禁止 repair fsck、raw write 或盲试 RW。因此 Vim、GCC、Rust、full
-  clone 与最终 RW→reset→RO 验收均未执行/未通过，不得让用户继续 push/pull 验证。
+  已消失且无残留挂载。此后用户明确撤销针对该卡的一次性 raw-image 禁令并指定
+  `/home/msp/learning/Txv2/local-images/alpine-linux-riscv64-ext4fs.img` 覆盖重建。源镜像
+  723,517,440 bytes、SHA-256
+  `d547220caf7b3ce4c1d67560bbed66f4ee491d10718d1ea3e55741019aef5eb4`，源端
+  `e2fsck -fn` 五阶段通过且 filesystem clean；受限 root 脚本再次锁定 USB/removable/
+  serial `121220160204`/31,719,424,000-byte `/dev/sda` 后写入、`sync`、flush，并先
+  `blockdev --setro` 再验证。目标前 723,517,440 bytes 与源逐字节 `cmp` 相同、目标
+  SHA-256 相同、目标 `e2fsck -fn` 通过。硬只读 `ro,noload` 挂载可读取根目录以及
+  Git/Vim/GCC/Rust/CA bundle，内核日志无 checksum/orphan/I/O error，随后已卸载并
+  power-off。旧板端证据已被覆盖，只保留串口/宿主日志；当前介质是干净基线而不是
+  已通过的持久化结果。因此 Vim、GCC、Rust、full clone 与最终 RW→reset→RO 验收仍
+  未执行/未通过，不得让用户继续 push/pull 验证。
 
 - 2026-08-16 (**LA stall/File-I/O 修复已整理提交；VF2 工具与复位持久化交接已冻结**).
   **Changed**：只在 `/tmp/txv2-la-full-clone.Nt4BdE/worktree` 将分支移到已审计的

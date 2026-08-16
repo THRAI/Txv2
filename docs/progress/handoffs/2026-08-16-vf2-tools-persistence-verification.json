@@ -17,7 +17,8 @@
     "Commit f11ad1076 fixes a separate proven wait interruption bug: ProcessIdentity now delegates thread_signal_interrupts_wait to the existing disposition-aware pending-signal predicate. This explains why a wait could consume SIGINT or SIGCANCEL and park again; the previously failing focused drive test and the full 24-test drive integration suite pass. This source change has not been built or physically booted because the MMC RW blocker appeared first.",
     "After the hung commit was physically reset, the same fixed image with tx.root=mmcblk0 rw failed at mount:rootfs:ext4:mmcblk0:stage=rw-discovered:errno=EIO, fell back to tmpfs, and panicked when /bin/sh was absent. The aggregate RW path can include journal replay, home-block writes, barriers, orphan recovery, recovery-bit writes, and runtime construction, so the sentinel does not prove zero device writes before failure.",
     "The same MMC still mounted and read successfully with plain tx.root=mmcblk0 ro before host removal. README and recovery-probe hashes, Git HEAD/log/status, and git fsck were readable. A later exact-opt-in, final-ro tx.ext4.journal-preflight=1 boot returned recovery-required=1:stage=scan:error=corrupt before refusing the root mount and falling back to tmpfs/panic. This strictly read-only shadow scan confirmed the RECOVER bit is set and the bounded journal scan is corrupt.",
-    "After board power-off, the host identified the whole-device MMC through a USB reader as /dev/sda, 29.5 GiB ext4 UUID dff3fc28-3a72-4c0f-92cb-b681cc185680. A protective blockdev --setro attempt did not take effect because passwordless sudo was unavailable. The subsequent ro,noload mount unexpectedly logged orphan cleanup on readonly fs and deleted one orphan inode, so it was not a zero-write operation and the medium is no longer bit-identical to its pre-reader state. Linux then reported inode #2 directory-block checksum failures and every root-directory/git/hash read returned Bad message; df reported zero available space. The card was immediately unmounted and powered off, and /dev/sda plus its mount disappeared. Do not reinsert it for board writes or use it for continued acceptance. Vim, GCC, Rust, full non-shallow clone, the final synced reset, and complete RO durability verification remain unexecuted and failed as a matrix. Do not invite push or pull verification."
+    "After board power-off, the host identified the whole-device MMC through a USB reader as /dev/sda, 29.5 GiB ext4 UUID dff3fc28-3a72-4c0f-92cb-b681cc185680. A protective blockdev --setro attempt did not take effect because passwordless sudo was unavailable. The subsequent ro,noload mount unexpectedly logged orphan cleanup on readonly fs and deleted one orphan inode, so it was not a zero-write operation and the medium was no longer bit-identical to its pre-reader state. Linux then reported inode #2 directory-block checksum failures and every root-directory/git/hash read returned Bad message; df reported zero available space. The card was immediately unmounted and powered off. This describes the failed pre-restore state and was superseded by the explicitly authorized reimage below.",
+    "Because this is the user's only SD card, the user explicitly authorized overwriting it with /home/msp/learning/Txv2/local-images/alpine-linux-riscv64-ext4fs.img. The 723,517,440-byte source SHA-256 is d547220caf7b3ce4c1d67560bbed66f4ee491d10718d1ea3e55741019aef5eb4; source e2fsck -fn completed all five passes and reported a clean filesystem. A constrained root script revalidated /dev/sda as USB, removable, serial 121220160204, and 31,719,424,000 bytes before copying, syncing, flushing, and setting the block device read-only. Full-length cmp, target SHA-256, and target e2fsck -fn all passed. A block-level-read-only ro,noload mount read the root and Git/Vim/GCC/Rust/CA files with no checksum, orphan, or I/O errors in the kernel log. The card is unmounted and powered off, ready to return to the VF2. Reimaging erased the old on-card acceptance evidence; only its logs remain. The complete physical matrix remains unexecuted/failed and push/pull must not be invited."
   ],
   "changed_files": [
     {
@@ -102,6 +103,11 @@
       "notes": "Linux mounted the whole-device ext4 read-only without journal but unexpectedly performed orphan cleanup and deleted one orphan inode because the block device itself was not write-protected. Root inode 2 then failed directory-block checksums, reads returned Bad message, and df showed zero available space. The card was immediately unmounted and powered off; this inspection is explicitly not zero-write evidence."
     },
     {
+      "command": "Authorized whole-device restore from alpine-linux-riscv64-ext4fs.img to locked USB /dev/sda; sync; blockdev --flushbufs; blockdev --setro; full-length cmp; target SHA-256; e2fsck -fn; ro,noload readback",
+      "status": "passed",
+      "notes": "Source and target prefix are 723,517,440 bytes with SHA-256 d547220caf7b3ce4c1d67560bbed66f4ee491d10718d1ea3e55741019aef5eb4. Source and target e2fsck completed all five passes; block-level RO readback exposed the root plus Git/Vim/GCC/Rust/CA bundle and produced no ext4 checksum, orphan, or I/O error. The reader was unmounted and powered off."
+    },
+    {
       "command": "cargo -q xtask unit",
       "status": "failed",
       "notes": "Known baseline remains: 37 tx-shims shared-state dispatch failures and two tx-kernel libc command-string assertions. tx-ext4 95 passed, tx-scripts 168 passed."
@@ -125,9 +131,9 @@
   "next_actions": [
     {
       "id": "vf2-1",
-      "title": "Preserve the current MMC and decide on safe writable media outside this handoff",
+      "title": "Return the verified restored MMC to the VF2 and re-run the board preflight",
       "paths": [],
-      "notes": "Keep the current reader powered off and do not reinsert this MMC for board writes. Do not repair, reformat, raw-write, or blindly retry RW under the current hard boundary. Continue acceptance only with a separate safely prepared physical MMC/ext4 image; the host inspection also proved zero free space and root-directory checksum corruption on the current card."
+      "notes": "The reader is powered off and the card may be removed and installed in the VF2. The restored filesystem has 6,322 free 4 KiB blocks, about 24.7 MiB, although host df reports zero non-reserved availability. Boot the next unique image RO first, then enforce the board-side free-space gate before any fresh add-only RW acceptance directory."
     },
     {
       "id": "vf2-2",
@@ -157,7 +163,7 @@
   "caveats": [
     "Do not modify, stage, commit, clean, stash, switch, or otherwise mutate /home/msp/learning/Txv2 or /tmp/txv2-la-full-clone.Nt4BdE/worktree.",
     "Do not push or pull, request a PAT, or store credentials in a remote URL. The full local clone and persistence matrix has not passed.",
-    "Do not run dd, mkfs, partitioning, repair fsck, raw block writes, saveenv, flash writes, or deletion/overwrite of existing evidence and TFTP images.",
+    "The user explicitly authorized one whole-device restore of the only SD card from the named Alpine image; that restore is complete and erased the prior on-card evidence. Do not perform another raw write, mkfs, partitioning, repair fsck, saveenv, flash write, or evidence/TFTP overwrite without new explicit authorization.",
     "rw-discovered:EIO is an aggregate mount failure. The RW path may attempt journal replay/home-block writes, barriers, orphan recovery, recovery-bit writes, and runtime construction before returning EIO; never report it as a guaranteed no-write failure.",
     "A final-ro tx.ext4.journal-preflight=1 boot is a strictly read-only shadow-replay classifier, but it cannot prove actual replay writes/barriers, classic orphan recovery, or later RW runtime construction. It does not remove the need for safe writable media.",
     "A Linux ext4 ro,noload mount is not guaranteed zero-write when the underlying block device is writable: the host unexpectedly performed orphan cleanup and deleted one orphan inode. Require hardware or kernel block-device read-only protection before any future host mount, and do not treat this reader attempt as pristine forensic evidence.",
