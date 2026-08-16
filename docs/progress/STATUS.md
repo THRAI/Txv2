@@ -1,3 +1,22 @@
+- 2026-08-16 (**QEMU/VF2 历史合并完成，两个交叉生命周期遗漏已补红测修复，host 聚焦矩阵全绿**).
+  **Changed**：在隔离分支 `codex/qemu-vf2-integration` 先提交计划 `14ca78bb1`，再以
+  双父 merge `64fbbca1f` 保留 QEMU `37d38778f` 与 VF2 `e619fe098` 的完整历史；唯一
+  `STATUS.md` 冲突保留双方全部条目，PageBacked 与 Process 自动合并经三路只读审计。
+  审计另发现两个非文本冲突但会妨碍完整保证的真实遗漏：普通 wait 只看最低 pending
+  signal，可能被 Ignore/default-ignore/SA_RESTART 遮蔽，现由 `2c8a54901` 只读扫描
+  thread/group 全部可递送位；fork fd 快照在后续失败时未回滚显式引用，现由
+  `7d67c753b` 的 armed ledger 在所有失败/移交路径撤销并走统一 last-close finalizer。
+  **Verification**：mixed pending 5/5、signal delivery 50/50、fd-table 21/21、step_fork
+  5/5；ext4 pager 1/1、mount settlement 9/9、File-I/O runtime 5/5、kernel drain 1/1、
+  drive 24/24、VF2 MMC 1/1、exec stack 1/1、procfs 1/1、tx-fs 117/117、dup 9/9、
+  F_DUPFD 2/2、writev 4/4、rename-over 2/2、newfstatat 6/6、statx 5/5 全部串行通过。
+  `cargo -q xtask unit` 的红项与合并前精确一致：37 个 tx-shims shared-state 用例和两个
+  kernel libctest 命令断言；tx-ext4 95 passed/2 ignored、tx-scripts 170/170。
+  **Next**：从最新集成 HEAD 重建并直接哈希 RV64/LA64 release ELF、VF2 uImage 和
+  LA2K1000 kernel-only uImage，再以全新副本按短命令协议先跑 RV 四个 orphan case 与
+  RV/LA 完整矩阵。**Blocker**：当前 merge/host 无 blocker；VF2 约 6 MiB 空间只阻塞
+  后续实板阶段，首次介质写入前仍须明确告知用户。
+
 - 2026-08-16 (**QEMU/VF2 双工作树合并已获准执行，验收扩展至 VF2 与 LA2K1000 两块实板**).
   **Changed**：审计主工作树 `feature/portable-net-vf2-dwmac@37d38778f`、VF2 次工作树
   `codex/vf2-file-io-runtime-rebind-fix@e619fe098` 与共同基线 `3df096b94`，并向两项

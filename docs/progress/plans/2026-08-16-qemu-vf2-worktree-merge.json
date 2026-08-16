@@ -76,7 +76,7 @@
     {
       "id": "step-2-create-integration-merge",
       "title": "Create an isolated integration branch and perform a history-preserving merge",
-      "status": "in-progress",
+      "status": "complete",
       "depends_on": [
         "step-1-freeze-source-tips"
       ],
@@ -94,7 +94,7 @@
     {
       "id": "step-3-semantic-overlap-audit",
       "title": "Audit the auto-merged PageBacked and Process semantics",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "step-2-create-integration-merge"
       ],
@@ -114,7 +114,7 @@
     {
       "id": "step-4-host-gates",
       "title": "Run focused cross-feature tests followed by repository gates",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "step-3-semantic-overlap-audit"
       ],
@@ -141,7 +141,7 @@
     {
       "id": "step-5-rebuild-merge-artifacts",
       "title": "Build and fingerprint every artifact from the merge commit",
-      "status": "pending",
+      "status": "in-progress",
       "depends_on": [
         "step-4-host-gates"
       ],
@@ -291,6 +291,26 @@
       "command": "cargo xtask lint docs",
       "status": "failed",
       "notes": "The existing baseline remains 25 broken links and 7 stale-vocabulary warnings. Neither changed planning file appears in the failure output."
+    },
+    {
+      "command": "Merge e619fe098 into the integration branch and audit all overlap semantics",
+      "status": "passed",
+      "notes": "Pure merge 64fbbca1f has both expected parents. PageBacked/File-I/O and Process/fd/signal semantics from both source branches are present; all 2 plus 14 source commits remain reachable."
+    },
+    {
+      "command": "Mixed-pending signal and fork fd-snapshot failure regressions",
+      "status": "passed",
+      "notes": "2c8a54901 scans every deliverable signal; mixed-pending tests pass 5/5 and signal delivery 50/50. 7d67c753b rolls back explicit fork fd refs; fd-table passes 21/21 and step_fork 5/5."
+    },
+    {
+      "command": "Focused cross-feature host matrix",
+      "status": "passed",
+      "notes": "ext4 pager 1/1, mount settlement 9/9, File-I/O runtime 5/5, kernel drain 1/1, drive 24/24, VF2 MMC 1/1, exec-stack 1/1, procfs 1/1, tx-fs 117/117, dup 9/9, F_DUPFD 2/2, writev PageBacked 4/4, rename-over 2/2, newfstatat 6/6, and statx 5/5 passed serially."
+    },
+    {
+      "command": "cargo -q xtask unit",
+      "status": "failed",
+      "notes": "Failure set matches the pre-merge baseline exactly: 37 tx-shims shared-state tests and two tx-kernel libctest command assertions. tx-ext4 passes 95 with 2 ignored; tx-scripts passes 170/170. No new failure was observed."
     },
     {
       "command": "Fresh host/QEMU/VF2/LA2K1000 validation from the merge commit",
