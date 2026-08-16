@@ -4,7 +4,7 @@
   "title": "Merge the QEMU and VF2 fixes with QEMU, VF2, and LA2K1000 reproduction",
   "status": "in-progress",
   "created": "2026-08-16",
-  "updated": "2026-08-16",
+  "updated": "2026-08-17",
   "owner": "codex-01a00a3b-f64c-7c43-9ee0-6512899dcc80",
   "summary": "Merge QEMU commit 37d38778f and VF2 commit e619fe098 through an isolated integration branch, preserve both semantic fix sets, and advance the main QEMU branch only after fresh RV64/LA64 QEMU plus physical VF2 and LA2K1000 acceptance from the merge commit.",
   "scope": {
@@ -141,7 +141,7 @@
     {
       "id": "step-5-rebuild-merge-artifacts",
       "title": "Build and fingerprint every artifact from the merge commit",
-      "status": "in-progress",
+      "status": "complete",
       "depends_on": [
         "step-4-host-gates"
       ],
@@ -156,12 +156,12 @@
         "cargo xtask image vf2-uimage --release",
         "Compute sha256sum directly for each produced ELF and uImage and bind each artifact to the merge HEAD"
       ],
-      "notes": "Use unique artifact directories and TFTP names. Old QEMU/VF2 hashes are historical evidence only. Never trust the known-stale target/images/txv2-la2k1000.uimage.sha256 sidecar; compute the actual file hash after rebuilding."
+      "notes": "Final board artifacts from cb275b28c were directly hashed and deployed no-clobber under /srv/tftp/txv2 with source/target cmp: LA2K1000 uImage 5b2675e5d1693bbaa215130f5812aa2063c3b0d9ff7b5a26c4a7e5ba1f066373, VF2 uImage 1075540b44a97f300395b6c608473b319399b986c4ca9701eda3a4d56305e495, and VF2 initrd 16f08b556cdea1eff01433db92102629e5f13609442a8f5bbb221bd6ca35449c. The stale LA2K1000 sidecar was not trusted."
     },
     {
       "id": "step-6-rv64-qemu-acceptance",
       "title": "Reproduce the RV64 QEMU persistence acceptance on fresh disk copies",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "step-5-rebuild-merge-artifacts"
       ],
@@ -173,12 +173,12 @@
         "On another fresh SMP4 direct-root copy, pass the short-command Vim -> GCC -> Rust -> Git RW matrix, explicit fsync/syncfs, same-disk RO reboot, all 25 content hashes, EROFS checks, and final e2fsck -fn exit 0",
         "Verify the RV64 read-only mother image hash is unchanged"
       ],
-      "notes": "Never reuse a failed experiment image. Preserve command-level transcripts, result JSON, fsck logs, mother hashes, merge HEAD, and kernel SHA-256."
+      "notes": "Formal cb275b28c evidence is target/qemu-merge-accept/rv-external-final3-cb275b28c/rv64.full-stepwise.result.json. It passed the exact real-network full clone of https://github.com/LLLPPPS/tx-push-test.git, Vim/GCC/Rust, local Git commit/fsck, parallel I/O, fsync/syncfs, same-disk RW-to-RO hashes, final e2fsck -fn=0, and unchanged mother hash d547220caf7b3ce4c1d67560bbed66f4ee491d10718d1ea3e55741019aef5eb4. Kernel SHA-256: 521884aac2f3d2a6cf03c39e8f5de53e7427560cf910b1b6cddf32ef92066078."
     },
     {
       "id": "step-7-la64-qemu-acceptance",
       "title": "Reproduce the LA64 QEMU persistence acceptance on fresh disk copies",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "step-6-rv64-qemu-acceptance"
       ],
@@ -190,12 +190,12 @@
         "On another fresh SMP4 direct-root copy, pass the short-command Vim -> GCC -> Rust -> Git RW matrix, explicit fsync/syncfs, same-disk RO reboot, all content hashes, EROFS checks, and final e2fsck -fn exit 0",
         "Verify the LA64 read-only mother image hash is unchanged"
       ],
-      "notes": "This mirrors the strongest successful LA64 evidence from the QEMU source task without inheriting its old kernel or disk artifacts."
+      "notes": "Formal cb275b28c evidence is target/qemu-merge-accept/la-external-final9-cb275b28c/la64.full-stepwise.result.json. It passed the exact real-network full clone of https://github.com/LLLPPPS/tx-push-test.git, Vim/GCC/Rust, local Git commit/fsck, parallel I/O, fsync/syncfs, same-disk RW-to-RO hashes, final e2fsck -fn=0, and unchanged mother hash 57c64d68d12aed1e503cc54753ea27f8c38936d6dde78d7c28dfc155763e25ca. Kernel SHA-256: 17c8149d67bb9d5eac62eb847a3b4b69b2d5ec200bd25e0b856297e6a0e4bca8."
     },
     {
       "id": "step-8-vf2-capacity-gate",
       "title": "Preserve the current VF2 evidence and provide space for a fresh matrix",
-      "status": "pending",
+      "status": "in-progress",
       "depends_on": [
         "step-7-la64-qemu-acceptance"
       ],
@@ -207,7 +207,7 @@
         "Rehearse whole-device ext4 resize on a working copy, then verify the retained VF2 acceptance directory, hashes, commits, and e2fsck -fn before requesting final physical-media authorization",
         "After authorized resize, return the block device to read-only, require e2fsck -fn exit 0, verify old evidence read-only, and power off the reader"
       ],
-      "notes": "This gate does not block merge or QEMU. The card currently has about 6 MiB free. Preferred remediation is verified full-card backup plus rehearsed whole-device resize; rewriting the Alpine baseline is disaster recovery only because it erases current evidence. No first write occurs silently."
+      "notes": "The exact historical restore script and device identity were recovered from the VF2 task. Current preferred remediation is to preserve the old card read-only and clone to a replacement medium before offline whole-device ext4 expansion; if only the old card is available, first make and verify a complete 31719424000-byte backup and rehearse the resize on a working copy. The current host has no matching media attached, and no first write has occurred. Rewriting the Alpine baseline is disaster recovery only because it erases current evidence."
     },
     {
       "id": "step-9-vf2-physical-acceptance",
@@ -313,9 +313,19 @@
       "notes": "Failure set matches the pre-merge baseline exactly: 37 tx-shims shared-state tests and two tx-kernel libctest command assertions. tx-ext4 passes 95 with 2 ignored; tx-scripts passes 170/170. No new failure was observed."
     },
     {
-      "command": "Fresh host/QEMU/VF2/LA2K1000 validation from the merge commit",
+      "command": "Fresh RV64 QEMU formal acceptance from cb275b28c with exact real GitHub full clone",
+      "status": "passed",
+      "notes": "target/qemu-merge-accept/rv-external-final3-cb275b28c/rv64.full-stepwise.result.json records PASS, final e2fsck 0, unchanged mother image, and identical RW/RO/final content hashes."
+    },
+    {
+      "command": "Fresh LA64 QEMU formal acceptance from cb275b28c with exact real GitHub full clone",
+      "status": "passed",
+      "notes": "target/qemu-merge-accept/la-external-final9-cb275b28c/la64.full-stepwise.result.json records PASS, final e2fsck 0, unchanged mother image, and identical RW/RO/final content hashes."
+    },
+    {
+      "command": "Physical VF2 and LA2K1000 validation from cb275b28c",
       "status": "not-run",
-      "notes": "The user approved merge execution and directed QEMU to run first. VF2 capacity remediation and both physical-board reset checkpoints remain later interactive gates."
+      "notes": "Both artifacts are built, directly hashed, and uniquely staged in TFTP. The host currently sees neither the VF2 removable medium nor any USB/ACM serial device. VF2 capacity remediation and all physical reset checkpoints remain interactive gates."
     }
   ],
   "risks": [
@@ -327,7 +337,8 @@
     "A stale LA2K1000 checksum sidecar can falsely identify a rebuilt image unless the artifact itself is hashed."
   ],
   "blockers": [
-    "The retained VF2 MMC acceptance filesystem has about 6 MiB free, below the space needed for a fresh add-only full clone and persistence matrix. This blocks only the later VF2 physical phase; it does not block merge or QEMU. Before the first media mutation, the exact target and evidence-preserving backup/resize procedure must be explained to the user."
+    "The retained VF2 MMC acceptance filesystem has about 6 MiB free, below the space needed for a fresh add-only full clone and persistence matrix. Before the first media mutation, the exact target and evidence-preserving backup/resize procedure must be explained to the user and explicitly authorized.",
+    "No VF2 removable medium and no VF2/LA2K1000 USB or ACM serial device is currently attached to the host, so both physical-board matrices require user hardware attachment and reset actions."
   ],
   "handoff": {
     "needed": true,

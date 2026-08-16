@@ -1,3 +1,27 @@
+- 2026-08-17 (**合并态双架构 QEMU 正式真实 GitHub clone 已通过；两块实板镜像已唯一部署，等待接入硬件**).
+  **Changed**：在 `codex/qemu-vf2-integration` 上继续收口 PageBacked 压力路径与 SMP
+  lost-wake；最终提交 `cb275b28c` 将 `WaitSource` 空 subscriber 快照时的 pending latch
+  移入 subscriber 锁内，与注册建立同锁线性化，关闭 LA64 `git index-pack` worker 已退出
+  而 joiner 永久停在 `FUTEX_WAIT_PRIVATE` 的竞态。确定性交错回归修前稳定失败、修后通过；
+  `wait_source` 17/17、`tx-substrate --lib` 62/62、futex 27/27 与独立 target
+  `cargo check -p tx-substrate --lib` 通过。**Verification**：RV64 正式结果
+  `target/qemu-merge-accept/rv-external-final3-cb275b28c/rv64.full-stepwise.result.json`
+  与 LA64 正式结果
+  `target/qemu-merge-accept/la-external-final9-cb275b28c/la64.full-stepwise.result.json`
+  均为 PASS：逐条短命令完成 Vim/GCC/Rust、真实公网完整非 shallow
+  `git clone https://github.com/LLLPPPS/tx-push-test.git`、本地 commit/fsck、并行 I/O、
+  fsync/syncfs、同盘 RW→RO 哈希复验，最终宿主 `e2fsck -fn=0`；母盘哈希保持 RV
+  `d547220c…ef5eb4`、LA `57c64d68…25ca`。从同一 HEAD 构建并直接哈希：LA2K1000
+  uImage `5b2675e5…066373`、VF2 uImage `1075540b…e495`、VF2 initrd
+  `16f08b55…f49c`；三者以含 HEAD/哈希的唯一名称 no-clobber 部署到
+  `/srv/tftp/txv2/`，源/目标 `cmp` 与直接 SHA-256 一致，旧 TFTP 文件未覆盖。
+  **Next**：先只读识别 VF2 serial `121220160204`、`31719424000` bytes whole-device
+  ext4 和 LA2K1000 `Kingchuxing 32GB W010`、`62533296×512`、MBR `sda1`，再按短命令
+  分别完成 VF2 RW-reset-RO 与 LA2K1000 RO-RW-reset-RO。**Blocker**：当前宿主未发现
+  VF2 介质或任何 USB/ACM 串口；VF2 旧验收根仅约 6 MiB 可用，首次介质修改前必须先
+  完整校验整卡备份、在副本演练 whole-device ext4 扩容并向用户说明精确节点/命令/
+  验证/回滚后取得明确授权，绝不删除旧证据或直接恢复 Alpine 基线。
+
 - 2026-08-16 (**QEMU/VF2 历史合并完成，两个交叉生命周期遗漏已补红测修复，host 聚焦矩阵全绿**).
   **Changed**：在隔离分支 `codex/qemu-vf2-integration` 先提交计划 `14ca78bb1`，再以
   双父 merge `64fbbca1f` 保留 QEMU `37d38778f` 与 VF2 `e619fe098` 的完整历史；唯一
