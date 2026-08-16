@@ -2158,6 +2158,20 @@ mod tests {
     }
 
     #[test]
+    fn procfs_stat_exposes_linux_field_count_for_busybox_ps() {
+        let _setup = setup();
+        bootstrap_procfs_test_init_process();
+
+        let stat = read::render(pid_stat_id(Pid(1)));
+        let fields: Vec<_> = stat.split_ascii_whitespace().collect();
+
+        assert_eq!(fields.len(), 52, "incomplete /proc/<pid>/stat: {stat}");
+        assert_eq!(fields[0], "1");
+        assert_eq!(fields[19], "1", "field 20 is num_threads");
+        assert_eq!(fields[37], "17", "field 38 is exit_signal");
+    }
+
+    #[test]
     fn procfs_sysvipc_files_render_live_sysv_ipc_rows() {
         let _setup = setup();
         let fs = Procfs::new();

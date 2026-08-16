@@ -210,6 +210,8 @@ fn render_if_inet6() -> String {
 }
 
 fn render_stat(pid: Pid) -> String {
+    use core::fmt::Write as _;
+
     let Some(proc) = process::process_by_pid(pid) else {
         return String::new();
     };
@@ -223,15 +225,30 @@ fn render_stat(pid: Pid) -> String {
 
     let state = proc.state_char() as char;
 
-    alloc::format!(
-        "{} ({}) {} {} {} {}\n",
+    let mut out = alloc::format!(
+        "{} ({}) {} {} {} {}",
         pid.0,
         comm,
         state,
         ppid.0,
         pgrp.0,
         session.0
-    )
+    );
+
+    // Linux publishes 52 fields in /proc/<pid>/stat.  BusyBox ps does not
+    // stop after the session id: it advances through the fixed field layout
+    // while collecting time, thread, memory, and signal data.  Supplying only
+    // fields 1-6 therefore makes its unbounded field scanner run beyond the
+    // procfs read buffer.  Keep unavailable counters at zero while preserving
+    // the complete ABI shape.  This array covers fields 7 through 52.
+    let mut trailing_fields = [0u64; 46];
+    trailing_fields[20 - 7] = proc.live_thread_count() as u64;
+    trailing_fields[38 - 7] = 17; // exit_signal = SIGCHLD
+    for value in trailing_fields {
+        let _ = write!(out, " {value}");
+    }
+    out.push('\n');
+    out
 }
 
 fn render_cmdline(pid: Pid) -> String {
