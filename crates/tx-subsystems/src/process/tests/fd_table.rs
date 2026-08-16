@@ -384,6 +384,65 @@ fn step_fork_accounts_inherited_pipe_writer_fd() {
 }
 
 #[test]
+fn failed_fork_rolls_back_inherited_pipe_writer_fd() {
+    let _g = setup();
+    let parent = bootstrap();
+    let (reader, writer) =
+        crate::pipe::step_pipe2(crate::pipe::PipeFlags::default()).expect("pipe2");
+    let payload = pipe_payload_of(&reader);
+
+    parent.set_fd(3, Some(reader));
+    parent.set_fd(4, Some(writer));
+
+    let result = step_fork_with_options::<TestPmap>(
+        &parent,
+        ForkOptions {
+            clone_vm: true,
+            clone_newns: true,
+            ..ForkOptions::default()
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(ForkError::Zone(
+            crate::process::adapter::step_engine::ZoneError::InvalidState
+        ))
+    ));
+
+    parent.set_fd(4, None);
+    assert_pipe_read_eof(&payload);
+    parent.set_fd(3, None);
+}
+
+#[test]
+fn fork_fd_snapshot_rolls_back_after_table_handoff() {
+    let _g = setup();
+    let parent = bootstrap();
+    let (reader, writer) =
+        crate::pipe::step_pipe2(crate::pipe::PipeFlags::default()).expect("pipe2");
+    let payload = pipe_payload_of(&reader);
+
+    parent.set_fd(3, Some(reader));
+    parent.set_fd(4, Some(writer));
+
+    let (fds, cloexec) = parent
+        .payload_slot()
+        .lock()
+        .as_ref()
+        .expect("parent payload")
+        .clone_fd_state_for_fork();
+    let mut snapshot = crate::process::execution::ForkFdSnapshot::new(fds, cloexec);
+    let (handed_off_fds, handed_off_cloexec) = snapshot.take_for_payload();
+    drop(handed_off_fds);
+    drop(handed_off_cloexec);
+    drop(snapshot);
+
+    parent.set_fd(4, None);
+    assert_pipe_read_eof(&payload);
+    parent.set_fd(3, None);
+}
+
+#[test]
 fn child_exit_drains_inherited_pipe_writer_fd_and_publishes_eof() {
     let _g = setup();
     let parent = bootstrap();

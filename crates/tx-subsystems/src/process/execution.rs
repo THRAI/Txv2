@@ -57,6 +57,63 @@ pub(crate) const PROCESS_LOCK_SERVICE_TRACE_NAMES: &[&[u8]] = &[
 /// filesystem or block-I/O code runs.
 static DEFERRED_PAGE_WRITEBACKS: SpinMutex<Vec<Cap<PageContainer>>> = SpinMutex::new(Vec::new());
 
+/// Owns the explicit fd-reference increments taken for a fork snapshot until
+/// the new [`ProcessPayload`] has accepted the fd table.
+///
+/// `Cap<OpenFile>` drops do not change `process_fd_refs`, so every fallible
+/// return between the snapshot and payload publication must explicitly undo
+/// those increments.  The rollback ledger keeps independent Cap pins after
+/// the fd map itself is moved into `sign_process_payload`, which also covers a
+/// late signing failure without reviving or double-decrementing an OpenFile.
+pub(in crate::process) struct ForkFdSnapshot {
+    fds: Option<BTreeMap<u32, Cap<OpenFile>>>,
+    cloexec: Option<BTreeSet<u32>>,
+    rollback_files: Vec<Cap<OpenFile>>,
+    armed: bool,
+}
+
+impl ForkFdSnapshot {
+    pub(in crate::process) fn new(
+        fds: BTreeMap<u32, Cap<OpenFile>>,
+        cloexec: BTreeSet<u32>,
+    ) -> Self {
+        let rollback_files = fds.values().cloned().collect();
+        Self {
+            fds: Some(fds),
+            cloexec: Some(cloexec),
+            rollback_files,
+            armed: true,
+        }
+    }
+
+    pub(in crate::process) fn take_for_payload(
+        &mut self,
+    ) -> (BTreeMap<u32, Cap<OpenFile>>, BTreeSet<u32>) {
+        (
+            self.fds.take().unwrap_or_default(),
+            self.cloexec.take().unwrap_or_default(),
+        )
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+        self.rollback_files.clear();
+    }
+}
+
+impl Drop for ForkFdSnapshot {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        for file in &self.rollback_files {
+            crate::process::structure::decr_pipe_fd_ref(file);
+        }
+        let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
+        let _ = finalize_detached_open_files(self.rollback_files.iter(), &guard);
+    }
+}
+
 #[inline(always)]
 pub(crate) fn measure_process_lock_service<R>(name: &'static [u8], f: impl FnOnce() -> R) -> R {
     let known_names = PROCESS_LOCK_SERVICE_TRACE_NAMES;
@@ -516,8 +573,7 @@ fn step_fork_with_prepared_aspace<P: PmapIf>(
         parent_nsproxy,
         parent_cred,
         parent_cwd,
-        parent_fds,
-        parent_fd_cloexec,
+        mut parent_fd_snapshot,
         parent_rlimit_nofile,
         parent_rlimit_memlock,
         parent_net_namespace,
@@ -536,13 +592,13 @@ fn step_fork_with_prepared_aspace<P: PmapIf>(
             return Err(ForkError::Busy);
         }
         let (parent_fds, parent_fd_cloexec) = payload.clone_fd_state_for_fork();
+        let parent_fd_snapshot = ForkFdSnapshot::new(parent_fds, parent_fd_cloexec);
         (
             parent_aspace,
             payload.nsproxy_cap(),
             payload.cred(),
             payload.cwd_state(),
-            parent_fds,
-            parent_fd_cloexec,
+            parent_fd_snapshot,
             payload.rlimit_nofile(),
             payload.rlimit_memlock(),
             payload.net_namespace(),
@@ -627,6 +683,7 @@ fn step_fork_with_prepared_aspace<P: PmapIf>(
     } else {
         parent_net_namespace
     };
+    let (parent_fds, parent_fd_cloexec) = parent_fd_snapshot.take_for_payload();
     let payload = sign_process_payload(
         child_aspace_cap,
         vec![leader],
@@ -645,6 +702,7 @@ fn step_fork_with_prepared_aspace<P: PmapIf>(
         child_sig_actions,
     )
     .map_err(ForkError::Zone)?;
+    parent_fd_snapshot.disarm();
     *child_proc.payload.lock() = Some(payload);
 
     register_pid(child_pid, child_proc.clone());
