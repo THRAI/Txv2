@@ -443,8 +443,12 @@ impl TaskMailbox {
         *self.waker.lock() = Some(waker);
     }
 
-    /// Drop any registered waker without waking. Used by drivers
-    /// that have observed completion and want to detach.
+    /// Drop any registered waker without waking.
+    ///
+    /// This is only valid when the caller owns the whole mailbox (for example
+    /// a private deadline mailbox). A reactor task mailbox is shared by the
+    /// task wrapper, signals, and nested wait protocols; a nested wait must
+    /// not clear that task-level wake route when only its own wait completes.
     pub fn clear_waker(&self) {
         *self.waker.lock() = None;
     }

@@ -3893,12 +3893,14 @@ impl<P: TxPlatform> CoreInit<P> {
         // before the deadline under TCG and abandon a live timer in the
         // reactor domain, which then gets reprogrammed as an already-expired
         // one-shot on every loop iteration.
+        let mut observed_timer_wake = false;
         for _ in 0..AP_REACTOR_WAIT_SPINS {
             P::wait_for_interrupt_once();
             let step =
                 Self::boot_reactor_once(current_cpu).expect("boot reactor timer idle step failed");
+            observed_timer_wake |= step.observed_timer_wakes();
             if Self::bsp_timer_smoke_done(cpu_bit) {
-                assert!(step.observed_timer_wakes(), "BSP timer smoke wake");
+                assert!(observed_timer_wake, "BSP timer smoke wake");
                 Self::write_board_sentinel_prefix();
                 tx_hal::console_write_str::<P>(":reactor:timer-idle:ok\n");
                 return;

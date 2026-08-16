@@ -1538,7 +1538,7 @@ pub(super) async fn sys_pipe2<'a>(
     // remove an unrelated file that reused the first descriptor while the
     // second end was being allocated.
     let Some((reader_fd, writer_fd)) =
-        ctx.install_new_fd_pair(reader_cap, writer_cap, pipe_flags.cloexec)
+        ctx.install_new_fd_pair(reader_cap.clone(), writer_cap.clone(), pipe_flags.cloexec)
     else {
         return SyscallResult::Error(EMFILE_VALUE);
     };
@@ -1554,8 +1554,12 @@ pub(super) async fn sys_pipe2<'a>(
         super::user_copy::bootstrap_copy_to_user_wait(&ctx.aspace, pipefd_uaddr, &pipefd_bytes)
             .await
     {
-        let _ = ctx.process.set_fd(reader_fd, None);
-        let _ = ctx.process.set_fd(writer_fd, None);
+        let _ = ctx.process_payload.take_fd_pair_if_matches(
+            reader_fd,
+            &reader_cap,
+            writer_fd,
+            &writer_cap,
+        );
         return SyscallResult::error_from(errno);
     }
 

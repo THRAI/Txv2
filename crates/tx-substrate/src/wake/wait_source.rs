@@ -263,9 +263,9 @@ impl WaitSource {
 
     /// Fire `mask` with an explicit scheduler hint for delivered events.
     pub fn notify_with_hint(&self, mask: InterestMask, hint: MailboxSchedulerHint) -> usize {
-        self.pending_mask.fetch_or(mask.raw(), Ordering::AcqRel);
         let mut subs = self.subscribers.lock();
         let mut posted = 0usize;
+        let mut delivered_mask = 0u64;
         // Walk forward and use `retain_mut` semantics: drop dead
         // subscribers, deliver to live ones with overlapping interest.
         subs.retain(|sub| {
@@ -282,12 +282,17 @@ impl WaitSource {
                 };
                 if mailbox.post_with_scheduler_hint(evt, hint) {
                     posted += 1;
+                    delivered_mask |= overlap;
                 }
                 // Note: on overflow the mailbox latches its flag;
                 // the subscriber stays registered.
             }
             true
         });
+        let undelivered = mask.raw() & !delivered_mask;
+        if undelivered != 0 {
+            self.pending_mask.fetch_or(undelivered, Ordering::AcqRel);
+        }
         posted
     }
 
@@ -306,10 +311,10 @@ impl WaitSource {
     where
         F: FnMut(&TaskMailbox, MailboxEvent, MailboxSchedulerHint) -> bool,
     {
-        self.pending_mask.fetch_or(mask.raw(), Ordering::AcqRel);
         let deliveries = {
             let mut subs = self.subscribers.lock();
             let mut deliveries = Vec::new();
+            let mut delivered_mask = 0u64;
             subs.retain(|sub| {
                 let Some(mailbox) = sub.mailbox.upgrade() else {
                     return false;
@@ -317,9 +322,17 @@ impl WaitSource {
                 let overlap = sub.interests.raw() & mask.raw();
                 if overlap != 0 {
                     deliveries.push((mailbox, sub.generation, InterestMask::new(overlap)));
+                    delivered_mask |= overlap;
                 }
                 true
             });
+            let undelivered = mask.raw() & !delivered_mask;
+            if undelivered != 0 {
+                // Publish the fallback while registration is still excluded
+                // by the same source lock. A waiter that commits after this
+                // point will consume the pending edge in register_if().
+                self.pending_mask.fetch_or(undelivered, Ordering::AcqRel);
+            }
             deliveries
         };
 
@@ -359,6 +372,7 @@ impl WaitSource {
         }
         let mut subs = self.subscribers.lock();
         let mut posted = 0usize;
+        let mut delivered_mask = 0u64;
         subs.retain(|sub| {
             let Some(mailbox) = sub.mailbox.upgrade() else {
                 return false;
@@ -372,12 +386,14 @@ impl WaitSource {
                 };
                 if mailbox.post_with_scheduler_hint(evt, hint) {
                     posted += 1;
+                    delivered_mask |= overlap;
                 }
             }
             true
         });
-        if posted == 0 {
-            self.pending_mask.fetch_or(mask.raw(), Ordering::AcqRel);
+        let undelivered = mask.raw() & !delivered_mask;
+        if undelivered != 0 {
+            self.pending_mask.fetch_or(undelivered, Ordering::AcqRel);
         }
         posted
     }
@@ -403,6 +419,7 @@ impl WaitSource {
         }
         let mut subs = self.subscribers.lock();
         let mut posted = 0usize;
+        let mut delivered_mask = 0u64;
         subs.retain(|sub| {
             let Some(mailbox) = sub.mailbox.upgrade() else {
                 return false;
@@ -416,6 +433,7 @@ impl WaitSource {
                 };
                 if mailbox.post_with_scheduler_hint(evt, hint) {
                     posted += 1;
+                    delivered_mask |= overlap;
                     if let Some(em) = tx_observe::current() {
                         em.wait_source_notify(
                             self.id.raw() as u32,
@@ -428,8 +446,9 @@ impl WaitSource {
             }
             true
         });
-        if posted == 0 {
-            self.pending_mask.fetch_or(mask.raw(), Ordering::AcqRel);
+        let undelivered = mask.raw() & !delivered_mask;
+        if undelivered != 0 {
+            self.pending_mask.fetch_or(undelivered, Ordering::AcqRel);
         }
         posted
     }
@@ -459,24 +478,27 @@ impl WaitSource {
         let deliveries = {
             let mut subs = self.subscribers.lock();
             let mut deliveries = Vec::new();
+            let mut delivered_mask = 0u64;
             subs.retain(|sub| {
                 let Some(mailbox) = sub.mailbox.upgrade() else {
                     return false;
                 };
                 let overlap = sub.interests.raw() & mask.raw();
-                if overlap != 0 {
+                if overlap != 0 && deliveries.len() < limit {
                     deliveries.push((mailbox, sub.generation, InterestMask::new(overlap)));
+                    delivered_mask |= overlap;
                 }
                 true
             });
+            let undelivered = mask.raw() & !delivered_mask;
+            if undelivered != 0 {
+                self.pending_mask.fetch_or(undelivered, Ordering::AcqRel);
+            }
             deliveries
         };
 
         let mut posted = 0usize;
         for (mailbox, generation, interests) in deliveries {
-            if posted >= limit {
-                break;
-            }
             let evt = MailboxEvent::SourceFired {
                 generation,
                 source: self.id,
@@ -493,9 +515,6 @@ impl WaitSource {
                     );
                 }
             }
-        }
-        if posted == 0 {
-            self.pending_mask.fetch_or(mask.raw(), Ordering::AcqRel);
         }
         posted
     }
@@ -527,9 +546,9 @@ impl WaitSource {
     /// Fire `mask` with an explicit scheduler hint and emit one
     /// `WaitSourceNotify` observation record per woken task.
     pub fn notify_emit_with_hint(&self, mask: InterestMask, hint: MailboxSchedulerHint) -> usize {
-        self.pending_mask.fetch_or(mask.raw(), Ordering::AcqRel);
         let mut subs = self.subscribers.lock();
         let mut posted = 0usize;
+        let mut delivered_mask = 0u64;
 
         subs.retain(|sub| {
             let Some(mailbox) = sub.mailbox.upgrade() else {
@@ -544,6 +563,7 @@ impl WaitSource {
                 };
                 if mailbox.post_with_scheduler_hint(evt, hint) {
                     posted += 1;
+                    delivered_mask |= overlap;
                     // Emit one Instant record per woken task (OBS-4 / γ-fix).
                     if let Some(em) = tx_observe::current() {
                         em.wait_source_notify(
@@ -557,6 +577,10 @@ impl WaitSource {
             }
             true
         });
+        let undelivered = mask.raw() & !delivered_mask;
+        if undelivered != 0 {
+            self.pending_mask.fetch_or(undelivered, Ordering::AcqRel);
+        }
         posted
     }
 

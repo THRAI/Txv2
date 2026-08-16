@@ -307,7 +307,6 @@ impl Future for MailboxSourceFuture<'_> {
                     MailboxEvent::SignalDelivered { .. } | MailboxEvent::SignalTimerFired { .. }
                 )
             {
-                self.mailbox.clear_waker();
                 return Poll::Ready(());
             }
         }
@@ -315,7 +314,6 @@ impl Future for MailboxSourceFuture<'_> {
         // object state.  Consuming it also prevents a permanently runnable
         // task after a full mailbox dropped the concrete event.
         if self.mailbox.take_overflow() {
-            self.mailbox.clear_waker();
             return Poll::Ready(());
         }
         Poll::Pending
@@ -338,7 +336,6 @@ impl Future for MailboxAnySourceFuture<'_> {
         while let Some(event) = self.mailbox.poll() {
             if let MailboxEvent::TimerFired { token } = event {
                 if self.deadline_token == Some(token) {
-                    self.mailbox.clear_waker();
                     return Poll::Ready(false);
                 }
             }
@@ -348,12 +345,10 @@ impl Future for MailboxAnySourceFuture<'_> {
                     MailboxEvent::SignalDelivered { .. } | MailboxEvent::SignalTimerFired { .. }
                 )
             {
-                self.mailbox.clear_waker();
                 return Poll::Ready(true);
             }
         }
         if self.mailbox.take_overflow() {
-            self.mailbox.clear_waker();
             return Poll::Ready(true);
         }
         Poll::Pending

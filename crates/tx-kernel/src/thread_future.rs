@@ -477,7 +477,6 @@ where
         let _prev = set_current_thread_payload(hart, this.payload.clone());
         this.payload.bind_lifecycle_waker(cx.waker().clone());
         let task_mailbox = crate::adapter::boot_runtime::current_task_mailbox(hart);
-        let mut mailbox_post_sequence = None;
         if let Some(mailbox) = task_mailbox.as_ref() {
             this.payload.bind_mailbox(Arc::downgrade(mailbox));
             // `ThreadPayload::mailbox` is the lifecycle wake route used by
@@ -485,16 +484,12 @@ where
             // even when the inner future is parked on a userspace-run wait
             // rather than one of drive.rs' mailbox-backed waits.
             //
-            // Local wait futures are allowed to replace/clear the mailbox
-            // waker while they are polled, so install it both before and
-            // after the inner poll. Registering before the poll closes the
-            // register-vs-post race: an older matching event is observed by
-            // the wait while it polls, and a concurrent/new event sees this
-            // registered waker.
+            // The task wrapper owns this task-level wake route. Nested waits
+            // may register the same task waker but must not clear the shared
+            // mailbox when one wait completes. Register-before-poll closes the
+            // producer-vs-park race without adding a post-sequence check to
+            // every userspace task poll.
             mailbox.register_waker(cx.waker().clone());
-            if matches!(P::ARCH, tx_hal::Arch::LoongArch64) {
-                mailbox_post_sequence = Some(mailbox.post_sequence());
-            }
         }
 
         // Process termination is a task-level AST, not a property of the
@@ -577,16 +572,11 @@ where
 
         if out.is_pending() {
             if let Some(mailbox) = task_mailbox.as_ref() {
+                // Reassert task ownership after nested polling. All nested
+                // futures receive the same task Context waker; this assignment
+                // is defensive and does not synthesize an extra scheduler
+                // wake for an event already consumed by the inner future.
                 mailbox.register_waker(cx.waker().clone());
-                // LA64 still needs a post-poll recheck because a nested wait
-                // may temporarily replace and clear the task mailbox waker.
-                // Compare post edges, not queue state: an unrelated old event
-                // is not readiness and must not make the wrapper self-wake
-                // forever.  Register-before/sample and re-register/recheck
-                // closes both sides of the register-vs-park window.
-                if mailbox_post_sequence.is_some_and(|before| mailbox.post_sequence() != before) {
-                    cx.waker().wake_by_ref();
-                }
             }
         }
 

@@ -514,6 +514,18 @@ fn drive_selecting_on_agent_returns_enosys() {
 
 #[test]
 fn drive_waiting_on_wait_source_wake_retries() {
+    struct CountWake(std::sync::atomic::AtomicUsize);
+
+    impl std::task::Wake for CountWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+
     let mailbox = Arc::new(TaskMailbox::new());
     let source_id = WaitSourceId::new(7);
     let interests = InterestMask::new(0xff);
@@ -533,7 +545,8 @@ fn drive_waiting_on_wait_source_wake_retries() {
 
     let mut ctx = ScriptCtx::new().with_mailbox(Arc::clone(&mailbox));
     let fut = tx_scripts::drive(op, &mut ctx, DriveMode::Waiting, Some(&mailbox), None, None);
-    let waker = std::task::Waker::noop().clone();
+    let wake_count = Arc::new(CountWake(std::sync::atomic::AtomicUsize::new(0)));
+    let waker = std::task::Waker::from(Arc::clone(&wake_count));
     let mut task_ctx = std::task::Context::from_waker(&waker);
     let mut pinned = Box::pin(fut);
     assert!(
@@ -546,9 +559,80 @@ fn drive_waiting_on_wait_source_wake_retries() {
 
     assert_eq!(ws.notify(interests), 1);
     assert_eq!(
+        wake_count.0.load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "the wait-source event wakes the parked task once"
+    );
+    assert_eq!(
         pinned.as_mut().poll(&mut task_ctx),
         std::task::Poll::Ready(Ok(42))
     );
+    assert!(
+        mailbox.has_waker(),
+        "a completed nested wait must retain the task-level mailbox route"
+    );
+    assert!(mailbox.post(MailboxEvent::SignalDelivered {
+        signum: 15,
+        routing: SignalRouting::ProcessDirected,
+    }));
+    assert_eq!(
+        wake_count.0.load(std::sync::atomic::Ordering::Acquire),
+        2,
+        "a lifecycle event posted after wait completion still wakes the task"
+    );
+    unregister_source(source_id);
+}
+
+#[test]
+fn drive_wait_source_reactor_handoff_parks_and_completes_without_poll_loop() {
+    let source_id = WaitSourceId::new(0xd12e);
+    let interests = InterestMask::new(0b1);
+    let source = Arc::new(WaitSource::new(source_id));
+    register_source(Arc::clone(&source));
+
+    let reactor = tx_reactor::Reactor::new();
+    let task = reactor.submit(async move {
+        let mailbox = tx_reactor::current_task_mailbox(0)
+            .expect("reactor publishes the current task mailbox while polling");
+        let op = MockStepOp::new([
+            StepOutcome::Yield {
+                progress: NoProgress,
+                shape: YieldShape::OnWaitSource {
+                    source: source_id,
+                    interests,
+                },
+            },
+            StepOutcome::Done(42),
+        ]);
+        let mut ctx = ScriptCtx::new().with_mailbox(Arc::clone(&mailbox));
+        assert_eq!(
+            tx_scripts::drive(op, &mut ctx, DriveMode::Waiting, Some(&mailbox), None, None,).await,
+            Ok(42)
+        );
+    });
+
+    let parked = reactor.run_until_idle();
+    assert_eq!(parked.polled, 1);
+    assert_eq!(parked.completed, 0);
+    assert_eq!(
+        reactor.task_status(task),
+        Some(tx_reactor::TaskStatus::Parked)
+    );
+
+    assert_eq!(source.notify(interests), 1);
+    let completed = reactor.run_until_idle();
+    assert_eq!(completed.polled, 1, "one source event needs one re-poll");
+    assert_eq!(completed.completed, 1);
+    assert_eq!(
+        reactor.task_status(task),
+        Some(tx_reactor::TaskStatus::Completed)
+    );
+    assert_eq!(
+        reactor.run_until_idle().polled,
+        0,
+        "a consumed event must not leave a self-wake loop"
+    );
+
     unregister_source(source_id);
 }
 

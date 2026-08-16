@@ -849,12 +849,10 @@ where
                 }
             }) {
                 if matches!(event, MailboxEvent::SignalDelivered { .. }) {
-                    self.mailbox.clear_waker();
                     return Poll::Ready(MailboxWake::Signal(
                         self.interrupt_state.classify_signal_wake(),
                     ));
                 }
-                self.mailbox.clear_waker();
                 return Poll::Ready(MailboxWake::Matched);
             }
             // Overflow means at least one wake hint was dropped.  The step
@@ -862,7 +860,6 @@ where
             // let drive() re-run the operation instead of spinning forever on
             // a permanently latched overflow bit.
             if self.mailbox.take_overflow() {
-                self.mailbox.clear_waker();
                 return Poll::Ready(MailboxWake::Matched);
             }
             Poll::Pending

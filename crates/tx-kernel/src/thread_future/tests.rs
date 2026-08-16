@@ -32,6 +32,10 @@ use tx_shims::linux_syscall::{
     FUTEX_WAKE, FUTEX_WAKE_BITSET, NR_CLONE, NR_EXIT_GROUP, NR_FUTEX, NR_GETPPID, NR_PSELECT6,
     NR_READ, NR_READV, NR_SETITIMER, NR_WRITE, NR_WRITEV,
 };
+use tx_substrate::step::{
+    DriveMode, InterestMask, NoProgress, ProcessIdentity as StepProcessIdentity, ScriptCtx, StepOp,
+    StepOutcome, WaitSourceId, YieldShape,
+};
 use tx_substrate::wake::MailboxEvent;
 use tx_subsystems::process::ExitStatus;
 use tx_subsystems::reactor_submit::SubmitChildThreadStatus;
@@ -927,6 +931,92 @@ fn per_hart_slotted_binds_current_task_mailbox() {
             .is_some(),
         "payload retains a weak handle to the task mailbox after poll",
     );
+}
+
+#[test]
+fn per_hart_slotted_drive_wait_source_handoff_has_no_lost_or_extra_wake() {
+    struct WaitThenDone {
+        source: WaitSourceId,
+        interests: InterestMask,
+        yielded: bool,
+    }
+
+    impl StepOp<StepProcessIdentity> for WaitThenDone {
+        type Output = ();
+        type Progress = NoProgress;
+
+        fn step(
+            &mut self,
+            _ctx: &mut ScriptCtx<StepProcessIdentity>,
+        ) -> StepOutcome<Self::Output, Self::Progress> {
+            if self.yielded {
+                StepOutcome::Done(())
+            } else {
+                self.yielded = true;
+                StepOutcome::Yield {
+                    progress: NoProgress,
+                    shape: YieldShape::OnWaitSource {
+                        source: self.source,
+                        interests: self.interests,
+                    },
+                }
+            }
+        }
+    }
+
+    let _g = setup();
+    let payload = bootstrap_payload();
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS populated post-bootstrap");
+    let leader = init.nth_thread(0).expect("leader");
+    let source_id = WaitSourceId::new(0xc10e);
+    let interests = InterestMask::new(1);
+    let source = std::sync::Arc::new(tx_substrate::wake::WaitSource::new(source_id));
+    tx_substrate::wake::register_source(std::sync::Arc::clone(&source));
+
+    let inner = async move {
+        let hart = <TestPlatform as tx_hal::SmpIf>::current_cpu_id().0;
+        let mailbox = crate::adapter::boot_runtime::current_task_mailbox(hart)
+            .expect("reactor exposes the current task mailbox");
+        let op = WaitThenDone {
+            source: source_id,
+            interests,
+            yielded: false,
+        };
+        let mut ctx = ScriptCtx::new().with_mailbox(std::sync::Arc::clone(&mailbox));
+        tx_scripts::drive(op, &mut ctx, DriveMode::Waiting, Some(&mailbox), None, None)
+            .await
+            .expect("wait-source retry completes");
+    };
+    let wrapped = PerHartSlotted::<TestPlatform, _>::new(leader, payload, inner);
+    let reactor = crate::adapter::boot_runtime::Reactor::new();
+    let task = reactor.submit_task(wrapped);
+
+    let parked = reactor.run_until_idle();
+    assert_eq!(parked.polled, 1);
+    assert_eq!(parked.completed, 0);
+    assert_eq!(
+        reactor.task_status(task.id()),
+        Some(crate::adapter::boot_runtime::TaskStatus::Parked)
+    );
+    assert_eq!(source.subscriber_count(), 1);
+
+    assert_eq!(source.notify(interests), 1);
+    assert_eq!(
+        source.pending_mask_snapshot(),
+        0,
+        "an event delivered to this wait generation must not leak into the next one"
+    );
+    let completed = reactor.run_until_idle();
+    assert_eq!(completed.polled, 1, "one source event needs one re-poll");
+    assert_eq!(completed.completed, 1);
+    assert_eq!(
+        reactor.task_status(task.id()),
+        Some(crate::adapter::boot_runtime::TaskStatus::Completed)
+    );
+    assert_eq!(reactor.run_until_idle().polled, 0);
+
+    tx_substrate::wake::unregister_source(source_id);
 }
 
 /// A task mailbox is shared by several independent wait protocols. An event

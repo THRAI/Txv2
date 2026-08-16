@@ -115,3 +115,35 @@ fn notify_before_register_is_delivered_as_pending_source_fire() {
         .install();
     assert!(mb2.is_empty(), "pending mask is consumed once");
 }
+
+/// An event delivered to a live waiter is consumed by that wait generation.
+/// It must not remain pending and spuriously wake the next generation.
+#[test]
+fn delivered_notify_is_not_replayed_to_the_next_waiter() {
+    let src = wake::new_source(102);
+    let first = Arc::new(TaskMailbox::new());
+    let first_guard = src
+        .prepare(
+            Arc::downgrade(&first),
+            WaitGeneration::new(1),
+            InterestMask::new(0b1),
+        )
+        .install();
+
+    assert_eq!(wake::notify(&src, 0b1), 1);
+    assert!(first.poll().is_some(), "the live waiter receives the event");
+    drop(first_guard);
+
+    let second = Arc::new(TaskMailbox::new());
+    let _second_guard = src
+        .prepare(
+            Arc::downgrade(&second),
+            WaitGeneration::new(2),
+            InterestMask::new(0b1),
+        )
+        .install();
+    assert!(
+        second.is_empty(),
+        "a delivered event must not wake a later wait generation"
+    );
+}

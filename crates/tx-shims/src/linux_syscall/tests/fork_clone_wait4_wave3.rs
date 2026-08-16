@@ -229,7 +229,8 @@ fn dispatch_wait4_blocking_resolves_when_child_zombifies() {
     let proc_cap = bootstrap();
     let thread = first_thread(&proc_cap);
     seed_parent_trap_context(&thread);
-    let ctx = make_ctx(proc_cap.clone(), thread).with_mailbox(Arc::new(TaskMailbox::new()));
+    let mailbox = Arc::new(TaskMailbox::new());
+    let ctx = make_ctx(proc_cap.clone(), thread).with_mailbox(Arc::clone(&mailbox));
 
     let clone_req = SyscallRequest::new(NR_CLONE, [SIGCHLD, 0, 0, 0, 0, 0]);
     let _ = block_on(dispatch::<ShimsTestPmap>(clone_req, &ctx));
@@ -275,6 +276,10 @@ fn dispatch_wait4_blocking_resolves_when_child_zombifies() {
             );
             // The reap retired the child from parent.children.
             assert_eq!(proc_cap.children().len(), 0);
+            assert!(
+                mailbox.has_waker(),
+                "wait4 completion must not clear the task-level mailbox waker"
+            );
             return;
         }
     }

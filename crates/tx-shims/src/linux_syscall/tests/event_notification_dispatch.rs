@@ -212,6 +212,12 @@ fn dispatch_eventfd_write_uses_syscall_ctx_mailbox_ref_post_for_reader_wake() {
     );
     assert_eq!(block_on(read), SyscallResult::Return(8));
     assert_eq!(out, value);
+    assert!(
+        ctx.mailbox
+            .as_ref()
+            .is_some_and(|mailbox| mailbox.has_waker()),
+        "eventfd read completion must retain the task-level mailbox waker"
+    );
 }
 
 #[test]
@@ -253,6 +259,12 @@ fn dispatch_pipe_write_uses_syscall_ctx_mailbox_ref_post_for_reader_wake() {
     );
     assert_eq!(block_on(read), SyscallResult::Return(1));
     assert_eq!(out[0], byte[0]);
+    assert!(
+        ctx.mailbox
+            .as_ref()
+            .is_some_and(|mailbox| mailbox.has_waker()),
+        "pipe read completion must retain the task-level mailbox waker"
+    );
 }
 
 #[test]
