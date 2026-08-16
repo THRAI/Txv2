@@ -4,179 +4,157 @@
   "title": "Verify Git, Vim, GCC, Rust and reset durability on the VisionFive 2",
   "created": "2026-08-16",
   "from": "codex",
-  "status": "open",
+  "status": "closed",
   "plan": null,
   "current_state": [
-    "The writable app worktree is /home/msp/.codex/worktrees/2990/Txv2 on branch codex/vf2-file-io-runtime-rebind-fix. It started at a91f0807d9350cb8c52a8c07f016814a7b38a094; the two local code commits are 3d6b65223895ae8fde354c8977e8159cb6ae6083 and f11ad1076. Nothing was pushed or pulled.",
-    "The physical board is a 4 GiB VisionFive 2. Serial is /dev/serial/by-id/usb-1a86_USB_Single_Serial_5A32000345-if00 at 115200 8N1; the full log is target/vf2-acceptance/run-20260816-vf2-a91f0807-190020Z/serial-full.log. The host TFTP NIC is eth0 at 192.168.1.2/24 and the board uses 192.168.1.10/24 transiently.",
-    "The physical root is whole-device /dev/mmcblk0 ext4, not tmpfs. It began with about 23.7 MiB free. All new board evidence is add-only under /proj/vf2-accept-a91f0807-b251e11d-20260816-1942z or /proj/vf2-accept-3d6b6522-ea831da8-20260816-0403z; the first path is rejected failed-run evidence.",
-    "The a91f0807 image reproduced a permanent File-I/O runtime orphan: git help emitted repeated execve EIO and later ls/stat emitted repeated newfstatat EIO. Commit 3d6b65223 requeues a live PageContainer claim with the same registry and wake source and makes AP/BSP convergence resubmit it. The fixed physical image passed write, stat, read, chmod, exec, and git help on the same MMC direct-root RW path.",
-    "The physically booted fixed image is /srv/tftp/txv2/vf2-accept-3d6b6522-ea831da8-20260816-041139-cst/txv2-vf2-3d6b6522-ea831da8.uimage, 5,362,144 bytes, SHA-256 ea831da84c8a7ad220805618374f3fb4728af4c360619b5b2d893a472e5dbf43. Host cmp and mkimage inspection passed; every U-Boot transfer reported 5,362,144 bytes and iminfo checksum OK.",
-    "Formal Git baseline init, repository-local name/email, README creation, and git add completed. git commit did not return a summary or shell prompt. A later same-image, same-MMC RO boot proved commit b574dba3b66bdd0e4cb2a3327ea2f5163b3752e3, the matching master ref and log, clean git status, and git fsck --full exit 0. The commit is durable, but the command-completion requirement failed.",
-    "A qemu-riscv64 syscall replay of the same Git 2.49.1 showed refs are published before git maintenance run --auto --no-quiet --detach and a parent wait4. This makes post-commit process lifecycle the leading hypothesis, but the hung physical run had no valid stall snapshot, so wait4 is not claimed as the sole proven root cause.",
-    "Commit f11ad1076 fixes a separate proven wait interruption bug: ProcessIdentity now delegates thread_signal_interrupts_wait to the existing disposition-aware pending-signal predicate. This explains why a wait could consume SIGINT or SIGCANCEL and park again; the previously failing focused drive test and the full 24-test drive integration suite pass. This source change has not been built or physically booted because the MMC RW blocker appeared first.",
-    "After the hung commit was physically reset, the same fixed image with tx.root=mmcblk0 rw failed at mount:rootfs:ext4:mmcblk0:stage=rw-discovered:errno=EIO, fell back to tmpfs, and panicked when /bin/sh was absent. The aggregate RW path can include journal replay, home-block writes, barriers, orphan recovery, recovery-bit writes, and runtime construction, so the sentinel does not prove zero device writes before failure.",
-    "The same MMC still mounted and read successfully with plain tx.root=mmcblk0 ro before host removal. README and recovery-probe hashes, Git HEAD/log/status, and git fsck were readable. A later exact-opt-in, final-ro tx.ext4.journal-preflight=1 boot returned recovery-required=1:stage=scan:error=corrupt before refusing the root mount and falling back to tmpfs/panic. This strictly read-only shadow scan confirmed the RECOVER bit is set and the bounded journal scan is corrupt.",
-    "After board power-off, the host identified the whole-device MMC through a USB reader as /dev/sda, 29.5 GiB ext4 UUID dff3fc28-3a72-4c0f-92cb-b681cc185680. A protective blockdev --setro attempt did not take effect because passwordless sudo was unavailable. The subsequent ro,noload mount unexpectedly logged orphan cleanup on readonly fs and deleted one orphan inode, so it was not a zero-write operation and the medium was no longer bit-identical to its pre-reader state. Linux then reported inode #2 directory-block checksum failures and every root-directory/git/hash read returned Bad message; df reported zero available space. The card was immediately unmounted and powered off. This describes the failed pre-restore state and was superseded by the explicitly authorized reimage below.",
-    "Because this is the user's only SD card, the user explicitly authorized overwriting it with /home/msp/learning/Txv2/local-images/alpine-linux-riscv64-ext4fs.img. The 723,517,440-byte source SHA-256 is d547220caf7b3ce4c1d67560bbed66f4ee491d10718d1ea3e55741019aef5eb4; source e2fsck -fn completed all five passes and reported a clean filesystem. A constrained root script revalidated /dev/sda as USB, removable, serial 121220160204, and 31,719,424,000 bytes before copying, syncing, flushing, and setting the block device read-only. Full-length cmp, target SHA-256, and target e2fsck -fn all passed. A block-level-read-only ro,noload mount read the root and Git/Vim/GCC/Rust/CA files with no checksum, orphan, or I/O errors in the kernel log. The card is unmounted and powered off, ready to return to the VF2. Reimaging erased the old on-card acceptance evidence; only its logs remain. The complete physical matrix remains unexecuted/failed and push/pull must not be invited."
+    "The writable app worktree is /home/msp/.codex/worktrees/2990/Txv2 on branch codex/vf2-file-io-runtime-rebind-fix. It started at a91f0807d9350cb8c52a8c07f016814a7b38a094. Nothing was pushed or pulled, no PAT was requested, and the dirty /home/msp/learning/Txv2 plus /tmp/txv2-la-full-clone.Nt4BdE/worktree remained read-only.",
+    "The physically tested source is c45256cebace5eaf386f02fb882c951fcf2d1e8e. The fix sequence is 3d6b65223 File-I/O claim rebind, f11ad1076 wait interruption wiring, b13e6987d replacement wake, ee6ad7aad VF2 MMC transaction serialization, 2fca80b1f exec-stack top zero word, and c45256ceb complete procfs pid-stat fields.",
+    "The final procfs fix was derived from physical evidence. BusyBox ps faulted at the exact stack upper boundary while scanning whitespace, and the physical /proc/1/stat contained only six fields. c45256ceb publishes all 52 Linux pid-stat fields; the host regression first failed left 6/right 52, then passed, and physical ps -ef worked on both RW and RO boots.",
+    "The final release ELF is 9,375,872 bytes with SHA-256 d2b186b607a5574cc58c82f95ab9ab35dc318fb7890203778e537bfc012c09e5. The raw binary is 5,362,080 bytes with SHA-256 a89837a00ffae599ebe3f9c287235b1b5923087509776c09cf280bd2e90ab829. The VF2 uImage is 5,362,144 bytes with SHA-256 1cc998d76cb4dbe363a8765588ee452f99d53ce881683d5d0defa6ad2271ca06. Host cmp/SHA/mkimage and U-Boot iminfo all passed.",
+    "The unique TFTP image is /srv/tftp/txv2/vf2-accept-c45256ce-1cc998d7-20260816-170746-cst/txv2-vf2-c45256ce-1cc998d7.uimage. Its archived host artifacts are under target/vf2-acceptance/run-20260816-vf2-a91f0807-190020Z/final-c45256ce-1cc998d7-build-artifacts-20260816-090746Z/. U-Boot variables were transient and saveenv was not used.",
+    "The user's only SD was restored only after their explicit authorization from /home/msp/learning/Txv2/local-images/alpine-linux-riscv64-ext4fs.img. The 723,517,440-byte source and target prefix both had SHA-256 d547220caf7b3ce4c1d67560bbed66f4ee491d10718d1ea3e55741019aef5eb4; cmp, read-only e2fsck -fn, flush, block read-only, readback, and power-off passed. No second raw write, mkfs, partitioning, or repair fsck was performed.",
+    "Physical RW acceptance used /dev/mmcblk0 whole-device ext4, not tmpfs, under the fresh add-only directory /proj/vf2-accept-c45256ce-1cc998d7-20260816-0914z. Preflight recorded about 24.7 MiB free, MemTotal 1 GiB with about 512 MiB available, a valid UTC, CA bundle SHA-256 8cf3f2d5222508ca469c78a347764ee1b1fab10a903172612c489ebcca05c91c, board 192.168.1.10/24, default route 192.168.1.2, and DNS 10.248.98.30.",
+    "Git baseline passed help, init, repository-local identity, README creation, add, commit, log, clean status, and fsck. The persistent commit is a7bd5cbd671b519bf4aef82811c6fd1456026217. Vim -h passed and a real serial full-screen Vim insert/Escape/:wq session wrote hello.c. GCC and Rust help, compile, and execute passed; both programs printed Hello, World!.",
+    "The first no-depth HTTPS clone into retained directory full-clone failed with OpenSSL unexpected EOF, 16,428 missing body bytes, early EOF, and invalid index-pack. Memory remained plentiful and free filesystem space returned, so this was classified as TLS transport failure, not OOM or ext4 exhaustion.",
+    "A new add-only retry directory full-clone-retry1 used HTTP/1.1 and one HTTP request, still with no --depth, and completed. Remote HEAD before/after, clone original HEAD, and local commit parent are 72be011c12223e3eb6977ca2fa162f8967a379fa; the repository has 7,824 packed objects, two tracked files, shallow=false, clean status, and fsck success before and after a local evidence commit. The local commit is c88012db417f1acf9d45af55915ae064b9215025. Evidence file VF2-LOCAL-EVIDENCE-c45256ce-20260816.txt has SHA-256 eddf215b34e0f4977b23ac0ce7f30fe788c614b42cf568a61467d4edec9d44bb.",
+    "Before reset, the run manifest had SHA-256 fd1a91cc7db869bbda2c1a4d520d61eb90d51ab9dde47adf6746db85c85dc5c7. Mount/df, all C/Rust source and binary hashes, both commits, non-shallow state, evidence, clean status, program output, and fsck were checked. Two sync calls returned zero, userspace exited, and the serial line was static before the user was asked to press physical reset once.",
+    "After the physical reset, the same uImage and same MMC booted with tx.root=mmcblk0 ro. The root was /dev/mmcblk0 ext4 ro. The manifest and four artifact hashes were unchanged; both binaries again printed Hello, World!; baseline commit a7bd5cbd remained and fsck passed; clone original HEAD 72be011c and local commit c88012db remained; shallow=false, evidence existence/hash, clean status, and full fsck over 7,824 objects all passed. Final marker: FINAL_RO_MATRIX_PASS_c45256ce_20260816.",
+    "The append-only serial log is target/vf2-acceptance/run-20260816-vf2-a91f0807-190020Z/serial-ee6ad7aa-f9e43adc-20260816-0755Z.log with SHA-256 51cda4599658baae60f64275787061a2a04e62e0a42472cdb40a65cd0975be59. The detailed local ledger is msp/debug-logs/2026-08-16-vf2-full-tools-clone-reset-persistence.md.",
+    "Three non-blocking harness defects remain recorded: an early grouped redirection hit sed write error and was replaced by independent files; a late wait on the successful background clone returned 127 because BusyBox had already reaped the Done job; and one RO cat used four incorrect relative summary names. Direct Git/hash/fsck evidence replaced all three, so no acceptance cell depends on them.",
+    "The scoped Git/Vim/GCC/Rust/full-clone RW-create, physical-reset, RO-verify matrix is complete. This agent did not push or pull. The user may now perform their own credentialed push/pull verification. Only about 6 MiB remains free, so any new persistent workload needs a capacity gate and must preserve the acceptance evidence."
   ],
   "changed_files": [
     {
       "path": "crates/tx-subsystems/src/device.rs",
-      "reason": "Keep live PageContainer File-I/O runtime registrations pending across claim drop, reuse the attached wake source, and preserve explicit retire semantics; add focused recovery tests."
+      "reason": "Preserve/rebind live File-I/O claims and wake requeued replacement service tasks."
     },
     {
       "path": "crates/tx-kernel/src/init.rs",
-      "reason": "Submit pending replacement File-I/O runtimes during AP reactor convergence."
+      "reason": "Resubmit pending File-I/O replacements during AP convergence."
     },
     {
       "path": "crates/tx-kernel/src/init/exec.rs",
-      "reason": "Submit pending replacement File-I/O runtimes before BSP userspace idle/WFI."
+      "reason": "Resubmit pending File-I/O replacements before BSP userspace idle."
     },
     {
       "path": "crates/tx-subsystems/src/process/structure.rs",
-      "reason": "Wire ProcessIdentity wait interruption to the existing disposition-aware pending-signal predicate so SIGINT and libc SIGCANCEL can return EINTR instead of being consumed and retried."
+      "reason": "Use the disposition-aware predicate when deciding whether a signal interrupts a wait."
+    },
+    {
+      "path": "crates/tx-drivers/src/mmc/mod.rs",
+      "reason": "Serialize VF2 MMC controller transactions to eliminate concurrent-command corruption/EIO."
+    },
+    {
+      "path": "crates/tx-scripts/src/process/exec/stack.rs",
+      "reason": "Reserve an in-range zero word above initial exec strings without expanding the stack recipe."
+    },
+    {
+      "path": "crates/tx-scripts/src/process/exec/script/tests.rs",
+      "reason": "Regress the readable zero-word boundary in the real exec stack fixture."
+    },
+    {
+      "path": "crates/tx-fs/src/procfs/mod.rs",
+      "reason": "Expose the complete pid-stat record through procfs."
+    },
+    {
+      "path": "crates/tx-fs/src/procfs/read.rs",
+      "reason": "Publish all 52 Linux /proc/pid/stat fields and regress the physical BusyBox ps crash."
     },
     {
       "path": "docs/progress/STATUS.md",
-      "reason": "Record the exact physical pass/fail boundary, image identity, persistent Git commit, RW mount blocker, and incomplete scoring matrix."
+      "reason": "Record full physical matrix completion, exact failures, image identity, and durability evidence."
     },
     {
       "path": "docs/progress/handoffs/2026-08-16-vf2-tools-persistence-verification.json",
-      "reason": "Replace the pre-run handoff with current physical evidence and safe next actions."
+      "reason": "Close the handoff with the complete RW/reset/RO result and evidence paths."
     }
   ],
   "verification": [
     {
-      "command": "cargo test -p tx-subsystems --lib file_io_runtime -- --test-threads=1",
+      "command": "cargo fmt --all -- --check",
       "status": "passed",
-      "notes": "Five runtime registry tests passed, including live claim drop requeue and replacement resubmission."
+      "notes": "Formatting passed after the procfs fix and is rerun after progress edits."
     },
     {
-      "command": "cargo test -p tx-subsystems --lib device::tests::idle_maintenance_wakes_claim_after_final_cap_before_payload_drop -- --exact --test-threads=1; cargo test -p tx-subsystems --lib device::tests::retired_owner_latch_closes_wake_before_subscription_race -- --exact --test-threads=1; cargo test -p tx-kernel file_io_service_task_tracking_is_generation_safe_and_terminal_drained -- --test-threads=1",
+      "command": "cargo test -q -p tx-fs -- --test-threads=1",
       "status": "passed",
-      "notes": "Both owner-retirement race witnesses and generation-safe terminal drain passed."
-    },
-    {
-      "command": "cargo test -q -p tx-scripts --test drive",
-      "status": "passed",
-      "notes": "All 24 drive tests passed after wiring disposition-aware wait interruption; the exact libc SIGCANCEL case had failed before the fix with Ok(77) instead of EINTR."
+      "notes": "117/117 passed. Default parallel mode separately exposed seven known shared epoch/lock-fixture failures, so the focused semantic gate is serialized."
     },
     {
       "command": "cargo xtask build --target rv64-qemu --release; cargo xtask image vf2-uimage --release",
       "status": "passed",
-      "notes": "Commit 3d6b65223 produced ELF SHA-256 d7be94e1953dee44caec8786d755c119e4d160f7a483f9a3274467fd0c252e96 and VF2 uImage SHA-256 ea831da84c8a7ad220805618374f3fb4728af4c360619b5b2d893a472e5dbf43."
+      "notes": "c45256ceb produced the physically booted ELF and uImage. The uImage SHA-256 is 1cc998d76cb4dbe363a8765588ee452f99d53ce881683d5d0defa6ad2271ca06."
     },
     {
-      "command": "cargo xtask build --target rv64-qemu --release",
+      "command": "Physical VF2 RW Git/Vim/GCC/Rust matrix on /dev/mmcblk0 ext4",
       "status": "passed",
-      "notes": "Final source f11ad1076 produced a 9,375,568-byte release ELF with SHA-256 4dfdf1f9ff7250e52d5d4782fccfdc5bbc80d200e71f43daa90d932a61b8e421. It was not wrapped or physically booted after the MMC RW blocker."
+      "notes": "Fresh add-only directory; real interactive Vim; both Hello World programs; baseline Git commit a7bd5cbd; all required help/log/hash/fsck probes passed."
     },
     {
-      "command": "Physical VF2 fixed-image write/stat/read/chmod/exec and git help on /dev/mmcblk0 ext4 RW",
-      "status": "passed",
-      "notes": "All recovery-probe return codes were zero and the script printed VF2_FILE_IO_RECOVERY_OK; git help returned zero."
-    },
-    {
-      "command": "Physical Git baseline init/config/README/add/commit/log",
+      "command": "git clone https://github.com/LLLPPPS/tx-push-test.git full-clone",
       "status": "failed",
-      "notes": "Commit b574dba3b66bdd0e4cb2a3327ea2f5163b3752e3 was later proved durable and fsck-clean, but git commit never returned a summary or shell prompt during the RW run."
+      "notes": "Exact first attempt failed in TLS with OpenSSL unexpected EOF, 16,428 missing bytes, early EOF, and invalid index-pack. Failed evidence was retained; no shallow workaround was used."
     },
     {
-      "command": "Physical post-reset boot with tx.root=mmcblk0 rw",
-      "status": "failed",
-      "notes": "RW discovery returned EIO, tmpfs fallback could not execute /bin/sh, and the kernel panicked. No repair or raw write was attempted."
-    },
-    {
-      "command": "Physical same-image, same-MMC boot with tx.root=mmcblk0 ro",
+      "command": "git -c http.version=HTTP/1.1 -c http.maxRequests=1 clone https://github.com/LLLPPPS/tx-push-test.git full-clone-retry1",
       "status": "passed",
-      "notes": "Root was ext4 ro; recovery-probe and README were readable; HEAD/ref/log matched b574dba3b66bdd0e4cb2a3327ea2f5163b3752e3; git status was clean and git fsck --full returned zero."
+      "notes": "Full non-shallow retry completed in a new directory; HEAD equality, 7,824 objects, working-tree contents, remote HEAD, fsck, evidence commit c88012db, and clean state passed."
     },
     {
-      "command": "Physical same-image boot with tx.root=mmcblk0 tx.ext4.journal-preflight=1 ro",
+      "command": "Physical VF2 reset, same uImage and same MMC with tx.root=mmcblk0 ro",
       "status": "passed",
-      "notes": "The strictly read-only classifier returned recovery-required=1:stage=scan:error=corrupt, refused the root mount, and fell back to tmpfs/panic. It did not invoke the RW mount path or repair the disk."
-    },
-    {
-      "command": "Host USB-reader inspection with udisksctl mount -b /dev/sda -o ro,noload",
-      "status": "failed",
-      "notes": "Linux mounted the whole-device ext4 read-only without journal but unexpectedly performed orphan cleanup and deleted one orphan inode because the block device itself was not write-protected. Root inode 2 then failed directory-block checksums, reads returned Bad message, and df showed zero available space. The card was immediately unmounted and powered off; this inspection is explicitly not zero-write evidence."
-    },
-    {
-      "command": "Authorized whole-device restore from alpine-linux-riscv64-ext4fs.img to locked USB /dev/sda; sync; blockdev --flushbufs; blockdev --setro; full-length cmp; target SHA-256; e2fsck -fn; ro,noload readback",
-      "status": "passed",
-      "notes": "Source and target prefix are 723,517,440 bytes with SHA-256 d547220caf7b3ce4c1d67560bbed66f4ee491d10718d1ea3e55741019aef5eb4. Source and target e2fsck completed all five passes; block-level RO readback exposed the root plus Git/Vim/GCC/Rust/CA bundle and produced no ext4 checksum, orphan, or I/O error. The reader was unmounted and powered off."
-    },
-    {
-      "command": "cargo -q xtask unit",
-      "status": "failed",
-      "notes": "Known baseline remains: 37 tx-shims shared-state dispatch failures and two tx-kernel libc command-string assertions. tx-ext4 95 passed, tx-scripts 168 passed."
+      "notes": "Root was ext4 ro; C/Rust hashes and execution, both Git commits, clone parent/original HEAD, shallow=false, evidence hash, clean statuses, and both fsck checks all survived."
     },
     {
       "command": "jq empty docs/progress/handoffs/2026-08-16-vf2-tools-persistence-verification.json",
       "status": "passed",
-      "notes": "The updated handoff is valid JSON."
+      "notes": "The completed handoff is valid JSON."
     },
     {
       "command": "cargo xtask progress validate",
       "status": "failed",
-      "notes": "Global pre-existing blocker: docs/progress/plans/2026-07-24-network-time-integration.json uses legacy status completed instead of complete."
+      "notes": "The completed VF2 handoff itself parsed through validation. The global command then stopped at the pre-existing docs/progress/plans/2026-07-24-network-time-integration.json legacy status completed, which must be complete under the current schema."
+    },
+    {
+      "command": "cargo -q xtask unit",
+      "status": "failed",
+      "notes": "Build passed; tx-ext4 passed 95 with 2 ignored and tx-scripts passed 170/170. The known baseline remains 37 tx-shims shared-state dispatch failures and two tx-kernel libc command-string assertions."
     },
     {
       "command": "cargo xtask lint docs",
       "status": "failed",
-      "notes": "Global pre-existing debt remains: 17 broken links or missing fine-grained anchors, none in the two progress files changed here."
+      "notes": "Global pre-existing debt: 17 broken links or missing fine-grained anchors plus seven retired-vocabulary warnings. Neither changed progress file appeared in the failure list."
     }
   ],
   "next_actions": [
     {
-      "id": "vf2-1",
-      "title": "Return the verified restored MMC to the VF2 and re-run the board preflight",
+      "id": "vf2-followup-1",
+      "title": "Optional user-owned push and pull verification",
       "paths": [],
-      "notes": "The reader is powered off and the card may be removed and installed in the VF2. The restored filesystem has 6,322 free 4 KiB blocks, about 24.7 MiB, although host df reports zero non-reserved availability. Boot the next unique image RO first, then enforce the board-side free-space gate before any fresh add-only RW acceptance directory."
+      "notes": "The local acceptance matrix is complete. Only the user should supply credentials and perform any desired push/pull verification; this agent did neither."
     },
     {
-      "id": "vf2-2",
-      "title": "Build a new unique VF2 image from the final source tip",
-      "paths": [
-        "crates/tx-subsystems/src/process/structure.rs",
-        "target/images"
-      ],
-      "notes": "The physically tested ea831da8 image contains 3d6b65223 but not f11ad1076. After writable media exists, rebuild rv64-qemu --release and wrap vf2-uimage from the final tip, archive fixed-name local outputs first, and use a new TFTP directory and filename."
-    },
-    {
-      "id": "vf2-3",
-      "title": "Reproduce post-commit process completion with diagnostics before the scoring matrix",
-      "paths": [
-        "crates/tx-kernel/src/thread_future/tests.rs",
-        "crates/tx-shims/src/linux_syscall/tests/fork_clone_wait4_wave3.rs"
-      ],
-      "notes": "Use tx.smp.stall-diag=1 and bounded logs. Add a real-Reactor wait4 regression for child exit before and after subscription and a nested maintenance/detached-child lifecycle witness. Do not call wait4 the physical root cause unless an active-syscall/task snapshot proves it."
-    },
-    {
-      "id": "vf2-4",
-      "title": "Restart the entire physical scoring matrix in a new add-only MMC directory",
+      "id": "vf2-followup-2",
+      "title": "Protect evidence and recheck capacity before further writes",
       "paths": [],
-      "notes": "Repeat Git help/init/config/README/add/commit/log, real interactive full-screen Vim, GCC and Rust Hello World, full non-shallow HTTPS clone with remote-HEAD equality/fsck/local evidence commit, sync/close, one physical reset, and same-image same-MMC RO hash/execute/commit/fsck verification. Partial evidence from this run cannot fill missing cells."
+      "notes": "The MMC has only about 6 MiB free. Do not delete existing evidence or start another persistent workload without an explicit capacity and preservation decision."
     }
   ],
   "caveats": [
     "Do not modify, stage, commit, clean, stash, switch, or otherwise mutate /home/msp/learning/Txv2 or /tmp/txv2-la-full-clone.Nt4BdE/worktree.",
-    "Do not push or pull, request a PAT, or store credentials in a remote URL. The full local clone and persistence matrix has not passed.",
-    "The user explicitly authorized one whole-device restore of the only SD card from the named Alpine image; that restore is complete and erased the prior on-card evidence. Do not perform another raw write, mkfs, partitioning, repair fsck, saveenv, flash write, or evidence/TFTP overwrite without new explicit authorization.",
-    "rw-discovered:EIO is an aggregate mount failure. The RW path may attempt journal replay/home-block writes, barriers, orphan recovery, recovery-bit writes, and runtime construction before returning EIO; never report it as a guaranteed no-write failure.",
-    "A final-ro tx.ext4.journal-preflight=1 boot is a strictly read-only shadow-replay classifier, but it cannot prove actual replay writes/barriers, classic orphan recovery, or later RW runtime construction. It does not remove the need for safe writable media.",
-    "A Linux ext4 ro,noload mount is not guaranteed zero-write when the underlying block device is writable: the host unexpectedly performed orphan cleanup and deleted one orphan inode. Require hardware or kernel block-device read-only protection before any future host mount, and do not treat this reader attempt as pristine forensic evidence.",
-    "The VF2 MMC barrier may report success without a hardware flush. sync success alone is never persistence proof; a completed physical reset and same-disk RO verification remain mandatory.",
-    "Keep clone/compiler silence bounded and preserve the complete serial log. Do not replace the required full clone with --depth, tmpfs, or a simpler command."
+    "No push or pull was performed, no PAT was requested, and no credentials were stored in a remote URL.",
+    "The one explicitly authorized SD restore is complete. Do not perform another raw write, mkfs, partitioning, repair fsck, saveenv, flash write, or evidence overwrite without new explicit authorization.",
+    "The first clone transport attempt and all harness-recording defects remain preserved in the serial/debug logs; they are not silently converted to passes.",
+    "The VF2 MMC barrier may report success without a hardware flush. Persistence is established by the physical reset and independent RO readback, not by sync alone.",
+    "The root is 99% full after acceptance. Preserve the run directory and enforce a free-space gate before any further persistent operation."
   ],
   "links": [
     "docs/progress/STATUS.md",
-    "docs/design/05_filesystem/EXT4_LIFECYCLE_v1.md",
+    "msp/debug-logs/2026-08-16-vf2-full-tools-clone-reset-persistence.md",
     "xtask/src/image.rs",
     "xtask/src/target.rs",
-    "crates/tx-ext4/src/mount.rs",
     "crates/tx-subsystems/src/device.rs",
-    "crates/tx-subsystems/src/process/structure.rs"
+    "crates/tx-drivers/src/mmc/mod.rs",
+    "crates/tx-fs/src/procfs/read.rs"
   ]
 }

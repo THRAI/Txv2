@@ -1,3 +1,37 @@
+- 2026-08-16 (**VF2 Git/Vim/GCC/Rust、完整非 shallow clone 与物理复位后同盘 RO
+  持久化全矩阵通过**). **Changed**：在隔离分支
+  `codex/vf2-file-io-runtime-rebind-fix` 上完成此前 File-I/O、wait interruption、
+  replacement wake、VF2 MMC 串行化、exec 顶部零字与 procfs pid-stat 修复；最终物理
+  源码为 `c45256ceb`。最后一项 procfs 修复来自精确实板反证：旧 `/proc/1/stat`
+  只有 6 字段，BusyBox `ps` 的空白扫描越过缓冲区并在 stack top SIGSEGV；现发布
+  Linux 兼容的 52 字段，聚焦回归由 `left 6/right 52` 转为通过，实板 `ps -ef`
+  正常。用户唯一 SD 经其明确授权从 Alpine 基线恢复后，以全新 add-only 目录
+  `/proj/vf2-accept-c45256ce-1cc998d7-20260816-0914z` 完成 RW 阶段：Git help/init/
+  repo-local config/add/commit/log/fsck（commit `a7bd5cbd...`）；真实串口全屏 Vim
+  insert/Esc/`:wq` 保存 `hello.c`；GCC 与 Rust help、编译、运行均输出
+  `Hello, World!`；以及 `tx-push-test.git` 的完整 HTTPS clone。首次 clone 因 OpenSSL
+  unexpected EOF/early EOF 精确失败并保留；新目录用 HTTP/1.1 单请求、不带
+  `--depth` 的 retry 完成 7,824 对象，原始/远端 HEAD 均为 `72be011c...`，
+  `shallow=false`、fsck 成功，并提交本地证据为 `c88012db...`。**Verification**：
+  复位前 manifest SHA-256 为 `fd1a91cc...c5c7`，两次 `sync` 后仅在串口安全静止时
+  请求一次物理 reset；同一 uImage、同一 `/dev/mmcblk0` 以 `ro` 启动，根挂载明确
+  为 ext4 RO，C/Rust 四个文件哈希不变且二进制再次输出 Hello，两个 Git commit
+  均存在且工作区 clean，full clone 仍 non-shallow，证据文件 SHA-256
+  `eddf215b...44bb` 不变，两个 `git fsck --full` 均为 0（full clone 检查 7,824
+  对象）。最终 marker 为 `FINAL_RO_MATRIX_PASS_c45256ce_20260816`。物理 uImage
+  5,362,144 bytes，SHA-256
+  `1cc998d76cb4dbe363a8765588ee452f99d53ce881683d5d0defa6ad2271ca06`；U-Boot
+  `iminfo`、宿主 cmp/SHA/mkimage 检查通过。串口日志
+  `target/vf2-acceptance/run-20260816-vf2-a91f0807-190020Z/serial-ee6ad7aa-f9e43adc-20260816-0755Z.log`
+  SHA-256 为 `51cda459...e59`。聚焦 `tx-fs` 串行测试 117/117 及 fmt 通过；完整最终
+  门禁见本次 handoff。**Next**：本代理没有 push/pull；用户现在可以自行做带凭据的
+  push/pull 验证。卡仅余约 6 MiB，任何新增持久化工作先做容量门禁，并保留现有证据。
+  **Blocker**：验收范围无 blocker。非阻断记录缺陷如实保留：一次聚合重定向出现
+  `sed: write error`，成功后台 clone 的事后 `wait` 因 BusyBox 已回收返回 127，RO
+  阶段四个汇总文件用了错误相对路径；全部正式字段均已通过独立仓库/哈希/fsck
+  命令复验。详细账本见
+  `msp/debug-logs/2026-08-16-vf2-full-tools-clone-reset-persistence.md`。
+
 - 2026-08-16 (**VF2 物理验收止于 Git post-commit 挂起与复位后 MMC ext4 RW
   拒绝；完整矩阵保持失败**). **Changed**：在 app 隔离工作树从
   `a91f0807d` 新建 `codex/vf2-file-io-runtime-rebind-fix`。首轮物理 RW 的
