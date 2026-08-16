@@ -1080,6 +1080,13 @@ impl FileIoManagerRuntimeClaim {
                 },
             )
         {
+            // A replacement task starts in Sleeping and the terminating task
+            // may already have consumed the last latched service edge.  Post
+            // one recovery kick after the registry lock is released so the
+            // replacement's first subscription performs a fresh level-state
+            // service turn instead of parking forever.
+            let _ =
+                post_file_io_service_kick(&self.wake_source, ServiceKick::new(IoServiceKind::Page));
             return;
         }
 
@@ -2542,7 +2549,28 @@ mod tests {
             .lock()
             .take()
             .expect("replacement runtime claim");
-        assert!(replacement.retire());
+        let mut replacement_task = core::pin::pin!(page_container_file_io_service_task_loop_owned(
+            replacement,
+            PageContainerFileIoServiceTaskConfig::run_turns(
+                1,
+                ServiceBudget::new(1),
+                ServiceBudget::new(1),
+            ),
+        ));
+        let waker = core::task::Waker::noop();
+        let mut cx = core::task::Context::from_waker(waker);
+        let report = match replacement_task.as_mut().poll(&mut cx) {
+            Poll::Ready(report) => report,
+            Poll::Pending => panic!("replacement runtime must consume a recovery wake"),
+        };
+        assert_eq!(report.waits_ready, 1);
+        assert_eq!(report.waits_failed, 0);
+        assert_eq!(report.ready_turns, 1);
+
+        assert_eq!(submit_pending_file_io_service_runtimes(), 1);
+        assert_eq!(spawner.spawned.load(Ordering::Acquire), 3);
+        let final_claim = spawner.claim.lock().take().expect("final runtime claim");
+        assert!(final_claim.retire());
         assert_eq!(page_container_file_io_service_runtime_count(), 0);
         reset_page_container_file_io_service_registry_for_test();
     }
