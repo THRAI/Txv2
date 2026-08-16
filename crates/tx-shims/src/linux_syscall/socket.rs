@@ -109,6 +109,10 @@ const ETH_P_ARP: u16 = 0x0806;
 const ARPOP_REQUEST: u16 = 1;
 const ARPOP_REPLY: u16 = 2;
 const ARP_ETH_IPV4_PACKET_BYTES: usize = 28;
+/// Rare-path guard for a lost Unix-stream close edge. Normal child-exec
+/// handshakes complete through the readiness queue; only a waiter which has
+/// remained blocked for one second performs the peer-liveness repair check.
+const UNIX_STREAM_CLOSE_RECOVERY_NS: u64 = 1_000_000_000;
 
 pub(super) fn is_netlink_socket_kind(kind: SocketKind) -> bool {
     matches!(
@@ -628,8 +632,8 @@ mod helpers;
 pub(super) use helpers::drive_loopback_pending;
 use helpers::*;
 pub(crate) use helpers::{
-    socket_identity_from_file, socket_poll_mask_from_file, socket_poll_wait_token_from_file,
-    unix_pathname_key,
+    repair_orphaned_unix_stream, socket_identity_from_file, socket_poll_mask_from_file,
+    socket_poll_wait_token_from_file, unix_pathname_key,
 };
 
 pub(super) fn sys_getsockname<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
@@ -1159,15 +1163,28 @@ where
                 ) else {
                     return SyscallResult::Error(EIO_VALUE);
                 };
-                if matches!(
-                    wait_on_socket_or_itimer::<P>(future, ctx).await,
-                    SocketWaitWake::ItimerExpired
-                ) {
-                    if recv_queued_len(&socket) > 0 {
-                        yielded_before_wait = false;
-                        continue;
+                let wake = if socket.kind == SocketKind::UnixStream {
+                    wait_on_socket_or_itimer_with_recovery::<P>(
+                        future,
+                        ctx,
+                        UNIX_STREAM_CLOSE_RECOVERY_NS,
+                    )
+                    .await
+                } else {
+                    wait_on_socket_or_itimer::<P>(future, ctx).await
+                };
+                match wake {
+                    SocketWaitWake::ItimerExpired => {
+                        if recv_queued_len(&socket) > 0 {
+                            yielded_before_wait = false;
+                            continue;
+                        }
+                        return SyscallResult::Error(EINTR_VALUE);
                     }
-                    return SyscallResult::Error(EINTR_VALUE);
+                    SocketWaitWake::RecoveryProbe => {
+                        let _ = repair_orphaned_unix_stream(&socket);
+                    }
+                    SocketWaitWake::SocketReady => {}
                 }
                 yielded_before_wait = false;
                 continue;
@@ -1224,14 +1241,27 @@ where
                     return SyscallResult::Error(EAGAIN_VALUE);
                 }
                 if let Some(future) = wait_on_yield_shape(shape) {
-                    if matches!(
-                        wait_on_socket_or_itimer::<P>(future, ctx).await,
-                        SocketWaitWake::ItimerExpired
-                    ) {
-                        if recv_queued_len(&socket) > 0 {
-                            continue;
+                    let wake = if socket.kind == SocketKind::UnixStream {
+                        wait_on_socket_or_itimer_with_recovery::<P>(
+                            future,
+                            ctx,
+                            UNIX_STREAM_CLOSE_RECOVERY_NS,
+                        )
+                        .await
+                    } else {
+                        wait_on_socket_or_itimer::<P>(future, ctx).await
+                    };
+                    match wake {
+                        SocketWaitWake::ItimerExpired => {
+                            if recv_queued_len(&socket) > 0 {
+                                continue;
+                            }
+                            return SyscallResult::Error(EINTR_VALUE);
                         }
-                        return SyscallResult::Error(EINTR_VALUE);
+                        SocketWaitWake::RecoveryProbe => {
+                            let _ = repair_orphaned_unix_stream(&socket);
+                        }
+                        SocketWaitWake::SocketReady => {}
                     }
                 } else {
                     return SyscallResult::Error(EIO_VALUE);

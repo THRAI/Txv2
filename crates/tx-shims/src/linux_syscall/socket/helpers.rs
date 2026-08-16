@@ -1748,11 +1748,41 @@ pub(super) fn wait_on_yield_shape(shape: YieldShape) -> Option<wait_source::Regi
 pub(super) enum SocketWaitWake {
     SocketReady,
     ItimerExpired,
+    /// A low-frequency recovery probe requested by a caller which can
+    /// validate an object-specific terminal condition.
+    RecoveryProbe,
 }
 
 pub(super) async fn wait_on_socket_or_itimer<P>(
+    socket_future: wait_source::RegisteredWaitFuture,
+    ctx: &SyscallCtx<'_>,
+) -> SocketWaitWake
+where
+    TimekeeperClock<P>: ClockRead,
+{
+    wait_on_socket_or_itimer_inner::<P>(socket_future, ctx, None).await
+}
+
+/// Socket wait with an additional, low-frequency recovery deadline.
+///
+/// The deadline is not a readiness poll: callers use it only to repair a
+/// terminal condition whose normal close notification was lost. Normal
+/// socket traffic still wakes through the registered readiness source.
+pub(super) async fn wait_on_socket_or_itimer_with_recovery<P>(
+    socket_future: wait_source::RegisteredWaitFuture,
+    ctx: &SyscallCtx<'_>,
+    recovery_after_ns: u64,
+) -> SocketWaitWake
+where
+    TimekeeperClock<P>: ClockRead,
+{
+    wait_on_socket_or_itimer_inner::<P>(socket_future, ctx, Some(recovery_after_ns)).await
+}
+
+async fn wait_on_socket_or_itimer_inner<P>(
     mut socket_future: wait_source::RegisteredWaitFuture,
     ctx: &SyscallCtx<'_>,
+    recovery_after_ns: Option<u64>,
 ) -> SocketWaitWake
 where
     TimekeeperClock<P>: ClockRead,
@@ -1770,13 +1800,24 @@ where
     if super::time::consume_itimer_real_delivered_interrupt(pid) {
         return SocketWaitWake::ItimerExpired;
     }
-    let Some(deadline_ns) = super::time::itimer_real_deadline_ns(pid) else {
-        let _ = socket_future.await;
-        return SocketWaitWake::SocketReady;
+    let now_ns = timekeeper_clock::<P>().monotonic_now_ns();
+    let itimer_deadline_ns = super::time::itimer_real_deadline_ns(pid);
+    let recovery_deadline_ns = recovery_after_ns.map(|delay| now_ns.saturating_add(delay));
+    let deadline_ns = match (itimer_deadline_ns, recovery_deadline_ns) {
+        (Some(itimer), Some(recovery)) => core::cmp::min(itimer, recovery),
+        (Some(itimer), None) => itimer,
+        (None, Some(recovery)) => recovery,
+        (None, None) => {
+            let _ = socket_future.await;
+            return SocketWaitWake::SocketReady;
+        }
     };
-    if timekeeper_clock::<P>().monotonic_now_ns() >= deadline_ns {
+    if itimer_deadline_ns.is_some_and(|deadline| now_ns >= deadline) {
         super::time::fire_itimer_real_with_post::<P>(ctx);
         return SocketWaitWake::ItimerExpired;
+    }
+    if recovery_deadline_ns.is_some_and(|deadline| now_ns >= deadline) {
+        return SocketWaitWake::RecoveryProbe;
     }
     let Some(mut timer_future) = super::deadline_timer(ctx, deadline_ns) else {
         let _ = socket_future.await;
@@ -1794,9 +1835,50 @@ where
     })
     .await;
     if wake == SocketWaitWake::ItimerExpired {
-        super::time::fire_itimer_real_with_post::<P>(ctx);
+        let now_ns = timekeeper_clock::<P>().monotonic_now_ns();
+        if itimer_deadline_ns.is_some_and(|deadline| now_ns >= deadline) {
+            super::time::fire_itimer_real_with_post::<P>(ctx);
+        } else {
+            return SocketWaitWake::RecoveryProbe;
+        }
     }
     wake
+}
+
+/// Repair a missing Unix-stream peer-close edge.
+///
+/// `step_socket_close` normally marks the peer's receive queue BROKEN before
+/// withdrawing both peer-table entries. Exec/exit closes many descriptors at
+/// once, and an interrupted last-close episode can leave the table already
+/// withdrawn while the edge was not published. A connected endpoint with no
+/// live peer (or a peer with no fd-table owners) is terminal, so reconstructing
+/// BROKEN here is equivalent to the close publication and makes the next recv
+/// return EOF.
+pub(crate) fn repair_orphaned_unix_stream(socket: &Cap<SocketIdentity>) -> bool {
+    if socket.kind != SocketKind::UnixStream {
+        return false;
+    }
+    let Some(payload) = socket.acquire_operational() else {
+        return false;
+    };
+    if !matches!(
+        payload.protocol_snapshot(),
+        SocketProtocol::UnixStream(UnixStreamState::Connected { .. })
+    ) {
+        return false;
+    }
+
+    let table = payload.socket_table();
+    let guard = tx_substrate::epoch::guard();
+    let peer_is_live = table
+        .lookup_unix_stream_peer(socket.raw(), &guard)
+        .is_some_and(|peer| peer.fd_ref_count() != 0 && peer.is_payload_live());
+    if peer_is_live {
+        return false;
+    }
+
+    socket.readiness.fire_recv(RecvWireSet::BROKEN);
+    true
 }
 
 pub(super) fn recv_special_flags_errno(flags: SendRecvFlags) -> Option<i32> {

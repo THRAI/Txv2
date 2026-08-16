@@ -177,6 +177,54 @@ fn dispatch_socketpair_stream_and_datagram_round_trip() {
 }
 
 #[test]
+fn dispatch_socketpair_repairs_missing_peer_close_edge() {
+    let _setup = socket_setup();
+    let (process, ctx) = socket_ctx();
+    let mut fds = [-1i32; 2];
+    assert_eq!(
+        socket_req(
+            NR_SOCKETPAIR,
+            [
+                AF_UNIX as u64,
+                SOCK_STREAM | O_NONBLOCK as u64,
+                0,
+                fds.as_mut_ptr() as u64,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let mut byte = 0u8;
+    let byte_ptr = core::ptr::addr_of_mut!(byte) as u64;
+    let recv = || socket_req(NR_RECVFROM, [fds[0] as u64, byte_ptr, 1, 0, 0, 0], &ctx);
+    assert_eq!(recv(), SyscallResult::Error(EAGAIN_VALUE));
+
+    let file = process.fd(fds[0] as u32).expect("receiver fd");
+    let socket = crate::linux_syscall::socket::socket_identity_from_file(&file)
+        .expect("receiver Unix-stream identity");
+    let payload = socket.acquire_operational().expect("receiver payload");
+    assert!(
+        !crate::linux_syscall::socket::repair_orphaned_unix_stream(&socket),
+        "a connected endpoint with a live peer must stay untouched"
+    );
+    payload
+        .socket_table()
+        .withdraw_unix_stream_peer(socket.raw())
+        .expect("simulate a close path which lost its peer notification");
+
+    // With the peer-table entry gone but no BROKEN edge published, the recv
+    // side remains stuck at EAGAIN.  The rare-path repair must reconstruct EOF.
+    assert_eq!(recv(), SyscallResult::Error(EAGAIN_VALUE));
+    assert!(crate::linux_syscall::socket::repair_orphaned_unix_stream(
+        &socket
+    ));
+    assert_eq!(recv(), SyscallResult::Return(0));
+}
+
+#[test]
 fn dispatch_socketpair_sets_cloexec_and_nonblock_on_both_fds() {
     let _setup = socket_setup();
     let (_process, ctx) = socket_ctx();
