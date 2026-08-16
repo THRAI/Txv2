@@ -7,6 +7,8 @@ use super::la64_percpu::{
 use super::la64_pmap::*;
 use super::*;
 
+const LA64_IPI_ACK_TIMEOUT_NS: u64 = 2_000_000_000;
+
 #[cfg(all(not(target_arch = "loongarch64"), test))]
 use core::sync::atomic::AtomicU8;
 
@@ -906,6 +908,30 @@ impl SmpIf for Platform {
 
     fn ipi_ack_cpus(kind: IpiKind) -> CpuMask {
         boot_smp::ipi_ack_cpus(kind)
+    }
+
+    fn wait_for_ipi_ack_cpus(mask: CpuMask, kind: IpiKind) -> usize {
+        let target = mask.bits();
+        if target == 0 {
+            return 0;
+        }
+
+        // Multi-threaded TCG does not schedule every vCPU within a fixed
+        // number of BSP spin iterations. Use the architectural counter, as
+        // the RV64 board does, so the final healthy AP gets a real-time
+        // acknowledgement window independent of host scheduling jitter.
+        let start_ns = <Platform as MonotonicCounterIf>::read_ns();
+        let deadline_ns = start_ns.saturating_add(LA64_IPI_ACK_TIMEOUT_NS);
+        loop {
+            let acked = Self::ipi_ack_cpus(kind).bits() & target;
+            if acked == target {
+                return mask.count();
+            }
+            if <Platform as MonotonicCounterIf>::read_ns() >= deadline_ns {
+                return acked.count_ones() as usize;
+            }
+            core::hint::spin_loop();
+        }
     }
 }
 

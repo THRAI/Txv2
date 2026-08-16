@@ -13,6 +13,29 @@ use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+type SpinWaitProgressFn = fn();
+
+/// Architecture progress hook used only after a lock has remained contended.
+///
+/// LA64 masks ordinary IPIs while executing kernel paths. A hart spinning on
+/// a lock can therefore be the target of a synchronous TLB shootdown initiated
+/// by the lock owner. Servicing the lock-free shootdown mailbox here breaks
+/// that cycle without adding work to the uncontended lock path.
+static SPIN_WAIT_PROGRESS: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn install_spin_wait_progress(callback: SpinWaitProgressFn) {
+    SPIN_WAIT_PROGRESS.store(callback as usize, Ordering::Release);
+}
+
+#[inline]
+fn service_spin_wait_progress() {
+    let raw = SPIN_WAIT_PROGRESS.load(Ordering::Acquire);
+    if raw != 0 {
+        let callback: SpinWaitProgressFn = unsafe { core::mem::transmute(raw) };
+        callback();
+    }
+}
+
 pub struct SpinMutex<T, M = LockMetricsOff> {
     locked: AtomicBool,
     value: UnsafeCell<T>,
@@ -110,7 +133,16 @@ impl<T, M: LockMetricsMode> SpinMutex<T, M> {
 
     #[inline]
     pub fn lock(&self) -> SpinMutexGuard<'_, T, M> {
-        self.lock_with_progress(|| {})
+        // Do not tax the uncontended path. Once a lock is genuinely
+        // contended, service architecture progress periodically instead of
+        // allowing a target hart to wait forever with maskable IPIs disabled.
+        let mut spins = 0usize;
+        self.lock_with_progress(|| {
+            spins = spins.wrapping_add(1);
+            if spins & 63 == 0 {
+                service_spin_wait_progress();
+            }
+        })
     }
 
     /// Acquire the lock while periodically running a non-blocking progress

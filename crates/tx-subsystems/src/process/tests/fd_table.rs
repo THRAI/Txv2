@@ -280,6 +280,32 @@ fn process_payload_install_fd_pair_has_no_partial_commit_at_limit() {
     assert!(!proc_cap.fd_cloexec(3));
 }
 
+#[test]
+fn process_payload_fd_pair_rollback_preserves_reused_descriptor() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let payload = proc_cap.payload_cap().expect("live process payload");
+    let first = fresh_open_file();
+    let second = fresh_open_file();
+    let (first_fd, second_fd) = payload
+        .install_new_fd_pair(first.clone(), second.clone(), true)
+        .expect("descriptor pair");
+
+    let replacement = fresh_open_file();
+    let _ = payload.install_fd_with_cloexec(first_fd, replacement.clone(), false);
+    let removed = payload.take_fd_pair_if_matches(first_fd, &first, second_fd, &second);
+
+    assert_eq!(
+        removed.len(),
+        1,
+        "only the unchanged endpoint is rolled back"
+    );
+    assert_eq!(payload.fd(first_fd), Some(replacement));
+    assert!(payload.fd(second_fd).is_none());
+    assert!(!payload.fd_cloexec_get(first_fd));
+    assert!(!payload.fd_cloexec_get(second_fd));
+}
+
 /// fd-ops Wave 1: `install_fd` returns the previous occupant so the
 /// caller can EBR-defer-drop the displaced `Cap<OpenFile>`. Matches
 /// the `dup2`/`dup3` shape (Wave 4).

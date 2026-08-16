@@ -48,7 +48,7 @@ use tx_subsystems::zones;
 
 use super::{
     dispatch, dispatch_cap_only_immediate, dispatch_clone_oneshot, dispatch_direct_trap_oneshot,
-    dispatch_direct_trap_payload_oneshot, dispatch_fs_hot_oneshot,
+    dispatch_direct_trap_payload_oneshot, dispatch_fs_hot_oneshot, dispatch_openat_cached_oneshot,
     dispatch_process_aspace_immediate, dispatch_thread_aspace_oneshot,
     dispatch_thread_payload_aspace_oneshot, dispatch_vm_hot, dispatch_writev_hot,
     is_direct_trap_syscall, SyscallCtx, SyscallResult, AT_FDCWD, BRK_LINEAR_HEAP_SOFT_LIMIT_BYTES,
@@ -1469,6 +1469,11 @@ fn openat_is_direct_eligible_and_invalid_pointer_finishes_without_handoff() {
     assert!(is_direct_trap_syscall(request.nr));
     assert_eq!(
         dispatch_direct_trap_oneshot::<ShimsTestPmap>(&request, &proc_cap, &thread, &aspace,),
+        Some(SyscallResult::Error(EFAULT_VALUE))
+    );
+    let ctx = SyscallCtx::new(proc_cap, thread, aspace);
+    assert_eq!(
+        dispatch_openat_cached_oneshot(&request, &ctx),
         Some(SyscallResult::Error(EFAULT_VALUE))
     );
 }

@@ -309,6 +309,11 @@ impl TaskMailboxSchedulerOwner {
 /// `PayloadWaitSourceNotify` records.
 pub struct TaskMailbox {
     generation: AtomicU64,
+    /// Monotonic edge counter advanced for every post attempt, including
+    /// coalesced and overflowed events.  Poll wrappers use this to close the
+    /// register-vs-park race without treating an old queued event as a reason
+    /// to self-wake forever.
+    post_sequence: AtomicU64,
     queue: SpinMutex<VecDeque<MailboxEvent>>,
     overflow: AtomicBool,
     /// Optional `core::task::Waker` registered by the current poll
@@ -344,6 +349,7 @@ impl TaskMailbox {
             // never-issued sentinel callers can use to mean "no active
             // wait."
             generation: AtomicU64::new(1),
+            post_sequence: AtomicU64::new(0),
             queue: SpinMutex::new(VecDeque::new()),
             overflow: AtomicBool::new(false),
             waker: SpinMutex::new(None),
@@ -462,6 +468,17 @@ impl TaskMailbox {
         WaitGeneration(raw)
     }
 
+    /// Return the current mailbox-post edge sequence.
+    ///
+    /// Unlike queue length, this distinguishes an event that arrived during
+    /// the caller's poll from unrelated state that was already queued.  Every
+    /// post attempt advances the sequence, even when it coalesces with an
+    /// existing event or only latches overflow.
+    #[inline]
+    pub fn post_sequence(&self) -> u64 {
+        self.post_sequence.load(Ordering::Acquire)
+    }
+
     /// Post an event to the mailbox. Returns `true` if enqueued,
     /// `false` if the queue overflowed. On overflow the
     /// [`Self::overflow`] flag is latched until the driver consumes
@@ -526,6 +543,12 @@ impl TaskMailbox {
                 true
             }
         };
+        // Publish the post edge after the queue/overflow update is visible and
+        // before firing the registered waker.  A poll wrapper can therefore
+        // register, sample, poll an inner future that temporarily replaces the
+        // mailbox waker, then re-register and compare the sequence to close
+        // the complete register-vs-park window.
+        self.post_sequence.fetch_add(1, Ordering::AcqRel);
         // Wake the parked future (if any) so it re-polls and drains
         // the queue. Both enqueue and overflow paths wake: an
         // overflow is still wake-relevant (driver re-observes via
@@ -767,6 +790,41 @@ mod tests {
         assert_eq!(mb.poll(), Some(e1));
         assert_eq!(mb.poll(), Some(e2));
         assert_eq!(mb.poll(), None);
+    }
+
+    #[test]
+    fn post_sequence_tracks_enqueued_coalesced_and_overflow_posts() {
+        let mb = TaskMailbox::new();
+        assert_eq!(mb.post_sequence(), 0);
+
+        let first = MailboxEvent::SourceFired {
+            generation: WaitGeneration::new(1),
+            source: WaitSourceId::new(1),
+            interests: InterestMask::new(0b1),
+        };
+        assert!(mb.post(first));
+        assert_eq!(mb.post_sequence(), 1);
+
+        assert!(!mb.post(MailboxEvent::SourceFired {
+            generation: WaitGeneration::new(1),
+            source: WaitSourceId::new(1),
+            interests: InterestMask::new(0b10),
+        }));
+        assert_eq!(mb.post_sequence(), 2, "coalesced post is still an edge");
+
+        for i in 1..MAILBOX_QUEUE_BOUND {
+            assert!(mb.post(MailboxEvent::SourceFired {
+                generation: WaitGeneration::new(i as u64 + 1),
+                source: WaitSourceId::new(1),
+                interests: InterestMask::new(0b1),
+            }));
+        }
+        let before_overflow = mb.post_sequence();
+        assert!(!mb.post(MailboxEvent::TimerFired {
+            token: TimerToken::new(99),
+        }));
+        assert!(mb.overflow());
+        assert_eq!(mb.post_sequence(), before_overflow + 1);
     }
 
     #[test]

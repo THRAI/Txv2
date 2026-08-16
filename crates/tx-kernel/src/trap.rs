@@ -34,9 +34,7 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
         // mutation happens here.
         let info = trap_handoff::translate_user_pf::<P>(&view.view(), &fault);
         let hart = <P as PercpuIf>::current_cpu_id().0;
-        if !matches!(P::ARCH, tx_hal::Arch::LoongArch64)
-            && try_direct_resident_file_page_fault(hart, info)
-        {
+        if try_direct_resident_file_page_fault(hart, info) {
             return TrapAction::Resume;
         }
         let outcome = trap_handoff::hand_off_user_pf(hart, &view, info);
@@ -84,14 +82,6 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
     fn on_timer_interrupt(cpu: CpuId, view: TrapFrameMut<'_>) -> TrapAction {
         HalDeadlineTimer::<P>::new().cancel_deadline();
         if view.view().previous_mode == tx_hal::TrapPreviousMode::User {
-            if matches!(P::ARCH, tx_hal::Arch::LoongArch64) {
-                let hart = <P as PercpuIf>::current_cpu_id().0;
-                let outcome = trap_handoff::hand_off_timer_preempt(hart, &view);
-                if matches!(outcome, trap_handoff::TimerPreemptOutcome::Preempted) {
-                    crate::init::mark_boot_reactor_userspace_preempt(cpu);
-                }
-                return trap_handoff::timer_preempt_outcome_to_trap_action(&outcome);
-            }
             // A supervisor-mode expiry may have left a fallback bit just
             // before this user trap. This trap is now the authoritative
             // preemption, so avoid an extra empty yield on the next entry.
@@ -576,25 +566,8 @@ fn try_direct_trap_syscall<P: TxPlatform>(
     // process and address space. Previously every VFS/VM syscall paid all of
     // that direct-lane setup only for the dispatcher to return `None` and run
     // the ordinary async path anyway.
-    if !tx_shims::linux_syscall::is_direct_trap_syscall(req.nr) {
-        return None;
-    }
-    // The cache-hit VFS/VM fast lanes were introduced and validated on RV64.
-    // LA64 keeps mainline's shallow direct calls and hands deep operations to
-    // the reactor, where they do not execute on the architecture trap stack.
-    if matches!(P::ARCH, tx_hal::Arch::LoongArch64)
-        && matches!(
-            req.nr,
-            tx_shims::linux_syscall::numbers::NR_OPENAT
-                | NR_READ
-                | NR_WRITE
-                | NR_FCNTL
-                | NR_FSTAT
-                | NR_LSEEK
-                | NR_BRK
-                | NR_MMAP
-                | tx_shims::linux_syscall::numbers::NR_STATX
-        )
+    if !tx_shims::linux_syscall::is_direct_trap_syscall(req.nr)
+        || !direct_trap_syscall_is_stack_safe(P::ARCH, req.nr)
     {
         return None;
     }
@@ -755,6 +728,96 @@ fn try_direct_trap_syscall<P: TxPlatform>(
         direct_total_start,
     );
     Some(TrapAction::Resume)
+}
+
+/// Syscalls that are small enough to finish on an architecture trap stack.
+///
+/// The shims-level direct dispatcher also exposes cached VFS/VM helpers for
+/// ordinary kernel-stack call sites. Do not confuse that synchronous property
+/// with trap-stack safety: pathname walking, page-backed I/O and VM mutation
+/// can form deep call chains even when they do not wait. BuildStorm has
+/// exercised those chains past an architecture trap-stack boundary and into
+/// the adjacent saved kernel-resume context.
+///
+/// Keep this as an allow-list so a newly added direct syscall falls back to
+/// the reactor until its maximum stack depth is reviewed explicitly.
+const fn direct_trap_syscall_is_stack_safe(arch: tx_hal::Arch, nr: u64) -> bool {
+    use tx_shims::linux_syscall::numbers::{
+        NR_CLOCK_GETTIME, NR_FUTEX, NR_GETEGID, NR_GETEUID, NR_GETGID, NR_GETPID, NR_GETPPID,
+        NR_GETTID, NR_GETTIMEOFDAY, NR_GETUID, NR_OPENAT, NR_STATX,
+    };
+
+    let shallow = matches!(
+        nr,
+        NR_GETPPID
+            | NR_GETPID
+            | NR_GETTID
+            | NR_GETUID
+            | NR_GETEUID
+            | NR_GETGID
+            | NR_GETEGID
+            | NR_CLOCK_GETTIME
+            | NR_GETTIMEOFDAY
+            | NR_FUTEX
+            | NR_RT_SIGPROCMASK
+            | NR_SET_TID_ADDRESS
+    );
+    if shallow {
+        return true;
+    }
+
+    // `openat` is the proven cross-architecture offender: even its cache-hit
+    // walker has enough nested VFS/zone state to overrun a trap stack under
+    // BuildStorm. RV64 keeps its already-validated cached data/metadata and VM
+    // lanes; LA64 continues to hand all of those deeper operations to the
+    // ordinary kernel stack.
+    matches!(arch, tx_hal::Arch::Riscv64)
+        && !matches!(nr, NR_OPENAT)
+        && matches!(
+            nr,
+            NR_READ | NR_WRITE | NR_FCNTL | NR_FSTAT | NR_LSEEK | NR_BRK | NR_MMAP | NR_STATX
+        )
+}
+
+#[cfg(test)]
+mod direct_trap_stack_safety_tests {
+    use super::direct_trap_syscall_is_stack_safe;
+    use tx_hal::Arch;
+    use tx_shims::linux_syscall::numbers::{
+        NR_BRK, NR_CLOCK_GETTIME, NR_FCNTL, NR_FSTAT, NR_FUTEX, NR_GETPID, NR_LSEEK, NR_MMAP,
+        NR_OPENAT, NR_READ, NR_RT_SIGPROCMASK, NR_SET_TID_ADDRESS, NR_STATX, NR_WRITE,
+    };
+
+    #[test]
+    fn openat_stays_off_every_trap_stack() {
+        for arch in [Arch::Riscv64, Arch::LoongArch64] {
+            assert!(!direct_trap_syscall_is_stack_safe(arch, NR_OPENAT));
+        }
+    }
+
+    #[test]
+    fn rv64_keeps_validated_cached_lanes() {
+        for nr in [
+            NR_READ, NR_WRITE, NR_FCNTL, NR_FSTAT, NR_LSEEK, NR_BRK, NR_MMAP, NR_STATX,
+        ] {
+            assert!(direct_trap_syscall_is_stack_safe(Arch::Riscv64, nr));
+            assert!(!direct_trap_syscall_is_stack_safe(Arch::LoongArch64, nr));
+        }
+    }
+
+    #[test]
+    fn shallow_direct_calls_are_portable() {
+        for nr in [
+            NR_GETPID,
+            NR_CLOCK_GETTIME,
+            NR_FUTEX,
+            NR_RT_SIGPROCMASK,
+            NR_SET_TID_ADDRESS,
+        ] {
+            assert!(direct_trap_syscall_is_stack_safe(Arch::Riscv64, nr));
+            assert!(direct_trap_syscall_is_stack_safe(Arch::LoongArch64, nr));
+        }
+    }
 }
 
 pub(crate) fn direct_trap_syscall_needs_wake_handoff(

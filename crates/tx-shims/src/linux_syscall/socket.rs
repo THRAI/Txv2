@@ -244,20 +244,30 @@ pub(super) async fn sys_socketpair<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
         }
     }
 
-    let first_fd = ctx.process.allocate_fd();
-    let _ = ctx.process.set_fd(first_fd, Some(first.file));
-    ctx.process.set_fd_cloexec(first_fd, first.cloexec);
-    let second_fd = ctx.process.allocate_fd();
-    let _ = ctx.process.set_fd(second_fd, Some(second.file));
-    ctx.process.set_fd_cloexec(second_fd, second.cloexec);
+    // Rust's process launcher creates this CLOEXEC socketpair from several
+    // worker threads concurrently. Select and publish both descriptors under
+    // one fd-table lock: separate allocate/install calls can choose the same
+    // slot in two threads, overwrite an endpoint, and later make the launcher's
+    // error-channel read fail with EBADF.
+    let first_file = first.file;
+    let second_file = second.file;
+    let Some((first_fd, second_fd)) =
+        ctx.install_new_fd_pair(first_file.clone(), second_file.clone(), first.cloexec)
+    else {
+        return SyscallResult::Error(EMFILE_VALUE);
+    };
     let mut fd_bytes = [0u8; 8];
     fd_bytes[..4].copy_from_slice(&(first_fd as i32).to_le_bytes());
     fd_bytes[4..].copy_from_slice(&(second_fd as i32).to_le_bytes());
     match bootstrap_copy_to_user_wait(&ctx.aspace, sv, &fd_bytes).await {
         Ok(()) => SyscallResult::Return(0),
         Err(errno) => {
-            let _ = ctx.process.set_fd(first_fd, None);
-            let _ = ctx.process.set_fd(second_fd, None);
+            let _ = ctx.process_payload.take_fd_pair_if_matches(
+                first_fd,
+                &first_file,
+                second_fd,
+                &second_file,
+            );
             SyscallResult::Error(errno_to_i32(errno))
         }
     }

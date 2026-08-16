@@ -1111,6 +1111,23 @@ pub fn dispatch_pagebacked_io_oneshot(
     }
 }
 
+/// Cache-hit `openat(2)` lane for the ordinary kernel stack.
+///
+/// Path walking is synchronous on an authoritative dentry-cache hit, but its
+/// call chain is too deep for an architecture trap stack. The trap shell hands
+/// `openat` to `run_thread`, which invokes this helper before allocating the
+/// wait-capable open future. Cold paths still fall through to
+/// [`dispatch_openat_hot`].
+pub fn dispatch_openat_cached_oneshot(
+    req: &SyscallRequest,
+    ctx: &SyscallCtx<'_>,
+) -> Option<SyscallResult> {
+    if req.nr != NR_OPENAT || tx_observe::current().is_some() {
+        return None;
+    }
+    sys_openat_cached_oneshot(req.args, ctx)
+}
+
 /// Compact synchronous lane for common descriptor and metadata operations.
 /// These arms contain no await point in the canonical dispatcher; selecting
 /// them before the broad async match avoids one heap allocation per call while

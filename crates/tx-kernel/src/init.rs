@@ -47,7 +47,6 @@ use tx_subsystems::vm::{
 // pushed the AP further behind the 10M budget; bumped to 50M. Still
 // sub-second on real hardware.
 const AP_REACTOR_WAIT_SPINS: usize = 50_000_000;
-const BSP_REACTOR_TIMER_WAIT_SPINS: usize = 20_000;
 
 /// Minimum platform-timer period used in the userspace reactor loop when the
 /// reactor has no pending deadline. Without this, WFI never wakes when all
@@ -64,11 +63,11 @@ pub(crate) const IDLE_TIMER_PERIOD_NS: u64 = 5_000_000; // 5 ms
 /// fallback for a missed notification.
 const UNCONTENDED_USER_SLICE_EXTENSION_NS: u64 = 50_000_000;
 const POLLING_IDLE_SPINS: usize = 256;
-/// One-shot reactor-state dump used by the explicit `tx.profile=cagentdiag`
-/// lane. CAgent normally finishes in about a second, so a snapshot five
-/// seconds after userspace starts captures a lost-progress run without being
-/// masked by periodically-polled kernel service tasks.
-const SMP_STALL_DIAG_NS: u64 = 5_000_000_000;
+/// Opt-in LA64 diagnostic threshold.  The dump path also checks the per-hart
+/// userspace slots, so a CPU-bound compiler is not mistaken for a lost wake.
+/// Ten seconds matches the OSComp hang criterion without delaying the
+/// one-shot snapshot.
+const SMP_STALL_DIAG_NS: u64 = 10_000_000_000;
 /// Return from the reactor after each future poll so task-context device IRQ
 /// work runs promptly on the hart that claimed the interrupt.
 const REACTOR_POLLS_PER_DEVICE_IRQ_CHECK: usize = 1;
@@ -3237,6 +3236,17 @@ impl<P: TxPlatform> CoreInit<P> {
                 })
     }
 
+    pub(crate) fn la64_spawn_path_diag_enabled() -> bool {
+        matches!(P::ARCH, tx_hal::Arch::LoongArch64)
+            && <P as tx_hal::BootInfoIf>::boot_info()
+                .cmdline
+                .is_some_and(|cmdline| {
+                    cmdline
+                        .split_ascii_whitespace()
+                        .any(|token| token == "tx.profile=cagentdiag")
+                })
+    }
+
     pub(super) fn reset_smp_stall_diagnostic() {
         if !Self::reactor_stall_diag_enabled() {
             return;
@@ -3277,10 +3287,20 @@ impl<P: TxPlatform> CoreInit<P> {
     }
 
     fn maybe_dump_reactor_diagnostics_with_masks(cpu_id: CpuId, idle: u64, online: u64) {
-        // Dump from one known reactor boundary only. Requiring every hart to
-        // be idle hid the failure when a periodic kernel task kept getting
-        // polled even though no CAgent process made userspace progress.
+        // Dump from one known reactor boundary only. The software idle bitmap
+        // is intentionally not the gate here: the BSP's bounded maintenance
+        // timer clears its bit every few milliseconds even when every
+        // userspace task is parked. Per-hart userspace slots are the
+        // authoritative distinction between a long CPU-only rustc phase and
+        // a kernel-wide lost wake.
         if cpu_id.0 != 0 {
+            return;
+        }
+        if online == 0
+            || (0..P::online_cpus().count()).any(|hart| {
+                tx_subsystems::thread_runtime::current_userspace_payload(hart).is_some()
+            })
+        {
             return;
         }
         let stalled_ns =
@@ -3867,37 +3887,25 @@ impl<P: TxPlatform> CoreInit<P> {
 
         Self::deadline_timer().enable_timer_wakeups();
 
-        let mut deadline_reached = false;
-        for _ in 0..BSP_REACTOR_TIMER_WAIT_SPINS {
-            if Self::monotonic_now_ns() >= deadline_ns {
-                deadline_reached = true;
-                break;
-            }
-            core::hint::spin_loop();
-        }
-
-        if !deadline_reached {
-            Self::write_board_sentinel_prefix();
-            tx_hal::console_write_str::<P>(":reactor:timer-idle:WARN-deadline\n");
-            return;
-        }
-
-        let mut observed_timer_wake = false;
-        for _ in 0..1024 {
+        // This is an idle-timer smoke test, so wait through the platform's
+        // interrupt-idle primitive instead of trying to approximate 5 ms
+        // with a fixed number of spin iterations.  The latter can finish
+        // before the deadline under TCG and abandon a live timer in the
+        // reactor domain, which then gets reprogrammed as an already-expired
+        // one-shot on every loop iteration.
+        for _ in 0..AP_REACTOR_WAIT_SPINS {
+            P::wait_for_interrupt_once();
             let step =
                 Self::boot_reactor_once(current_cpu).expect("boot reactor timer idle step failed");
-            observed_timer_wake |= step.observed_timer_wakes();
             if Self::bsp_timer_smoke_done(cpu_bit) {
-                assert!(observed_timer_wake, "BSP timer smoke wake");
+                assert!(step.observed_timer_wakes(), "BSP timer smoke wake");
                 Self::write_board_sentinel_prefix();
                 tx_hal::console_write_str::<P>(":reactor:timer-idle:ok\n");
                 return;
             }
-            core::hint::spin_loop();
         }
 
-        Self::write_board_sentinel_prefix();
-        tx_hal::console_write_str::<P>(":reactor:timer-idle:WARN-wake\n");
+        panic!("BSP reactor timer idle smoke did not complete");
     }
 
     fn report_reactor_sched_observability() {

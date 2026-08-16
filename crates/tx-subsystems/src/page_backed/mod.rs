@@ -9,7 +9,8 @@
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::ops::Bound::{Excluded, Included, Unbounded};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 pub mod adapter;
 pub mod notification;
@@ -117,6 +118,14 @@ const PAGE_CACHE_RECLAIM_MIN_BATCH: usize = 256;
 const PAGE_CACHE_RECLAIM_MAX_BATCH: usize = 4096;
 const PAGE_CACHE_RECLAIM_MIN_WATERMARK: usize = 1024;
 const PAGE_CACHE_RECLAIM_MAX_WATERMARK: usize = 128 * 1024;
+/// Amortise proactive watermark reclaim across page allocations. Exhaustion
+/// still enters the full reclaim path immediately.
+const PAGE_CACHE_RECLAIM_PRESSURE_CADENCE: usize = 32;
+/// Bound one proactive pass independently of the number of cached files and
+/// pages accumulated by BuildStorm.
+const PAGE_CACHE_RECLAIM_PRESSURE_CONTAINERS: usize = 256;
+const PAGE_CACHE_RECLAIM_PRESSURE_PAGE_SCANS: usize = 4096;
+static PAGE_CACHE_RECLAIM_PRESSURE_TURNS: AtomicUsize = AtomicUsize::new(0);
 const MAX_FILE_WRITEBACK_BATCH_PAGES: usize = 64;
 const RESIDENT_ROOT_RETIRE_MAINTENANCE_BUDGET: usize = 64;
 const RESIDENT_ROOT_RETIRE_MAINTENANCE_ATTEMPTS: usize = 4;
@@ -377,12 +386,22 @@ pub enum DirectIoSubmissionError {
 #[derive(Debug, Default)]
 pub struct PageCacheIndex {
     pages: BTreeMap<PageIndex, PageCacheEntry>,
+    /// Last page examined by bounded reclaim. The next pass resumes strictly
+    /// after this key and wraps once, avoiding repeated scans of a dirty or
+    /// pinned prefix.
+    reclaim_cursor: Option<PageIndex>,
+}
+
+struct PageCacheReclaimScan {
+    candidates: Vec<(PageIndex, Ppn)>,
+    examined: usize,
 }
 
 impl PageCacheIndex {
     pub const fn new() -> Self {
         Self {
             pages: BTreeMap::new(),
+            reclaim_cursor: None,
         }
     }
 
@@ -467,31 +486,78 @@ impl PageCacheIndex {
         Ok(Some(current))
     }
 
-    fn clean_pages(
-        &self,
+    fn clean_pages_bounded(
+        &mut self,
         page_slots: &BTreeMap<PageIndex, Arc<PageSlot>>,
         budget: usize,
-    ) -> Vec<(PageIndex, Ppn)> {
-        if budget == 0 {
-            return Vec::new();
+        scan_budget: usize,
+    ) -> PageCacheReclaimScan {
+        let scan_limit = self.pages.len().min(scan_budget);
+        if budget == 0 || scan_limit == 0 {
+            if self.pages.is_empty() {
+                self.reclaim_cursor = None;
+            }
+            return PageCacheReclaimScan {
+                candidates: Vec::new(),
+                examined: 0,
+            };
         }
 
-        self.pages
-            .iter()
-            .filter_map(|(page, entry)| {
-                // Dirty/writeback state moved from PageCacheEntry to PageSlot
-                // during the resident-root split.  Candidate selection must
-                // follow that state instead of merely relying on the later
-                // withdrawal revalidation; otherwise a dirty prefix consumes
-                // the whole scan budget and hides clean pages behind it.
-                let clean = page_slots.get(page).is_some_and(|slot| {
-                    slot.snapshot().state == PageSlotState::Resident { ppn: entry.ppn() }
-                });
-                let reclaimable = clean && !entry.get_mark(PageCacheMark::NoReclaim);
-                reclaimable.then_some((*page, entry.ppn()))
-            })
-            .take(budget)
-            .collect()
+        let mut candidates = Vec::with_capacity(budget.min(scan_limit));
+        let mut examined = 0usize;
+        let mut last_examined = None;
+        let mut visit = |page: &PageIndex, entry: &PageCacheEntry| {
+            if examined >= scan_limit || candidates.len() >= budget {
+                return false;
+            }
+            examined += 1;
+            last_examined = Some(*page);
+
+            // Dirty/writeback state moved from PageCacheEntry to PageSlot
+            // during the resident-root split.  Candidate selection must
+            // follow that state instead of merely relying on the later
+            // withdrawal revalidation; otherwise a dirty prefix consumes
+            // the whole scan budget and hides clean pages behind it.
+            let clean = page_slots.get(page).is_some_and(|slot| {
+                slot.snapshot().state == PageSlotState::Resident { ppn: entry.ppn() }
+            });
+            if clean && !entry.get_mark(PageCacheMark::NoReclaim) {
+                candidates.push((*page, entry.ppn()));
+            }
+
+            examined < scan_limit && candidates.len() < budget
+        };
+
+        match self.reclaim_cursor {
+            Some(cursor) => {
+                for (page, entry) in self.pages.range((Excluded(cursor), Unbounded)) {
+                    if !visit(page, entry) {
+                        break;
+                    }
+                }
+                for (page, entry) in self.pages.range((Unbounded, Included(cursor))) {
+                    if !visit(page, entry) {
+                        break;
+                    }
+                }
+            }
+            None => {
+                for (page, entry) in &self.pages {
+                    if !visit(page, entry) {
+                        break;
+                    }
+                }
+            }
+        }
+
+        drop(visit);
+        if let Some(page) = last_examined {
+            self.reclaim_cursor = Some(page);
+        }
+        PageCacheReclaimScan {
+            candidates,
+            examined,
+        }
     }
 
     fn clean_pages_in_range(&self, range: PageRange) -> Vec<(PageIndex, Ppn)> {
@@ -6081,22 +6147,40 @@ pub fn reclaim_clean_file_pages_if_low() -> usize {
     if free > watermark {
         return 0;
     }
+    let turn = PAGE_CACHE_RECLAIM_PRESSURE_TURNS.fetch_add(1, Ordering::Relaxed);
+    if !turn.is_multiple_of(PAGE_CACHE_RECLAIM_PRESSURE_CADENCE) {
+        return 0;
+    }
     let deficit = watermark.saturating_sub(free).saturating_add(1);
-    reclaim_clean_file_pages(
+    reclaim_clean_file_pages_with_limits(
         deficit.clamp(PAGE_CACHE_RECLAIM_MIN_BATCH, PAGE_CACHE_RECLAIM_MAX_BATCH),
+        PAGE_CACHE_RECLAIM_PRESSURE_CONTAINERS,
+        PAGE_CACHE_RECLAIM_PRESSURE_PAGE_SCANS,
     )
 }
 
 pub fn reclaim_clean_file_pages(budget: usize) -> usize {
-    if budget == 0 {
+    reclaim_clean_file_pages_with_limits(budget, usize::MAX, usize::MAX)
+}
+
+fn reclaim_clean_file_pages_with_limits(
+    budget: usize,
+    container_budget: usize,
+    page_scan_budget: usize,
+) -> usize {
+    if budget == 0 || container_budget == 0 || page_scan_budget == 0 {
         return 0;
     }
 
     let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
     let mut reclaimed = 0usize;
-    let scan_limit = PAGE_CONTAINER_RECLAIM_REGISTRY.lock().scan_limit();
+    let mut page_scans_remaining = page_scan_budget;
+    let scan_limit = PAGE_CONTAINER_RECLAIM_REGISTRY
+        .lock()
+        .scan_limit()
+        .min(container_budget);
     for _ in 0..scan_limit {
-        if reclaimed >= budget {
+        if reclaimed >= budget || page_scans_remaining == 0 {
             break;
         }
         let candidate = PAGE_CONTAINER_RECLAIM_REGISTRY.lock().next_live(&guard);
@@ -6105,22 +6189,37 @@ pub fn reclaim_clean_file_pages(budget: usize) -> usize {
         };
         // Never enter a PageContainer state or resident-publication domain
         // while retaining the mount-independent registry lock.
-        reclaimed += pc.reclaim_clean_file_pages(budget - reclaimed);
+        let (container_reclaimed, examined) =
+            pc.reclaim_clean_file_pages_with_scan_budget(budget - reclaimed, page_scans_remaining);
+        reclaimed = reclaimed.saturating_add(container_reclaimed);
+        page_scans_remaining = page_scans_remaining.saturating_sub(examined);
     }
     reclaimed
 }
 
 impl PageContainer {
     fn reclaim_clean_file_pages(&self, budget: usize) -> usize {
+        self.reclaim_clean_file_pages_with_scan_budget(budget, usize::MAX)
+            .0
+    }
+
+    fn reclaim_clean_file_pages_with_scan_budget(
+        &self,
+        budget: usize,
+        scan_budget: usize,
+    ) -> (usize, usize) {
         if !matches!(self.kind(), PageContainerKind::File { .. }) {
-            return 0;
+            return (0, 0);
         }
         let mut reclaimed = 0usize;
-        let candidates = {
-            let state = self.state.lock();
-            state.pages.clean_pages(&state.page_slots, budget)
+        let scan = {
+            let mut state = self.state.lock();
+            let PageContainerState {
+                pages, page_slots, ..
+            } = &mut *state;
+            pages.clean_pages_bounded(page_slots, budget, scan_budget)
         };
-        for (page, ppn) in candidates {
+        for (page, ppn) in scan.candidates {
             let reservation = {
                 let mut state = self.state.lock();
                 if state.pages.lookup(page) != Some(ppn) {
@@ -6152,7 +6251,7 @@ impl PageContainer {
                 Err(_) => {}
             }
         }
-        reclaimed
+        (reclaimed, scan.examined)
     }
 }
 

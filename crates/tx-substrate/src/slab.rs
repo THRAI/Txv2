@@ -693,6 +693,11 @@ fn init_vmalloc<P: TxPlatform>() {
     VMALLOC_SHOOTDOWN_MAPPINGS.store(P::shootdown_kernel_mappings as usize, Ordering::Release);
     VMALLOC_SERVICE_PENDING_TLB_SHOOTDOWN
         .store(P::service_pending_tlb_shootdown as usize, Ordering::Release);
+    // A synchronous LA64 shootdown can target a hart which is spinning on a
+    // lock held by the sender. Publish the same allocation-free progress hook
+    // to the generic spin mutex so every contended kernel lock can drain its
+    // inbound mailbox. The lock's uncontended fast path remains unchanged.
+    crate::sync::install_spin_wait_progress(P::service_pending_tlb_shootdown);
 
     // Keep one leaf permanently mapped in every Sv39 root slot covered by the
     // window. RV64 process roots copy the kernel-half root slots when they are

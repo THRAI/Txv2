@@ -1027,16 +1027,16 @@ impl<P: TxPlatform> CoreInit<P> {
                 // PLIC path is active since `read_bytes` returns 0 once the
                 // FIFO has already been drained by the IRQ handler.
                 Self::drain_sbi_console_into_tty();
-                // Flush deferred EBR drops so pipe write-end close
-                // propagates to blocked readers. OpenFile::drop() (which
-                // calls decr_writer → EOF signal) fires only when EBR
-                // reclaims the slot; without an explicit drain here the
-                // reactor never calls drain_with_budget unless the retired
-                // queue hits RETIRE_THRESHOLD=64, which a simple pipeline
-                // never reaches. This ensures EOF propagates within a
-                // few timer ticks (~20 ms) after the last writer closes.
-                let _ = step_engine::drain_with_budget(usize::MAX);
-                let _ = step_engine::drain_with_budget(usize::MAX);
+                // Advance deferred EBR drops so pipe write-end close
+                // propagates to blocked readers. Two passes cover the common
+                // ProcessPayload -> fd table -> OpenFile deferral chain, but
+                // each pass stays bounded: BuildStorm can accumulate a large
+                // retire backlog, and draining it with `usize::MAX` here
+                // monopolises the BSP reactor for minutes. Any remainder is
+                // observed by the bounded pre-idle drain above, which keeps
+                // running reactor turns until the local backlog is empty.
+                let _ = step_engine::drain_with_budget(REACTOR_EPOCH_MAINTENANCE_BUDGET);
+                let _ = step_engine::drain_with_budget(REACTOR_EPOCH_MAINTENANCE_BUDGET);
             }
         }
 

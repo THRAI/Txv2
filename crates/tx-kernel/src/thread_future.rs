@@ -95,10 +95,10 @@ use boot_runtime::userspace::{
 use tx_hal::{PercpuIf, TrapIf, TxPlatform};
 use tx_services::time::{platform::HalDeadlineTimer, DeadlineRegistrar, DeadlineRegistrarHandle};
 use tx_shims::linux_syscall::numbers::{
-    FUTEX_CMD_MASK, FUTEX_WAKE, FUTEX_WAKE_BITSET, NR_CLONE, NR_CLOSE, NR_DUP3, NR_EXECVE,
-    NR_EXIT, NR_EXIT_GROUP, NR_FACCESSAT, NR_FACCESSAT2, NR_FUTEX, NR_GETDENTS64, NR_MMAP,
-    NR_MPROTECT, NR_MUNMAP, NR_NEWFSTATAT, NR_OPENAT, NR_PIPE2, NR_READ, NR_READLINKAT,
-    NR_READV, NR_RT_SIGPROCMASK, NR_STATX, NR_WRITE, NR_WRITEV,
+    FUTEX_CMD_MASK, FUTEX_WAKE, FUTEX_WAKE_BITSET, NR_CLONE, NR_CLOSE, NR_DUP3, NR_EXECVE, NR_EXIT,
+    NR_EXIT_GROUP, NR_FACCESSAT, NR_FACCESSAT2, NR_FUTEX, NR_GETDENTS64, NR_MMAP, NR_MPROTECT,
+    NR_MUNMAP, NR_NEWFSTATAT, NR_OPENAT, NR_PIPE2, NR_READ, NR_READLINKAT, NR_READV,
+    NR_RT_SIGPROCMASK, NR_STATX, NR_WRITE, NR_WRITEV,
 };
 use tx_shims::linux_syscall::SyscallResult;
 use tx_substrate::wake::MailboxSchedulerHint;
@@ -477,6 +477,7 @@ where
         let _prev = set_current_thread_payload(hart, this.payload.clone());
         this.payload.bind_lifecycle_waker(cx.waker().clone());
         let task_mailbox = crate::adapter::boot_runtime::current_task_mailbox(hart);
+        let mut mailbox_post_sequence = None;
         if let Some(mailbox) = task_mailbox.as_ref() {
             this.payload.bind_mailbox(Arc::downgrade(mailbox));
             // `ThreadPayload::mailbox` is the lifecycle wake route used by
@@ -491,6 +492,9 @@ where
             // the wait while it polls, and a concurrent/new event sees this
             // registered waker.
             mailbox.register_waker(cx.waker().clone());
+            if matches!(P::ARCH, tx_hal::Arch::LoongArch64) {
+                mailbox_post_sequence = Some(mailbox.post_sequence());
+            }
         }
 
         // Process termination is a task-level AST, not a property of the
@@ -574,14 +578,13 @@ where
         if out.is_pending() {
             if let Some(mailbox) = task_mailbox.as_ref() {
                 mailbox.register_waker(cx.waker().clone());
-                // LA64's mainline IRQ/mailbox handoff still relies on the
-                // post-poll mailbox check to close a register-vs-park race.
-                // RV64 uses the newer polling wake-commit handshake instead;
-                // retaining this fallback there can spin forever on an event
-                // owned by a different nested wait.
-                if matches!(P::ARCH, tx_hal::Arch::LoongArch64)
-                    && (!mailbox.is_empty() || mailbox.overflow())
-                {
+                // LA64 still needs a post-poll recheck because a nested wait
+                // may temporarily replace and clear the task mailbox waker.
+                // Compare post edges, not queue state: an unrelated old event
+                // is not readiness and must not make the wrapper self-wake
+                // forever.  Register-before/sample and re-register/recheck
+                // closes both sides of the register-vs-park window.
+                if mailbox_post_sequence.is_some_and(|before| mailbox.post_sequence() != before) {
                     cx.waker().wake_by_ref();
                 }
             }
@@ -1248,7 +1251,7 @@ fn log_cagent_spawn_path<P: TxPlatform>(
     process: &Cap<ProcessIdentity>,
     thread: &Cap<ThreadIdentity>,
 ) {
-    if !crate::init::CoreInit::<P>::reactor_stall_diag_enabled()
+    if !crate::init::CoreInit::<P>::la64_spawn_path_diag_enabled()
         || !matches!(P::ARCH, tx_hal::Arch::LoongArch64)
     {
         return;
@@ -1429,6 +1432,9 @@ async fn dispatch_full_syscall<P: TxPlatform>(
 ) -> SyscallResult {
     let result = if let Some(result) =
         tx_shims::linux_syscall::dispatch_pthread_hot_oneshot(req, ctx)
+    {
+        result
+    } else if let Some(result) = tx_shims::linux_syscall::dispatch_openat_cached_oneshot(&req, ctx)
     {
         result
     } else if let Some(result) = tx_shims::linux_syscall::dispatch_fs_hot_oneshot::<P>(&req, ctx) {

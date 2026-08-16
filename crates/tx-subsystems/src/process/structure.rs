@@ -1765,6 +1765,41 @@ impl ProcessPayload {
         Some((first_fd, second_fd))
     }
 
+    /// Roll back a paired descriptor publication without removing descriptors
+    /// that another thread has already closed and reused.
+    ///
+    /// User-memory writeback happens after [`Self::install_new_fd_pair`] drops
+    /// the fd-table lock. If that writeback fails, another thread may have
+    /// closed either descriptor and installed an unrelated file at the same
+    /// number. Match the originally published capabilities while holding the
+    /// table lock so rollback only detaches the pair entries that still belong
+    /// to this operation.
+    pub fn take_fd_pair_if_matches(
+        &self,
+        first_fd: u32,
+        first_file: &Cap<OpenFile>,
+        second_fd: u32,
+        second_file: &Cap<OpenFile>,
+    ) -> Vec<Cap<OpenFile>> {
+        let mut files = self.fds.lock();
+        let mut cloexec = self.fd_cloexec.lock();
+        let mut removed = Vec::with_capacity(2);
+        for (fd, expected) in [(first_fd, first_file), (second_fd, second_file)] {
+            if files.get(&fd).is_some_and(|current| current == expected) {
+                if let Some(file) = files.remove(&fd) {
+                    cloexec.remove(&fd);
+                    removed.push(file);
+                }
+            }
+        }
+        drop(cloexec);
+        drop(files);
+        for file in &removed {
+            decr_pipe_fd_ref(file);
+        }
+        removed
+    }
+
     pub fn install_fd_with_cloexec(
         &self,
         fd: u32,

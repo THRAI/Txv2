@@ -6304,6 +6304,35 @@ fn reclaim_budget_skips_dirty_prefix_and_reaches_clean_page() {
 }
 
 #[test]
+fn bounded_reclaim_resumes_after_a_dirty_prefix() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let pc = file_page_container(fs.clone(), fs, FsObjectId::new(159), 8);
+
+    for raw_page in 0..6 {
+        let page = PageIndex::new(raw_page);
+        assert!(pc
+            .install_resident_if_absent_published(page, cached_frame_for_test())
+            .expect("publish reclaim cursor page"));
+        if raw_page < 4 {
+            let state = pc.state.lock();
+            state
+                .page_slots
+                .get(&page)
+                .expect("dirty prefix slot")
+                .mark_dirty()
+                .expect("mark reclaim prefix dirty");
+        }
+    }
+
+    assert_eq!(pc.reclaim_clean_file_pages_with_scan_budget(1, 2), (0, 2));
+    assert_eq!(pc.reclaim_clean_file_pages_with_scan_budget(1, 2), (0, 2));
+    assert_eq!(pc.reclaim_clean_file_pages_with_scan_budget(1, 2), (1, 1));
+    assert!(pc.lookup(PageIndex::new(4)).is_none());
+}
+
+#[test]
 fn reclaim_withdraws_slot_before_a_refetch_can_begin() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
     setup_host_substrate();
