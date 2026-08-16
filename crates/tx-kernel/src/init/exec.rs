@@ -968,6 +968,10 @@ impl<P: TxPlatform> CoreInit<P> {
             };
             let ebr_active =
                 drain_stats.reclaimed > 0 || drain_stats.remaining > 0 || vm_recipe_reclaims > 0;
+            let resubmitted_file_io = step.should_idle()
+                && tx_subsystems::device::submit_pending_file_io_service_runtimes() != 0;
+            let woke_unowned_file_io = step.should_idle()
+                && tx_subsystems::device::wake_unowned_file_io_service_runtimes() != 0;
             if step.should_idle()
                 && !drained_device_after_poll
                 && !submitted_child_before_poll
@@ -975,6 +979,8 @@ impl<P: TxPlatform> CoreInit<P> {
                 && !drained_terminal_before_poll
                 && !drained_terminal_after_poll
                 && !ebr_active
+                && !resubmitted_file_io
+                && !woke_unowned_file_io
                 && !init.is_zombie()
             {
                 // When the reactor has no pending deadline, the platform

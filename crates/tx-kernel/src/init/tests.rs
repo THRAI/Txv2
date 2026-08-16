@@ -31,8 +31,11 @@ use tx_hal::{
 const TEST_PAGE_SIZE: usize = 4096;
 
 use crate::init::{
-    console_tty, dev_mount, dev_shm_mount, publish_boot_mountpoint_dentry, root_mount, CoreInit,
-    RootExt4JournalPreflightDecision,
+    automatic_smp_stall_diagnostic_enabled_from_boot, console_tty, dev_mount, dev_shm_mount,
+    is_file_io_service_reactor_task, publish_boot_mountpoint_dentry,
+    register_file_io_service_reactor_task, root_mount, CoreInit, RootExt4JournalPreflightDecision,
+    FILE_IO_SERVICE_REACTOR_TASKS, REACTOR_IDLE_CPUS, REACTOR_LAST_PROGRESS_NS,
+    REACTOR_STALL_DUMPED,
 };
 
 use crate::adapter::step_engine::{self as step_engine, guard, page_allocator, StepOutcome};
@@ -655,6 +658,83 @@ fn file_io_runtime_task_submission_is_pinned_fair_work() {
     assert_eq!(depths.kernel, 0);
     assert_eq!(depths.new, 1);
     assert!(!scheduler.can_migrate(task));
+}
+
+#[test]
+fn file_io_service_task_tracking_is_generation_safe_and_terminal_drained() {
+    let _serial = setup();
+    let reactor = crate::adapter::boot_runtime::Reactor::new();
+
+    let original = reactor.submit_task(async {});
+    register_file_io_service_reactor_task(original);
+    let stats = reactor.run_until_idle();
+    assert_eq!(stats.completed, 1);
+    let drained = reactor
+        .drain_completed()
+        .into_iter()
+        .map(|record| record.handle)
+        .collect::<std::vec::Vec<_>>();
+    assert_eq!(drained, std::vec![original]);
+
+    assert!(CoreInit::<TestPlatform>::finish_terminal_thread_reactor_drain(&drained));
+    assert!(FILE_IO_SERVICE_REACTOR_TASKS.lock().is_empty());
+
+    let replacement = reactor.submit_task(core::future::pending::<()>());
+    assert_eq!(
+        replacement.id(),
+        original.id(),
+        "drain should reuse the slot"
+    );
+    assert_ne!(
+        replacement.generation(),
+        original.generation(),
+        "slot reuse must advance the task generation"
+    );
+    let diagnostic = reactor
+        .task_runtime_diagnostics()
+        .into_iter()
+        .find(|task| task.id == replacement.id())
+        .expect("replacement task diagnostic");
+    assert!(
+        !is_file_io_service_reactor_task(&[original], &diagnostic),
+        "a stale service-task key must not label a later slot occupant"
+    );
+}
+
+#[test]
+fn reactor_stall_snapshot_is_opt_in_and_progress_does_not_rearm_it() {
+    let _serial = setup();
+    REACTOR_IDLE_CPUS.store(0b11, Ordering::Release);
+    REACTOR_LAST_PROGRESS_NS.store(7, Ordering::Release);
+    REACTOR_STALL_DUMPED.store(true, Ordering::Release);
+
+    CoreInit::<TestPlatform>::note_reactor_progress(CpuId(0), 99);
+
+    assert_eq!(REACTOR_IDLE_CPUS.load(Ordering::Acquire), 0b10);
+    assert_eq!(REACTOR_LAST_PROGRESS_NS.load(Ordering::Acquire), 99);
+    assert!(
+        REACTOR_STALL_DUMPED.load(Ordering::Acquire),
+        "ordinary task progress must not turn a userspace-run one-shot into a periodic dump"
+    );
+
+    CoreInit::<TestPlatform>::reset_smp_stall_diagnostic();
+    assert!(
+        REACTOR_STALL_DUMPED.load(Ordering::Acquire),
+        "a normal boot must keep the automatic snapshot disarmed"
+    );
+
+    assert!(!automatic_smp_stall_diagnostic_enabled_from_boot(
+        "tx.profile=alpine console=ttyS0"
+    ));
+    assert!(!automatic_smp_stall_diagnostic_enabled_from_boot(
+        "tx.smp.stall-diag=0"
+    ));
+    assert!(automatic_smp_stall_diagnostic_enabled_from_boot(
+        "tx.profile=alpine tx.smp.stall-diag=1"
+    ));
+    assert!(!automatic_smp_stall_diagnostic_enabled_from_boot(
+        "tx.smp.stall-diag=1 tx.smp.stall-diag=0"
+    ));
 }
 
 #[test]

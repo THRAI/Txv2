@@ -211,6 +211,10 @@ impl step_engine::SubjectIdentity for ProcessIdentity {
         crate::signal::thread_pending_signal_interrupts(thread)
     }
 
+    fn thread_signal_interrupts_wait(thread: &Cap<Self::ThreadIdentity>) -> bool {
+        crate::signal::thread_pending_signal_interrupts(thread)
+    }
+
     fn thread_termination_in_force(thread: &Cap<Self::ThreadIdentity>) -> bool {
         thread
             .payload_cap()

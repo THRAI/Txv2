@@ -69,6 +69,11 @@ const AUXV_PAIR_SIZE: usize = 16;
 /// Width of a single pointer / counter on RV64.
 const WORD_SIZE: usize = 8;
 
+/// Keep one readable, zeroed machine word above the final initial-stack C
+/// string. Libc startup code may inspect strings a word at a time, and Linux
+/// likewise leaves one system word below the stack VMA's exclusive end.
+const STACK_TOP_SLACK_SIZE: usize = WORD_SIZE;
+
 /// AT_RANDOM region size (musl reads exactly 16 bytes via
 /// `__init_ssp((void*)aux[AT_RANDOM])`).
 const AT_RANDOM_REGION_SIZE: usize = 16;
@@ -191,7 +196,7 @@ pub struct AuxvFacts<'a> {
 
 /// Build the initial userspace stack image for execve.
 ///
-/// `stack_top` is the highest user-VA byte the stack image occupies;
+/// `stack_top` is the first user VA excluded from the stack image;
 /// the layout grows *down* from there. The function computes the
 /// resulting `initial_sp` (16-byte aligned) and returns the
 /// kernel-side bytes to write.
@@ -216,6 +221,7 @@ pub struct AuxvFacts<'a> {
 /// ```text
 ///   [high addresses]
 ///   ┌──────────────────────────────────┐  stack_top
+///   │   zeroed top-word slack          │
 ///   │   string pool (envp strings)     │
 ///   │   string pool (argv strings)     │
 ///   │   AT_EXECFN C string              │
@@ -341,6 +347,7 @@ pub fn build_initial_user_stack(
     // ---- 4. Compute total bytes and 16-byte alignment padding ------------
     //
     // Layout (high → low):
+    //   top_slack      (one zeroed machine word)
     //   string_pool    (envp, argv, execfn, platform strings)
     //   AT_RANDOM      (16 bytes, also 16-byte aligned)
     //   pad            (so initial_sp = stack_top - total ends up 16-aligned)
@@ -354,6 +361,7 @@ pub fn build_initial_user_stack(
     let unpadded = upper_table_size
         .checked_add(AT_RANDOM_REGION_SIZE)
         .and_then(|size| size.checked_add(string_pool_size))
+        .and_then(|size| size.checked_add(STACK_TOP_SLACK_SIZE))
         .ok_or(StackBuildError::InvalidLayout)?;
     let stack_top_mod = usize::try_from(stack_top & (STACK_ALIGN as u64 - 1))
         .map_err(|_| StackBuildError::InvalidLayout)?;
@@ -379,15 +387,13 @@ pub fn build_initial_user_stack(
     // ---- 5. Compute key user-VA addresses --------------------------------
     //
     // String-pool layout (low → high addresses):
-    //   platform, execfn, argv, envp.
+    //   platform, execfn, argv, envp, zeroed top-word slack.
     //
-    // Sitting just below the AT_RANDOM region, which sits at
-    //   [stack_top - AT_RANDOM_REGION_SIZE, stack_top).
-    //
-    // Wait — the layout block above places the string pool *between*
-    // AT_RANDOM and stack_top:
+    // The string pool sits above the AT_RANDOM region and below the
+    // compatibility slack at the stack recipe's exclusive upper bound:
     //
     //     stack_top
+    //     [zeroed top-word slack]
     //     [envp strings]
     //     [argv strings]
     //     [AT_EXECFN]
@@ -399,11 +405,11 @@ pub fn build_initial_user_stack(
     // But musl reads AT_RANDOM via a pointer; its physical position
     // in the pool is irrelevant as long as the auxv entry's a_val
     // points at 16 contiguous bytes. We pin the layout above for
-    // determinism. The string pool occupies the topmost bytes; the
-    // AT_RANDOM region sits below all four string groups.
+    // determinism. The string pool occupies the bytes immediately below the
+    // top-word slack; the AT_RANDOM region sits below all four string groups.
     //
     // Concretely:
-    //   envp_pool_top  = stack_top
+    //   envp_pool_top  = stack_top - STACK_TOP_SLACK_SIZE
     //   envp_pool_base = envp_pool_top - envp_string_total
     //   argv_pool_top  = envp_pool_base
     //   argv_pool_base = argv_pool_top - argv_string_total
@@ -417,7 +423,11 @@ pub fn build_initial_user_stack(
     // upper_table_top    = at_random_base - pad
     // upper_table_base   = upper_table_top - upper_table_size
     //                    = initial_sp
-    let envp_pool_top = stack_top;
+    let envp_pool_top = stack_top
+        .checked_sub(
+            u64::try_from(STACK_TOP_SLACK_SIZE).map_err(|_| StackBuildError::InvalidLayout)?,
+        )
+        .ok_or(StackBuildError::InvalidLayout)?;
     let envp_pool_base = envp_pool_top
         .checked_sub(u64::try_from(envp_string_total).map_err(|_| StackBuildError::InvalidLayout)?)
         .ok_or(StackBuildError::InvalidLayout)?;
@@ -675,7 +685,7 @@ pub fn build_initial_user_stack(
     for s in envp {
         cursor = write_cstring(&mut bytes, cursor, s)?;
     }
-    if cursor != total {
+    if cursor != user_offset(envp_pool_top, initial_sp)? {
         return Err(StackBuildError::InvalidLayout);
     }
 
@@ -937,6 +947,30 @@ mod tests {
         // (string pool layout: argv pool, then envp pool, then top).
         assert!(argv0 < envp0);
         assert!(argv1 < envp0);
+    }
+
+    #[test]
+    fn build_initial_user_stack_keeps_a_zero_word_above_the_last_cstring() {
+        let stack_top = 0x4000_0000u64;
+        let argv: [&[u8]; 1] = [b"/init"];
+        let envp: [&[u8]; 1] = [b"PATH=/bin"];
+        let image =
+            build_initial_user_stack(stack_top, &argv, &envp, &facts()).expect("stack image");
+
+        let envp0 = read_u64(&image.bytes, 3 * WORD_SIZE);
+        assert_eq!(read_cstring(&image, envp0), envp[0]);
+
+        let first_byte_after_envp = envp0 + envp[0].len() as u64 + 1;
+        assert_eq!(
+            stack_top - first_byte_after_envp,
+            WORD_SIZE as u64,
+            "libc word-at-a-time probes need one readable word above the final C string"
+        );
+        assert_eq!(
+            &image.bytes[image.bytes.len() - WORD_SIZE..],
+            &[0; WORD_SIZE],
+            "top-stack compatibility slack must be explicitly zeroed"
+        );
     }
 
     #[test]

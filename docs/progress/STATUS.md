@@ -67,6 +67,132 @@
   kernel-only release uImage。**Blocker**：LA QEMU 的沙箱提权审批流中断后被环境
   拒绝，且明确禁止自动重试；无遗留 QEMU 进程，case19 只有 prepare 文件、尚无串口
   或 qemu.result。已知 bridge/progress-schema/tx-substrate 漂移仍按既有范围排除。
+- 2026-08-16 (**VF2 用户侧 credentialed Git push 报告成功；敏感串口输出未读取**).
+  **Changed**：完整验收关闭后，仍使用物理验收源码 `c45256ceb` 与同一 uImage，
+  以一次性 `tx.root=mmcblk0 rw` 重新启动同盘 MMC；确认根为 ext4 RW、校正 UTC、
+  恢复 `192.168.1.10/24`/默认路由/DNS，并在不认证的只读路径验证 GitHub TLS、
+  远端 `main=72be011c...`、本地待推送 `main=c88012db...` 与 clean status 后释放串口。
+  用户随后报告 `git push origin main` 验证成功。**Verification**：push 结果仅采用用户
+  明确确认；因其终端输出包含 PAT，本代理未读取、搜索、复制或引用该段串口输出，
+  也没有自行执行 push/pull。此前 Git/Vim/GCC/Rust/full non-shallow clone 的
+  RW→物理 reset→RO 全矩阵保持通过。**Next**：保留 MMC 验收目录与本分支原子提交，
+  后续可按项目合并流程审阅/合并；若项目还要求 pull，需由用户另行明确验证。
+  **Blocker**：比赛验收无 blocker；仅有既有全局 unit/progress/docs-lint 债务，且 MMC
+  仍仅余约 6 MiB。
+
+- 2026-08-16 (**VF2 Git/Vim/GCC/Rust、完整非 shallow clone 与物理复位后同盘 RO
+  持久化全矩阵通过**). **Changed**：在隔离分支
+  `codex/vf2-file-io-runtime-rebind-fix` 上完成此前 File-I/O、wait interruption、
+  replacement wake、VF2 MMC 串行化、exec 顶部零字与 procfs pid-stat 修复；最终物理
+  源码为 `c45256ceb`。最后一项 procfs 修复来自精确实板反证：旧 `/proc/1/stat`
+  只有 6 字段，BusyBox `ps` 的空白扫描越过缓冲区并在 stack top SIGSEGV；现发布
+  Linux 兼容的 52 字段，聚焦回归由 `left 6/right 52` 转为通过，实板 `ps -ef`
+  正常。用户唯一 SD 经其明确授权从 Alpine 基线恢复后，以全新 add-only 目录
+  `/proj/vf2-accept-c45256ce-1cc998d7-20260816-0914z` 完成 RW 阶段：Git help/init/
+  repo-local config/add/commit/log/fsck（commit `a7bd5cbd...`）；真实串口全屏 Vim
+  insert/Esc/`:wq` 保存 `hello.c`；GCC 与 Rust help、编译、运行均输出
+  `Hello, World!`；以及 `tx-push-test.git` 的完整 HTTPS clone。首次 clone 因 OpenSSL
+  unexpected EOF/early EOF 精确失败并保留；新目录用 HTTP/1.1 单请求、不带
+  `--depth` 的 retry 完成 7,824 对象，原始/远端 HEAD 均为 `72be011c...`，
+  `shallow=false`、fsck 成功，并提交本地证据为 `c88012db...`。**Verification**：
+  复位前 manifest SHA-256 为 `fd1a91cc...c5c7`，两次 `sync` 后仅在串口安全静止时
+  请求一次物理 reset；同一 uImage、同一 `/dev/mmcblk0` 以 `ro` 启动，根挂载明确
+  为 ext4 RO，C/Rust 四个文件哈希不变且二进制再次输出 Hello，两个 Git commit
+  均存在且工作区 clean，full clone 仍 non-shallow，证据文件 SHA-256
+  `eddf215b...44bb` 不变，两个 `git fsck --full` 均为 0（full clone 检查 7,824
+  对象）。最终 marker 为 `FINAL_RO_MATRIX_PASS_c45256ce_20260816`。物理 uImage
+  5,362,144 bytes，SHA-256
+  `1cc998d76cb4dbe363a8765588ee452f99d53ce881683d5d0defa6ad2271ca06`；U-Boot
+  `iminfo`、宿主 cmp/SHA/mkimage 检查通过。串口日志
+  `target/vf2-acceptance/run-20260816-vf2-a91f0807-190020Z/serial-ee6ad7aa-f9e43adc-20260816-0755Z.log`
+  SHA-256 为 `51cda459...e59`。聚焦 `tx-fs` 串行测试 117/117 及 fmt 通过；完整最终
+  门禁见本次 handoff。**Next**：本代理没有 push/pull；用户现在可以自行做带凭据的
+  push/pull 验证。卡仅余约 6 MiB，任何新增持久化工作先做容量门禁，并保留现有证据。
+  **Blocker**：验收范围无 blocker。非阻断记录缺陷如实保留：一次聚合重定向出现
+  `sed: write error`，成功后台 clone 的事后 `wait` 因 BusyBox 已回收返回 127，RO
+  阶段四个汇总文件用了错误相对路径；全部正式字段均已通过独立仓库/哈希/fsck
+  命令复验。详细账本见
+  `msp/debug-logs/2026-08-16-vf2-full-tools-clone-reset-persistence.md`。
+
+- 2026-08-16 (**VF2 物理验收止于 Git post-commit 挂起与复位后 MMC ext4 RW
+  拒绝；完整矩阵保持失败**). **Changed**：在 app 隔离工作树从
+  `a91f0807d` 新建 `codex/vf2-file-io-runtime-rebind-fix`。首轮物理 RW 的
+  `git help` 后，`execve`/`newfstatat` 持续 EIO；提交 `3d6b65223` 使仍有 live
+  `PageContainer` 的 File-I/O claim Drop 复用原 registry/wake source，并由 AP/BSP
+  convergence 重提 replacement。新镜像
+  `txv2-vf2-3d6b6522-ea831da8.uimage`（5,362,144 bytes，SHA-256
+  `ea831da84c8a7ad220805618374f3fb4728af4c360619b5b2d893a472e5dbf43`）在 VF2
+  同盘 direct-root RW 上通过 write/stat/read/chmod/exec 探针和 `git help`。正式 Git
+  baseline 的 init、repo-local config、README、add 均完成，但 commit 命令在不输出
+  摘要/提示符的情况下挂起。只读 syscall 重放表明同版 Git 会在 refs 发布后启动
+  `git maintenance --auto --detach` 并 wait4；RO 复位后现场 commit
+  `b574dba3b66bdd0e4cb2a3327ea2f5163b3752e3`、README、clean status 和
+  `git fsck --full=0` 均存在，故挂点位于 commit 已线性化后的阶段，但本次没有有效
+  stall 快照，不能把 wait4 当作已确诊的唯一根因。另提交 `f11ad1076`，让真实
+  `ProcessIdentity::thread_signal_interrupts_wait` 委托已有 disposition-aware 判定，
+  修复 wait4 收到 SIGINT/SIGCANCEL 后消费事件却重新停车的确定 wiring 缺口。
+  **Verification**：runtime 聚焦测试 5/5、两条 owner-retirement 竞态、kernel
+  generation-safe drain、fmt/diff check 通过；`tx-scripts --test drive` 24/24 通过。
+  最终源码 `f11ad1076` 的 RV64 release build 通过，ELF 9,375,568 bytes、SHA-256
+  `4dfdf1f9ff7250e52d5d4782fccfdc5bbc80d200e71f43daa90d932a61b8e421`；该 ELF 未包装或
+  物理启动，避免在 RW blocker 后产生未经验证的新镜像。
+  `cargo -q xtask unit` 仍只有既有 37 个 tx-shims shared-state 失败与两个 kernel
+  libc 命令断言失败，tx-ext4 95/95、tx-scripts 168/168 通过。release ELF SHA-256
+  `d7be94e1...52e96`，板端 TFTP 5,362,144 bytes 与 `iminfo` CRC OK。完整串口见
+  `target/vf2-acceptance/run-20260816-vf2-a91f0807-190020Z/serial-full.log`。新 handoff
+  通过 `jq empty`；全局 `cargo xtask progress validate` 仍被既有
+  `2026-07-24-network-time-integration.json` 的旧枚举 `completed` 阻断，docs lint
+  仍报告 17 个未由本次引入的旧断链/anchor 缺口。
+  **Next**：用户因只有这一张 SD 卡，随后明确授权以已知基线镜像覆盖损坏介质；卡已
+  重建并安全断电。待用户把卡装回 VF2 后，从最终源码重新构建唯一 VF2 镜像，并从
+  全新目录重跑 Git/Vim/GCC/Rust/full non-shallow clone、sync、物理 reset、同盘 RO
+  哈希/commit/fsck 全矩阵。**Blocker**：post-commit 物理复位后，同一 MMC 的
+  txKernel RW mount 在 `rw-discovered` 聚合阶段返回 EIO；该路径可能已尝试 journal
+  replay/home-block/barrier，不能声称失败前零写入。随后同盘 RO mount 和 Git fsck
+  成功；额外以同一镜像、最终 `ro` 和 `tx.ext4.journal-preflight=1` 执行严格只读
+  shadow scan，明确返回 `recovery-required=1:stage=scan:error=corrupt`，随后拒绝挂载并
+  落入 tmpfs/panic。关机拔卡后，宿主把该整盘识别为 USB `/dev/sda`（29.5 GiB、
+  whole-device ext4、UUID `dff3fc28-3a72-4c0f-92cb-b681cc185680`）。因无免密权限，
+  `blockdev --setro` 未生效；随后一次 `ro,noload` 挂载虽以只读、无 journal 方式
+  完成，Linux 仍执行 `orphan cleanup on readonly fs` 并删除 1 个 orphan inode，故该
+  操作不能作为零写入证据，介质也不再与拔卡前逐位等价。根目录读取随即以
+  `inode #2: checksumming directory block 0` / `Directory block failed checksum`
+  失败，`df` 同时显示 0 可用空间。发现后立即卸载并 power-off；复核时 `/dev/sda`
+  已消失且无残留挂载。此后用户明确撤销针对该卡的一次性 raw-image 禁令并指定
+  `/home/msp/learning/Txv2/local-images/alpine-linux-riscv64-ext4fs.img` 覆盖重建。源镜像
+  723,517,440 bytes、SHA-256
+  `d547220caf7b3ce4c1d67560bbed66f4ee491d10718d1ea3e55741019aef5eb4`，源端
+  `e2fsck -fn` 五阶段通过且 filesystem clean；受限 root 脚本再次锁定 USB/removable/
+  serial `121220160204`/31,719,424,000-byte `/dev/sda` 后写入、`sync`、flush，并先
+  `blockdev --setro` 再验证。目标前 723,517,440 bytes 与源逐字节 `cmp` 相同、目标
+  SHA-256 相同、目标 `e2fsck -fn` 通过。硬只读 `ro,noload` 挂载可读取根目录以及
+  Git/Vim/GCC/Rust/CA bundle，内核日志无 checksum/orphan/I/O error，随后已卸载并
+  power-off。旧板端证据已被覆盖，只保留串口/宿主日志；当前介质是干净基线而不是
+  已通过的持久化结果。因此 Vim、GCC、Rust、full clone 与最终 RW→reset→RO 验收仍
+  未执行/未通过，不得让用户继续 push/pull 验证。
+
+- 2026-08-16 (**LA stall/File-I/O 修复已整理提交；VF2 工具与复位持久化交接已冻结**).
+  **Changed**：只在 `/tmp/txv2-la-full-clone.Nt4BdE/worktree` 将分支移到已审计的
+  `3df096b94` 干净历史，再恢复并提交 7 个 runtime 文件为 `905746018`；自动
+  `smp-stall` 改为 `tx.smp.stall-diag=1` opt-in，File-I/O task 追踪改用完整
+  `TaskKey` 并在 terminal drain 清理，stale `Weak<PageContainer>` runtime 获得
+  lost-wake-safe 退休路径。硬编码 `exec-git`/`linkat-error` 诊断未提交，缺失的
+  checksum-v3 集成测试已由干净历史恢复。新增 VF2 handoff，要求 Git/Vim/GCC/
+  Rust、非 shallow HTTPS clone、本地 commit、物理 reset 与同盘 RO 复验完整闭环，
+  明确禁止 push/pull、PAT、破坏性存储命令和修改主工作区。
+  **Verification**：fmt/diff check、两条 kernel 回归、final-Cap lifecycle 与四条
+  File-I/O runtime 测试通过；最终源码可构建 LA release/uImage（8,949,424 bytes，
+  SHA-256 `9bf21606...e45d77`）。LA 实板核心修复已通过双核/ext4 RW、70+ 秒静默、
+  96 文件创建/读取/删除/`sync`、再空闲 42 秒及真实仓库 `git status`；标准 unit
+  仍只有既有 37 条 tx-shims 与两条 kernel libc 断言失败。
+  **Next**：下一代理从该隔离工作树最终 tip 执行
+  `docs/progress/handoffs/2026-08-16-vf2-tools-persistence-verification.json`，所有
+  RV 真板项目和 reset/RO 证据完成前不让用户尝试 push/pull。
+  **Blocker**：当前代码整理无 blocker；VF2 现场 SD 空间、网络/UTC/CA 与物理 reset
+  尚需按 handoff 逐项确认。新 handoff 通过 `jq empty`，但全局
+  `cargo xtask progress validate` 仍先被既有
+  `2026-07-24-network-time-integration.json` 的旧枚举 `completed` 阻断；docs lint
+  仍报告 17 个未由本次引入的断链/anchor 缺口。
 
 - 2026-08-16 (**双 worktree 汇合成果已按语义冻结为九笔代码提交；orphan 洁净问题继续单独追踪**).
   **Changed**：在 `/tmp/txv2-precommit-freeze-s9nMZS` 保存提交前 status、完整
