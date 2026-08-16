@@ -2458,6 +2458,29 @@ fn destroy_plan_removes_head_orphan_from_superblock_chain() {
 }
 
 #[test]
+fn destroy_plan_defers_zero_link_inode_behind_orphan_head() {
+    let mut image = mock_image();
+    let mut superblock = Superblock::parse(&image.block(0)[1024..2048]).unwrap();
+    superblock.last_orphan = 14;
+    superblock
+        .encode(&mut image.block_mut(0)[1024..2048])
+        .unwrap();
+    mark_block_bitmap_used(&mut image, 31);
+    mark_inode_bitmap_used(&mut image, 13);
+    let mut victim = Inode::parse(&image.block(4)[11 * 256..12 * 256]).unwrap();
+    victim.links_count = 0;
+    victim.dtime = 0;
+    write_inode(&mut image, 12, &victim);
+    let mut pager = Ext4Pager::open(image).unwrap();
+
+    assert_eq!(
+        pager.plan_destroy_inode(InodeNo::new(12), FsyncStamp::new(44)),
+        Err(Ext4FormatError::WouldBlock),
+        "a non-head orphan is valid but cannot be removed by the bounded head-only plan"
+    );
+}
+
+#[test]
 fn destroy_plan_removes_singleton_orphan_head_from_superblock_chain() {
     let mut image = mock_image();
     let mut superblock = Superblock::parse(&image.block(0)[1024..2048]).unwrap();

@@ -44,6 +44,7 @@ pub fn step_read_to_user(
         aspace,
         effective_len,
         UserBuffer::Read { dst },
+        start,
         guard,
     )
 }
@@ -64,6 +65,21 @@ pub fn step_write_from_user(
     len: usize,
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
+    step_write_from_user_at(pc, of, aspace, src, len, of.offset(), guard)
+}
+
+/// Variant of [`step_write_from_user`] whose first byte is written at
+/// `start`. The shared file offset is published only after bytes move, so an
+/// append attempt that faults or waits with zero progress leaves it unchanged.
+pub fn step_write_from_user_at(
+    pc: &PageContainer,
+    of: &OpenFile,
+    aspace: &AddressSpace,
+    src: UserPtr<u8>,
+    len: usize,
+    start: u64,
+    guard: &Guard<'_>,
+) -> StepOutcome<usize, ByteProgress> {
     // observe
     // upgrade
     // reserve
@@ -71,7 +87,7 @@ pub fn step_write_from_user(
     // publish
     use crate::page_backed::adapter::step_engine::StepOutcome as V3;
     emit_pagebacked_trace(b"debug.pagebacked.write_user.len", len as i64);
-    emit_pagebacked_trace(b"debug.pagebacked.write_user.offset", of.offset() as i64);
+    emit_pagebacked_trace(b"debug.pagebacked.write_user.offset", start as i64);
     emit_pagebacked_trace(b"debug.pagebacked.write_user.phase", 0);
     if len == 0 {
         return V3::done(0);
@@ -84,7 +100,7 @@ pub fn step_write_from_user(
         emit_pagebacked_trace(b"debug.pagebacked.write_user.err", 2);
         return V3::err(Errno::EINVAL.into());
     };
-    let Some(end) = of.offset().checked_add(len as u64) else {
+    let Some(end) = start.checked_add(len as u64) else {
         emit_pagebacked_trace(b"debug.pagebacked.write_user.err", 3);
         return V3::err(Errno::EINVAL.into());
     };
@@ -92,10 +108,9 @@ pub fn step_write_from_user(
         emit_pagebacked_trace(b"debug.pagebacked.write_user.err", 4);
         return V3::err(Errno::EINVAL.into());
     }
-    let start = of.offset();
     emit_pagebacked_trace(b"debug.pagebacked.write_user.phase", 1);
     let outcome =
-        step_range_with_user_buffer(pc, of, aspace, len, UserBuffer::Write { src }, guard);
+        step_range_with_user_buffer(pc, of, aspace, len, UserBuffer::Write { src }, start, guard);
     emit_pagebacked_trace(b"debug.pagebacked.write_user.phase", 2);
     let advanced_bytes = match &outcome {
         V3::Done(n) => *n,
@@ -148,11 +163,12 @@ fn step_range_with_user_buffer(
     aspace: &AddressSpace,
     len: usize,
     buffer: UserBuffer,
+    start_offset: u64,
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
     use crate::page_backed::adapter::step_engine::{ByteProgress, StepOutcome as V3};
     let mut advanced = 0usize;
-    let mut offset = of.offset();
+    let mut offset = start_offset;
     emit_pagebacked_trace(b"debug.pagebacked.user_range.len", len as i64);
     emit_pagebacked_trace(b"debug.pagebacked.user_range.phase", 0);
     while advanced < len {

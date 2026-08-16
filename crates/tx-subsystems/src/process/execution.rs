@@ -1302,6 +1302,7 @@ impl FinalizeDetachedOpenFileOp {
                 ops.on_last_close(guard);
             }
         }
+        self.file.complete_rnode_last_close();
         self.last_close_completed = true;
     }
 }
@@ -1345,6 +1346,7 @@ pub(crate) fn finalize_detached_open_file_without_retry(
             ops.on_last_close(guard);
         }
     }
+    file.complete_rnode_last_close();
     flush_result
 }
 
@@ -2512,16 +2514,13 @@ impl StepOp<crate::process::ProcessIdentity> for DupOp {
         &mut self,
         _ctx: &mut ScriptCtx<crate::process::ProcessIdentity>,
     ) -> StepOutcome<u32, NoProgress> {
-        let file = match self.process.fd(self.oldfd) {
-            Some(f) => f,
-            None => return StepOutcome::Err(crate::process::adapter::step_engine::Errno::EBADF),
-        };
-        super::structure::incr_pipe_fd_ref(&file);
-        match self.process.install_new_fd(file.clone(), false) {
-            Some(newfd) => StepOutcome::Done(newfd),
-            None => {
-                super::structure::decr_pipe_fd_ref(&file);
-                StepOutcome::Err(crate::process::adapter::step_engine::Errno::EAGAIN)
+        match self.process.duplicate_fd_at_least(self.oldfd, 0, false) {
+            Ok(newfd) => StepOutcome::Done(newfd),
+            Err(super::structure::DuplicateFdError::BadFileDescriptor) => {
+                StepOutcome::Err(crate::process::adapter::step_engine::Errno::EBADF)
+            }
+            Err(super::structure::DuplicateFdError::LimitReached) => {
+                StepOutcome::Err(crate::process::adapter::step_engine::Errno::EMFILE)
             }
         }
     }
@@ -2551,16 +2550,19 @@ impl StepOp<crate::process::ProcessIdentity> for Dup3Op {
         if self.flags & !O_CLOEXEC != 0 {
             return StepOutcome::Err(crate::process::adapter::step_engine::Errno::EINVAL);
         }
-        let file = match self.process.fd(self.oldfd) {
-            Some(f) => f,
-            None => return StepOutcome::Err(crate::process::adapter::step_engine::Errno::EBADF),
-        };
-        super::structure::incr_pipe_fd_ref(&file);
         let want_cloexec = self.flags & O_CLOEXEC != 0;
-        let previous = self
+        match self
             .process
-            .install_fd_with_cloexec(self.newfd, file, want_cloexec);
-        StepOutcome::Done((self.newfd, previous))
+            .duplicate_fd_to(self.oldfd, self.newfd, want_cloexec)
+        {
+            Ok(previous) => StepOutcome::Done((self.newfd, previous)),
+            Err(super::structure::DuplicateFdError::BadFileDescriptor) => {
+                StepOutcome::Err(crate::process::adapter::step_engine::Errno::EBADF)
+            }
+            Err(super::structure::DuplicateFdError::LimitReached) => {
+                StepOutcome::Err(crate::process::adapter::step_engine::Errno::EMFILE)
+            }
+        }
     }
 }
 
@@ -2612,19 +2614,16 @@ impl StepOp<crate::process::ProcessIdentity> for FcntlDupFdOp {
         &mut self,
         _ctx: &mut ScriptCtx<crate::process::ProcessIdentity>,
     ) -> StepOutcome<u32, NoProgress> {
-        if self.process.fd(self.fd).is_none() {
-            return StepOutcome::Err(crate::process::adapter::step_engine::Errno::EBADF);
-        }
-        let file = self.process.fd(self.fd).unwrap();
-        super::structure::incr_pipe_fd_ref(&file);
         match self
             .process
-            .install_new_fd_at_least(self.min, file.clone(), self.cloexec)
+            .duplicate_fd_at_least(self.fd, self.min, self.cloexec)
         {
-            Some(new_fd) => StepOutcome::Done(new_fd),
-            None => {
-                super::structure::decr_pipe_fd_ref(&file);
-                StepOutcome::Err(crate::process::adapter::step_engine::Errno::EAGAIN)
+            Ok(newfd) => StepOutcome::Done(newfd),
+            Err(super::structure::DuplicateFdError::BadFileDescriptor) => {
+                StepOutcome::Err(crate::process::adapter::step_engine::Errno::EBADF)
+            }
+            Err(super::structure::DuplicateFdError::LimitReached) => {
+                StepOutcome::Err(crate::process::adapter::step_engine::Errno::EMFILE)
             }
         }
     }

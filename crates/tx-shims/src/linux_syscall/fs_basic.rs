@@ -2681,7 +2681,16 @@ pub(super) async fn sys_statx<'a, P: tx_hal::ConsoleIf>(
                 }
             };
             let walker_cred = ctx.walker_cred();
-            let result = {
+            let result = if flags & (AT_SYMLINK_NOFOLLOW as u32) != 0 {
+                let mut script_ctx = build_subject_script_ctx(ctx);
+                let mut op = LstatxOp {
+                    rooted_at: &rooted_at,
+                    path: &path,
+                    cred: &walker_cred,
+                    target: None,
+                };
+                step_engine::drive_oneshot(&mut op, &mut script_ctx)
+            } else {
                 let mut script_ctx = build_subject_script_ctx(ctx);
                 let mut op = StatxOp {
                     rooted_at: &rooted_at,
@@ -2735,8 +2744,8 @@ pub(super) async fn sys_newfstatat<'a, P: tx_hal::ConsoleIf>(
         return SyscallResult::Error(EFAULT_VALUE);
     }
 
-    // Slice 6 honours: AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW (ignored)
-    // | AT_NO_AUTOMOUNT (ignored). Other bits are rejected so a
+    // Slice 6 honours AT_EMPTY_PATH and AT_SYMLINK_NOFOLLOW;
+    // AT_NO_AUTOMOUNT remains accepted as a no-op. Other bits are rejected so a
     // future caller passing an unrecognised flag (`AT_STATX_*`,
     // `AT_RECURSIVE`, etc.) sees `-EINVAL` rather than silent
     // misbehaviour. Note: AT_SYMLINK_NOFOLLOW is `i32` in numbers.rs
@@ -2755,8 +2764,9 @@ pub(super) async fn sys_newfstatat<'a, P: tx_hal::ConsoleIf>(
     let walker_cred = ctx.walker_cred();
 
     // AT_EMPTY_PATH + empty path: stat the cwd itself for AT_FDCWD,
-    // or mirror fstat(fd) for a real fd. Otherwise use StatOp +
-    // drive_oneshot from the same cwd/dirfd anchor as openat/mkdirat.
+    // or mirror fstat(fd) for a real fd. Otherwise select StatOp/LstatOp
+    // from AT_SYMLINK_NOFOLLOW and drive it from the same cwd/dirfd anchor as
+    // openat/mkdirat.
     let cwd = match ctx.process.cwd() {
         Some(d) => d,
         None => return SyscallResult::Error(ENOENT_VALUE),
@@ -2782,7 +2792,16 @@ pub(super) async fn sys_newfstatat<'a, P: tx_hal::ConsoleIf>(
                 None => return SyscallResult::Error(ENOTDIR_VALUE),
             }
         };
-        let result = {
+        let result = if flags & (AT_SYMLINK_NOFOLLOW as u32) != 0 {
+            let mut script_ctx = build_subject_script_ctx(ctx);
+            let mut op = LstatOp {
+                rooted_at: &rooted_at,
+                path: &path,
+                cred: &walker_cred,
+                target: None,
+            };
+            step_engine::drive_oneshot(&mut op, &mut script_ctx)
+        } else {
             let mut script_ctx = build_subject_script_ctx(ctx);
             let mut op = StatOp {
                 rooted_at: &rooted_at,

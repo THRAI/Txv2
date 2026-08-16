@@ -3454,7 +3454,11 @@ impl<I: BlockImage> Ext4Pager<I> {
             if observed.last_orphan == orphan_inode.get() {
                 next_last_orphan = next;
             } else if observed.last_orphan != 0 {
-                return Err(Ext4FormatError::Unsupported);
+                // The bounded destroy plan removes only the current orphan-list
+                // head. A zero-link inode behind another orphan is valid and
+                // becomes plannable after the head is destroyed; report
+                // temporary ordering, not a permanent format limitation.
+                return Err(Ext4FormatError::WouldBlock);
             }
         }
         let next_free_blocks = observed

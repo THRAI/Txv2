@@ -29,9 +29,9 @@ use tx_subsystems::vm::{
 
 use crate::linux_syscall::{
     AT_FDCWD, AT_REMOVEDIR, NR_FSTAT, NR_FTRUNCATE, NR_LINKAT, NR_LSEEK, NR_MKDIRAT, NR_MOUNT,
-    NR_NEWFSTATAT, NR_OPENAT, NR_READLINKAT, NR_RENAMEAT2, NR_SYMLINKAT, NR_TRUNCATE, NR_UNLINKAT,
-    NR_UTIMENSAT, NR_WRITE, O_RDWR, O_TMPFILE, RENAME_EXCHANGE, RENAME_NOREPLACE, SEEK_SET,
-    UTIME_NOW,
+    NR_NEWFSTATAT, NR_OPENAT, NR_READLINKAT, NR_RENAMEAT2, NR_SYMLINKAT, NR_SYNCFS, NR_TRUNCATE,
+    NR_UNLINKAT, NR_UTIMENSAT, NR_WRITE, O_DIRECTORY, O_RDONLY, O_RDWR, O_TMPFILE, RENAME_EXCHANGE,
+    RENAME_NOREPLACE, SEEK_SET, UTIME_NOW,
 };
 
 /// errno magnitudes (positive Linux RV64 generic ABI values).
@@ -321,6 +321,29 @@ fn nul_terminate(path: &[u8]) -> Vec<u8> {
     v.extend_from_slice(path);
     v.push(0);
     v
+}
+
+fn open_root_for_syncfs(ctx: &SyscallCtx<'_>) -> u64 {
+    let root = nul_terminate(b"/");
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_OPENAT,
+            [
+                AT_FDCWD as i64 as u64,
+                root.as_ptr() as u64,
+                (O_RDONLY | O_DIRECTORY) as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        ctx,
+    ));
+    drop(root);
+    match result {
+        SyscallResult::Return(fd) => fd as u64,
+        other => panic!("open root for syncfs: {other:?}"),
+    }
 }
 
 fn map_user_bytes(ctx: &SyscallCtx<'_>, uaddr: usize, bytes: &[u8]) -> u64 {
@@ -1366,10 +1389,8 @@ fn rename_op_preserves_pre_resolved_parents_across_yield() {
     assert!(lookup_exists(&tmpfs, b"target"));
 }
 
-/// Rename-over at the syscall layer must complete the VFS lifetime
-/// protocol by destroying the displaced inode after tmpfs drops its
-/// last link. Otherwise repeated temp-file replacement keeps old
-/// PageContainers resident until the whole tmpfs mount is torn down.
+/// Rename-over commits the namespace first, then mount settlement destroys the
+/// displaced zero-link inode once deferred VFS lifetimes are accounted for.
 #[test]
 fn dispatch_renameat2_over_existing_destroys_displaced_inode() {
     let _setup = fm_setup();
@@ -1386,6 +1407,7 @@ fn dispatch_renameat2_over_existing_destroys_displaced_inode() {
 
     let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
     let ctx = make_ctx(proc_cap, thread);
+    let syncfs_fd = open_root_for_syncfs(&ctx);
     let oldpath = nul_terminate(b"/source");
     let newpath = nul_terminate(b"/target");
     let req = SyscallRequest::new(
@@ -1404,18 +1426,34 @@ fn dispatch_renameat2_over_existing_destroys_displaced_inode() {
         SyscallResult::Return(0)
     );
 
-    let guard = guard();
+    let before_sync_guard = guard();
+    let deferred_meta = match tmpfs.load_inode_meta(displaced_id, &before_sync_guard) {
+        StepOutcome::Done(meta) => meta,
+        other => panic!("displaced inode before syncfs: {other:?}"),
+    };
+    assert_eq!(deferred_meta.nlinks, 0);
+    drop(before_sync_guard);
+
     assert_eq!(
-        tmpfs.load_inode_meta(displaced_id, &guard),
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(NR_SYNCFS, [syncfs_fd, 0, 0, 0, 0, 0]),
+            &ctx,
+        )),
+        SyscallResult::Return(0)
+    );
+
+    let after_sync_guard = guard();
+    assert_eq!(
+        tmpfs.load_inode_meta(displaced_id, &after_sync_guard),
         StepOutcome::Err(step_engine::Errno::ENOENT),
-        "rename-over should destroy the displaced zero-link inode"
+        "syncfs should settle and destroy the displaced zero-link inode"
     );
     drop(oldpath);
     drop(newpath);
 }
 
-/// Once rename-over has committed the namespace change, failure of the
-/// displaced inode's best-effort cleanup must not rewrite success to ENOSYS.
+/// Once rename-over has committed the namespace change, deferred cleanup must
+/// not rewrite syscall success; the following syncfs reports cleanup ENOSYS.
 #[test]
 fn dispatch_renameat2_over_existing_ignores_post_commit_destroy_enosys() {
     let _setup = fm_setup();
@@ -1437,6 +1475,7 @@ fn dispatch_renameat2_over_existing_ignores_post_commit_destroy_enosys() {
     );
     let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
     let ctx = make_ctx(proc_cap, thread);
+    let syncfs_fd = open_root_for_syncfs(&ctx);
     let oldpath = nul_terminate(b"/source");
     let newpath = nul_terminate(b"/target");
     let req = SyscallRequest::new(
@@ -1455,17 +1494,32 @@ fn dispatch_renameat2_over_existing_ignores_post_commit_destroy_enosys() {
         block_on(dispatch::<ShimsTestPmap>(req, &ctx)),
         SyscallResult::Return(0)
     );
-    assert_eq!(cleanup_fs.destroy_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(cleanup_fs.destroy_calls.load(Ordering::Relaxed), 0);
     assert!(!lookup_exists(&tmpfs, b"source"));
     assert!(lookup_exists(&tmpfs, b"target"));
-    let guard = guard();
+    let before_sync_guard = guard();
     assert!(
         matches!(
-            tmpfs.load_inode_meta(displaced_id, &guard),
+            tmpfs.load_inode_meta(displaced_id, &before_sync_guard),
             StepOutcome::Done(_)
         ),
-        "failed best-effort cleanup leaves the zero-link orphan backend-owned"
+        "rename defers zero-link inode cleanup to mount settlement"
     );
+    drop(before_sync_guard);
+
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(NR_SYNCFS, [syncfs_fd, 0, 0, 0, 0, 0]),
+            &ctx,
+        )),
+        SyscallResult::Error(E_NOSYS)
+    );
+    assert_eq!(cleanup_fs.destroy_calls.load(Ordering::Relaxed), 1);
+    let after_sync_guard = guard();
+    assert!(matches!(
+        tmpfs.load_inode_meta(displaced_id, &after_sync_guard),
+        StepOutcome::Done(_)
+    ));
     drop(oldpath);
     drop(newpath);
 }

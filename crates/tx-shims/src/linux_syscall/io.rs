@@ -806,9 +806,10 @@ pub(super) async fn sys_writev<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
 /// PageBacked-only synchronous `writev(2)` lane.
 ///
 /// This is intentionally narrower than [`sys_writev`]: it claims only regular
-/// PageBacked fds and only when each PageBacked write completes without a
-/// `Yield`. Other fd kinds, and future PageBacked backends that need to park,
-/// return `None` so the async `sys_writev` path remains the semantic fallback.
+/// PageBacked fds. A zero-progress `Yield` returns `None` so the async
+/// `sys_writev` path owns the wait; a partial-progress `Yield` returns the
+/// committed prefix as a Linux short write so that fallback cannot replay it.
+/// Other fd kinds also return `None`.
 pub(super) fn sys_writev_pagebacked_oneshot<'a>(
     args: [u64; 6],
     ctx: &SyscallCtx<'a>,
@@ -850,7 +851,6 @@ pub(super) fn sys_writev_pagebacked_oneshot<'a>(
     if !file.flags().write {
         return Some(SyscallResult::Error(EINVAL_VALUE));
     }
-
     const IOVEC_BYTES: u64 = 16;
     let mut total: i64 = 0;
     for i in 0..iovcnt as u64 {
@@ -897,12 +897,21 @@ pub(super) fn sys_writev_pagebacked_oneshot<'a>(
         }
 
         let guard = crate::adapter::step_engine::guard();
-        match tx_subsystems::page_backed::step_write_from_user(
+        // Select append EOF only once the iovec and its user range have been
+        // validated. The offset-aware helper publishes the position only
+        // after bytes move, preserving the old offset on zero-progress Yield.
+        let start = if file.flags().append && total == 0 {
+            pc.size_bytes()
+        } else {
+            file.offset()
+        };
+        match tx_subsystems::page_backed::step_write_from_user_at(
             &pc,
             &file,
             &ctx.aspace,
             tx_hal::UserPtr::<u8>::new(base as usize),
             len,
+            start,
             &guard,
         ) {
             tx_substrate::step::StepOutcome::Done(n) => {
@@ -929,7 +938,8 @@ pub(super) fn sys_writev_pagebacked_oneshot<'a>(
                 }
                 return Some(SyscallResult::error_from(errno));
             }
-            tx_substrate::step::StepOutcome::Yield { .. } => {
+            tx_substrate::step::StepOutcome::Yield { progress, .. } => {
+                total += progress.bytes() as i64;
                 if total > 0 {
                     return Some(SyscallResult::Return(total));
                 }

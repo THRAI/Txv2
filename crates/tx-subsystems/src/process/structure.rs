@@ -580,7 +580,10 @@ impl ProcessIdentity {
         let Some(payload) = payload.as_ref() else {
             return None;
         };
-        incr_pipe_fd_ref(&file);
+        assert!(
+            incr_pipe_fd_ref(&file),
+            "duplicated fd must reference a live OpenFile"
+        );
         payload.set_fd(idx, Some(file))
     }
 
@@ -686,6 +689,36 @@ impl ProcessIdentity {
 
     pub fn install_new_fd(&self, file: Cap<crate::vfs::OpenFile>, cloexec: bool) -> Option<u32> {
         self.install_new_fd_at_least(0, file, cloexec)
+    }
+
+    /// Atomically resolve `oldfd`, acquire one descriptor reference, and
+    /// install it into the lowest free slot at or above `min`.
+    pub(crate) fn duplicate_fd_at_least(
+        &self,
+        oldfd: u32,
+        min: u32,
+        cloexec: bool,
+    ) -> Result<u32, DuplicateFdError> {
+        let payload = self.payload.lock();
+        let payload = payload
+            .as_ref()
+            .ok_or(DuplicateFdError::BadFileDescriptor)?;
+        payload.duplicate_fd_at_least(oldfd, min, cloexec)
+    }
+
+    /// Atomically resolve `oldfd`, acquire one descriptor reference, and
+    /// replace `newfd`, returning its detached previous occupant.
+    pub(crate) fn duplicate_fd_to(
+        &self,
+        oldfd: u32,
+        newfd: u32,
+        cloexec: bool,
+    ) -> Result<Option<Cap<OpenFile>>, DuplicateFdError> {
+        let payload = self.payload.lock();
+        let payload = payload
+            .as_ref()
+            .ok_or(DuplicateFdError::BadFileDescriptor)?;
+        payload.duplicate_fd_to(oldfd, newfd, cloexec)
     }
 
     /// Atomically replace one descriptor and its close-on-exec state.
@@ -1156,6 +1189,12 @@ impl ProcessCwdState {
             Self::Legacy(_) => None,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DuplicateFdError {
+    BadFileDescriptor,
+    LimitReached,
 }
 
 pub struct ProcessPayload {
@@ -1689,6 +1728,78 @@ impl ProcessPayload {
         Some(fd)
     }
 
+    fn duplicate_fd_at_least(
+        &self,
+        oldfd: u32,
+        min: u32,
+        want_cloexec: bool,
+    ) -> Result<u32, DuplicateFdError> {
+        let mut files = self.fds.lock();
+        let file = files
+            .get(&oldfd)
+            .cloned()
+            .ok_or(DuplicateFdError::BadFileDescriptor)?;
+        let limit = self.rlimit_nofile_cur.load(Ordering::Acquire);
+        let mut fd = min;
+        for &existing in files.keys() {
+            if existing < fd {
+                continue;
+            }
+            if existing == fd {
+                fd = fd.checked_add(1).ok_or(DuplicateFdError::LimitReached)?;
+            } else {
+                break;
+            }
+        }
+        if fd >= limit {
+            return Err(DuplicateFdError::LimitReached);
+        }
+
+        assert!(
+            incr_pipe_fd_ref(&file),
+            "fd-table entry must retain a live OpenFile descriptor reference"
+        );
+        let mut cloexec = self.fd_cloexec.lock();
+        debug_assert!(!files.contains_key(&fd));
+        files.insert(fd, file);
+        if want_cloexec {
+            cloexec.insert(fd);
+        } else {
+            cloexec.remove(&fd);
+        }
+        Ok(fd)
+    }
+
+    fn duplicate_fd_to(
+        &self,
+        oldfd: u32,
+        newfd: u32,
+        want_cloexec: bool,
+    ) -> Result<Option<Cap<OpenFile>>, DuplicateFdError> {
+        let mut files = self.fds.lock();
+        let file = files
+            .get(&oldfd)
+            .cloned()
+            .ok_or(DuplicateFdError::BadFileDescriptor)?;
+        assert!(
+            incr_pipe_fd_ref(&file),
+            "fd-table entry must retain a live OpenFile descriptor reference"
+        );
+        let mut cloexec = self.fd_cloexec.lock();
+        let previous = files.insert(newfd, file);
+        if want_cloexec {
+            cloexec.insert(newfd);
+        } else {
+            cloexec.remove(&newfd);
+        }
+        drop(cloexec);
+        drop(files);
+        if let Some(previous) = &previous {
+            decr_pipe_fd_ref(previous);
+        }
+        Ok(previous)
+    }
+
     pub fn install_fd_with_cloexec(
         &self,
         fd: u32,
@@ -1811,7 +1922,10 @@ impl ProcessPayload {
         let cloexec = self.fd_cloexec.lock();
         let cloned = files.clone();
         for file in cloned.values() {
-            incr_pipe_fd_ref(file);
+            assert!(
+                incr_pipe_fd_ref(file),
+                "fork snapshot must reference a live OpenFile"
+            );
         }
         (cloned, cloexec.clone())
     }
@@ -2447,23 +2561,23 @@ unsafe impl ZoneAllocated for ProcessPayload {
     }
 }
 
-pub(crate) fn incr_pipe_fd_ref(file: &Cap<OpenFile>) {
-    adjust_pipe_fd_ref(file, true);
+pub(crate) fn incr_pipe_fd_ref(file: &Cap<OpenFile>) -> bool {
+    adjust_pipe_fd_ref(file, true)
 }
 
 pub(crate) fn decr_pipe_fd_ref(file: &Cap<OpenFile>) {
-    adjust_pipe_fd_ref(file, false);
+    let _ = adjust_pipe_fd_ref(file, false);
 }
 
 pub(crate) fn decr_pipe_fd_ref_with_post<F>(file: &Cap<OpenFile>, post: &mut F)
 where
     F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
 {
-    file.adjust_process_fd_reference_with_post(false, post);
+    let _ = file.adjust_process_fd_reference_with_post(false, post);
 }
 
-fn adjust_pipe_fd_ref(file: &Cap<OpenFile>, increment: bool) {
-    file.adjust_process_fd_reference(increment);
+fn adjust_pipe_fd_ref(file: &Cap<OpenFile>, increment: bool) -> bool {
+    file.adjust_process_fd_reference(increment)
 }
 
 unsafe impl ZoneAllocated for ProcessGroup {

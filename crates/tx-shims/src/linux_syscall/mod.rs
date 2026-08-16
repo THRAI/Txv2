@@ -88,7 +88,8 @@ use tx_subsystems::tty::execution::{
 };
 use tx_subsystems::tty::structure::{Termios, Winsize};
 use tx_subsystems::vfs::composite::{
-    AccessOp, ChmodOp, ChownOp, MknodOp, NanosleepOp, RenameOp, StatOp, StatxOp, StatxResult,
+    AccessOp, ChmodOp, ChownOp, LstatOp, LstatxOp, MknodOp, NanosleepOp, RenameOp, StatOp, StatxOp,
+    StatxResult,
 };
 use tx_subsystems::vfs::structure::{
     Credential, FsNotifyInstance, FsNotifyKind, InodeKind, InodeMeta, OpenFileBacking,
@@ -985,10 +986,9 @@ fn emit_writev_hot_trace(name: &[u8], value: i64) {
 /// This handles the libcbench tmpfile shape without allocating and polling the
 /// broad async `sys_writev` future. It is deliberately a narrow prefilter:
 /// non-PageBacked fds return `None` and continue through the existing async
-/// dispatcher. PageBacked writes that unexpectedly need to yield surface
-/// `EAGAIN`; the current PageBacked user-buffer path materializes
-/// synchronously, so that is a defensive future-backend branch rather than the
-/// libcbench path.
+/// dispatcher. A zero-progress PageBacked `Yield` also returns `None`, so the
+/// waiting async dispatcher owns the wait/retry rather than exposing a
+/// kernel-internal scheduling boundary as userspace `EAGAIN`.
 pub fn dispatch_writev_pagebacked_oneshot(
     req: &SyscallRequest,
     ctx: &SyscallCtx<'_>,
@@ -997,11 +997,10 @@ pub fn dispatch_writev_pagebacked_oneshot(
         return None;
     }
 
+    emit_writev_hot_trace(b"debug.writev.pagebacked_dispatch.enter", req.nr as i64);
+    let result = sys_writev_pagebacked_oneshot(req.args, ctx)?;
     let l0_span = emit_syscall_enter(req);
     let prev = tx_observe::set_current_parent_span(l0_span);
-    emit_writev_hot_trace(b"debug.writev.pagebacked_dispatch.enter", req.nr as i64);
-    let result =
-        sys_writev_pagebacked_oneshot(req.args, ctx).unwrap_or(SyscallResult::Error(EAGAIN_VALUE));
     emit_writev_hot_trace(b"debug.writev.pagebacked_dispatch.after", req.nr as i64);
     tx_observe::set_current_parent_span(prev);
     emit_syscall_exit(l0_span, &result);
@@ -1664,6 +1663,7 @@ pub(super) fn errno_to_i32(errno: Errno) -> i32 {
         Errno::EISDIR => 21,
         Errno::ELIBBAD => 80,
         Errno::ELOOP => 40,
+        Errno::EMFILE => EMFILE_VALUE,
         Errno::EMLINK => 31,
         Errno::ENAMETOOLONG => 36,
         Errno::ENODEV => 19,

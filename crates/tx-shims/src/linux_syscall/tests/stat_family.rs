@@ -413,6 +413,57 @@ fn dispatch_newfstatat_at_symlink_nofollow_stats_link() {
     drop(path);
 }
 
+/// Git and `find` use `newfstatat(..., AT_SYMLINK_NOFOLLOW)` as `lstat`.
+/// A dangling final symlink must therefore stat successfully as the link
+/// itself instead of following its missing target and returning `ENOENT`.
+#[test]
+fn dispatch_newfstatat_nofollow_stats_dangling_symlink() {
+    let _setup = stat_setup();
+    let (root_dentry, tmpfs, _root_rnode, root_mount) = build_tmpfs_root();
+    let owner_cred = Credential {
+        uid: 0,
+        gid: 0,
+        effective_caps: CapabilitySet::FULL,
+    };
+    let link_id = {
+        let guard = guard();
+        match tmpfs.symlink(
+            TMPFS_ROOT_OBJECT_ID,
+            b"probe-link",
+            b"missing-target",
+            &owner_cred,
+            &guard,
+        ) {
+            StepOutcome::Done((id, _meta)) => id,
+            other => panic!("symlink probe-link -> missing-target: {other:?}"),
+        }
+    };
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry, root_mount);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let path = nul_terminate(b"/probe-link");
+    let mut statbuf = vec![0u8; STAT_BYTES];
+    let req = SyscallRequest::new(
+        NR_NEWFSTATAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            statbuf.as_mut_ptr() as u64,
+            crate::linux_syscall::AT_SYMLINK_NOFOLLOW as u64,
+            0,
+            0,
+        ],
+    );
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Return(0));
+    assert_eq!(
+        read_u32_at(&statbuf, STAT_MODE_OFF) as u16 & 0o170000,
+        S_IFLNK
+    );
+    assert_eq!(read_u64_at(&statbuf, STAT_INO_OFF), link_id.as_u64());
+    drop(path);
+}
+
 /// `newfstatat(AT_FDCWD, "/missing", &statbuf, 0)` surfaces the
 /// walker's `Errno::ENOENT` as `-ENOENT`.
 #[test]
@@ -672,6 +723,55 @@ fn dispatch_statx_at_symlink_nofollow_stats_link() {
     let ctx = make_ctx(proc_cap, thread);
 
     let path = nul_terminate(b"/link");
+    let mut statxbuf = vec![0u8; STATX_BYTES];
+    let req = SyscallRequest::new(
+        NR_STATX,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            crate::linux_syscall::AT_SYMLINK_NOFOLLOW as u64,
+            crate::linux_syscall::numbers::STATX_BASIC_STATS as u64,
+            statxbuf.as_mut_ptr() as u64,
+            0,
+        ],
+    );
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Return(0));
+    let mode = read_u16_at(&statxbuf, STATX_MODE_OFF);
+    assert_eq!(mode & 0o170000, S_IFLNK, "expected S_IFLNK; got {mode:#o}");
+    assert_eq!(read_u64_at(&statxbuf, STATX_INO_OFF), link_id.as_u64());
+    drop(path);
+}
+
+/// LA64 BusyBox `find` uses `statx(..., AT_SYMLINK_NOFOLLOW)` as `lstat`.
+/// Git's dangling symlink capability probe must stat as the link itself rather
+/// than following the absent target and returning `ENOENT`.
+#[test]
+fn dispatch_statx_nofollow_stats_dangling_symlink() {
+    let _setup = stat_setup();
+    let (root_dentry, tmpfs, _root_rnode, root_mount) = build_tmpfs_root();
+    let owner_cred = Credential {
+        uid: 0,
+        gid: 0,
+        effective_caps: CapabilitySet::FULL,
+    };
+    let link_id = {
+        let guard = guard();
+        match tmpfs.symlink(
+            TMPFS_ROOT_OBJECT_ID,
+            b"probe-link",
+            b"missing-target",
+            &owner_cred,
+            &guard,
+        ) {
+            StepOutcome::Done((id, _meta)) => id,
+            other => panic!("symlink probe-link -> missing-target: {other:?}"),
+        }
+    };
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry, root_mount);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let path = nul_terminate(b"/probe-link");
     let mut statxbuf = vec![0u8; STATX_BYTES];
     let req = SyscallRequest::new(
         NR_STATX,

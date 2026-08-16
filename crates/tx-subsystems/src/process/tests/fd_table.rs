@@ -59,6 +59,23 @@ fn assert_pipe_read_blocks(payload: &Cap<crate::pipe::PipePayload>) {
 }
 
 #[test]
+fn open_file_fd_reference_cannot_revive_after_last_close() {
+    let _g = setup();
+    let file = fresh_open_file();
+
+    crate::process::structure::decr_pipe_fd_ref(&file);
+    assert!(
+        !crate::process::structure::incr_pipe_fd_ref(&file),
+        "a stale dup snapshot must not revive a zero-ref OpenFile"
+    );
+    file.complete_rnode_last_close();
+    assert!(
+        !crate::process::structure::incr_pipe_fd_ref(&file),
+        "last-close finalization is an irreversible descriptor boundary"
+    );
+}
+
+#[test]
 fn process_payload_fd_cloexec_default_zero() {
     let _g = setup();
     let proc_cap = bootstrap();

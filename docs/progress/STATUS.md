@@ -1,3 +1,28 @@
+- 2026-08-16 (**双架构 ext4 持久化与洁净验收最终转绿；逐条短命令证据已重建**).
+  **Changed**：在 `ed98cc0f5` 的 mount settlement 基础上补齐四个最小责任边界：
+  ext4 非 orphan-head 的 zero-link inode 以 `WouldBlock` 等待而非报 ENOSYS，destroy
+  队列保持 FIFO 轮转；逻辑 last-close 的 OpenFile EBR retain 被精确折算，dup/fork
+  fd 引用在 fd-table 锁内线性化且 0 引用不可复活；PageBacked direct-user/writev
+  正确实现 O_APPEND，EFAULT/零进度 Yield 不移动共享 offset，跨页 partial Yield
+  以 short write 返回已提交前缀而不异步重放；`newfstatat`/`statx` 正确遵守
+  `AT_SYMLINK_NOFOLLOW`，Git dangling-symlink 探针不再误报 ENOENT。**Verification**：
+  ext4 orphan 1/1、mount settlement 9/9、newfstatat 6/6、statx 5/5、rename-over
+  2/2、dup 9/9、F_DUPFD 2/2、zero-ref non-revival 1/1、writev PageBacked 4/4 及
+  append success/EFAULT 回归均通过；release RV64/LA64 构建通过。全新 SMP4
+  direct-root 副本按 `one-short-command; prompt; echo-$?; prompt` 协议完成
+  Vim→GCC→Rust→Git RW、显式 fsync/syncfs、同盘 RO 重启、25 项哈希与 EROFS，
+  两边最终宿主 `e2fsck -fn=0`：RV 证据
+  `target/qemu-persist-accept/run-20260816-rv-final-short-Gqb6DB/`，LA 证据
+  `target/qemu-persist-accept/run-20260816-la-final-short-PLFvg7/`；母盘 SHA-256
+  仍为 `d547220c...eb4` / `57c64d68...25ca`。LA2K1000 kernel-only release uImage
+  已生成于 `target/images/txv2-la2k1000.uimage`，SHA-256
+  `1fb25cec...5e79`，未操作物理板/U-Boot。`cargo -q xtask unit` 构建通过但仍被
+  既有 tx-shims 全局状态并行失败与两项 libctest 命令断言阻断，本次定向用例无
+  失败。**Next**：审查并创建一笔 post-`ed98cc0f5` 语义提交，不 push；保留所有
+  QEMU 副本。**Blocker**：本次 ext4 验收无阻塞；bridge forwarding、07-24
+  progress-schema 非法 `completed`、既有 tx-substrate API 漂移和网络压力仍排除。
+  详细总账见 `msp/debug-logs/2026-08-16-ext4-persistence-final-acceptance.md`。
+
 - 2026-08-16 (**RV64 ext4 零 dtime inode 泄漏已定位并修复；最小洁净门禁转绿，LA64
   QEMU 等待执行授权**). **Changed**：从保留的 RV31 原副本确认 journal replay 后残余
   inode 7193/7197/7199 均为无目录项、link=0、dtime=0 的已分配目录；最小并发目录

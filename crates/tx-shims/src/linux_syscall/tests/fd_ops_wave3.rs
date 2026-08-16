@@ -15,6 +15,140 @@ use tx_services::time::{
 };
 use tx_substrate::wake::{MailboxEvent, TaskMailbox};
 
+#[derive(Default)]
+struct YieldingWritevPageBacking {
+    complete_first_page: bool,
+}
+
+impl tx_subsystems::page_backed::FsPageBacking for YieldingWritevPageBacking {
+    fn fetch_page(
+        &self,
+        _fs_object_id: tx_subsystems::vfs::FsObjectId,
+        offset: u64,
+        _guard: &tx_subsystems::execution::Guard<'_>,
+    ) -> StepOutcome<tx_subsystems::page_backed::Frame, step_engine::NoProgress> {
+        if self.complete_first_page && offset == 0 {
+            let owned = crate::adapter::step_engine::page_allocator::reserve_frame(
+                crate::adapter::step_engine::page_allocator::ZeroPolicy::Zeroed,
+            )
+            .expect("reserve first writev destination page")
+            .commit();
+            return StepOutcome::Done(tx_subsystems::page_backed::Frame::from_owned(owned));
+        }
+        StepOutcome::yield_on_wait_source(step_engine::NoProgress, 0x5756, 1)
+    }
+
+    fn flush_page(
+        &self,
+        _fs_object_id: tx_subsystems::vfs::FsObjectId,
+        _offset: u64,
+        _frame: &tx_subsystems::page_backed::Frame,
+        _guard: &tx_subsystems::execution::Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        StepOutcome::done(())
+    }
+
+    fn truncate(
+        &self,
+        _fs_object_id: tx_subsystems::vfs::FsObjectId,
+        _new_size: u64,
+        _guard: &tx_subsystems::execution::Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        StepOutcome::done(())
+    }
+
+    fn fsync_file(
+        &self,
+        _fs_object_id: tx_subsystems::vfs::FsObjectId,
+        _guard: &tx_subsystems::execution::Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        StepOutcome::done(())
+    }
+}
+
+fn writev_pagebacked_file(
+    append: bool,
+    initial_size: u64,
+    complete_first_page: bool,
+) -> Cap<OpenFile> {
+    use tx_subsystems::mount::{DevId, MountOptions, MountPayload, MountPayloadPin, SourceLabel};
+    use tx_subsystems::page_backed::PageContainer;
+    use tx_subsystems::vfs::FsObjectId;
+
+    let fs_ops = Arc::new(tx_fs::tmpfs::Tmpfs::new());
+    let page_backing = Arc::new(YieldingWritevPageBacking {
+        complete_first_page,
+    });
+    let mount = MountPayload::new_cap(
+        fs_ops,
+        page_backing,
+        None,
+        DevId::new(0x5756),
+        MountOptions::default(),
+        "yielding-writev-test",
+        SourceLabel::Static("yielding-writev-test"),
+    )
+    .expect("yielding writev mount payload");
+    let guard = guard();
+    let (pc, _) = PageContainer::find_or_create_file_cap(
+        MountPayloadPin::acquire(&step_engine::PayloadCap::from_cap(mount)),
+        FsObjectId::new(0x5756),
+        initial_size,
+        2,
+        &guard,
+    )
+    .expect("yielding writev page container");
+    let rnode = RNode::new_cap(
+        FsObjectId::new(0x5756),
+        InodeMeta::new(InodeKind::Regular, 0o100644),
+        RNodeBacking::PageBacked { pc },
+    )
+    .expect("yielding writev rnode");
+    OpenFile::new_cap(
+        rnode,
+        OpenFileFlags {
+            read: true,
+            write: true,
+            append,
+            cloexec: false,
+            nonblocking: false,
+            packet: false,
+        },
+    )
+    .expect("yielding writev open file")
+}
+
+fn yielding_writev_pagebacked_file(append: bool) -> Cap<OpenFile> {
+    writev_pagebacked_file(append, if append { 7 } else { 0 }, false)
+}
+
+fn partially_yielding_append_writev_file() -> Cap<OpenFile> {
+    writev_pagebacked_file(true, tx_subsystems::vm::USER_PAGE_SIZE as u64 - 1, true)
+}
+
+fn map_writev_test_bytes(ctx: &SyscallCtx<'_>, uaddr: usize, bytes: &[u8]) -> u64 {
+    let range = tx_subsystems::vm::UserRange::new_aligned(
+        tx_subsystems::vm::UserVirtAddr(uaddr),
+        tx_subsystems::vm::USER_PAGE_SIZE,
+    )
+    .expect("aligned writev test range");
+    let request = tx_subsystems::vm::VmMapRequest::fixed(
+        range,
+        tx_subsystems::vm::MapPlacement::FixedReplace,
+        tx_subsystems::vm::Prot::READ_WRITE,
+        tx_subsystems::vm::VmEntryFlags::PRIVATE,
+        tx_subsystems::vm::VmBacking::PrivateAnon,
+    );
+    ctx.aspace.try_mmap(request).expect("map writev test bytes");
+    let guard = guard();
+    assert_eq!(
+        ctx.aspace
+            .copy_to_user(tx_hal::UserPtr::<u8>::new(uaddr), bytes, &guard),
+        StepOutcome::Done(bytes.len())
+    );
+    uaddr as u64
+}
+
 const E_INVAL: i32 = 22;
 const E_NOSYS: i32 = 38;
 const E_BUSY: i32 = 16;
@@ -479,14 +613,102 @@ fn writev_pagebacked_prefilter_rejects_socketpair_without_rnode_panic() {
     let ctx = make_ctx(proc_cap.clone(), thread);
     let sv = dispatch_socketpair(&ctx);
 
-    let payload = *b"wv";
-    let iov = [payload.as_ptr() as u64, payload.len() as u64];
+    // Socketpair has no RNode/PageBacked backing, so the narrow prefilter must
+    // reject it before inspecting any iovec payload.
+    let iov = [0u64, 0u64];
     let req = SyscallRequest::new(NR_WRITEV, [sv[0] as u64, iov.as_ptr() as u64, 1, 0, 0, 0]);
 
     assert_eq!(
         crate::linux_syscall::dispatch_writev_pagebacked_oneshot(&req, &ctx),
         None,
         "socketpair writev must fall through to the generic writev path"
+    );
+}
+
+#[test]
+fn writev_pagebacked_yield_falls_through_to_async_dispatch() {
+    let _setup = pipe2_setup();
+    let (proc_cap, thread) = fresh_proc_thread();
+    let ctx = make_ctx(proc_cap.clone(), thread);
+    let fd = 91;
+    assert!(
+        proc_cap
+            .install_fd(fd, yielding_writev_pagebacked_file(false))
+            .is_none(),
+        "test fd is initially vacant"
+    );
+
+    let payload = map_writev_test_bytes(&ctx, 0x5500_0000, b"wv");
+    let iov = [payload, 2u64];
+    let iov_bytes = unsafe {
+        core::slice::from_raw_parts(iov.as_ptr().cast::<u8>(), core::mem::size_of_val(&iov))
+    };
+    let iov_ptr = map_writev_test_bytes(&ctx, 0x5500_1000, iov_bytes);
+    let req = SyscallRequest::new(NR_WRITEV, [fd as u64, iov_ptr, 1, 0, 0, 0]);
+
+    assert_eq!(
+        crate::linux_syscall::dispatch_writev_pagebacked_oneshot(&req, &ctx),
+        None,
+        "zero-progress PageBacked Yield must enter the waiting async writev path"
+    );
+}
+
+#[test]
+fn writev_pagebacked_append_yield_preserves_offset_without_progress() {
+    let _setup = pipe2_setup();
+    let (proc_cap, thread) = fresh_proc_thread();
+    let ctx = make_ctx(proc_cap.clone(), thread);
+    let fd = 92;
+    let file = yielding_writev_pagebacked_file(true);
+    file.set_offset(1);
+    assert!(proc_cap.install_fd(fd, file.clone()).is_none());
+
+    let payload = map_writev_test_bytes(&ctx, 0x5500_2000, b"wv");
+    let iov = [payload, 2u64];
+    let iov_bytes = unsafe {
+        core::slice::from_raw_parts(iov.as_ptr().cast::<u8>(), core::mem::size_of_val(&iov))
+    };
+    let iov_ptr = map_writev_test_bytes(&ctx, 0x5500_3000, iov_bytes);
+    let req = SyscallRequest::new(NR_WRITEV, [fd as u64, iov_ptr, 1, 0, 0, 0]);
+
+    assert_eq!(
+        crate::linux_syscall::dispatch_writev_pagebacked_oneshot(&req, &ctx),
+        None
+    );
+    assert_eq!(
+        file.offset(),
+        1,
+        "zero-progress append Yield must leave the shared offset unchanged"
+    );
+}
+
+#[test]
+fn writev_pagebacked_partial_yield_returns_committed_prefix_once() {
+    let _setup = pipe2_setup();
+    let (proc_cap, thread) = fresh_proc_thread();
+    let ctx = make_ctx(proc_cap.clone(), thread);
+    let fd = 93;
+    let file = partially_yielding_append_writev_file();
+    file.set_offset(3);
+    assert!(proc_cap.install_fd(fd, file.clone()).is_none());
+
+    let payload = map_writev_test_bytes(&ctx, 0x5500_4000, b"xy");
+    let iov = [payload, 2u64];
+    let iov_bytes = unsafe {
+        core::slice::from_raw_parts(iov.as_ptr().cast::<u8>(), core::mem::size_of_val(&iov))
+    };
+    let iov_ptr = map_writev_test_bytes(&ctx, 0x5500_5000, iov_bytes);
+    let req = SyscallRequest::new(NR_WRITEV, [fd as u64, iov_ptr, 1, 0, 0, 0]);
+
+    assert_eq!(
+        crate::linux_syscall::dispatch_writev_pagebacked_oneshot(&req, &ctx),
+        Some(SyscallResult::Return(1)),
+        "partial Yield must return the committed prefix instead of retrying it"
+    );
+    assert_eq!(
+        file.offset(),
+        tx_subsystems::vm::USER_PAGE_SIZE as u64,
+        "append offset advances by exactly the committed prefix"
     );
 }
 

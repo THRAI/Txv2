@@ -91,7 +91,7 @@ use sparse_index::SparseIndex;
 pub use targeted_read::read_exact_at;
 pub use user_buffer::{
     step_read_to_kernel, step_read_to_user, step_write_from_kernel, step_write_from_user,
-    ReadToUserOp, WriteFromUserOp,
+    step_write_from_user_at, ReadToUserOp, WriteFromUserOp,
 };
 
 #[cfg(test)]
