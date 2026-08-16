@@ -35,8 +35,15 @@
   replay/home-block/barrier，不能声称失败前零写入。随后同盘 RO mount 和 Git fsck
   成功；额外以同一镜像、最终 `ro` 和 `tx.ext4.journal-preflight=1` 执行严格只读
   shadow scan，明确返回 `recovery-required=1:stage=scan:error=corrupt`，随后拒绝挂载并
-  落入 tmpfs/panic。当前 MMC 必须封存，不能 repair/replay/再试 RW。硬边界禁止
-  repair fsck、raw write 或盲试 RW。因此 Vim、GCC、Rust、full
+  落入 tmpfs/panic。关机拔卡后，宿主把该整盘识别为 USB `/dev/sda`（29.5 GiB、
+  whole-device ext4、UUID `dff3fc28-3a72-4c0f-92cb-b681cc185680`）。因无免密权限，
+  `blockdev --setro` 未生效；随后一次 `ro,noload` 挂载虽以只读、无 journal 方式
+  完成，Linux 仍执行 `orphan cleanup on readonly fs` 并删除 1 个 orphan inode，故该
+  操作不能作为零写入证据，介质也不再与拔卡前逐位等价。根目录读取随即以
+  `inode #2: checksumming directory block 0` / `Directory block failed checksum`
+  失败，`df` 同时显示 0 可用空间。发现后立即卸载并 power-off；复核时 `/dev/sda`
+  已消失且无残留挂载。当前 MMC 必须封存，不能 repair/replay/再试 RW，也不应再放回
+  板上写入。硬边界禁止 repair fsck、raw write 或盲试 RW。因此 Vim、GCC、Rust、full
   clone 与最终 RW→reset→RO 验收均未执行/未通过，不得让用户继续 push/pull 验证。
 
 - 2026-08-16 (**LA stall/File-I/O 修复已整理提交；VF2 工具与复位持久化交接已冻结**).

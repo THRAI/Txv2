@@ -16,7 +16,8 @@
     "A qemu-riscv64 syscall replay of the same Git 2.49.1 showed refs are published before git maintenance run --auto --no-quiet --detach and a parent wait4. This makes post-commit process lifecycle the leading hypothesis, but the hung physical run had no valid stall snapshot, so wait4 is not claimed as the sole proven root cause.",
     "Commit f11ad1076 fixes a separate proven wait interruption bug: ProcessIdentity now delegates thread_signal_interrupts_wait to the existing disposition-aware pending-signal predicate. This explains why a wait could consume SIGINT or SIGCANCEL and park again; the previously failing focused drive test and the full 24-test drive integration suite pass. This source change has not been built or physically booted because the MMC RW blocker appeared first.",
     "After the hung commit was physically reset, the same fixed image with tx.root=mmcblk0 rw failed at mount:rootfs:ext4:mmcblk0:stage=rw-discovered:errno=EIO, fell back to tmpfs, and panicked when /bin/sh was absent. The aggregate RW path can include journal replay, home-block writes, barriers, orphan recovery, recovery-bit writes, and runtime construction, so the sentinel does not prove zero device writes before failure.",
-    "The same MMC still mounts and reads successfully with plain tx.root=mmcblk0 ro. README and recovery-probe hashes, Git HEAD/log/status, and git fsck are readable. A later exact-opt-in, final-ro tx.ext4.journal-preflight=1 boot returned recovery-required=1:stage=scan:error=corrupt before refusing the root mount and falling back to tmpfs/panic. This strictly read-only shadow scan confirms the RECOVER bit is set and the bounded journal scan is corrupt; the current MMC must be preserved, not repaired, replayed, or retried RW under this hard boundary. Vim, GCC, Rust, full non-shallow clone, the final synced reset, and complete RO durability verification remain unexecuted and failed as a matrix. Do not invite push or pull verification."
+    "The same MMC still mounted and read successfully with plain tx.root=mmcblk0 ro before host removal. README and recovery-probe hashes, Git HEAD/log/status, and git fsck were readable. A later exact-opt-in, final-ro tx.ext4.journal-preflight=1 boot returned recovery-required=1:stage=scan:error=corrupt before refusing the root mount and falling back to tmpfs/panic. This strictly read-only shadow scan confirmed the RECOVER bit is set and the bounded journal scan is corrupt.",
+    "After board power-off, the host identified the whole-device MMC through a USB reader as /dev/sda, 29.5 GiB ext4 UUID dff3fc28-3a72-4c0f-92cb-b681cc185680. A protective blockdev --setro attempt did not take effect because passwordless sudo was unavailable. The subsequent ro,noload mount unexpectedly logged orphan cleanup on readonly fs and deleted one orphan inode, so it was not a zero-write operation and the medium is no longer bit-identical to its pre-reader state. Linux then reported inode #2 directory-block checksum failures and every root-directory/git/hash read returned Bad message; df reported zero available space. The card was immediately unmounted and powered off, and /dev/sda plus its mount disappeared. Do not reinsert it for board writes or use it for continued acceptance. Vim, GCC, Rust, full non-shallow clone, the final synced reset, and complete RO durability verification remain unexecuted and failed as a matrix. Do not invite push or pull verification."
   ],
   "changed_files": [
     {
@@ -96,6 +97,11 @@
       "notes": "The strictly read-only classifier returned recovery-required=1:stage=scan:error=corrupt, refused the root mount, and fell back to tmpfs/panic. It did not invoke the RW mount path or repair the disk."
     },
     {
+      "command": "Host USB-reader inspection with udisksctl mount -b /dev/sda -o ro,noload",
+      "status": "failed",
+      "notes": "Linux mounted the whole-device ext4 read-only without journal but unexpectedly performed orphan cleanup and deleted one orphan inode because the block device itself was not write-protected. Root inode 2 then failed directory-block checksums, reads returned Bad message, and df showed zero available space. The card was immediately unmounted and powered off; this inspection is explicitly not zero-write evidence."
+    },
+    {
       "command": "cargo -q xtask unit",
       "status": "failed",
       "notes": "Known baseline remains: 37 tx-shims shared-state dispatch failures and two tx-kernel libc command-string assertions. tx-ext4 95 passed, tx-scripts 168 passed."
@@ -121,7 +127,7 @@
       "id": "vf2-1",
       "title": "Preserve the current MMC and decide on safe writable media outside this handoff",
       "paths": [],
-      "notes": "Do not repair, reformat, raw-write, or blindly retry RW under the current hard boundary. Continue only with a separate safely prepared physical MMC/ext4 image or an explicitly external recovery result that does not overwrite this evidence."
+      "notes": "Keep the current reader powered off and do not reinsert this MMC for board writes. Do not repair, reformat, raw-write, or blindly retry RW under the current hard boundary. Continue acceptance only with a separate safely prepared physical MMC/ext4 image; the host inspection also proved zero free space and root-directory checksum corruption on the current card."
     },
     {
       "id": "vf2-2",
@@ -154,6 +160,7 @@
     "Do not run dd, mkfs, partitioning, repair fsck, raw block writes, saveenv, flash writes, or deletion/overwrite of existing evidence and TFTP images.",
     "rw-discovered:EIO is an aggregate mount failure. The RW path may attempt journal replay/home-block writes, barriers, orphan recovery, recovery-bit writes, and runtime construction before returning EIO; never report it as a guaranteed no-write failure.",
     "A final-ro tx.ext4.journal-preflight=1 boot is a strictly read-only shadow-replay classifier, but it cannot prove actual replay writes/barriers, classic orphan recovery, or later RW runtime construction. It does not remove the need for safe writable media.",
+    "A Linux ext4 ro,noload mount is not guaranteed zero-write when the underlying block device is writable: the host unexpectedly performed orphan cleanup and deleted one orphan inode. Require hardware or kernel block-device read-only protection before any future host mount, and do not treat this reader attempt as pristine forensic evidence.",
     "The VF2 MMC barrier may report success without a hardware flush. sync success alone is never persistence proof; a completed physical reset and same-disk RO verification remain mandatory.",
     "Keep clone/compiler silence bounded and preserve the complete serial log. Do not replace the required full clone with --depth, tmpfs, or a simpler command."
   ],
