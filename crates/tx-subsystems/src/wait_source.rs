@@ -61,6 +61,7 @@ pub struct WaitSourceWaitFuture {
     mailbox: Arc<TaskMailbox>,
     active_wait: Option<ActiveWait>,
     subscriber: Option<tx_substrate::wake::SubscriberId>,
+    still_blocked: Option<Box<dyn Fn() -> bool + Send + Sync>>,
 }
 
 /// Awaitable readiness wait over a bus [`RawQueue`].
@@ -265,6 +266,7 @@ pub fn install_registered_mailbox_wait(
 fn wait_source_future(
     source: Arc<tx_substrate::wake::WaitSource>,
     interest: u64,
+    still_blocked: Option<Box<dyn Fn() -> bool + Send + Sync>>,
 ) -> WaitSourceWaitFuture {
     WaitSourceWaitFuture {
         source,
@@ -272,6 +274,7 @@ fn wait_source_future(
         mailbox: Arc::new(TaskMailbox::new()),
         active_wait: None,
         subscriber: None,
+        still_blocked,
     }
 }
 
@@ -279,7 +282,7 @@ fn wait_source_future(
 /// mailbox-backed [`tx_substrate::wake::WaitSource`].
 #[cfg(test)]
 pub fn wait_on_source_id(source_id: u64, interest: u64) -> Option<WaitSourceWaitFuture> {
-    lookup_wait_source(source_id).map(|source| wait_source_future(source, interest))
+    lookup_wait_source(source_id).map(|source| wait_source_future(source, interest, None))
 }
 
 /// Convert an object-owned endpoint and interest mask into an awaitable
@@ -288,7 +291,7 @@ pub fn wait_on_endpoint(
     endpoint: &(impl WaitEndpoint + ?Sized),
     interest: u64,
 ) -> WaitSourceWaitFuture {
-    wait_source_future(endpoint.source(), interest)
+    wait_source_future(endpoint.source(), interest, None)
 }
 
 /// Convert an object-owned endpoint into the same erased wait-future shape used
@@ -300,6 +303,28 @@ pub fn wait_on_registered_endpoint(
     RegisteredWaitFuture::WaitSource(Box::new(wait_on_endpoint(endpoint, interest)))
 }
 
+/// Wait on an object-owned endpoint while atomically rechecking whether the
+/// caller is still blocked as the subscription is installed.
+///
+/// `still_blocked` runs while the source's subscriber lock is held. It must be
+/// a short, nonblocking level check (normally one or more atomic loads). When
+/// it returns `false`, the future completes immediately so the caller can
+/// rescan the object instead of sleeping after a wake raced with registration.
+pub fn wait_on_registered_endpoint_if<F>(
+    endpoint: &(impl WaitEndpoint + ?Sized),
+    interest: u64,
+    still_blocked: F,
+) -> RegisteredWaitFuture
+where
+    F: Fn() -> bool + Send + Sync + 'static,
+{
+    RegisteredWaitFuture::WaitSource(Box::new(wait_source_future(
+        endpoint.source(),
+        interest,
+        Some(Box::new(still_blocked)),
+    )))
+}
+
 /// Convert a registered source id and interest mask into an awaitable wait over
 /// the concrete registered source kind.
 pub fn wait_on_registered_source_id(source_id: u64, interest: u64) -> Option<RegisteredWaitFuture> {
@@ -307,7 +332,7 @@ pub fn wait_on_registered_source_id(source_id: u64, interest: u64) -> Option<Reg
     let source = REGISTRY.lock().get(&source_id).cloned()?;
     match source {
         RegisteredWaitSource::WaitSource { source, .. } => Some(RegisteredWaitFuture::WaitSource(
-            Box::new(wait_source_future(source, mask.bits())),
+            Box::new(wait_source_future(source, mask.bits(), None)),
         )),
         RegisteredWaitSource::RawQueue(queue) => Some(RegisteredWaitFuture::RawQueue(Box::new(
             RawQueueWaitFuture {
@@ -371,13 +396,27 @@ impl Future for WaitSourceWaitFuture {
                 this.source.id(),
                 InterestMask::new(this.mask.bits()),
             ));
-            let subscriber = this.source.register(
-                Arc::downgrade(&this.mailbox),
-                generation,
-                InterestMask::new(this.mask.bits()),
-            );
-            // The legacy WaitToken bridge has no predicate to re-test here.
-            // Object-specific endpoint users should prefer prepare/install_if.
+            let subscriber = if let Some(still_blocked) = this.still_blocked.as_ref() {
+                let prepared = this.source.prepare(
+                    Arc::downgrade(&this.mailbox),
+                    generation,
+                    InterestMask::new(this.mask.bits()),
+                );
+                let Some(registration) = prepared.install_if(still_blocked.as_ref()) else {
+                    this.active_wait = None;
+                    return Poll::Ready(WaitOutcome::Ready);
+                };
+                registration
+                    .forget()
+                    .expect("installed wait registration has a subscriber id")
+            } else {
+                // The legacy WaitToken bridge has no predicate to re-test.
+                this.source.register(
+                    Arc::downgrade(&this.mailbox),
+                    generation,
+                    InterestMask::new(this.mask.bits()),
+                )
+            };
             this.subscriber = Some(subscriber);
         }
 
@@ -616,6 +655,112 @@ mod tests {
             Pin::new(&mut wait).poll(&mut cx),
             Poll::Ready(WaitOutcome::Ready)
         ));
+    }
+
+    #[test]
+    fn conditional_endpoint_wait_rechecks_level_before_subscribing() {
+        use core::sync::atomic::{AtomicBool, Ordering};
+
+        let source = Arc::new(tx_substrate::wake::WaitSource::new(
+            tx_substrate::step::WaitSourceId::new(0x48),
+        ));
+        let blocked = Arc::new(AtomicBool::new(false));
+        let blocked_for_wait = Arc::clone(&blocked);
+        let mut wait = wait_on_registered_endpoint_if(&source, 0x1, move || {
+            blocked_for_wait.load(Ordering::Acquire)
+        });
+
+        let waker = core::task::Waker::noop();
+        let mut cx = core::task::Context::from_waker(waker);
+        assert!(matches!(
+            Pin::new(&mut wait).poll(&mut cx),
+            Poll::Ready(WaitOutcome::Ready)
+        ));
+        assert_eq!(source.subscriber_count(), 0);
+    }
+
+    #[test]
+    fn conditional_endpoint_wait_subscribes_while_level_remains_blocked() {
+        use core::sync::atomic::{AtomicBool, Ordering};
+
+        let source = Arc::new(tx_substrate::wake::WaitSource::new(
+            tx_substrate::step::WaitSourceId::new(0x49),
+        ));
+        let blocked = Arc::new(AtomicBool::new(true));
+        let blocked_for_wait = Arc::clone(&blocked);
+        let mut wait = wait_on_registered_endpoint_if(&source, 0x1, move || {
+            blocked_for_wait.load(Ordering::Acquire)
+        });
+
+        let waker = core::task::Waker::noop();
+        let mut cx = core::task::Context::from_waker(waker);
+        assert!(matches!(Pin::new(&mut wait).poll(&mut cx), Poll::Pending));
+        assert_eq!(source.subscriber_count(), 1);
+
+        blocked.store(false, Ordering::Release);
+        assert_eq!(source.notify(InterestMask::new(0x1)), 1);
+        assert!(matches!(
+            Pin::new(&mut wait).poll(&mut cx),
+            Poll::Ready(WaitOutcome::Ready)
+        ));
+        assert_eq!(source.subscriber_count(), 0);
+    }
+
+    #[test]
+    fn conditional_endpoint_wait_survives_notify_registration_race_stress() {
+        use core::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Barrier;
+
+        const ITERATIONS: usize = 20_000;
+
+        let source = Arc::new(tx_substrate::wake::WaitSource::new(
+            tx_substrate::step::WaitSourceId::new(0x4a),
+        ));
+        let blocked = Arc::new(AtomicBool::new(true));
+        let start = Arc::new(Barrier::new(2));
+        let fired = Arc::new(Barrier::new(2));
+
+        std::thread::scope(|scope| {
+            let producer_source = Arc::clone(&source);
+            let producer_blocked = Arc::clone(&blocked);
+            let producer_start = Arc::clone(&start);
+            let producer_fired = Arc::clone(&fired);
+            scope.spawn(move || {
+                for iteration in 0..ITERATIONS {
+                    producer_start.wait();
+                    if iteration & 1 == 0 {
+                        std::thread::yield_now();
+                    }
+                    producer_blocked.store(false, Ordering::Release);
+                    let _ = producer_source.notify(InterestMask::new(0x1));
+                    producer_fired.wait();
+                }
+            });
+
+            let waker = core::task::Waker::noop();
+            let mut cx = core::task::Context::from_waker(waker);
+            for iteration in 0..ITERATIONS {
+                blocked.store(true, Ordering::Release);
+                let blocked_for_wait = Arc::clone(&blocked);
+                let mut wait = wait_on_registered_endpoint_if(&source, 0x1, move || {
+                    blocked_for_wait.load(Ordering::Acquire)
+                });
+
+                start.wait();
+                if iteration & 1 != 0 {
+                    std::thread::yield_now();
+                }
+                let first = Pin::new(&mut wait).poll(&mut cx);
+                fired.wait();
+                let outcome = match first {
+                    Poll::Ready(outcome) => Poll::Ready(outcome),
+                    Poll::Pending => Pin::new(&mut wait).poll(&mut cx),
+                };
+                assert!(matches!(outcome, Poll::Ready(WaitOutcome::Ready)));
+                drop(wait);
+                assert_eq!(source.subscriber_count(), 0);
+            }
+        });
     }
 
     #[test]

@@ -1135,6 +1135,7 @@ where
 
         let mut ready: i64 = 0;
         let mut wait_tokens = alloc::vec::Vec::new();
+        let mut conditional_waits = alloc::vec::Vec::new();
         let mut effective_deadline_ns = timeout_deadline_ns;
         for i in 0..nfds {
             let ent_ptr = fds_ptr.wrapping_add(i * POLLFD_BYTES);
@@ -1164,11 +1165,12 @@ where
                             if efd.counter() > 0 {
                                 revents |= POLLIN;
                             } else {
-                                push_unique_wait_token(
-                                    &mut wait_tokens,
-                                    tx_subsystems::execution::WaitToken::new(
-                                        efd.reader_source_id(),
+                                let wait_efd = efd.clone();
+                                conditional_waits.push(
+                                    wait_source::wait_on_registered_endpoint_if(
+                                        efd.reader_endpoint(),
                                         EVENTFD_POLL_READABLE,
+                                        move || wait_efd.counter() == 0,
                                     ),
                                 );
                             }
@@ -1177,11 +1179,15 @@ where
                             if efd.counter() < tx_subsystems::eventfd::EVENTFD_MAX {
                                 revents |= POLLOUT;
                             } else {
-                                push_unique_wait_token(
-                                    &mut wait_tokens,
-                                    tx_subsystems::execution::WaitToken::new(
-                                        efd.writer_source_id(),
+                                let wait_efd = efd.clone();
+                                conditional_waits.push(
+                                    wait_source::wait_on_registered_endpoint_if(
+                                        efd.writer_endpoint(),
                                         EVENTFD_POLL_WRITABLE,
+                                        move || {
+                                            wait_efd.counter()
+                                                >= tx_subsystems::eventfd::EVENTFD_MAX
+                                        },
                                     ),
                                 );
                             }
@@ -1472,12 +1478,12 @@ where
             break 0;
         }
 
-        if !yielded_before_wait && !wait_tokens.is_empty() {
+        if !yielded_before_wait && (!wait_tokens.is_empty() || !conditional_waits.is_empty()) {
             yielded_before_wait = true;
             tx_reactor::yield_now().await;
             continue;
         }
-        if wait_tokens.is_empty() {
+        if wait_tokens.is_empty() && conditional_waits.is_empty() {
             if let Some(deadline_ns) = effective_deadline_ns {
                 wait_until_pselect_deadline::<P>(ctx, deadline_ns).await;
             } else if timeout == PselectTimeout::Infinite {
@@ -1487,10 +1493,12 @@ where
             break 0;
         }
 
-        let futures = wait_tokens
-            .into_iter()
-            .filter_map(wait_source::wait_on_token)
-            .collect::<alloc::vec::Vec<_>>();
+        let mut futures = conditional_waits;
+        futures.extend(
+            wait_tokens
+                .into_iter()
+                .filter_map(wait_source::wait_on_token),
+        );
         if futures.is_empty() {
             if let Some(deadline_ns) = timeout_deadline_ns {
                 wait_until_pselect_deadline::<P>(ctx, deadline_ns).await;
@@ -1604,6 +1612,7 @@ where
         let mut except_ready = alloc::vec![0u64; word_count as usize];
         let mut ready_count: i64 = 0;
         let mut wait_tokens = alloc::vec::Vec::new();
+        let mut conditional_waits = alloc::vec::Vec::new();
         let mut effective_deadline_ns = timeout_deadline_ns;
 
         for fd in 0..nfds {
@@ -1634,13 +1643,12 @@ where
                         fdset_set(&mut read_ready, fd);
                         fd_ready = true;
                     } else {
-                        push_unique_wait_token(
-                            &mut wait_tokens,
-                            tx_subsystems::execution::WaitToken::new(
-                                efd.reader_source_id(),
-                                EVENTFD_POLL_READABLE,
-                            ),
-                        );
+                        let wait_efd = efd.clone();
+                        conditional_waits.push(wait_source::wait_on_registered_endpoint_if(
+                            efd.reader_endpoint(),
+                            EVENTFD_POLL_READABLE,
+                            move || wait_efd.counter() == 0,
+                        ));
                     }
                 }
                 if want_write {
@@ -1648,13 +1656,12 @@ where
                         fdset_set(&mut write_ready, fd);
                         fd_ready = true;
                     } else {
-                        push_unique_wait_token(
-                            &mut wait_tokens,
-                            tx_subsystems::execution::WaitToken::new(
-                                efd.writer_source_id(),
-                                EVENTFD_POLL_WRITABLE,
-                            ),
-                        );
+                        let wait_efd = efd.clone();
+                        conditional_waits.push(wait_source::wait_on_registered_endpoint_if(
+                            efd.writer_endpoint(),
+                            EVENTFD_POLL_WRITABLE,
+                            move || wait_efd.counter() >= tx_subsystems::eventfd::EVENTFD_MAX,
+                        ));
                     }
                 }
             } else if let Some(tfd) = file.timerfd() {
@@ -1843,12 +1850,12 @@ where
         if ready_count != 0 || timeout == PselectTimeout::Poll {
             break (read_ready, write_ready, except_ready, ready_count);
         }
-        if !yielded_before_wait && !wait_tokens.is_empty() {
+        if !yielded_before_wait && (!wait_tokens.is_empty() || !conditional_waits.is_empty()) {
             yielded_before_wait = true;
             tx_reactor::yield_now().await;
             continue;
         }
-        if wait_tokens.is_empty() {
+        if wait_tokens.is_empty() && conditional_waits.is_empty() {
             if let Some(deadline_ns) = effective_deadline_ns {
                 wait_until_pselect_deadline::<P>(ctx, deadline_ns).await;
             } else if timeout == PselectTimeout::Infinite {
@@ -1857,10 +1864,12 @@ where
             }
             break (read_ready, write_ready, except_ready, ready_count);
         };
-        let futures = wait_tokens
-            .into_iter()
-            .filter_map(wait_source::wait_on_token)
-            .collect::<alloc::vec::Vec<_>>();
+        let mut futures = conditional_waits;
+        futures.extend(
+            wait_tokens
+                .into_iter()
+                .filter_map(wait_source::wait_on_token),
+        );
         if !futures.is_empty() {
             if let Some(deadline_ns) = effective_deadline_ns {
                 match wait_on_any_token_or_pselect_deadline::<P>(

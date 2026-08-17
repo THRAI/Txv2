@@ -3,7 +3,7 @@ use super::*;
 use crate::linux_syscall::{
     NR_EPOLL_CREATE1, NR_EPOLL_CTL, NR_EPOLL_PWAIT2, NR_EVENTFD2, NR_FANOTIFY_INIT,
     NR_FANOTIFY_MARK, NR_INOTIFY_ADD_WATCH, NR_INOTIFY_INIT1, NR_INOTIFY_RM_WATCH, NR_PIPE2,
-    NR_PPOLL, NR_READ, NR_SIGNALFD4, NR_WRITE,
+    NR_PPOLL, NR_PSELECT6, NR_READ, NR_SIGNALFD4, NR_WRITE,
 };
 use tx_substrate::wake::{MailboxEvent, MailboxSchedulerHint, TaskMailbox};
 
@@ -224,6 +224,112 @@ fn dispatch_ppoll_handles_qemu_eventfd_without_vfs_rnode_dispatch() {
         SyscallResult::Return(8)
     );
     assert_eq!(u64::from_le_bytes(drain[..8].try_into().unwrap()), value);
+}
+
+#[test]
+fn dispatch_blocking_ppoll_wakes_after_qemu_eventfd_write() {
+    const POLLIN: i16 = 0x0001;
+
+    let (_setup, proc_cap, thread) = event_notify_setup();
+    let ctx = make_ctx(proc_cap, thread).with_mailbox(alloc::sync::Arc::new(TaskMailbox::new()));
+    let eventfd = create_eventfd(&ctx, 0);
+    let mut pollfd = TestPollFd {
+        fd: eventfd as i32,
+        events: POLLIN,
+        revents: 0,
+    };
+    let mut poll = alloc::boxed::Box::pin(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_PPOLL,
+            [&mut pollfd as *mut TestPollFd as u64, 1, 0, 0, 0, 0],
+        ),
+        &ctx,
+    ));
+    let waker = Waker::noop();
+    let mut cx = Context::from_waker(waker);
+
+    // The first poll takes ppoll's fairness yield. The second one installs the
+    // eventfd wait and must remain pending until a writer publishes readiness.
+    assert!(matches!(poll.as_mut().poll(&mut cx), Poll::Pending));
+    assert!(matches!(poll.as_mut().poll(&mut cx), Poll::Pending));
+
+    let value = 1u64;
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_WRITE,
+                [
+                    eventfd as u64,
+                    &value as *const u64 as u64,
+                    core::mem::size_of::<u64>() as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(8)
+    );
+
+    assert_eq!(
+        poll.as_mut().poll(&mut cx),
+        Poll::Ready(SyscallResult::Return(1))
+    );
+    assert_eq!(pollfd.revents & POLLIN, POLLIN);
+}
+
+#[test]
+fn dispatch_blocking_pselect6_wakes_after_eventfd_write() {
+    let (_setup, proc_cap, thread) = event_notify_setup();
+    let ctx = make_ctx(proc_cap, thread).with_mailbox(alloc::sync::Arc::new(TaskMailbox::new()));
+    let eventfd = create_eventfd(&ctx, 0) as u32;
+    assert!(eventfd < u64::BITS);
+    let mut readfds = 1u64 << eventfd;
+    let mut select = alloc::boxed::Box::pin(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_PSELECT6,
+            [
+                u64::from(eventfd + 1),
+                &mut readfds as *mut u64 as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    let waker = Waker::noop();
+    let mut cx = Context::from_waker(waker);
+
+    assert!(matches!(select.as_mut().poll(&mut cx), Poll::Pending));
+    assert!(matches!(select.as_mut().poll(&mut cx), Poll::Pending));
+
+    let value = 1u64;
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_WRITE,
+                [
+                    u64::from(eventfd),
+                    &value as *const u64 as u64,
+                    core::mem::size_of::<u64>() as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(8)
+    );
+
+    assert_eq!(
+        select.as_mut().poll(&mut cx),
+        Poll::Ready(SyscallResult::Return(1))
+    );
+    assert_ne!(readfds & (1u64 << eventfd), 0);
 }
 
 #[test]

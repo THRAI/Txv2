@@ -1,3 +1,20 @@
+- 2026-08-17 (**BuildStrom 嵌套 QEMU eventfd 偶发丢失唤醒已修复**).
+  平台 LA64 已完成 ELF/BIN 生成却长期停在
+  `boot arceos-helloworld in qemu`，对应嵌套 QEMU 主循环在阻塞
+  `ppoll(eventfd)` 后没有退出。根因是 fd 就绪扫描先读取 eventfd counter，
+  随后才通过旧 `WaitToken` 注册等待者；若退出线程恰在两者之间写 eventfd，
+  通知发生时没有订阅者，而主线程仍按旧的 counter 结果睡眠。**Changed**：
+  `WaitSourceWaitFuture` 增加基于 `prepare/install_if` 的条件注册入口，在等待源
+  subscriber 锁内以原子 load 复检“仍不可读/仍不可写”；`ppoll` 与
+  `pselect6` 的 eventfd 路径改用该入口，竞态发生时直接返回外层重新扫描，
+  不再停驻。没有增加常驻轮询、超时重试或粗粒度锁。**Verification**：条件
+  注册竞态测试 2/2、event-notification dispatch 11/11；RV64、LA64 release
+  优化内核均编译通过；`cargo fmt --all -- --check` 与 `git diff --check`
+  通过。**Next**：使用保留预编译缓存的官方测试镜像各跑一次完整 RV64/LA64，
+  LA64 必须观察到嵌套启动后的 `BUILDSTORM_RESULT ... run=OK`。
+  **Blocker**：本地专项测试已覆盖丢失唤醒窗口，但尚未完成耗时的平台同形完整
+  BuildStrom 复验。
+
 - 2026-08-01 (**RV64 guest curl/wget HTTPS 与 ext4 重定向验证完成**).
   **Changed**：未改内核或母盘；只在 `boot.sh` 生成的临时 disk 副本中运行探针。
   母盘自带 BusyBox 1.37.0 `wget`，但没有 curl。wget 访问测试仓库 raw README
