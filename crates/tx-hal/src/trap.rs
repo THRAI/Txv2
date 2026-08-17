@@ -348,6 +348,13 @@ pub trait KernelTrapSink<P: TxPlatform> {
     /// save and hand off that user context before returning `Reschedule`.
     fn on_ipi(cpu: CpuId, view: TrapFrameMut<'_>) -> TrapAction;
 
+    /// User/kernel illegal-instruction trap. Kept distinct from the generic
+    /// synchronous-fault callback so kernels can deliver SIGILL to a user
+    /// handler instead of collapsing every synchronous exception to SIGSEGV.
+    fn on_illegal_instruction(view: TrapFrameMut<'_>, fault: FaultInfo) -> TrapAction {
+        Self::on_illegal_or_sync_fault(view, fault)
+    }
+
     fn on_illegal_or_sync_fault(view: TrapFrameMut<'_>, fault: FaultInfo) -> TrapAction;
 }
 

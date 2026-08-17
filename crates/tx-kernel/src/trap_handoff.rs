@@ -344,6 +344,35 @@ pub fn hand_off_user_fatal(
     }
 }
 
+/// Hand an illegal instruction to the thread future without losing its
+/// semantic class. User space may have installed a SIGILL handler specifically
+/// to probe optional ISA extensions, so this must not be flattened to SIGSEGV.
+pub fn hand_off_user_illegal_instruction(
+    hart: usize,
+    view: &TrapFrameMut<'_>,
+    cause: u64,
+    value: u64,
+) -> HandoffOutcome {
+    let Some(payload) = current_payload_for_hart(hart) else {
+        return HandoffOutcome::NoActivePayload;
+    };
+
+    let Some(active) = payload.active_userspace_request() else {
+        return HandoffOutcome::NoActiveRequest;
+    };
+
+    payload.store_captured_user_context(view.capture_user_context());
+
+    let slot: UserspaceRunSlot = payload.userspace_slot().clone();
+    match slot.complete_running_trap(
+        active,
+        UserspaceTrapInfo::Fatal(FatalTrapInfo::illegal_instruction(cause, value)),
+    ) {
+        Ok(_status) => HandoffOutcome::Resolved,
+        Err(err) => HandoffOutcome::SlotError(err),
+    }
+}
+
 /// Record a timer preemption of an active userspace-run request.
 ///
 /// Timer preemption is intentionally not an "interesting trap": it must not

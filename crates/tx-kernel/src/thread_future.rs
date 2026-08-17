@@ -103,11 +103,11 @@ use tx_shims::linux_syscall::numbers::{
 use tx_shims::linux_syscall::SyscallResult;
 use tx_substrate::wake::MailboxSchedulerHint;
 use tx_subsystems::process::{ExitStatus, ProcessIdentity, ProcessPayload};
-use tx_subsystems::signal::deliver_synchronous_fault;
 use tx_subsystems::signal::Signum;
 use tx_subsystems::signal::{
     ast_dispatch_with_payload, refresh_deliverable_signal_summary, AstOutcome,
 };
+use tx_subsystems::signal::{deliver_synchronous_fault, SynchronousFaultOutcome};
 use tx_subsystems::thread_runtime::execution::prepare_userspace_entry_payload_into;
 use tx_subsystems::thread_runtime::{
     clear_current_thread_identity, clear_current_thread_payload, clear_current_userspace_payload,
@@ -1145,18 +1145,29 @@ async fn dispatch_userspace_trap<P: TxPlatform>(
             tx_hal::console_write_str::<P>(":tval=0x");
             write_hex_u64::<P>(info.value);
             tx_hal::console_write_str::<P>("\n");
-            log_user_segv::<P>(
-                thread,
-                payload,
-                info.value,
-                PageFaultAccess::Unknown,
-                "fatal",
-                tx_subsystems::vm::VmFaultError::NoRecipe,
-            );
-            dump_syscall_history::<P>();
-            match deliver_synchronous_fault(thread, Signum::SIGSEGV) {
-                tx_subsystems::process::ProcessExitOutcome::Completed => ThreadLoopControl::Exit,
-                tx_subsystems::process::ProcessExitOutcome::Retry => ThreadLoopControl::Continue,
+            let sig = match info.kind {
+                boot_runtime::userspace::FatalTrapKind::IllegalInstruction => Signum::SIGILL,
+                boot_runtime::userspace::FatalTrapKind::Other => Signum::SIGSEGV,
+            };
+            if matches!(info.kind, boot_runtime::userspace::FatalTrapKind::Other) {
+                log_user_segv::<P>(
+                    thread,
+                    payload,
+                    info.value,
+                    PageFaultAccess::Unknown,
+                    "fatal",
+                    tx_subsystems::vm::VmFaultError::NoRecipe,
+                );
+                dump_syscall_history::<P>();
+            }
+            match deliver_synchronous_fault(thread, sig) {
+                SynchronousFaultOutcome::HandlerQueued => ThreadLoopControl::Continue,
+                SynchronousFaultOutcome::ProcessExit(
+                    tx_subsystems::process::ProcessExitOutcome::Completed,
+                ) => ThreadLoopControl::Exit,
+                SynchronousFaultOutcome::ProcessExit(
+                    tx_subsystems::process::ProcessExitOutcome::Retry,
+                ) => ThreadLoopControl::Continue,
             }
         }
     }
@@ -1610,10 +1621,13 @@ async fn handle_page_fault_trap<P: TxPlatform>(
                 dump_all_recipes::<P>(aspace);
             }
             match deliver_synchronous_fault(thread, Signum::SIGSEGV) {
-                tx_subsystems::process::ProcessExitOutcome::Completed => ThreadLoopControl::Exit,
-                tx_subsystems::process::ProcessExitOutcome::Retry => {
-                    ThreadLoopControl::YieldBeforeContinue
-                }
+                SynchronousFaultOutcome::HandlerQueued => ThreadLoopControl::Continue,
+                SynchronousFaultOutcome::ProcessExit(
+                    tx_subsystems::process::ProcessExitOutcome::Completed,
+                ) => ThreadLoopControl::Exit,
+                SynchronousFaultOutcome::ProcessExit(
+                    tx_subsystems::process::ProcessExitOutcome::Retry,
+                ) => ThreadLoopControl::YieldBeforeContinue,
             }
         }
     }

@@ -1082,7 +1082,7 @@ where
                 instruction: true,
                 from_user,
             };
-            K::on_illegal_or_sync_fault(frame.view_mut(), fault)
+            K::on_illegal_instruction(frame.view_mut(), fault)
         }
         TrapClass::Breakpoint
         | TrapClass::AlignmentFault { .. }

@@ -67,14 +67,33 @@ pub struct PageFaultInfo {
 /// The numbers are intentionally raw at this layer. Architecture-specific
 /// decoding belongs below this shell; semantic policy belongs above it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FatalTrapKind {
+    Other,
+    IllegalInstruction,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FatalTrapInfo {
+    pub kind: FatalTrapKind,
     pub cause: u64,
     pub value: u64,
 }
 
 impl FatalTrapInfo {
     pub const fn new(cause: u64, value: u64) -> Self {
-        Self { cause, value }
+        Self {
+            kind: FatalTrapKind::Other,
+            cause,
+            value,
+        }
+    }
+
+    pub const fn illegal_instruction(cause: u64, value: u64) -> Self {
+        Self {
+            kind: FatalTrapKind::IllegalInstruction,
+            cause,
+            value,
+        }
     }
 }
 

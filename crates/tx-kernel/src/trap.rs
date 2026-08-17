@@ -217,6 +217,33 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
         }
         action
     }
+
+    fn on_illegal_instruction(view: TrapFrameMut<'_>, fault: FaultInfo) -> TrapAction {
+        if !fault.from_user {
+            log_kernel_fault_context::<P>(<P as PercpuIf>::current_cpu_id().0);
+            return TrapAction::Terminate;
+        }
+
+        let hart = <P as PercpuIf>::current_cpu_id().0;
+        // RISC-V scause=2 is Illegal Instruction. The semantic kind is also
+        // carried separately, so upper layers do not depend on this raw value.
+        let raw_cause = if matches!(P::ARCH, tx_hal::Arch::Riscv64) {
+            2
+        } else {
+            0
+        };
+        let outcome = trap_handoff::hand_off_user_illegal_instruction(
+            hart,
+            &view,
+            raw_cause,
+            fault.address.0 as u64,
+        );
+        let action = trap_handoff::outcome_to_trap_action(&outcome);
+        if matches!(action, TrapAction::Terminate) {
+            log_page_fault_handoff_failure::<P>(hart, &outcome);
+        }
+        action
+    }
 }
 
 /// Temporary opt-in syscall mix profiler. Normal release builds do not carry

@@ -1044,33 +1044,64 @@ fn kill_outcome_from_exit(outcome: crate::process::ProcessExitOutcome) -> KillOu
 ///    SIGBUS/SIGFPE this is `Term` or `Core`, which maps to
 ///    the fatal group-exit transition.
 ///
-/// Phase B (first pass): always takes the default-action path
-///    (calls the fatal group-exit transition).  Handler routing
-///    via `sig_actions` and signal-frame delivery land in
-///    Phase D once `SignalFrameIf` integration is complete.
-///
 /// The `thread` argument supplies the trapping thread's `Cap` so
 ///    the function can resolve the owning process.  The faulting
 ///    signum must be one of the synchronous set (SIGSEGV, SIGILL,
 ///    SIGBUS, SIGFPE, SIGTRAP, SIGSYS); other signums panic.
 ///
 /// See: `txdoc:SIGNAL-V1-S20-SYNCHRONOUS-FAULT`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SynchronousFaultOutcome {
+    HandlerQueued,
+    ProcessExit(crate::process::ProcessExitOutcome),
+}
+
 pub fn deliver_synchronous_fault(
     thread: &Cap<crate::thread_runtime::ThreadIdentity>,
     sig: Signum,
-) -> crate::process::ProcessExitOutcome {
+) -> SynchronousFaultOutcome {
     let guard = step_engine::guard();
     if let Some(process) = thread.owner_proc.upgrade(&guard) {
         drop(guard);
-        // Phase B: always take default action.
-        return crate::process::execution::step_exit_group_with_signal_with_posts(
-            &process,
-            sig,
-            direct_task_mailbox_post,
-            |mailbox, event| mailbox.post(event),
+        let disposition = match process.upgrade_operational() {
+            Ok(payload) => payload.sig_actions().get(sig),
+            Err(_) => {
+                return SynchronousFaultOutcome::ProcessExit(
+                    crate::process::ProcessExitOutcome::Completed,
+                );
+            }
+        };
+        if matches!(disposition, SigDisposition::Handler(_)) {
+            let info = SigInfo {
+                si_signo: sig.raw() as u32,
+                // Linux ILL_ILLOPC. Other synchronous signals currently do
+                // not inspect this field, but SIGILL SA_SIGINFO handlers do.
+                si_code: 1,
+                si_pid: 0,
+                si_uid: 0,
+            };
+            post_signal_with_post(
+                thread,
+                sig,
+                SignalRouting::ThreadDirected {
+                    tid: thread.tid.0 as u64,
+                },
+                Some(info),
+                direct_task_mailbox_post,
+            );
+            return SynchronousFaultOutcome::HandlerQueued;
+        }
+
+        return SynchronousFaultOutcome::ProcessExit(
+            crate::process::execution::step_exit_group_with_signal_with_posts(
+                &process,
+                sig,
+                direct_task_mailbox_post,
+                |mailbox, event| mailbox.post(event),
+            ),
         );
     }
-    crate::process::ProcessExitOutcome::Completed
+    SynchronousFaultOutcome::ProcessExit(crate::process::ProcessExitOutcome::Completed)
 }
 
 /// Deliver a signal via the canonical POSIX entry point.
