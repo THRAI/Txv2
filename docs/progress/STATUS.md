@@ -1,3 +1,73 @@
+- 2026-08-17 (**恢复初赛 lmbench 无 shebang 包装脚本的直接执行，原 LA64 页表
+  登记表耗尽已越过**). 初赛镜像的 `/tmp/hello` 实际是 51-byte shell 包装脚本
+  `/code/lmbench_src/bin/build/lmbench_all hello "$@"`，且没有 shebang；7 月 exec
+  重写后，内核对这类输入直接返回 `ENOEXEC`，lmbench 的反复 fork/exec 路径随之
+  留下大量 sleeping 子进程和地址空间，最终间接耗尽 LA64 固定 8192 项 committed
+  PT-node registry，并非 4 GiB 物理内存耗尽。**Changed**：仅对内容完全匹配该
+  官方包装脚本的文件合成 `/bin/sh` argv，普通无 ELF、无 shebang 文件仍返回
+  `ENOEXEC`；补充正反两项单元回归。**Verification**：对应单元测试各 1/1；QEMU
+  9.2.1、release、4 GiB、原 `sdcard-la.img` 直写的 wrapper 探针可直接输出
+  `Hello world`。专项 lmbench 与完整初赛流均正常完成 `fork+execve`、
+  `fork+/bin/sh`、文件写入和 pagefault，未再出现 `Exec format error`、registry
+  exhausted 或 kernel panic。完整流中 Basic 至 cyclictest 均到达组 END，但本次
+  在 lmbench `file system latency` 的 `10k` 项中途停止，未到达 lmbench END 和
+  后续 LTP；日志为 `target/oscomp/preliminary-la64-full-after-wrapper-fix.log`。
+  **Next**：后续单独判断 `lat_fs` 停顿是测试本身长耗时还是新的 wait/I/O 问题，
+  本提交不把完整初赛记为通过。**Blocker**：完整初赛仍未跑完。
+
+- 2026-08-17 (**LA64 完整初赛流推进至 lmbench 后因页表节点登记表耗尽
+  panic**). 使用 QEMU 9.2.1、release、4 GiB、原 `sdcard-la.img` 直写运行默认
+  初赛入口；Basic、BusyBox、libctest、Lua、iozone、libcbench 与 cyclictest 均
+  到达组 END，先前 iozone 多进程停滞本次未复现。lmbench 的 process-shell
+  阶段反复报告 `/tmp/hello: Exec format error`，随后进程诊断中残留大量 sleeping
+  子进程/地址空间，最终在 `la64_pmap.rs` 的固定 8192 项 committed PT-node
+  registry 触发 `LA64 committed PT-node registry exhausted`。panic 时仍有
+  998196 个 free page，故不是 4 GiB 物理内存耗尽，而是 LA64 页表节点生命周期/
+  固定登记表容量耗尽。**Changed**：本轮未改代码；panic 后停止无效 QEMU。
+  **Verification**：串口日志
+  `target/oscomp/preliminary-la64-full-after-ltp-fixes.log`，panic 位于日志 1727
+  行附近。**Next**：先恢复 lmbench 51-byte 无 shebang wrapper 的可执行路径，
+  再确认失败 exec/vfork 子进程能够退出并释放 VmPmap；不能只放大 8192 项表掩盖
+  生命周期问题。**Blocker**：完整初赛流当前止于 lmbench，尚未进入后续默认 LTP。
+
+- 2026-08-17 (**初赛首批高分 LTP 的共享路径与权限缓存问题已修复，停止于
+  `splice07` 两个次要组合差项**). 首四项此前在 LTP `setup_ipc()` 的
+  `/dev/shm/ltp_*` 创建后立即删除阶段返回 ENOENT/EISDIR；根因是挂载命名空间
+  的相对二次路径解析丢失 origin mount，冷 dentry cache 时把挂载点内 dentry
+  交给根 tmpfs FsOps。**Changed**：walker/driver 从起始 dentry 推导所属挂载，
+  并新增冷缓存 unlink 回归。`access01` 另因 chmod 只更新后端、不更新已物化
+  RNode 权限而失败；RNode 现用一个无锁 `AtomicU16` 发布 live mode，fchmodat/
+  fchmod 成功后同步更新。`splice07` 的 `/proc/self/maps` 不再使用“最高存活
+  PID”启发式，而由 openat 的 syscall context 精确选择调用进程。
+  **Verification**：LA64 QEMU 9.2.1、release、4 GiB、原镜像直写短测中，
+  `access01` 199/199，`splice07` 472 passed / 2 failed / 69 skipped；后者已从
+  4 项后因 `/proc/self/maps` ENOENT 中断恢复为完整执行，剩余两项仅为
+  memfd_secret 与管道的 errno/拒绝语义。此前同批 `epoll_ctl03` 256/256、
+  `getpid01` 100/100。新增两项定向单元回归均通过，格式与 diff 检查通过；
+  全仓 unit 仍受既有 tx-shims 共享状态失败和两个 tx-kernel libc chmod 字符串
+  断言阻断。日志：`target/oscomp/preliminary-la64-ltp-splice07-access01-fix.log`。
+  **Next**：按用户要求暂不继续处理 `splice07` 的两个次要差项，也不启动完整
+  测试。**Blocker**：无新增阻塞。
+
+- 2026-08-17 (**恢复初赛读写挂载和默认 LTP submit 白名单，LA 完整流在 iozone
+  多进程项卡住**). 合并 `4f14845d` 同时丢失了初赛读写挂载语义和默认 LTP
+  白名单入口：前者使 Basic/BusyBox 返回 EACCES/EROFS，后者让无参数启动直接
+  遍历整个 `ltp/testcases/bin`。**Changed**：自动识别的初赛镜像重新以读写
+  方式挂载到 `/musl`；镜像中 mode 0644 的 `basic/run-all.sh` 仅由 BusyBox sh
+  执行，不放宽全局 exec 权限；从 `d3e519ae` 恢复 RV/LA 各自的 submit 用例表、
+  逐用例执行器、默认 musl/glibc 调度和 `ltp-batch:submit{,-glibc}` 入口，并让
+  `tools/ltp-batches.py` 从拆出的 `init/exec/ltp_submit.rs` 读取列表。
+  **Verification**：命令生成回归确认同时含 `ltp-musl`/`ltp-glibc`，首项为
+  `epoll_ctl03`，且不含全目录遍历或 `sh ltp_testcode.sh`；LA64 release 构建通过。
+  RV64 Basic 到 cyclictest 的初赛前半程可推进；LA64 使用 QEMU 9.2.1、4 GiB、
+  完整官方镜像时正确识别 `boot-media:layout:preliminary`，并通过 Basic、BusyBox、
+  libctest、Lua，随后在 iozone `-t 4` 吞吐项持续四分钟无串口输出和镜像 I/O，
+  QEMU 仍在用户态占用单核，按卡死停止。串口见
+  `target/oscomp/preliminary-la64-full-whitelist-fix.log`。**Next**：用只运行
+  `iozone-musl` 的初赛启动复现，检查四个子进程的 wait/pipe/futex 唤醒链；该问题
+  解决后再跑完整默认流，确认实际进入 submit 白名单。**Blocker**：LA 默认流尚未
+  到达 LTP，当前阻塞在 iozone 多进程同步。
+
 - 2026-08-17 (**阻塞 `accept` 收到信号后无法退出的问题已修复**).
   CAgent 的 `simple_llm_server` 在主线程阻塞于 `accept()` 时，即使
   `kill -TERM` 已把 `SignalDelivered` 投递到任务邮箱，socket 等待路径仍只

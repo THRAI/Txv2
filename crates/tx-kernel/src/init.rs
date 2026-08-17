@@ -446,6 +446,34 @@ static AP_REACTOR_STOPPED_CPUS: AtomicU64 = AtomicU64::new(0);
 /// poll. Retain the event until `run_thread` reaches its next safe
 /// kernel-to-user boundary instead of forgetting an already-consumed slice.
 static DEFERRED_USER_PREEMPT_CPUS: AtomicU64 = AtomicU64::new(0);
+/// Harts currently polling a userspace-thread Future.
+///
+/// The timer trap reads this lock-free marker when a scheduling deadline
+/// expires in supervisor mode.  Looking up `ThreadPayload` there would take
+/// the same per-hart spin lock that the interrupted poll may be updating.
+/// Bracketing the complete `PerHartSlotted::poll` instead gives the trap an
+/// interrupt-safe answer and covers all entry-side work before `ertn`/`sret`.
+static USERSPACE_THREAD_POLL_CPUS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn begin_userspace_thread_poll(cpu_id: CpuId) {
+    USERSPACE_THREAD_POLL_CPUS.fetch_or(CpuMask::single(cpu_id).bits(), Ordering::Release);
+}
+
+pub(crate) fn end_userspace_thread_poll(cpu_id: CpuId) {
+    let bit = CpuMask::single(cpu_id).bits();
+    // Clear ownership first so an interrupt racing with poll return cannot
+    // publish a new deferred marker after the cleanup below.  Returning to
+    // the reactor is itself a safe scheduling boundary, so a supervisor-mode
+    // expiry retained by this poll no longer needs to cross into the next
+    // task selected on the same hart.
+    USERSPACE_THREAD_POLL_CPUS.fetch_and(!bit, Ordering::Release);
+    DEFERRED_USER_PREEMPT_CPUS.fetch_and(!bit, Ordering::AcqRel);
+}
+
+pub(crate) fn userspace_thread_poll_active(cpu_id: CpuId) -> bool {
+    USERSPACE_THREAD_POLL_CPUS.load(Ordering::Acquire) & CpuMask::single(cpu_id).bits() != 0
+}
+
 pub(crate) fn defer_userspace_preempt(cpu_id: CpuId) {
     DEFERRED_USER_PREEMPT_CPUS.fetch_or(CpuMask::single(cpu_id).bits(), Ordering::Release);
 }
@@ -465,7 +493,8 @@ static ROOTFS_FROM_BOOT_MEDIA: AtomicBool = AtomicBool::new(false);
 
 /// True when the default QEMU disk was recognised as an OSComp preliminary
 /// image. Preliminary media keeps the compatibility layout: tmpfs at `/`,
-/// with the image mounted read-only at `/musl`.
+/// with the image mounted read-write at `/musl` so the original preliminary
+/// scripts can use their in-image working directories.
 static PRELIMINARY_OSCOMP_MEDIA: AtomicBool = AtomicBool::new(false);
 
 pub(super) fn preliminary_oscomp_media_detected() -> bool {
@@ -2204,9 +2233,11 @@ impl<P: TxPlatform> CoreInit<P> {
     /// Mount the sdcard ext4 image at `/musl` on the rootfs tmpfs.
     ///
     /// If a `vda` block device is registered (RV64 QEMU virtio-blk
-    /// path), opens its ext4 image via `BlockDeviceImage`, mounts it
-    /// read-only, creates `/musl` in the rootfs tmpfs, and binds the
-    /// ext4 mount there. Boards without a block device silently skip.
+    /// path), opens its ext4 image via `BlockDeviceImage`, creates `/musl` in
+    /// the rootfs tmpfs, and binds the ext4 mount there. Auto-detected
+    /// preliminary media uses its original read-write working-directory
+    /// contract; other compatibility sidecars remain read-only. Boards
+    /// without a block device silently skip.
     ///
     /// **Order invariant:** must follow `mount_devfs_at_dev` (ROOT_MOUNT
     /// already populated, `/dev` already created in tmpfs) and precede
@@ -2216,15 +2247,22 @@ impl<P: TxPlatform> CoreInit<P> {
             return;
         }
 
-        use tx_fs::tx_ext4::{mount_ext4_read_only, BlockDeviceImage, Ext4FileIoRuntimeBinder};
+        use tx_fs::tx_ext4::{
+            mount_ext4_read_only, mount_ext4_read_write, BlockDeviceImage, Ext4FileIoRuntimeBinder,
+        };
         use tx_subsystems::device::{block_device_by_name, BlockDeviceHandle};
 
         let Some(reg) = block_device_by_name(b"vda") else {
             return;
         };
 
+        let preliminary = PRELIMINARY_OSCOMP_MEDIA.load(Ordering::Acquire);
         let image = BlockDeviceImage::new(reg.ops);
-        let mount_output = match mount_ext4_read_only(image) {
+        let mount_output = match if preliminary {
+            mount_ext4_read_write(image)
+        } else {
+            mount_ext4_read_only(image)
+        } {
             Ok(out) => out,
             Err(_) => {
                 Self::write_board_sentinel_prefix();
@@ -2268,14 +2306,20 @@ impl<P: TxPlatform> CoreInit<P> {
         let musl_dentry_on_root =
             publish_boot_mountpoint_dentry(root_mount.root_dentry(), b"musl", musl_rnode_in_root);
 
-        // Plain read-only mounts have no async backend planner, so preliminary
-        // bootstrap reads retain the established synchronous path.
+        let mount_flags = if preliminary {
+            MountFlags::empty()
+        } else {
+            MountFlags::READ_ONLY
+        };
+
+        // Compatibility sidecar mounts use the synchronous pager path. This
+        // is also the original preliminary-suite read-write implementation.
         let ext4_payload = MountPayload::new_cap_with_backend_planner(
             mount_output.fs_ops().clone(),
             mount_output.fs_page_backing().clone(),
             None,
             mount::allocate_dev_id(),
-            MountOptions::default(),
+            MountOptions { flags: mount_flags },
             "ext4",
             SourceLabel::Static("vda"),
             mount_output.backend_planner(),
@@ -2314,7 +2358,7 @@ impl<P: TxPlatform> CoreInit<P> {
             ext4_root_rnode,
             Some(root_mount),
             ext4_payload,
-            MountFlags::empty(),
+            mount_flags,
         )
         .expect("mount_sdcard_at_musl: mount identity reservation");
 
@@ -2433,7 +2477,11 @@ impl<P: TxPlatform> CoreInit<P> {
             }
         }
 
-        note_mount_line("/dev/vda /musl ext4 rw 0 0");
+        note_mount_line(if preliminary {
+            "/dev/vda /musl ext4 rw 0 0"
+        } else {
+            "/dev/vda /musl ext4 ro 0 0"
+        });
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":mount:sdcard:ext4:ok\n");
     }

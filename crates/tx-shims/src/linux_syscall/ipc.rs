@@ -341,6 +341,7 @@ struct SysvSemopWaitOp<'a> {
     sops: &'a [SemBuf],
     cred: &'a Cap<Cred>,
     process: &'a Cap<ProcessIdentity>,
+    thread: &'a Cap<tx_subsystems::thread_runtime::ThreadIdentity>,
     post: Option<MailboxRefPostFn>,
     post_with_hint: Option<MailboxRefPostWithHintFn>,
 }
@@ -353,6 +354,15 @@ impl StepOp<ProcessIdentity> for SysvSemopWaitOp<'_> {
         &mut self,
         _ctx: &mut ScriptCtx<ProcessIdentity>,
     ) -> StepOutcome<Self::Output, Self::Progress> {
+        // Unlike most slow syscalls, semop/semtimedop are never restarted
+        // after a signal handler, even when that handler has SA_RESTART.
+        // The generic drive loop deliberately retries SA_RESTART waits, so
+        // enforce the SysV semaphore exception before re-observing the array.
+        // This is also checked before the first park to close a signal-before-
+        // subscribe race.
+        if tx_subsystems::signal::pending_signal_interrupts_wait(self.thread, self.process) {
+            return StepOutcome::err(Errno::EINTR.into());
+        }
         ipc::sysv_sem::execution::step_semop_v3_with_post(
             self.semid,
             self.sops,
@@ -415,6 +425,7 @@ async fn drive_semop(
         sops,
         cred: &cred,
         process: &ctx.process,
+        thread: &ctx.thread,
         post: ctx.mailbox_ref_post,
         post_with_hint: ctx.mailbox_ref_post_with_hint,
     };

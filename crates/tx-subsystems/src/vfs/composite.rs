@@ -64,12 +64,16 @@ impl<'a, I: SubjectIdentity> StepOp<I> for ChmodOp<'a> {
             }
         };
         let fs_ops = walker::fs_ops_for(&target, &__guard).expect("NoFsOps for ChmodOp");
-        fs_ops.chmod_inode(
+        let outcome = fs_ops.chmod_inode(
             target.rnode().fs_object_id(),
             self.mode,
             self.cred,
             &__guard,
-        )
+        );
+        if matches!(outcome, StepOutcome::Done(())) {
+            target.rnode().set_mode(self.mode);
+        }
+        outcome
     }
 }
 

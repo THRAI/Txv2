@@ -915,6 +915,30 @@ pub(super) async fn sys_openat<'a, P: PmapIf + tx_hal::ConsoleIf>(
         return SyscallResult::Return(fd as i64);
     }
 
+    // Resolve this caller-sensitive procfs node from the syscall context.
+    // The generic procfs read_link seam cannot carry a caller pid and its
+    // historical "highest live pid" fallback races LTP helper/watchdog exit,
+    // making /proc/self/maps intermittently resolve to a dead process.
+    if path.as_slice() == b"/proc/self/maps" && !want_create && !want_trunc {
+        if want_directory {
+            return SyscallResult::Error(ENOTDIR_VALUE);
+        }
+        if want_write {
+            return SyscallResult::Error(EACCES_VALUE);
+        }
+        let openfile = match open_procfs_projected_file(
+            tx_fs::procfs::pid_maps_id(ctx.process.pid),
+            open_flags,
+        ) {
+            Ok(file) => file,
+            Err(result) => return result,
+        };
+        let Some(fd) = ctx.install_new_fd(openfile, want_cloexec) else {
+            return SyscallResult::Error(EMFILE_VALUE);
+        };
+        return SyscallResult::Return(fd as i64);
+    }
+
     if path.as_slice() == b"/proc/self/ns/net" && !want_create && !want_trunc {
         if want_directory {
             return SyscallResult::Error(ENOTDIR_VALUE);

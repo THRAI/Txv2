@@ -395,6 +395,36 @@ pub struct PerHartSlotted<P: TxPlatform, F: Future> {
     _platform: core::marker::PhantomData<fn() -> P>,
 }
 
+/// Lock-free ownership marker for supervisor-mode scheduling-timer traps.
+///
+/// The guard is armed before any per-hart payload lock is acquired and is
+/// explicitly finished before those slots are cleared.  Its `Drop` fallback
+/// keeps early-return and panic paths from publishing a stale active bit.
+struct UserspaceThreadPollGuard {
+    cpu: tx_hal::CpuId,
+    active: bool,
+}
+
+impl UserspaceThreadPollGuard {
+    fn new(cpu: tx_hal::CpuId) -> Self {
+        crate::init::begin_userspace_thread_poll(cpu);
+        Self { cpu, active: true }
+    }
+
+    fn finish(mut self) {
+        crate::init::end_userspace_thread_poll(self.cpu);
+        self.active = false;
+    }
+}
+
+impl Drop for UserspaceThreadPollGuard {
+    fn drop(&mut self) {
+        if self.active {
+            crate::init::end_userspace_thread_poll(self.cpu);
+        }
+    }
+}
+
 // SAFETY: `PerHartSlotted` owns a `PayloadCap<ThreadPayload>` (Send)
 // and an `F: Future`. The EBR `Guard` held transiently inside `F`'s
 // async state machine is created and dropped within a single poll
@@ -471,7 +501,9 @@ where
         // SAFETY: structural pinning — we never move `inner` out of
         // `self` after pinning. The other fields are `Unpin`.
         let this = unsafe { self.get_unchecked_mut() };
-        let hart = <P as PercpuIf>::current_cpu_id().0;
+        let cpu = <P as PercpuIf>::current_cpu_id();
+        let hart = cpu.0;
+        let userspace_poll_guard = UserspaceThreadPollGuard::new(cpu);
 
         let _prev_thread = set_current_thread_identity(hart, this.thread.clone());
         let _prev = set_current_thread_payload(hart, this.payload.clone());
@@ -507,6 +539,7 @@ where
         }
         if let Some(exit) = this.exit.as_mut() {
             let out = exit.as_mut().poll(cx);
+            userspace_poll_guard.finish();
             let _ = clear_current_userspace_payload(hart);
             let _ = clear_current_thread_payload(hart);
             let _ = clear_current_thread_identity(hart);
@@ -580,6 +613,7 @@ where
             }
         }
 
+        userspace_poll_guard.finish();
         let _ = clear_current_userspace_payload(hart);
         let _ = clear_current_thread_payload(hart);
         let _ = clear_current_thread_identity(hart);

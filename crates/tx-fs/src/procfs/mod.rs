@@ -397,7 +397,7 @@ const fn pid_cmdline_id(pid: Pid) -> FsObjectId {
 const fn pid_mem_id(pid: Pid) -> FsObjectId {
     FsObjectId::new(PROCFS_MEM_BASE + pid.0 as u64)
 }
-const fn pid_maps_id(pid: Pid) -> FsObjectId {
+pub const fn pid_maps_id(pid: Pid) -> FsObjectId {
     FsObjectId::new(PROCFS_MAPS_BASE + pid.0 as u64)
 }
 const fn pid_smaps_id(pid: Pid) -> FsObjectId {

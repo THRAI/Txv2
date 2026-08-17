@@ -2163,6 +2163,45 @@ fn exec_script_invalid_elf_returns_enoexec_without_kernel_shell_fallback() {
 }
 
 #[test]
+fn exec_script_oscomp_lmbench_hello_wrapper_uses_bin_sh() {
+    let _setup = setup();
+    let (root, fs, mount) = build_fs_root_with_mount(MountId::new(1));
+    let bin = fs.add_directory(FsObjectId::new(2), b"bin");
+    fs.add_regular_with_bytes(bin, b"sh", &minimal_elf_bytes());
+    let tmp = fs.add_directory(FsObjectId::new(2), b"tmp");
+    fs.add_regular_with_bytes(
+        tmp,
+        b"hello",
+        b"/code/lmbench_src/bin/build/lmbench_all hello \"$@\"\n",
+    );
+
+    let process = bootstrap_init_process(fresh_aspace()).expect("bootstrap init");
+    let thread = process.nth_thread(0).expect("leader thread");
+    match step_chdir_with_mount(&process, root, mount.clone()) {
+        ChdirOutcome::Replaced { .. } => {}
+        ChdirOutcome::ZombieIgnored => panic!("mounted cwd rejected"),
+    }
+    step_set_mount_namespace(
+        &process,
+        MountNamespace::new_cap(mount).expect("mount namespace"),
+    )
+    .expect("install namespace");
+
+    assert_eq!(
+        block_on(exec_script::<ScriptsTestPmap>(
+            &process,
+            &thread,
+            b"/tmp/hello",
+            &[b"/tmp/hello", b"argument"],
+            &[],
+            &Credential::root(),
+        )),
+        Ok(())
+    );
+    assert_eq!(&process.comm()[..2], b"sh");
+}
+
+#[test]
 fn shebang_busybox_sh_normalization_consumes_applet_arg() {
     let header = b"#!/bin/busybox sh\n./lua $1\n";
     let (interp, opt_arg) = super::shebang_parse(header).expect("valid shebang");

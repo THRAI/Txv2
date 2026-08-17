@@ -440,6 +440,92 @@ fn dispatch_sysv_semop_uses_syscall_ctx_mailbox_ref_post_for_changed_wake() {
 }
 
 #[test]
+fn dispatch_sysv_semop_is_interrupted_even_with_sa_restart() {
+    let _setup = setup();
+    let process = bootstrap();
+    let thread = first_thread(&process);
+    let mailbox = alloc::sync::Arc::new(tx_substrate::wake::TaskMailbox::new());
+    thread
+        .payload_cap()
+        .expect("thread payload alive")
+        .bind_mailbox(alloc::sync::Arc::downgrade(&mailbox));
+
+    let mut action = tx_subsystems::signal::SigActionEntry::handler(0xCAFE);
+    action.flags = tx_subsystems::signal::SaFlags::RESTART;
+    let _ = tx_subsystems::signal::step_sigaction_entry(
+        &process,
+        tx_subsystems::signal::Signum::SIGHUP,
+        action,
+    );
+    let ctx =
+        make_ctx(process.clone(), thread.clone()).with_mailbox(alloc::sync::Arc::clone(&mailbox));
+
+    let semid = match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_SEMGET,
+            [
+                0x5345494E,
+                1,
+                (sysv_shm::execution::IPC_CREAT | 0o660) as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    )) {
+        SyscallResult::Return(id) => id as u32,
+        other => panic!("semget failed: {other:?}"),
+    };
+
+    let wait_op = SembufLayout {
+        sem_num: 0,
+        sem_op: -1,
+        sem_flg: 0,
+    };
+    let mut semop = alloc::boxed::Box::pin(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_SEMOP,
+            [
+                semid as u64,
+                (&wait_op as *const SembufLayout) as u64,
+                1,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    let waker = Waker::noop().clone();
+    let mut poll_ctx = Context::from_waker(&waker);
+    assert!(matches!(semop.as_mut().poll(&mut poll_ctx), Poll::Pending));
+
+    assert_eq!(
+        tx_subsystems::signal::step_kill_process_with_post(
+            &process,
+            tx_subsystems::signal::Signum::SIGHUP,
+            None,
+            |weak, event| {
+                if let Some(mailbox) = weak.upgrade() {
+                    let _ = mailbox.post(event);
+                }
+            },
+        ),
+        tx_subsystems::signal::KillOutcome::Delivered
+    );
+    assert!(
+        !tx_subsystems::signal::thread_pending_signal_interrupts(&thread),
+        "generic waits should still honour SA_RESTART"
+    );
+    assert_eq!(
+        semop.as_mut().poll(&mut poll_ctx),
+        Poll::Ready(SyscallResult::Error(crate::linux_syscall::EINTR_VALUE,)),
+        "semop is the Linux no-restart exception"
+    );
+}
+
+#[test]
 fn dispatch_sysv_semop_too_many_ops_returns_e2big() {
     let _setup = setup();
     let process = bootstrap();

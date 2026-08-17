@@ -313,7 +313,10 @@ pub(super) async fn sys_fchmod(fd: u32, mode: u32, ctx: &SyscallCtx<'_>) -> Sysc
     )
     .await
     {
-        Ok(()) => SyscallResult::Return(0),
+        Ok(()) => {
+            rnode.set_mode(new_mode);
+            SyscallResult::Return(0)
+        }
         Err(errno) => SyscallResult::Error(fs_change_errno_magnitude(Errno::from(errno))),
     }
 }

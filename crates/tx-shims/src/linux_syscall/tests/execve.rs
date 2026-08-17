@@ -548,7 +548,7 @@ fn dispatch_execve_non_elf_non_shebang_returns_enoexec() {
 fn dispatch_execve_short_non_elf_non_shebang_returns_enoexec() {
     let _setup = execve_setup();
 
-    let bytes = b"/code/lmbench_src/bin/build/lmbench_all hello \"$@\"\n".to_vec();
+    let bytes = b"echo ordinary no-shebang input\n".to_vec();
     assert!(bytes.len() < 64);
     let (process, thread, _fs) = bootstrap_with_file(b"short-script", &bytes);
     let ctx = make_ctx(process, thread);

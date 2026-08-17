@@ -11,7 +11,7 @@ use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use core::hash::{BuildHasher, Hash, Hasher};
-use core::sync::atomic::{AtomicI8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicI8, AtomicU16, AtomicU64, Ordering};
 use hashbrown::HashMap;
 
 use crate::vfs::adapter::step_engine::{
@@ -608,6 +608,11 @@ pub enum StructPayload {
 pub struct RNode {
     fs_object_id: FsObjectId,
     meta: InodeMeta,
+    /// Permission bits are mutable even though the inode identity and the
+    /// rest of its materialised metadata are stable.  Keep the live mode in
+    /// one relaxed atomic so chmod is immediately visible to every cached
+    /// dentry without putting a lock on the path-walk hot path.
+    mode: AtomicU16,
     backing: RNodeBacking,
     containing_mount: Option<Weak<MountPayload>>,
     /// Shared persistent-object lifetime.  All RNodes and file
@@ -627,6 +632,7 @@ impl RNode {
         Self {
             fs_object_id,
             meta,
+            mode: AtomicU16::new(meta.mode),
             backing,
             containing_mount: None,
             object_pin: None,
@@ -665,8 +671,20 @@ impl RNode {
         self.fs_object_id
     }
 
-    pub const fn meta(&self) -> InodeMeta {
-        self.meta
+    pub fn meta(&self) -> InodeMeta {
+        let mut meta = self.meta;
+        meta.mode = self.mode.load(Ordering::Relaxed);
+        meta
+    }
+
+    /// Publish a successful chmod to already-materialised VFS nodes.
+    /// File-kind bits remain immutable, matching every FsOps chmod backend.
+    pub fn set_mode(&self, requested_mode: u16) {
+        let old_mode = self.mode.load(Ordering::Relaxed);
+        self.mode.store(
+            (old_mode & S_IFMT) | (requested_mode & 0o7777),
+            Ordering::Relaxed,
+        );
     }
 
     pub const fn backing(&self) -> &RNodeBacking {
@@ -878,7 +896,7 @@ impl core::fmt::Debug for RNode {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("RNode")
             .field("fs_object_id", &self.fs_object_id)
-            .field("meta", &self.meta)
+            .field("meta", &self.meta())
             .field("backing", &self.backing)
             .field("containing_mount", &self.containing_mount)
             .field("object_pin", &self.object_pin)

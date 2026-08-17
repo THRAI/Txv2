@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CACHE_DIR = ROOT / "target" / "codex-tmp"
 CACHE_FILE = CACHE_DIR / "ltp-cases.txt"
 EXEC_RS = ROOT / "crates" / "tx-kernel" / "src" / "init" / "exec.rs"
+SUBMIT_RS = ROOT / "crates" / "tx-kernel" / "src" / "init" / "exec" / "ltp_submit.rs"
 
 
 def is_valid_case_name(case: str) -> bool:
@@ -298,12 +299,12 @@ def parse_cases(lines: list[str]) -> list[str]:
 
 
 def load_rust_const_string(name: str) -> str:
-    text = EXEC_RS.read_text()
     pattern = rf'const\s+{re.escape(name)}\s*:\s*&str\s*=\s*"(?P<value>(?:\\\n)?.*?)";'
-    match = re.search(pattern, text, re.S)
-    if not match:
-        raise SystemExit(f"failed to find {name} in {EXEC_RS}")
-    return re.sub(r"[\\\s]", "", match.group("value"))
+    for source in (SUBMIT_RS, EXEC_RS):
+        match = re.search(pattern, source.read_text(), re.S)
+        if match:
+            return re.sub(r"[\\\s]", "", match.group("value"))
+    raise SystemExit(f"failed to find {name} in {SUBMIT_RS} or {EXEC_RS}")
 
 
 def load_submit_cases(arch: str = "") -> list[str]:

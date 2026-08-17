@@ -1487,6 +1487,13 @@ fn dispatch_openat_creat_uses_process_mount_namespace_without_global_mount_table
     );
     drop(guard);
 
+    // Unlink must not depend on the positive dentry left behind by openat.
+    // LTP creates its shared result file under /dev/shm and immediately
+    // unlinks it; at early boot this lookup is commonly cache-cold.  The
+    // relative no-follow basename walk must retain the mounted tmpfs as its
+    // origin rather than interpreting its local inode ids through rootfs.
+    child_mount.root_dentry().clear_cached_children();
+
     let unlink_req = SyscallRequest::new(
         NR_UNLINKAT,
         [AT_FDCWD as i64 as u64, path.as_ptr() as u64, 0, 0, 0, 0],

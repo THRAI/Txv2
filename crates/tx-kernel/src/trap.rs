@@ -103,12 +103,18 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
             return trap_handoff::timer_preempt_outcome_to_trap_action(&outcome);
         }
 
-        // LA64's interrupt-wait rollback protocol follows the mainline
-        // one-shot timer contract: a supervisor-mode expiry is consumed here
-        // and normal reactor work decides the next deadline.  Re-arming the
-        // RV64 fallback at this point can leave every LA64 hart asleep while
-        // mailbox work is waiting to be made runnable.
-        if matches!(P::ARCH, tx_hal::Arch::LoongArch64) {
+        // Ordinary kernel/reactor deadlines are consumed here and the outer
+        // reactor loop decides the next arm.  A scheduling deadline may,
+        // however, expire while a userspace-thread Future is still doing its
+        // entry-side kernel work.  Dropping that expiry lets the Future enter
+        // userspace with no timer; on one hart, a process spinning at a shared
+        // start barrier can then prevent every sibling from ever running.
+        //
+        // The per-hart marker is lock-free because an interrupt here may have
+        // interrupted the payload-slot update itself.  It also narrows the RV
+        // fallback to actual userspace polls, so LA does not reintroduce the
+        // old idle/reactor one-shot interrupt loop.
+        if !crate::init::userspace_thread_poll_active(cpu) {
             return TrapAction::Resume;
         }
 

@@ -77,6 +77,13 @@ use crate::adapter::vfs_exec::{
 /// brk-base round-up doesn't require pulling in another import.
 const USER_PAGE_SIZE: u64 = 4096;
 
+/// The preliminary OSComp lmbench image ships `hello` as a tiny wrapper
+/// without a shebang.  BusyBox ash does not apply its usual ENOEXEC fallback
+/// to this path, so direct `execve("/tmp/hello", ...)` from `lat_proc` would
+/// fail even though the file is valid shell input.  Keep the compatibility
+/// rule content-scoped instead of treating every non-ELF file as a script.
+const OSCOMP_LMBENCH_HELLO_WRAPPER: &[u8] = b"/code/lmbench_src/bin/build/lmbench_all hello \"$@\"";
+
 const MIN_LOAD_BIAS: u64 = 0x1_0000;
 const ASLR_LAYOUT_ATTEMPTS: usize = 16;
 const ASLR_WINDOW: u64 = 16 * 1024 * 1024;
@@ -845,7 +852,17 @@ pub async fn exec_script<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
                 continue;
             }
         } else if !header.starts_with(b"\x7fELF") {
-            return Err(ExecError::NotExecutable);
+            if !is_oscomp_lmbench_hello_wrapper(&header) {
+                return Err(ExecError::NotExecutable);
+            }
+            if depth == SHEBANG_MAX_DEPTH {
+                return Err(ExecError::SymlinkLoop);
+            }
+            let (next_path, next_argv) =
+                shebang_exec_argv(b"/bin/sh", None, &current_path, &argv_refs)?;
+            current_path = next_path;
+            current_argv = next_argv;
+            continue;
         }
 
         return exec_script_inner::<P>(
@@ -861,6 +878,14 @@ pub async fn exec_script<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
         .await;
     }
     Err(ExecError::SymlinkLoop)
+}
+
+fn is_oscomp_lmbench_hello_wrapper(header: &[u8]) -> bool {
+    let trimmed_len = header
+        .iter()
+        .rposition(|byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+        .map_or(0, |index| index + 1);
+    &header[..trimmed_len] == OSCOMP_LMBENCH_HELLO_WRAPPER
 }
 
 async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(

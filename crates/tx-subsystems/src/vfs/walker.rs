@@ -179,10 +179,19 @@ pub fn step_walk_in_mount_namespace<'g>(
 ) -> StepOutcome<Cap<DEntry>, NoProgress> {
     use StepOutcome as V3;
 
-    let root_mount = mount_namespace.root().clone();
+    // A relative walk keeps the filesystem containing `rooted_at` as its
+    // active mount.  Falling back unconditionally to the namespace root is
+    // only correct when `rooted_at` itself belongs to that mount.  In
+    // particular, unlinkat first resolves `/dev/shm/` and then performs a
+    // relative no-follow lookup of the basename from the mounted tmpfs root;
+    // using the namespace root there interprets the tmpfs-local inode number
+    // through the wrong FsOps surface whenever the dentry cache is cold.
+    let origin_mount = mount_namespace
+        .mount_containing_dentry(&rooted_at)
+        .unwrap_or_else(|| mount_namespace.root().clone());
     match step_walk_in_mount_namespace_with_origin_mount(
         rooted_at,
-        &root_mount,
+        &origin_mount,
         path,
         cred,
         mount_namespace,

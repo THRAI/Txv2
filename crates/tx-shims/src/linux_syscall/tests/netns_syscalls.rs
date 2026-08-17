@@ -568,6 +568,37 @@ fn dispatch_openat_proc_self_ns_net_installs_calling_namespace_fd_payload() {
 }
 
 #[test]
+fn dispatch_openat_proc_self_maps_targets_calling_process() {
+    let _setup = setup();
+    let process = bootstrap();
+    let thread = first_thread(&process);
+    let ctx = make_ctx(process.clone(), thread);
+
+    let path = nul_terminate(b"/proc/self/maps");
+    let result = netns_req(
+        NR_OPENAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            O_RDONLY as u64,
+            0,
+            0,
+            0,
+        ],
+        &ctx,
+    );
+    let fd = match result {
+        SyscallResult::Return(fd) if fd >= 0 => fd as u32,
+        other => panic!("openat(/proc/self/maps) failed: {other:?}"),
+    };
+    let file = process.fd(fd).expect("maps fd installed");
+    assert_eq!(
+        tx_fs::procfs::pid_from_maps_id(file.rnode().fs_object_id()),
+        Some(process.pid)
+    );
+}
+
+#[test]
 fn dispatch_openat_proc_pid_ns_net_walks_intermediate_ns_directory() {
     let _setup = setup();
     let procfs_root = build_procfs_root(73, 73);

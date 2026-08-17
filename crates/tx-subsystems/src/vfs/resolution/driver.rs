@@ -415,6 +415,11 @@ fn initial_walk_frame(
     } else {
         try_copy_path(path)?.into()
     };
+    let inferred_origin_mount = if absolute {
+        None
+    } else {
+        mount_namespace.and_then(|namespace| namespace.mount_containing_dentry(&rooted_at))
+    };
     let current = if absolute {
         mount_root.clone()
     } else {
@@ -424,7 +429,17 @@ fn initial_walk_frame(
     let current_mount = if absolute {
         mount_root_mount.clone()
     } else {
-        origin_mount.cloned().or_else(|| mount_root_mount.clone())
+        // Callers that only carry a dentry (the no-follow unlink/rename
+        // helpers in particular) may not have an explicit origin mount.
+        // Infer it from the namespace instead of treating every relative
+        // path as rooted in the namespace root filesystem.  Filesystem object
+        // ids are mount-local, so pairing a mounted dentry with the root
+        // mount's FsOps can otherwise turn a present regular file into
+        // ENOENT or even the kind of an unrelated rootfs inode.
+        origin_mount
+            .cloned()
+            .or(inferred_origin_mount)
+            .or_else(|| mount_root_mount.clone())
     };
     Ok((
         current,

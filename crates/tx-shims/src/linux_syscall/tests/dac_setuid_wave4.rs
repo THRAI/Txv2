@@ -23,6 +23,7 @@ use tx_subsystems::vfs::structure::{
 };
 use tx_subsystems::vfs::FsOps;
 
+use crate::linux_syscall::walk_from;
 use crate::linux_syscall::{
     AT_EACCESS, AT_FDCWD, EXECVE_PATH_MAX, F_OK, NR_FACCESSAT, NR_FACCESSAT2, NR_FCHMOD,
     NR_FCHMODAT, NR_FCHMODAT2, NR_FCHOWN, NR_FCHOWNAT, NR_NEWFSTATAT, NR_OPENAT, O_RDONLY, R_OK,
@@ -232,6 +233,12 @@ fn dispatch_fchmodat_owner_succeeds() {
     );
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Return(0));
+
+    // The already-materialised rnode must observe chmod immediately. access(2)
+    // walks this cached node rather than reloading backend metadata.
+    let cached = walk_from(ctx.cwd().expect("cwd"), b"/f", &ctx.walker_cred())
+        .expect("walk cached chmod target");
+    assert_eq!(cached.rnode().meta().mode & 0o7777, 0o600);
 
     // Backend reflects the new mode.
     let guard = ebr_guard();

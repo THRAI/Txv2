@@ -397,6 +397,27 @@ fn drive_boot_wiring() {
 // --- tests --------------------------------------------------------
 
 #[test]
+fn userspace_thread_poll_marker_is_hart_local_and_clearable() {
+    let _isolation = setup();
+    let active = CpuId(7);
+    let other = CpuId(6);
+
+    super::end_userspace_thread_poll(active);
+    super::end_userspace_thread_poll(other);
+    assert!(!super::userspace_thread_poll_active(active));
+    assert!(!super::userspace_thread_poll_active(other));
+
+    super::begin_userspace_thread_poll(active);
+    assert!(super::userspace_thread_poll_active(active));
+    assert!(!super::userspace_thread_poll_active(other));
+
+    super::defer_userspace_preempt(active);
+    super::end_userspace_thread_poll(active);
+    assert!(!super::userspace_thread_poll_active(active));
+    assert!(!super::take_deferred_userspace_preempt(active));
+}
+
+#[test]
 fn reactor_epoch_boundary_replenishes_publication_retire_credit_under_load() {
     let _isolation = setup();
     tx_test_support::drain_to_quiescence();

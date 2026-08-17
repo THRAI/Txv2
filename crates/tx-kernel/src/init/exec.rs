@@ -22,6 +22,13 @@ use crate::adapter::step_engine::{self as step_engine};
 #[cfg(test)]
 use crate::adapter::step_engine::{page_allocator, StepOutcome};
 
+mod ltp_submit;
+
+use ltp_submit::{
+    append_batch_submit_ltp_runner, append_batch_submit_ltp_runner_for_libc,
+    append_submit_ltp_runner,
+};
+
 /// Finals first-stage PID 1 policy. The script is executed by the Bash from
 /// the official root filesystem, so the kernel does not overwrite `/init`.
 const FINAL_TESTCODE: &[u8] = include_bytes!("final_testcode.sh");
@@ -1108,6 +1115,7 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
     let mut cmd = String::from("cd /musl/musl 2>/dev/null || cd /musl");
     let bench_observe_enabled = oscomp_bench_observe_enabled::<P>();
     let bench_observe_threshold = oscomp_bench_observe_threshold::<P>();
+    let ltp_args = ltp_args_from_cmdline::<P>();
     let mut selected = 0usize;
     if let Some(groups) = oscomp_groups_from_cmdline::<P>() {
         for group in groups.split(',') {
@@ -1118,6 +1126,7 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
             if group == "all" {
                 append_default_oscomp_scripts(
                     &mut cmd,
+                    &ltp_args,
                     bench_observe_enabled,
                     bench_observe_threshold,
                 );
@@ -1138,12 +1147,22 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
                 selected += 1;
                 continue;
             }
+            if let Some(batch) = group.strip_prefix("ltp-batch:") {
+                match batch.trim() {
+                    "submit" | "whitelist" => append_batch_submit_ltp_runner(&mut cmd, &ltp_args),
+                    "submit-glibc" | "whitelist-glibc" => {
+                        append_batch_submit_ltp_runner_for_libc(&mut cmd, "glibc", &ltp_args)
+                    }
+                    _ => continue,
+                }
+                selected += 1;
+                continue;
+            }
             // `ltp-runtest:<module>[:<case-filter>]` runs a specific LTP runtest
             // file (e.g. `net.sctp`), optionally filtered to `+`-joined case tags.
             // Re-homed with the net subsystem (main dropped the LTP runner).
             if let Some(module) = group.strip_prefix("ltp-runtest:") {
                 let (module, filter) = module.split_once(':').unwrap_or((module, ""));
-                let ltp_args = ltp_args_from_cmdline::<P>();
                 append_ltp_runtest(&mut cmd, module, filter, &ltp_args);
                 selected += 1;
                 continue;
@@ -1183,7 +1202,6 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
             }
             if let Some(spec) = group.strip_prefix("ltp-bin:") {
                 let (lane, files) = spec.split_once(':').unwrap_or(("musl", spec));
-                let ltp_args = ltp_args_from_cmdline::<P>();
                 append_ltp_bin_walk(&mut cmd, lane, files, &ltp_args);
                 selected += 1;
                 continue;
@@ -1218,7 +1236,12 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
         }
     }
     if selected == 0 {
-        append_default_oscomp_scripts(&mut cmd, bench_observe_enabled, bench_observe_threshold);
+        append_default_oscomp_scripts(
+            &mut cmd,
+            &ltp_args,
+            bench_observe_enabled,
+            bench_observe_threshold,
+        );
     }
     cmd
 }
@@ -1490,10 +1513,11 @@ pub fn oscomp_bench_observe_live_drain<P: tx_hal::TxPlatform>() -> bool {
 
 fn append_default_oscomp_scripts(
     cmd: &mut alloc::string::String,
+    ltp_args: &LtpArgs<'_>,
     bench_observe_enabled: bool,
     bench_observe_threshold: Option<u64>,
 ) {
-    for (_, script) in DEFAULT_OSCOMP_MUSL_SCRIPTS {
+    for (_, script) in DEFAULT_OSCOMP_MUSL_PRE_LTP_SCRIPTS {
         if *script == "libctest_testcode.sh" {
             append_full_libctest(cmd);
         } else {
@@ -1505,7 +1529,21 @@ fn append_default_oscomp_scripts(
             );
         }
     }
-    for (_, script) in DEFAULT_OSCOMP_GLIBC_SCRIPTS {
+    for (_, script) in DEFAULT_OSCOMP_GLIBC_PRE_LTP_SCRIPTS {
+        append_oscomp_glibc_script(cmd, script);
+    }
+    append_submit_ltp_runner(cmd, "musl", ltp_args);
+    append_submit_ltp_runner(cmd, "glibc", ltp_args);
+    cmd.push_str("; cd /musl/musl 2>/dev/null || cd /musl");
+    for (_, script) in DEFAULT_OSCOMP_MUSL_POST_LTP_SCRIPTS {
+        append_oscomp_musl_script_with_observe(
+            cmd,
+            script,
+            bench_observe_enabled,
+            bench_observe_threshold,
+        );
+    }
+    for (_, script) in DEFAULT_OSCOMP_GLIBC_POST_LTP_SCRIPTS {
         append_oscomp_glibc_script(cmd, script);
     }
 }
@@ -1550,7 +1588,24 @@ fn append_oscomp_musl_script_with_observe(
         append_busybox_script(cmd, "busybox-musl", "./busybox");
         return;
     }
+    if script == "basic_testcode.sh" {
+        append_basic_script(cmd);
+        return;
+    }
     let _ = write!(cmd, "; ./busybox sh {script}");
+}
+
+/// Run the preliminary basic suite in its original image directory.
+///
+/// The official image ships `basic/run-all.sh` as mode 0644. Invoke that one
+/// script through BusyBox `sh` instead of weakening execute-bit checks for all
+/// userspace files; the surrounding group markers match `basic_testcode.sh`.
+fn append_basic_script(cmd: &mut alloc::string::String) {
+    cmd.push_str(
+        "; ./busybox echo \"#### OS COMP TEST GROUP START basic-musl ####\"\
+         ; (cd ./basic; ../busybox sh run-all.sh)\
+         ; ./busybox echo \"#### OS COMP TEST GROUP END basic-musl ####\"",
+    );
 }
 
 fn append_lmbench_probe(cmd: &mut alloc::string::String) {
@@ -1582,26 +1637,35 @@ fn append_lmbench_probe(cmd: &mut alloc::string::String) {
     );
 }
 
-const DEFAULT_OSCOMP_MUSL_SCRIPTS: &[(&str, &str)] = &[
+const DEFAULT_OSCOMP_MUSL_PRE_LTP_SCRIPTS: &[(&str, &str)] = &[
     ("basic-musl", "basic_testcode.sh"),
     ("busybox-musl", "busybox_testcode.sh"),
     ("libctest-musl", "libctest_testcode.sh"),
-    ("libcbench-musl", "libcbench_testcode.sh"),
     ("lua-musl", "lua_testcode.sh"),
-    ("lmbench-musl", "lmbench_testcode.sh"),
     ("iozone-musl", "iozone_testcode.sh"),
-    ("netperf-musl", "netperf_testcode.sh"),
-    ("iperf-musl", "iperf_testcode.sh"),
+    ("libcbench-musl", "libcbench_testcode.sh"),
     ("cyclictest-musl", "cyclictest_testcode.sh"),
-    ("ltp-musl", "ltp_testcode.sh"),
+    ("lmbench-musl", "lmbench_testcode.sh"),
 ];
 
-/// glibc groups included in the default (judged) boot. Kept to the
-/// benchmark groups for now — the wider glibc suites need their own
-/// validation pass before joining the default run.
-const DEFAULT_OSCOMP_GLIBC_SCRIPTS: &[(&str, &str)] = &[
-    ("netperf-glibc", "netperf_testcode.sh"),
+const DEFAULT_OSCOMP_GLIBC_PRE_LTP_SCRIPTS: &[(&str, &str)] = &[
+    ("basic-glibc", "basic_testcode.sh"),
+    ("busybox-glibc", "busybox_testcode.sh"),
+    ("lua-glibc", "lua_testcode.sh"),
+    ("iozone-glibc", "iozone_testcode.sh"),
+    ("libcbench-glibc", "libcbench_testcode.sh"),
+    ("cyclictest-glibc", "cyclictest_testcode.sh"),
+    ("lmbench-glibc", "lmbench_testcode.sh"),
+];
+
+const DEFAULT_OSCOMP_MUSL_POST_LTP_SCRIPTS: &[(&str, &str)] = &[
+    ("iperf-musl", "iperf_testcode.sh"),
+    ("netperf-musl", "netperf_testcode.sh"),
+];
+
+const DEFAULT_OSCOMP_GLIBC_POST_LTP_SCRIPTS: &[(&str, &str)] = &[
     ("iperf-glibc", "iperf_testcode.sh"),
+    ("netperf-glibc", "netperf_testcode.sh"),
 ];
 
 /// Map a `<suite>-glibc` group to its testcode script under `/musl/glibc`.
@@ -1646,6 +1710,18 @@ fn append_oscomp_glibc_script(cmd: &mut alloc::string::String, script: &str) {
         let _ = write!(cmd, "; cd /musl/glibc");
         append_busybox_script(cmd, "busybox-glibc", "/musl/musl/busybox");
         let _ = write!(cmd, "; cd /musl/musl");
+        return;
+    }
+    if script == "basic_testcode.sh" {
+        let _ = write!(
+            cmd,
+            "; cd /musl/glibc; {} \
+             /musl/musl/busybox echo \"#### OS COMP TEST GROUP START basic-glibc ####\"\
+             ; (cd ./basic; /musl/musl/busybox sh run-all.sh)\
+             ; /musl/musl/busybox echo \"#### OS COMP TEST GROUP END basic-glibc ####\"\
+             ; cd /musl/musl",
+            glibc_non_ltp_prelude()
+        );
         return;
     }
     let _ = write!(
@@ -2449,7 +2525,10 @@ mod tests {
         append_oscomp_musl_script(&mut cmd, "basic_testcode.sh");
         append_full_libctest(&mut cmd);
 
-        assert!(cmd.contains("; ./busybox sh basic_testcode.sh"));
+        assert!(cmd.contains("#### OS COMP TEST GROUP START basic-musl ####"));
+        assert!(cmd.contains("(cd ./basic; ../busybox sh run-all.sh)"));
+        assert!(!cmd.contains("tx_basic_work"));
+        assert!(!cmd.contains("./busybox sh basic_testcode.sh"));
         assert!(
             cmd.contains("; ./busybox echo \"#### OS COMP TEST GROUP START libctest-musl ####\"")
         );
@@ -2481,6 +2560,18 @@ mod tests {
     }
 
     #[test]
+    fn glibc_basic_uses_shell_for_non_executable_run_all_script() {
+        let mut cmd = alloc::string::String::from("cd /musl/musl");
+        append_oscomp_glibc_script(&mut cmd, "basic_testcode.sh");
+
+        assert!(cmd.contains("#### OS COMP TEST GROUP START basic-glibc ####"));
+        assert!(cmd.contains("(cd ./basic; /musl/musl/busybox sh run-all.sh)"));
+        assert!(cmd.contains("#### OS COMP TEST GROUP END basic-glibc ####"));
+        assert!(!cmd.contains("busybox sh basic_testcode.sh"));
+        assert!(cmd.ends_with("; cd /musl/musl"));
+    }
+
+    #[test]
     fn glibc_non_ltp_scripts_prepare_soname_library_links() {
         let mut cmd = alloc::string::String::from("cd /musl/musl");
         append_oscomp_glibc_script(&mut cmd, "netperf_testcode.sh");
@@ -2498,6 +2589,7 @@ mod tests {
         assert!(musl_cmd.contains("s/^rm test\\.txt -f$/rm test.txt/"));
         assert!(musl_cmd.contains("s/^rm busybox_cmd\\.bak -f$/rm busybox_cmd.bak/"));
         assert!(musl_cmd.contains("testcase busybox kill 10 success"));
+        assert!(!musl_cmd.contains("tx_busybox_work"));
         assert!(musl_cmd.contains("./busybox sh /tmp/tx-busybox-body.sh"));
 
         let mut glibc_cmd = alloc::string::String::from("cd /musl/musl");
@@ -2570,8 +2662,21 @@ mod tests {
     #[test]
     fn default_scripts_include_glibc_bench_groups() {
         let mut cmd = alloc::string::String::from("cd /musl/musl");
-        append_default_oscomp_scripts(&mut cmd, false, None);
+        append_default_oscomp_scripts(&mut cmd, &LtpArgs::none(), false, None);
         assert!(cmd.contains("/musl/musl/busybox sh netperf_testcode.sh; cd /musl/musl"));
         assert!(cmd.contains("/musl/musl/busybox sh iperf_testcode.sh; cd /musl/musl"));
+    }
+
+    #[test]
+    fn default_scripts_use_submit_ltp_whitelist() {
+        let mut cmd = alloc::string::String::from("cd /musl/musl");
+        append_default_oscomp_scripts(&mut cmd, &LtpArgs::none(), false, None);
+
+        assert!(cmd.contains("#### OS COMP TEST GROUP START ltp-musl ####"));
+        assert!(cmd.contains("#### OS COMP TEST GROUP START ltp-glibc ####"));
+        assert!(cmd.contains("for case in epoll_ctl03 splice07 access01"));
+        assert!(cmd.contains("RUN LTP CASE $case : $ltp_label"));
+        assert!(!cmd.contains("target_dir=\"ltp/testcases/bin\""));
+        assert!(!cmd.contains("sh ltp_testcode.sh"));
     }
 }
