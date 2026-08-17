@@ -2,11 +2,11 @@
   "schema": "tx.progress.plan.v1",
   "id": "2026-08-16-qemu-vf2-worktree-merge",
   "title": "Merge the QEMU and VF2 fixes with QEMU, VF2, and LA2K1000 reproduction",
-  "status": "in-progress",
+  "status": "complete",
   "created": "2026-08-16",
   "updated": "2026-08-17",
   "owner": "codex-01a00a3b-f64c-7c43-9ee0-6512899dcc80",
-  "summary": "Merge QEMU commit 37d38778f and VF2 commit e619fe098 through an isolated integration branch, preserve both semantic fix sets, and advance the main QEMU branch only after fresh RV64/LA64 QEMU plus physical VF2 and LA2K1000 acceptance from the merge commit. RV64 QEMU, LA64 QEMU, and physical VF2 now pass from cb275b28c; LA2K1000 remains the final physical gate.",
+  "summary": "QEMU commit 37d38778f and VF2 commit e619fe098 are history-preservingly merged on the integration branch. Fresh RV64/LA64 QEMU, physical VF2, and physical LA2K1000 acceptance all pass from merged code commit cb275b28c, including exact real GitHub clones, Vim/GCC/Rust, RW-to-RO persistence, Git object verification, and the target-specific filesystem gates. The validated integration tip is ready to fast-forward feature/portable-net-vf2-dwmac without moving the VF2 source branch or pushing.",
   "scope": {
     "in": [
       "All 2 commits unique to feature/portable-net-vf2-dwmac after merge-base 3df096b94",
@@ -230,7 +230,7 @@
     {
       "id": "step-10-la2k1000-physical-acceptance",
       "title": "Reproduce the LA2K1000 RO-RW-reset-RO persistence matrix",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "step-9-vf2-physical-acceptance"
       ],
@@ -239,15 +239,15 @@
         "Copy the freshly rebuilt kernel-only uImage to a unique TFTP name with cp --no-clobber, then require cmp, direct sha256sum on both files, and U-Boot iminfo CRC success",
         "Intercept U-Boot, run scsi reset, verify the expected disk model and 62533296 by 512 geometry, and stop if the observed root layout differs from the current sda1 tutorial or the older raw-ext4 sda handoff",
         "First boot read-only with the observed root token, tx.mount.sdcard=0, and no initrd; require AHCI, DWMAC, ext4 root, boot:ok, and an explicit RO mount",
-        "After RO and network gates pass, physically reset and boot RW with tx.ext4.rw-profile=legacy-nocsum, then run the fresh add-only Git/tool persistence workload with individual short commands and explicit fsync/syncfs/sync completion",
+        "After RO and network gates pass, diagnose the on-media feature tuple without writes, select its existing exact RW capability profile, then physically reset and run the fresh add-only Git/tool persistence workload with individual short commands and explicit sync completion",
         "Physically reset again, boot the same disk RO, and verify commits, hashes, executions, non-shallow state where exercised, and git fsck --full --no-progress"
       ],
-      "notes": "LA2K1000 loads only the kernel uImage by TFTP and reuses the existing SATA ext4 root. Do not dd, mkfs, repartition, mmc write, sf write, saveenv, run repair fsck, or trust target/images/txv2-la2k1000.uimage.sha256. If the disk appears as raw-ext4 sda rather than sda1, stop and reconcile the active handoff before booting RW."
+      "notes": "The uniquely named uImage SHA-256 5b2675e5d1693bbaa215130f5812aa2063c3b0d9ff7b5a26c4a7e5ba1f066373 passed TFTP and U-Boot iminfo on every boot; `scsi reset` repeatedly identified Kingchuxing 32GB W010 with 62533296 x 512 geometry and MBR sda1 at LBA 4194367. Initial RO boot passed two harts, AHCI, DWMAC, ext4 root, and boot:ok. The planned legacy-nocsum RW argument was correctly rejected with EOPNOTSUPP because a read-only raw-superblock witness found compat 0x003c, incompat 0x02c6, and ro_compat 0x046b with METADATA_CSUM; this tuple matches the existing default Tier1 profile, not legacy-nocsum. No kernel gate or media format was changed. Default Tier1 RW then passed and completed the exact genuine full clone of https://github.com/LLLPPPS/tx-push-test.git: HEAD 9d41e640f7686b8891744e232297341494de2e7d, 7830 objects, clean status, and git fsck. Existing /proj/onsite-tool-check sources were used for Vim/GCC/Rust; GCC and rustc rebuilt and ran, sync returned, and the user's physical reset led to an ext4 RO boot where a write probe failed, all four hashes matched, both binaries ran, and clone origin/HEAD/clean/fsck reproduced. Final serial log msp/serial/2026-08-17-la2k1000-merge-cb275b28c-profile-diag.log has SHA-256 f2c2249a35343a479b4c29de737ab841d24ee25ab0c34af19873d66118cea340."
     },
     {
       "id": "step-11-close-and-advance",
       "title": "Record the merged evidence and advance the main QEMU branch only after all targets pass",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "step-10-la2k1000-physical-acceptance"
       ],
@@ -263,7 +263,7 @@
         "cargo xtask lint docs",
         "Fast-forward feature/portable-net-vf2-dwmac to the validated integration merge; leave codex/vf2-file-io-runtime-rebind-fix unchanged"
       ],
-      "notes": "If any host, QEMU, or physical-board acceptance cell fails, do not advance the source branch. Preserve the failed integration branch, artifacts, and logs for diagnosis; return to the original QEMU branch by switching branches, never by destructive reset. Do not push unless separately requested."
+      "notes": "All four target cells passed. The final STATUS, closed handoff, plan, and local debug log record the exact artifacts and witnesses. After the progress catch-up commit, feature/portable-net-vf2-dwmac is fast-forwarded to the validated integration tip; codex/vf2-file-io-runtime-rebind-fix remains at e619fe098 and no branch is pushed. Known global unit/progress/docs failures remain unchanged baseline debt rather than acceptance regressions."
     }
   ],
   "verification": [
@@ -334,8 +334,8 @@
     },
     {
       "command": "Physical LA2K1000 validation from cb275b28c",
-      "status": "not-run",
-      "notes": "The uniquely staged kernel-only uImage is ready and directly hashed, but the host currently exposes no ttyUSB/ttyACM serial node. The user has reported powering hardware again; serial enumeration and the RO-RW-reset-RO checkpoints remain."
+      "status": "passed",
+      "notes": "The 5b2675e5 uImage repeatedly passed TFTP/iminfo against the exact SATA identity. RO preflight, read-only Tier1 feature diagnosis, default-Tier1 RW exact GitHub clone plus Vim/GCC/Rust/sync, user physical reset, RO write rejection, matching hashes, executable replay, and clone origin/HEAD/clean/fsck all passed. The frozen final log is msp/serial/2026-08-17-la2k1000-merge-cb275b28c-profile-diag.log with SHA-256 f2c2249a35343a479b4c29de737ab841d24ee25ab0c34af19873d66118cea340."
     }
   ],
   "risks": [
@@ -346,11 +346,9 @@
     "Global gates are already red for documented unrelated reasons; comparison must distinguish an unchanged baseline from a new merge regression.",
     "A stale LA2K1000 checksum sidecar can falsely identify a rebuilt image unless the artifact itself is hashed."
   ],
-  "blockers": [
-    "LA2K1000 is the only remaining target. Its kernel-only uImage is staged, but the host currently exposes no ttyUSB/ttyACM serial node; the serial adapter must enumerate before RO-RW-reset-RO validation can begin."
-  ],
+  "blockers": [],
   "handoff": {
-    "needed": true,
-    "path": "docs/progress/handoffs/2026-08-16-qemu-vf2-merge-validation.json"
+    "needed": false,
+    "path": null
   }
 }

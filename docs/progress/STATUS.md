@@ -1,3 +1,33 @@
+- 2026-08-17 (**QEMU/VF2 合并完成，RV64/LA64 QEMU、VF2 与 LA2K1000 四项目标全部通过**).
+  **Changed**：`codex/qemu-vf2-integration` 保留 QEMU `37d38778f` 与 VF2
+  `e619fe098` 双历史，合并后跨子系统修复链最终落在代码提交 `cb275b28c`；两来源提交
+  均为祖先，未 squash/rewrite/drop。RV64 与 LA64 正式验收均使用精确真实
+  `https://github.com/LLLPPPS/tx-push-test.git` full clone；VF2 在用户授权覆盖专用介质后
+  扩到 1 GiB，并完成 RW→物理断电→RO；LA2K1000 以唯一 uImage
+  `5b2675e5…066373` 完成 RO→RW→人工 reset→RO。LA 首次按旧计划传
+  `legacy-nocsum` 被 `EOPNOTSUPP` 正确拒绝；只读 raw-superblock 诊断确认当前盘为
+  `compat=0x003c/incompat=0x02c6/ro_compat=0x046b`、含 `METADATA_CSUM`，精确匹配现有
+  默认 Tier1，故未放宽内核门禁、未重写介质，改用默认 Tier1 后 RW 通过。
+  **Verification**：RV 结果
+  `target/qemu-merge-accept/rv-external-final3-cb275b28c/rv64.full-stepwise.result.json`
+  与 LA 结果
+  `target/qemu-merge-accept/la-external-final9-cb275b28c/la64.full-stepwise.result.json`
+  均 PASS、最终 `e2fsck -fn=0`、母盘哈希不变。VF2 exact clone HEAD
+  `9d41e640…de2e7d`、7830 objects、Vim/GCC/Rust、sync、物理断电、RO 哈希/二进制/
+  `git fsck` 全过。LA2K1000 同一 HEAD/objects/clean/fsck 通过，既有
+  `/proj/onsite-tool-check` 源上 Vim rc=0、GCC 与 rustc（冷启动最终编译
+  `3m12.19s`）重编运行成功；`sync` 后物理 reset，RO 写探针返回 1 且不存在，四项
+  哈希、两二进制、clone origin/HEAD/clean/fsck 全部复现。LA 完整日志
+  `msp/serial/2026-08-17-la2k1000-merge-cb275b28c-profile-diag.log` SHA-256
+  `f2c2249a…a340`；详细诊断见
+  `msp/debug-logs/2026-08-17-la2k1000-tier1-profile-and-merge-acceptance.md`。最终计划与
+  handoff 为 `docs/progress/plans/2026-08-16-qemu-vf2-worktree-merge.json` 和
+  `docs/progress/handoffs/2026-08-16-qemu-vf2-merge-validation.json`。
+  **Next**：提交本次 progress catch-up 后，仅 fast-forward
+  `feature/portable-net-vf2-dwmac` 到已验证集成 tip；VF2 来源分支保持 `e619fe098`，不
+  push。**Blocker**：四目标无 blocker；仅保留既有 unit shared-state/libctest、07-24
+  progress-schema 与 docs lint 债务，须另案处理。
+
 - 2026-08-17 (**合并态 VF2 扩容、真实公网 clone 与 RW→人工断电→RO 持久化验收全部通过；仅剩 LA2K1000**).
   **Changed**：用户停止并要求删除无必要的 31.7 GB 整卡临时备份，随后明确授权以既有
   `/home/msp/learning/Txv2/local-images/alpine-linux-riscv64-ext4fs.img` 覆盖专用验收卡。
