@@ -1,3 +1,19 @@
+- 2026-08-17 (**阻塞 `accept` 收到信号后无法退出的问题已修复**).
+  CAgent 的 `simple_llm_server` 在主线程阻塞于 `accept()` 时，即使
+  `kill -TERM` 已把 `SignalDelivered` 投递到任务邮箱，socket 等待路径仍只
+  轮询 socket 就绪状态；信号唤醒后它会再次返回 `Pending`，因而只能用
+  `SIGKILL` 结束。**Changed**：socket 等待现在注册任务邮箱 waker，并在每次
+  poll 的前后重新检查权威 pending-signal 状态；观察到可中断信号后返回
+  `EINTR`，同时只消费信号类 mailbox hint，保留其他等待事件。没有加入定时
+  轮询、粗粒度锁或长期 fallback。**Verification**：新增“`accept` 停驻后收到
+  SIGTERM”回归 1/1，通过既有 signal wake 回归 1/1；LA64 release 优化内核
+  编译通过。真实 LA64 guest 中修复前服务收到 SIGTERM 后仍存活，修复后输出
+  `Shutting down server...`、`wait` 返回 0 且任务表无残留。**Next**：在根文件
+  系统可正常挂载的官方同形镜像上重跑完整 CAgent + BuildStrom，单独确认平台
+  最终卡顿是否还有第二个根因。**Blocker**：手工 CAgent profile 启动时当前
+  store 镜像出现独立的 ext4 根挂载失败，未继续改动镜像；历史日志也表明残留
+  server 与最终 BuildStrom 卡死并非充分因果关系。
+
 - 2026-08-17 (**BuildStrom 嵌套 QEMU eventfd 偶发丢失唤醒已修复**).
   平台 LA64 已完成 ELF/BIN 生成却长期停在
   `boot arceos-helloworld in qemu`，对应嵌套 QEMU 主循环在阻塞

@@ -441,7 +441,7 @@ where
                 if let Some(future) = wait_on_yield_shape(shape) {
                     if matches!(
                         wait_on_socket_or_itimer::<P>(future, ctx).await,
-                        SocketWaitWake::ItimerExpired
+                        SocketWaitWake::Interrupted
                     ) {
                         return SyscallResult::Error(EINTR_VALUE);
                     }
@@ -1177,7 +1177,7 @@ where
                     wait_on_socket_or_itimer::<P>(future, ctx).await
                 };
                 match wake {
-                    SocketWaitWake::ItimerExpired => {
+                    SocketWaitWake::Interrupted => {
                         if recv_queued_len(&socket) > 0 {
                             yielded_before_wait = false;
                             continue;
@@ -1257,7 +1257,7 @@ where
                         wait_on_socket_or_itimer::<P>(future, ctx).await
                     };
                     match wake {
-                        SocketWaitWake::ItimerExpired => {
+                        SocketWaitWake::Interrupted => {
                             if recv_queued_len(&socket) > 0 {
                                 continue;
                             }
@@ -2106,7 +2106,7 @@ where
                 if let Some(future) = wait_on_yield_shape(shape) {
                     if matches!(
                         wait_on_socket_or_itimer::<P>(future, ctx).await,
-                        SocketWaitWake::ItimerExpired
+                        SocketWaitWake::Interrupted
                     ) {
                         if recv_queued_len(&socket) > 0 {
                             continue;

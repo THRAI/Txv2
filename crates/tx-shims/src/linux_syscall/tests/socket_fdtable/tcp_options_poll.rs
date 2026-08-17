@@ -28,6 +28,84 @@ fn tcp_connect_counting_waker(wakes: alloc::sync::Arc<core::sync::atomic::Atomic
     Waker::from(alloc::sync::Arc::new(TcpConnectCountWake { wakes }))
 }
 
+#[test]
+fn dispatch_blocking_accept_is_interrupted_by_sigterm_after_parking() {
+    let _setup = socket_setup();
+    let process = bootstrap();
+    let thread = first_thread(&process);
+    let mailbox = alloc::sync::Arc::new(tx_substrate::wake::TaskMailbox::new());
+    thread
+        .payload_cap()
+        .expect("thread payload alive")
+        .bind_mailbox(alloc::sync::Arc::downgrade(&mailbox));
+    let _ = tx_subsystems::signal::step_sigaction(
+        &process,
+        tx_subsystems::signal::Signum::SIGTERM,
+        tx_subsystems::signal::SigDisposition::Handler(0xCAFE),
+    );
+    let ctx = make_ctx(process.clone(), thread).with_mailbox(alloc::sync::Arc::clone(&mailbox));
+
+    let listener_fd = socket_stream(&ctx, SOCK_STREAM);
+    let listener_addr = sockaddr_in([127, 0, 0, 1], 49_100);
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                listener_fd as u64,
+                listener_addr.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        socket_req(NR_LISTEN, [listener_fd as u64, 1, 0, 0, 0, 0], &ctx),
+        SyscallResult::Return(0)
+    );
+
+    let wakes = alloc::sync::Arc::new(core::sync::atomic::AtomicUsize::new(0));
+    let waker = tcp_connect_counting_waker(alloc::sync::Arc::clone(&wakes));
+    let mut cx = core::task::Context::from_waker(&waker);
+    let mut accept = alloc::boxed::Box::pin(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_ACCEPT, [listener_fd as u64, 0, 0, 0, 0, 0]),
+        &ctx,
+    ));
+    assert!(matches!(
+        accept.as_mut().poll(&mut cx),
+        core::task::Poll::Pending
+    ));
+
+    assert_eq!(
+        tx_subsystems::signal::step_kill_process_with_post(
+            &process,
+            tx_subsystems::signal::Signum::SIGTERM,
+            None,
+            |weak, event| {
+                if let Some(mailbox) = weak.upgrade() {
+                    let _ = mailbox.post(event);
+                }
+            },
+        ),
+        tx_subsystems::signal::KillOutcome::Delivered
+    );
+    assert!(
+        wakes.load(core::sync::atomic::Ordering::SeqCst) > 0,
+        "SIGTERM must wake the task parked in accept"
+    );
+    assert_eq!(
+        accept.as_mut().poll(&mut cx),
+        core::task::Poll::Ready(SyscallResult::Error(EINTR_VALUE))
+    );
+    assert!(
+        mailbox.is_empty(),
+        "accept must consume its SignalDelivered wake hint after observing pending signal state"
+    );
+}
+
 fn dispatch_bind_listen_getsockname_round_trips_inet_addr() {
     let _setup = socket_setup();
     let (_process, ctx) = socket_ctx();

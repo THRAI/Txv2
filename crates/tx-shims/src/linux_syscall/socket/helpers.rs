@@ -1747,7 +1747,8 @@ pub(super) fn wait_on_yield_shape(shape: YieldShape) -> Option<wait_source::Regi
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SocketWaitWake {
     SocketReady,
-    ItimerExpired,
+    /// A deliverable signal interrupted the blocking socket syscall.
+    Interrupted,
     /// A low-frequency recovery probe requested by a caller which can
     /// validate an object-specific terminal condition.
     RecoveryProbe,
@@ -1795,54 +1796,109 @@ where
     // with no armed deadline AND a pending SIGALRM: it parked until unrelated
     // traffic woke the socket (observed as a 361s stall in if-updown).
     if tx_subsystems::signal::pending_signal_interrupts_wait(&ctx.thread, &ctx.process) {
-        return SocketWaitWake::ItimerExpired;
+        drain_socket_signal_hints(ctx);
+        return SocketWaitWake::Interrupted;
     }
     if super::time::consume_itimer_real_delivered_interrupt(pid) {
-        return SocketWaitWake::ItimerExpired;
+        drain_socket_signal_hints(ctx);
+        return SocketWaitWake::Interrupted;
     }
     let now_ns = timekeeper_clock::<P>().monotonic_now_ns();
     let itimer_deadline_ns = super::time::itimer_real_deadline_ns(pid);
     let recovery_deadline_ns = recovery_after_ns.map(|delay| now_ns.saturating_add(delay));
     let deadline_ns = match (itimer_deadline_ns, recovery_deadline_ns) {
-        (Some(itimer), Some(recovery)) => core::cmp::min(itimer, recovery),
-        (Some(itimer), None) => itimer,
-        (None, Some(recovery)) => recovery,
-        (None, None) => {
-            let _ = socket_future.await;
-            return SocketWaitWake::SocketReady;
-        }
+        (Some(itimer), Some(recovery)) => Some(core::cmp::min(itimer, recovery)),
+        (Some(itimer), None) => Some(itimer),
+        (None, Some(recovery)) => Some(recovery),
+        (None, None) => None,
     };
     if itimer_deadline_ns.is_some_and(|deadline| now_ns >= deadline) {
         super::time::fire_itimer_real_with_post::<P>(ctx);
-        return SocketWaitWake::ItimerExpired;
+        drain_socket_signal_hints(ctx);
+        return SocketWaitWake::Interrupted;
     }
     if recovery_deadline_ns.is_some_and(|deadline| now_ns >= deadline) {
         return SocketWaitWake::RecoveryProbe;
     }
-    let Some(mut timer_future) = super::deadline_timer(ctx, deadline_ns) else {
-        let _ = socket_future.await;
-        return SocketWaitWake::SocketReady;
-    };
+    let mut timer_future = deadline_ns.and_then(|deadline| super::deadline_timer(ctx, deadline));
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum PollWake {
+        SocketReady,
+        Interrupted,
+        Deadline,
+    }
 
     let wake = core::future::poll_fn(|cx| {
-        if core::future::Future::poll(core::pin::Pin::new(&mut socket_future), cx).is_ready() {
-            return core::task::Poll::Ready(SocketWaitWake::SocketReady);
+        // The task wrapper normally owns this same task-mailbox waker. Register
+        // it here as well so host tests and bootstrap callers get the identical
+        // signal wake route. Nested waits use the same task Context waker and do
+        // not clear it when they complete.
+        if let Some(mailbox) = ctx.mailbox.as_deref() {
+            mailbox.register_waker(cx.waker().clone());
         }
-        if core::future::Future::poll(core::pin::Pin::new(&mut timer_future), cx).is_ready() {
-            return core::task::Poll::Ready(SocketWaitWake::ItimerExpired);
+        if tx_subsystems::signal::pending_signal_interrupts_wait(&ctx.thread, &ctx.process)
+            || super::time::consume_itimer_real_delivered_interrupt(pid)
+        {
+            return core::task::Poll::Ready(PollWake::Interrupted);
+        }
+        if core::future::Future::poll(core::pin::Pin::new(&mut socket_future), cx).is_ready() {
+            return core::task::Poll::Ready(PollWake::SocketReady);
+        }
+        if timer_future.as_mut().is_some_and(|future| {
+            core::future::Future::poll(core::pin::Pin::new(future), cx).is_ready()
+        }) {
+            return core::task::Poll::Ready(PollWake::Deadline);
+        }
+        // Close the signal-post-vs-park window after both inner futures have
+        // installed their wake routes. A post racing this check also wakes the
+        // registered task waker, so the next poll observes authoritative signal
+        // state rather than sleeping until unrelated socket traffic arrives.
+        if tx_subsystems::signal::pending_signal_interrupts_wait(&ctx.thread, &ctx.process)
+            || super::time::consume_itimer_real_delivered_interrupt(pid)
+        {
+            return core::task::Poll::Ready(PollWake::Interrupted);
         }
         core::task::Poll::Pending
     })
     .await;
-    if wake == SocketWaitWake::ItimerExpired {
-        let now_ns = timekeeper_clock::<P>().monotonic_now_ns();
-        if itimer_deadline_ns.is_some_and(|deadline| now_ns >= deadline) {
-            super::time::fire_itimer_real_with_post::<P>(ctx);
-        } else {
-            return SocketWaitWake::RecoveryProbe;
+    match wake {
+        PollWake::SocketReady => SocketWaitWake::SocketReady,
+        PollWake::Interrupted => {
+            drain_socket_signal_hints(ctx);
+            SocketWaitWake::Interrupted
+        }
+        PollWake::Deadline => {
+            let now_ns = timekeeper_clock::<P>().monotonic_now_ns();
+            if itimer_deadline_ns.is_some_and(|deadline| now_ns >= deadline) {
+                super::time::fire_itimer_real_with_post::<P>(ctx);
+                drain_socket_signal_hints(ctx);
+                SocketWaitWake::Interrupted
+            } else {
+                SocketWaitWake::RecoveryProbe
+            }
         }
     }
-    wake
+}
+
+/// Consume only signal wake hints after the authoritative pending state has
+/// been observed. Other mailbox traffic belongs to independent nested waits
+/// and must remain queued.
+fn drain_socket_signal_hints(ctx: &SyscallCtx<'_>) {
+    let Some(mailbox) = ctx.mailbox.as_deref() else {
+        return;
+    };
+    let _ = mailbox.poll_select(|event| {
+        if matches!(
+            event,
+            tx_substrate::wake::MailboxEvent::SignalDelivered { .. }
+                | tx_substrate::wake::MailboxEvent::SignalTimerFired { .. }
+        ) {
+            tx_substrate::wake::mailbox::MailboxPollAction::Drop
+        } else {
+            tx_substrate::wake::mailbox::MailboxPollAction::Keep
+        }
+    });
 }
 
 /// Repair a missing Unix-stream peer-close edge.
