@@ -225,7 +225,7 @@
         "On RO boot, recheck ext4 RO, all file hashes and binaries, both Git repositories and commits, non-shallow state, clean status, and git fsck --full",
         "If credentialed push reproduction is required, the user performs it and supplies an attestation; the agent does not read, search, copy, or retain PAT-bearing output"
       ],
-      "notes": "The capacity gate in step 8 is mandatory. Do not delete the previous acceptance evidence. Pull is not a prior verified requirement and remains outside the gate unless the user explicitly adds it. A sync return is not durability proof; only the physical reset plus independent RO readback closes this step."
+      "notes": "A pre-capacity cb275b28c RO admission plus /dev/shm tools smoke passed on 2026-08-17: four-hart boot, DWMAC/MMC/root, retained old evidence, 600/600 host ping, public IP/DNS/CA, exact-URL git ls-remote, real Vim edit, local Git commit/fsck, GCC, Rust, ps, and sync. This deliberately made no MMC writes and cannot close this step. The capacity gate in step 8 is mandatory. Do not delete the previous acceptance evidence. Pull is not a prior verified requirement and remains outside the gate unless the user explicitly adds it. A sync return is not durability proof; only the physical reset plus independent RO readback closes this step."
     },
     {
       "id": "step-10-la2k1000-physical-acceptance",
@@ -323,9 +323,14 @@
       "notes": "target/qemu-merge-accept/la-external-final9-cb275b28c/la64.full-stepwise.result.json records PASS, final e2fsck 0, unchanged mother image, and identical RW/RO/final content hashes."
     },
     {
+      "command": "Physical VF2 pre-capacity RO boot and non-persistent tools smoke from cb275b28c",
+      "status": "passed",
+      "notes": "The uniquely named uImage passed U-Boot iminfo and booted mmcblk0 RO. Old evidence remained present with 5.9 MiB free. Network 600/600, exact-URL git ls-remote, full-screen Vim, local Git commit/fsck, GCC and Rust execution passed in /dev/shm. This is not clone or persistence evidence."
+    },
+    {
       "command": "Physical VF2 and LA2K1000 validation from cb275b28c",
       "status": "not-run",
-      "notes": "Both artifacts are built, directly hashed, and uniquely staged in TFTP. The host currently sees neither the VF2 removable medium nor any USB/ACM serial device. VF2 capacity remediation and all physical reset checkpoints remain interactive gates."
+      "notes": "Both artifacts are built, directly hashed, and uniquely staged in TFTP. The VF2 serial and board network are now identified and its pre-capacity RO/tools smoke passed, but the removable medium is still inside the board and no capacity mutation has occurred. VF2 capacity remediation, persistent RW/reset/RO, and LA2K1000 physical checkpoints remain interactive gates."
     }
   ],
   "risks": [
@@ -338,7 +343,7 @@
   ],
   "blockers": [
     "The retained VF2 MMC acceptance filesystem has about 6 MiB free, below the space needed for a fresh add-only full clone and persistence matrix. Before the first media mutation, the exact target and evidence-preserving backup/resize procedure must be explained to the user and explicitly authorized.",
-    "No VF2 removable medium and no VF2/LA2K1000 USB or ACM serial device is currently attached to the host, so both physical-board matrices require user hardware attachment and reset actions."
+    "The VF2 medium remains inside the board rather than attached to a host reader, so its full-card backup/resize gate cannot start yet. LA2K1000 serial/hardware is not attached. Both persistent physical-board matrices still require user reset actions."
   ],
   "handoff": {
     "needed": true,

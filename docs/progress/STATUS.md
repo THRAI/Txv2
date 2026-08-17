@@ -1,3 +1,21 @@
+- 2026-08-17 (**合并态 VF2 除 clone 外的 RO/tmpfs 实板功能预检通过；5.9 MiB MMC 容量门禁仍保留**).
+  **Changed**：从 `cb275b28c` 唯一 uImage 经 VF2 U-Boot TFTP/`iminfo` 启动，四 hart、
+  DWMAC、MMC、whole-device ext4 root 与 `boot:ok` 通过；`/dev/mmcblk0` 明确为 RO，旧
+  `/proj/vf2-accept-c45256ce-1cc998d7-20260816-0914z` 仍在，可用空间实测 5.9 MiB。
+  为不消耗 MMC，在 `/dev/shm` 全新目录实际完成 Vim 9.1 全屏编辑、Git 2.49.1
+  init/add/两次 commit/log/clean/fsck、GCC 14.2 编译运行 `VF2 C OK`、rustc 1.87
+  编译运行 `VF2 Rust OK`；`sync` 返回 0。网络通过宿主 3/3 与 600/600、0% 丢包、
+  公网 8.8.8.8 3/3、DNS/CA，并在校准临时 UTC 后以真实 URL
+  `https://github.com/LLLPPPS/tx-push-test.git` 完成非 clone 的 `git ls-remote HEAD`
+  （`9d41e640…`，rc 0）。**Verification**：详细串口证据
+  `msp/serial/2026-08-17-vf2-merge-cb275b28c-session.log`，SHA-256
+  `0f91429c…1b54c`；分类确认 RO admission 的 `/tmp` 不可写和 `PATH=/bin` 会让默认
+  GCC/rustc/pager/sha256sum 入口失败，显式 `TMPDIR=/dev/shm`、`PATH=/usr/bin:/bin`、
+  `PAGER=cat` 后同一正常路径全绿，未修改内核。**Next**：本轮只证明工具与网络，
+  不能当作 MMC 持久化或 clone 证据；容量门禁后须在新 add-only MMC 目录重跑、完成
+  真实 full clone、sync、物理 reset 与 RO 读回。**Blocker**：首次容量修改仍须完整
+  整卡备份、工作副本 resize 演练、旧证据复核与用户明确授权；本轮未写 MMC。
+
 - 2026-08-17 (**合并态双架构 QEMU 正式真实 GitHub clone 已通过；两块实板镜像已唯一部署，等待接入硬件**).
   **Changed**：在 `codex/qemu-vf2-integration` 上继续收口 PageBacked 压力路径与 SMP
   lost-wake；最终提交 `cb275b28c` 将 `WaitSource` 空 subscriber 快照时的 pending latch
