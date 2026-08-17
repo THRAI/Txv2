@@ -6,7 +6,7 @@
   "created": "2026-08-16",
   "updated": "2026-08-17",
   "owner": "codex-01a00a3b-f64c-7c43-9ee0-6512899dcc80",
-  "summary": "Merge QEMU commit 37d38778f and VF2 commit e619fe098 through an isolated integration branch, preserve both semantic fix sets, and advance the main QEMU branch only after fresh RV64/LA64 QEMU plus physical VF2 and LA2K1000 acceptance from the merge commit.",
+  "summary": "Merge QEMU commit 37d38778f and VF2 commit e619fe098 through an isolated integration branch, preserve both semantic fix sets, and advance the main QEMU branch only after fresh RV64/LA64 QEMU plus physical VF2 and LA2K1000 acceptance from the merge commit. RV64 QEMU, LA64 QEMU, and physical VF2 now pass from cb275b28c; LA2K1000 remains the final physical gate.",
   "scope": {
     "in": [
       "All 2 commits unique to feature/portable-net-vf2-dwmac after merge-base 3df096b94",
@@ -194,25 +194,25 @@
     },
     {
       "id": "step-8-vf2-capacity-gate",
-      "title": "Preserve the current VF2 evidence and provide space for a fresh matrix",
-      "status": "in-progress",
+      "title": "Provide verified VF2 media capacity for a fresh matrix",
+      "status": "complete",
       "depends_on": [
         "step-7-la64-qemu-acceptance"
       ],
       "paths": [],
       "verification": [
-        "Before the first media mutation, tell the user the exact source, target node, serial, capacity, operation, validation, and rollback evidence",
-        "Re-identify the removable USB device by serial 121220160204, 31719424000-byte capacity, USB transport, removable=1, whole-device ext4 layout, not mounted, and not the host root device",
-        "Set the block device read-only and create a complete verified backup of the current card before any resize or overwrite",
-        "Rehearse whole-device ext4 resize on a working copy, then verify the retained VF2 acceptance directory, hashes, commits, and e2fsck -fn before requesting final physical-media authorization",
-        "After authorized resize, return the block device to read-only, require e2fsck -fn exit 0, verify old evidence read-only, and power off the reader"
+        "Before the first media mutation, report the exact source image, stable target identity, capacity, operation, validation, and overwrite consequence",
+        "Re-identify /dev/disk/by-id/usb-Mass_Storage_Device_121220160204-0:0 as serial 121220160204, 31719424000-byte removable USB media, whole-device ext4, unmounted, and not the host root device",
+        "After the user explicitly rejected a full-card backup and authorized overwriting the old acceptance contents, write /home/msp/learning/Txv2/local-images/alpine-linux-riscv64-ext4fs.img and verify its full 723517440-byte prefix SHA-256 d547220caf7b3ce4c1d67560bbed66f4ee491d10718d1ea3e55741019aef5eb4",
+        "Expand the whole-device ext4 filesystem offline to exactly 1 GiB, require final e2fsck -fn exit 0, return the block device to read-only, and power off the reader",
+        "Record the write/resize and final e2fsck logs with hashes before returning the card to the VF2"
       ],
-      "notes": "The exact historical restore script and device identity were recovered from the VF2 task. Current preferred remediation is to preserve the old card read-only and clone to a replacement medium before offline whole-device ext4 expansion; if only the old card is available, first make and verify a complete 31719424000-byte backup and rehearse the resize on a working copy. The current host has no matching media attached, and no first write has occurred. Rewriting the Alpine baseline is disaster recovery only because it erases current evidence."
+      "notes": "The user stopped the unnecessary 31.7 GB backup, directed its temporary file to be deleted, selected the existing 723517440-byte Alpine image as the source, and explicitly authorized overwriting the old card because this medium is dedicated to validation. The write, prefix hash comparison, offline expansion to 1 GiB, read-only e2fsck, flush, read-only restoration, and reader power-off passed. The expanded filesystem reported 371982336 free bytes before the fresh workload. Evidence: local-images/vf2-write-results/vf2-flash-d547220c-to-1g-20260817.log (SHA-256 249995d95c17376e077860d16d916ba8e36086f91e224dec72260c37e056bffd) and its e2fsck-fn log (SHA-256 a3a7f55769237ff29edb575e0fa1df6917f65a04e5676ac5106e70e0f5acb624)."
     },
     {
       "id": "step-9-vf2-physical-acceptance",
       "title": "Reproduce the full VF2 RW-reset-RO matrix with the merge artifact",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "step-8-vf2-capacity-gate"
       ],
@@ -225,7 +225,7 @@
         "On RO boot, recheck ext4 RO, all file hashes and binaries, both Git repositories and commits, non-shallow state, clean status, and git fsck --full",
         "If credentialed push reproduction is required, the user performs it and supplies an attestation; the agent does not read, search, copy, or retain PAT-bearing output"
       ],
-      "notes": "A pre-capacity cb275b28c RO admission plus /dev/shm tools smoke passed on 2026-08-17: four-hart boot, DWMAC/MMC/root, retained old evidence, 600/600 host ping, public IP/DNS/CA, exact-URL git ls-remote, real Vim edit, local Git commit/fsck, GCC, Rust, ps, and sync. This deliberately made no MMC writes and cannot close this step. The capacity gate in step 8 is mandatory. Do not delete the previous acceptance evidence. Pull is not a prior verified requirement and remains outside the gate unless the user explicitly adds it. A sync return is not durability proof; only the physical reset plus independent RO readback closes this step."
+      "notes": "The cb275b28c uImage passed host hash and U-Boot iminfo, then booted four harts with DWMAC, MMC, whole-device ext4 RW root, and boot:ok. The board reached the host and 8.8.8.8, resolved github.com after transient route/DNS/time setup, and completed the exact genuine full clone `git -c http.version=HTTP/1.1 -c http.maxRequests=1 clone https://github.com/LLLPPPS/tx-push-test.git /proj/vf2-cb275b28c`: HEAD 9d41e640f7686b8891744e232297341494de2e7d, 7830 objects, clean status, and git fsck --full. Real full-screen Vim, GCC, and rustc 1.87 produced persistent source/binaries; C printed `VF2 C OK` and Rust printed `VF2 Rust OK`. After two sync calls and the user's physical power cycle, the same uImage and MMC booted RO; the 1 GiB filesystem, exact clone URL/HEAD/clean/fsck, all four artifact hashes, and both executable outputs survived. RW log msp/serial/2026-08-17-vf2-merge-cb275b28c-postflash.log has SHA-256 69ff0f0882cb550484ca92feca90aeee113154f0cc579b8fe489e04c30957424; RO replay log msp/serial/2026-08-17-vf2-merge-cb275b28c-postflash-ro-reboot.log has SHA-256 ce87b5ba906d67e5b3c3c9ef2a65a9f56bb7bd45ab2d18cd54b130694d1abacf. A nonfatal munmap-pending diagnostic appeared during clone, but the clone and all integrity checks completed. Pull/push were not required or attempted."
     },
     {
       "id": "step-10-la2k1000-physical-acceptance",
@@ -328,9 +328,14 @@
       "notes": "The uniquely named uImage passed U-Boot iminfo and booted mmcblk0 RO. Old evidence remained present with 5.9 MiB free. Network 600/600, exact-URL git ls-remote, full-screen Vim, local Git commit/fsck, GCC and Rust execution passed in /dev/shm. This is not clone or persistence evidence."
     },
     {
-      "command": "Physical VF2 and LA2K1000 validation from cb275b28c",
+      "command": "Physical VF2 capacity remediation and RW-reset-RO validation from cb275b28c",
+      "status": "passed",
+      "notes": "The user-authorized Alpine image rewrite and offline expansion to 1 GiB passed prefix SHA-256 and final e2fsck -fn. The board then passed exact real GitHub full clone, Vim/GCC/Rust, sync, user power cycle, independent RO readback, matching hashes, binary execution, and git fsck --full."
+    },
+    {
+      "command": "Physical LA2K1000 validation from cb275b28c",
       "status": "not-run",
-      "notes": "Both artifacts are built, directly hashed, and uniquely staged in TFTP. The VF2 serial and board network are now identified and its pre-capacity RO/tools smoke passed, but the removable medium is still inside the board and no capacity mutation has occurred. VF2 capacity remediation, persistent RW/reset/RO, and LA2K1000 physical checkpoints remain interactive gates."
+      "notes": "The uniquely staged kernel-only uImage is ready and directly hashed, but the host currently exposes no ttyUSB/ttyACM serial node. The user has reported powering hardware again; serial enumeration and the RO-RW-reset-RO checkpoints remain."
     }
   ],
   "risks": [
@@ -342,8 +347,7 @@
     "A stale LA2K1000 checksum sidecar can falsely identify a rebuilt image unless the artifact itself is hashed."
   ],
   "blockers": [
-    "The retained VF2 MMC acceptance filesystem has about 6 MiB free, below the space needed for a fresh add-only full clone and persistence matrix. Before the first media mutation, the exact target and evidence-preserving backup/resize procedure must be explained to the user and explicitly authorized.",
-    "The VF2 medium remains inside the board rather than attached to a host reader, so its full-card backup/resize gate cannot start yet. LA2K1000 serial/hardware is not attached. Both persistent physical-board matrices still require user reset actions."
+    "LA2K1000 is the only remaining target. Its kernel-only uImage is staged, but the host currently exposes no ttyUSB/ttyACM serial node; the serial adapter must enumerate before RO-RW-reset-RO validation can begin."
   ],
   "handoff": {
     "needed": true,

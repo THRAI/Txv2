@@ -1,3 +1,27 @@
+- 2026-08-17 (**合并态 VF2 扩容、真实公网 clone 与 RW→人工断电→RO 持久化验收全部通过；仅剩 LA2K1000**).
+  **Changed**：用户停止并要求删除无必要的 31.7 GB 整卡临时备份，随后明确授权以既有
+  `/home/msp/learning/Txv2/local-images/alpine-linux-riscv64-ext4fs.img` 覆盖专用验收卡。
+  稳定目标 `usb-Mass_Storage_Device_121220160204-0:0` 经 serial/容量/可移动/未挂载/
+  非宿主根盘复核后，723517440-byte 写入前缀与源镜像 SHA-256 均为
+  `d547220c…ef5eb4`；whole-device ext4 离线扩到 1 GiB，最终 `e2fsck -fn=0`，初始
+  可用空间 371982336 bytes，设备恢复 RO 并安全断电。**Verification**：同一
+  `cb275b28c` 唯一 VF2 uImage 通过 TFTP/`iminfo`，四 hart、DWMAC、MMC、ext4 RW root
+  与 `boot:ok`；短命令、低频交互下完成宿主/公网/DNS，真实完整
+  `git -c http.version=HTTP/1.1 -c http.maxRequests=1 clone
+  https://github.com/LLLPPPS/tx-push-test.git /proj/vf2-cb275b28c`，得到 7830 objects、
+  HEAD `9d41e640…de2e7d`、clean 与 `git fsck --full`。真实全屏 Vim、GCC、rustc 1.87
+  生成持久化源和二进制，分别输出 `VF2 C OK`、`VF2 Rust OK`；两次 `sync` 后由用户
+  物理断电重启，同一 MMC/uImage 以 root RO 启动，1 GiB 容量、clone URL/HEAD/对象、
+  四项工具哈希、两个程序输出与 fsck 全部复现。RW 串口日志
+  `msp/serial/2026-08-17-vf2-merge-cb275b28c-postflash.log` SHA-256
+  `69ff0f08…57424`；RO 重启日志
+  `msp/serial/2026-08-17-vf2-merge-cb275b28c-postflash-ro-reboot.log` SHA-256
+  `ce87b5ba…abacf`。写盘/扩容及最终 fsck 日志位于
+  `local-images/vf2-write-results/`，哈希已写入合并计划。clone 期间一条非致命
+  `munmap-pending` 诊断未影响 clone、哈希或 fsck，保留为后续观察项。**Next**：只剩
+  LA2K1000 以 `5b2675e5…066373` kernel-only uImage 完成 RO→RW→人工 reset→RO。
+  **Blocker**：当前宿主未枚举任何 `ttyUSB/ttyACM`；须先连接 LA2K1000 USB 串口。
+
 - 2026-08-17 (**合并态 VF2 除 clone 外的 RO/tmpfs 实板功能预检通过；5.9 MiB MMC 容量门禁仍保留**).
   **Changed**：从 `cb275b28c` 唯一 uImage 经 VF2 U-Boot TFTP/`iminfo` 启动，四 hart、
   DWMAC、MMC、whole-device ext4 root 与 `boot:ok` 通过；`/dev/mmcblk0` 明确为 RO，旧
