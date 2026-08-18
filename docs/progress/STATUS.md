@@ -1,3 +1,102 @@
+- 2026-08-18 (**当前功能分支工作树已收口**).
+  **Changed**：将 LA2K1000 UART RX 验收输出清理独立提交为 `7c48d57b9`；保留本地
+  `msp/knowledge-handbook/` 与 `.codex/hooks.json`，通过 `.git/info/exclude` 仅在本
+  工作树忽略；删除可重建的 `target-partition-io/` Cargo 缓存（约 3.3 GiB），未删除
+  源码、镜像或验收证据。**Verification**：`cargo fmt --all -- --check`、
+  `cargo test -p tx-hal-loongarch64-2k1000 --lib`（31/31）与 `git diff --check` 通过；
+  清理完成后要求 `git status --porcelain=v1 --untracked-files=all` 为空。
+  **Next**：需要共享时由用户决定是否将当前分支 push 到远端。
+  **Blocker**：无；本轮不执行 push。
+
+- 2026-08-18 (**VisionFive 2 读卡器上板手册已按现场操作重新简化**).
+  **Changed**：新增并完整复读
+  `msp/knowledge-handbook/11-VisionFive2烧录和上板流程（读卡器与网络配置）.md`，再按
+  用户反馈由 940 行审计式清单缩为约 560 行操作式流程；解压只保留 `cd`、`xz -dk`
+  及输出文件，删除可选 SHA、比赛文件名提示、`ARCHIVE`/`IMAGE`/`CARD_*`/`KERNEL_*`
+  等中间变量与重复
+  `stat`/`realpath`/哈希对账；进一步删除开头集中列出的“会变化的值”总表，将
+  读卡器设备、根分区号、串口、直连与上联网卡、`serverip`、DNS、TFTP
+  根目录、uImage 大小、FDT 地址和 UTC 时间的取值方法分别放到首次实际使用它们的
+  步骤旁。读卡器写卡只保留一次系统盘/目标盘确认和一次自动长度
+  `cmp`，其余按写卡→扩容→编译/uImage→TFTP→RW 启动→网络→Git/PAT→sync→复位
+  快捷卡顺序直接执行；按当前实测把所有读卡器命令改为 `/dev/sda`，并在每个命令块
+  就地标注该名称必须随 `lsblk` 结果替换；写卡前的系统盘/读卡器检查也补有当前
+  `/dev/sda` 预期输出和“两者不能相同”的判定；仍
+  为卸载步骤补充实际整盘 ext4 `/dev/sda` 示例，明确 `FSTYPE=ext4` 不等于已挂载、
+  只按 `MOUNTPOINTS` 判断；整盘挂载时卸载 `/dev/sda`，分区挂载时才卸载
+  `/dev/sdb1`，并给出挂载点消失的预期结果；仍保留整盘 ext4 与分区镜像的必要分支。
+  写卡后的 `partprobe`/`lsblk -f` 也补入当前实板输出，明确以 `sda` 直接显示 ext4、
+  无 `sda1` 子分区且挂载点为空作为进入整盘扩容分支的判据，UUID 不要求固定。
+  `e2fsck` 若报错或询问修复则不连续确认，直接回到写镜像和 `WRITE_OK` 校验后重试
+  扩容。VF2 编译章节补入当前 `rust-objcopy`、`mkimage`、uImage ready 与后续提示的
+  完整成功输出；标明构建时间和 `Data Size` 动态变化、缺少 BusyBox initramfs 在 SD
+  根流程中不是错误，且工具末尾 `cp`/U-Boot 行仅为通用提示，实际仍按 TFTP 章节部署。
+  **Verification**：当前镜像仍确认为
+  whole-device ext4；`xtask` VF2 包装入口、固定
+  `0x80200000` load/entry、`mmcblk0` 实板启动和网络命令未改变；简化后 whitespace
+  check 无报错，`cargo xtask lint docs` 仍仅报既有 25 个断链与 7 项旧词警告，新手册
+  未进入失败清单。**Next**：赛前按简化手册在可覆盖卡上完整演练写入、扩容、TFTP、
+  RW Git 和复位读回。**Blocker**：本轮只改手册，没有实际写卡或启动 VF2；执行
+  `dd` 前仍必须确认当前 `/dev/sda` 确实是读卡器而不是宿主系统盘；设备名变化时必须
+  按 `lsblk` 结果替换。
+
+- 2026-08-18 (**LA2K1000 现场手册已改为 ext4 U 盘烧录、kernel-only TFTP、双模式宿主路由与 Git/PAT 完整流程**).
+  **Changed**：重写
+  `msp/knowledge-handbook/10-LA2k1000烧录和上板流程（包含网络配置）.md`，删除旧的
+  救援 initramfs 主路线，按解压→串口→ext4 U 盘→U-Boot `ext4load`/`scsi write`→
+  `cargo xtask full-build --target la64-2k1000 --release --kernel-only`→TFTP→SATA RW
+  启动→板卡网络/DNS/时间→宿主无 Clash/Clash TUN 两类路由→真实 HTTPS clone、commit
+  身份、fine-grained PAT 与 push 的现场顺序重建；实际步骤统一高亮，镜像字节数、512-byte
+  扇区数、SATA `0x40003f` 起点、uImage 64-byte 头、TFTP `serverip` 均写明来源和动态
+  检查；追加固定/镜像动态/SATA 动态/内核动态/网络动态五类数值表与现场记录表，内核
+  大小强制对账电脑 `stat`、TFTP `Bytes transferred` 和 `iminfo Data Size`，PAT 明确
+  不进入 URL、脚本、仓库或 `git config`；新增复位后逐行粘贴快捷卡，将电脑准备、
+  U-Boot TFTP/`scsi reset`/FDT/SATA RW 启动、txKernel 联网、无 Clash/Clash 两套
+  宿主路由和可选 Git 重拉分组列出，并单列所有可能变化的 IP、网卡、DNS、根分区、
+  文件名、时间和规则优先级；明确镜像/内核大小变化不要求修改加载地址或手算长度。
+  **Verification**：当前源镜像与 ext4 U 盘
+  `/alpine.img` SHA-256 均为 `57c64d68…25ca`；实算镜像余数 `0`、扇区数 `1413120`，
+  当前 uImage 文件 `8978128` bytes、固定 64-byte 头后的 payload `8978064` bytes，
+  与 `mkimage -l` 完全一致；手册 no-index whitespace check 无报错；
+  `cargo xtask lint docs` 的 25 个断链与 7 项旧词警告均为既有基线，新手册未进入失败
+  清单。**Next**：把当前 ext4 U 盘插入 LA 板，先完成 `usb reset`、
+  `ext4ls usb 0:1 /`、`ext4load` 与全文件 CRC32 `94ebd02f`；只有 CRC 匹配后才允许
+  `scsi write`，随后按手册重跑 TFTP/RW 启动和真实 Git clone/push 演练。
+  **Blocker**：`scsi write/read` 与 raw-U 盘 CRC 已实测，但新 ext4 文件载体的首次
+  `ext4load usb` 尚未实板验收；GitHub PAT 必须在有网环境赛前创建，真正全程断网时只能
+  本地 commit，不能 clone/push。
+
+- 2026-08-17 (**LA2K1000 首字符 UART RX 验收哨兵已从交互路径移除，等待新 uImage 实板复验**).
+  **Changed**：删除 `boards/tx-hal-loongarch64-2k1000/src/platform_impls.rs`
+  `IrqChipIf::claim()` 在首次 UART RX IRQ 时写出的
+  `txkernel:loongson-2k1000:irq:uart-rx:ok`，并移除只为该输出服务的观察原子；
+  LIOINTC claim/complete、UART RX 与 polling fallback 均未改变。新 kernel-only
+  uImage 已以 add-only 文件名部署到
+  `/srv/tftp/txv2/txv2-la2k1000-local-no-uart-rx-log.uimage`，SHA-256 为
+  `ae061118eb808e546445f8650f89a1a4b80c5f56f67b3566a34db7771e84374b`，旧 TFTP
+  镜像未覆盖。**Verification**：2K HAL 31/31、release kernel-only build、
+  `la2k1000-uimage`、`cargo fmt --all -- --check`、`git diff --check` 与 TFTP
+  源/副本哈希一致均通过；`cargo -q xtask unit` 仍被当前工作树既有的
+  `tx-shims` dispatch 大批失败及两项 libctest `chmod` 断言阻断。
+  **Next**：下次 U-Boot 以新文件名 TFTP/`iminfo`/RW 启动，确认首个 shell 输入不再
+  插入哨兵且 UART 输入正常。**Blocker**：当前正在运行的旧内核不会热更新；必须重新
+  TFTP 启动后才能观察变化。
+
+- 2026-08-17 (**LA2K1000 断网现场操作手册已建立，当前记录到 U-Boot 临时网络配置**).
+  **Changed**：新建 `msp/knowledge-handbook/10-LA2k1000烧录和上板流程（包含网络配置）.md`，
+  以简短高亮命令记录 LoongArch64 Alpine ext4 镜像解压、当前大内核
+  `--kernel-only` 离线构建、从仓库 vendored BusyBox 重建 cpio、使用
+  `mkimage-loongarch` 新包装救援 initrd、独立 local 文件名 TFTP 部署、串口
+  进入与临时 IP 配置；明确禁止依赖旧救援文件。`serverip` 现定义为
+  `ip route get <board-ip>` 输出的 `src`，而非固定公网/网关地址；同时记录 U-Boot
+  粘贴命令粘连的 `Ctrl+C` 恢复方法。**Verification**：手册结构抽查与
+  `git diff --check` 通过；`cargo xtask lint docs` 仍只报仓库已知的 25 个断链与 7 项
+  旧词警告，新手册未进入失败清单。本轮尚未执行 TFTP 加载或 SATA 写入，不记为
+  烧录验收。**Next**：在 `ping $serverip` 通过后继续手册的 kernel/initrd TFTP、
+  动态 initrd 范围、RAM-root 确认与有校验的 `/dev/sda1` 写盘流程。
+  **Blocker**：本轮尚需成功设置 U-Boot `ipaddr/serverip` 并通过 LAN ping；在确认
+  救援根不使用 SATA 之前不允许写盘。
+
 - 2026-08-17 (**QEMU/VF2 合并完成，RV64/LA64 QEMU、VF2 与 LA2K1000 四项目标全部通过**).
   **Changed**：`codex/qemu-vf2-integration` 保留 QEMU `37d38778f` 与 VF2
   `e619fe098` 双历史，合并后跨子系统修复链最终落在代码提交 `cb275b28c`；两来源提交
