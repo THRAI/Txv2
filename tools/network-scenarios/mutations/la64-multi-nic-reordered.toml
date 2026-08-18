@@ -1,0 +1,38 @@
+schema = "tx.network-scenario.v1"
+name = "la64-multi-nic-reordered"
+target = "qemu-la64"
+
+[device]
+transport = "virtio-pci"
+selector = { kind = "device-id", value = "primary-network-device" }
+placement = { kind = "virtio-pci", slot = 5, function = 0 }
+
+[[auxiliary]]
+id = "old-location-decoy"
+kind = "virtio-rng-pci"
+order = "before-network"
+placement = { kind = "virtio-pci", slot = 2, function = 0 }
+
+[[auxiliary]]
+id = "secondary-network-device"
+kind = "virtio-net-pci"
+order = "after-network"
+placement = { kind = "virtio-pci", slot = 6, function = 0 }
+backend = { kind = "qemu-user", id = "secondary-network", network = "172.30.55.0/24", dhcp_start = "172.30.55.77", gateway = "172.30.55.9", dns = "172.30.55.10" }
+
+[[auxiliary]]
+id = "post-network-rng"
+kind = "virtio-rng-pci"
+order = "after-network"
+placement = { kind = "virtio-pci", slot = 7, function = 0 }
+
+[backend]
+kind = "qemu-user"
+id = "primary-network"
+network = "172.31.44.0/24"
+dhcp_start = "172.31.44.77"
+gateway = "172.31.44.9"
+dns = "172.31.44.10"
+
+[guest]
+kind = "dhcp"

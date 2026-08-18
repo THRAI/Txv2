@@ -7,11 +7,28 @@ use tx_hal::{BootHandoff, KernelMain};
 
 type ActivePlatform = tx_hal_riscv64_qemu_virt::Platform;
 
+struct ActiveDeviceBundle;
+
+const ACTIVE_DRIVERS: [tx_kernel::devices::binder::StaticDriverDescriptor<ActivePlatform>; 2] = [
+    tx_kernel::devices::virtio_mmio_net::driver_descriptor::<ActivePlatform>(),
+    tx_kernel::devices::dwmac_net::driver_descriptor::<ActivePlatform>(),
+];
+
+impl tx_kernel::devices::binder::StaticDeviceBundle<ActivePlatform> for ActiveDeviceBundle {
+    fn resource_providers() -> &'static [tx_hal::ResourceProviderDescriptor<ActivePlatform>] {
+        &[]
+    }
+
+    fn drivers() -> &'static [tx_kernel::devices::binder::StaticDriverDescriptor<ActivePlatform>] {
+        &ACTIVE_DRIVERS
+    }
+}
+
 struct Kernel;
 
 impl KernelMain<ActivePlatform> for Kernel {
     fn kernel_main(handoff: BootHandoff) -> ! {
-        tx_kernel::kernel_main::<ActivePlatform>(handoff)
+        tx_kernel::kernel_main::<ActivePlatform, ActiveDeviceBundle>(handoff)
     }
 }
 

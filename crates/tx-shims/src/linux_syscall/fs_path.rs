@@ -690,7 +690,7 @@ pub(super) async fn sys_chdir<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
 /// - `buf == NULL` with `size != 0` → `-EFAULT`.
 /// - rendered path + 1 (NUL) > size → `-ERANGE`.
 /// - cwd unset / chain broken → `-ENOENT`.
-pub(super) fn sys_getcwd<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_getcwd(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let buf_uaddr = args[0];
     let size = args[1] as usize;
 
@@ -728,7 +728,7 @@ pub(super) fn sys_getcwd<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
     let mut buf: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(needed);
     buf.extend_from_slice(&path);
     buf.push(0);
-    if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, buf_uaddr, &buf) {
+    if let Err(errno) = bootstrap_copy_to_user_wait(&ctx.aspace, buf_uaddr, &buf).await {
         return SyscallResult::error_from(errno);
     }
     SyscallResult::Return(needed as i64)

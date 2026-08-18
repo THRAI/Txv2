@@ -4,7 +4,7 @@
 
 > **⚠ SUPERSEDED by [`Txv3/02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md).**
 > Per `docs/Txv3/INDEX.md` §3, v4 is the prior invariant catalog.
-> v5 adds the SUBJ-*, YIELD-*, DELEGATE-*, SCOPE-* families and
+> v5 adds the SUBJ-*, YIELD-*, DELEGATE-*, SCOPE-*, LANE-*, and DEVRES-* families and
 > updates STEP-* over the four-variant outcome. v4 families that
 > v5 carries forward unchanged remain authoritative through their
 > v5 restatement. This file is retained for historical reference
@@ -797,11 +797,17 @@ LINT: summary bits can fast-path checks but cannot replace pending/mask re-obser
 
 LINT: early UART/timer/interrupt-controller code must not register VFS device nodes directly.
 
-**DEV-TIER2-STATIC.** Tier-2 devices are static board-composed entries outside the zone/ref hierarchy.
+**DEV-TIER2-STATIC.** Tier-2 device implementations are link-time selected;
+one-shot boot-discovered bindings and registrations become `&'static` outside
+the zone/ref hierarchy. Resource values need not be hand-authored board
+constants.
 
 LINT: static device entries use `&'static`, not fake `Cap<T>`.
 
-**DEV-TIER3-DEFERRED.** Dynamic discovery/matching is deferred; adding it requires a real dynamic registry and lifecycle model.
+**DEV-TIER3-DEFERRED.** Runtime arrival/removal/reclamation is deferred; adding
+it requires a real dynamic registry and lifecycle model. One-shot discovery
+before the tier-2 graph freeze is governed by canonical v5 `DEVRES-*`, not this
+tier-3 rule.
 
 LINT: hotplug/dynamic driver code requires explicit tier-3 feature gate.
 

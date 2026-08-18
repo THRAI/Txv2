@@ -325,12 +325,13 @@ impl<T> SpinLock<T> {
     }
 
     fn lock(&self) -> SpinLockGuard<'_, T> {
+        let mut wait = crate::SpinWait::new();
         while self
             .locked
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            core::hint::spin_loop();
+            wait.tick();
         }
 
         SpinLockGuard { lock: self }

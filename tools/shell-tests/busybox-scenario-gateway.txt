@@ -1,0 +1,42 @@
+# BusyBox shell probe whose network values come from --net-scenario.
+#
+# Example:
+#   cargo xtask shell-test --target rv64-qemu \
+#     --net-scenario tools/network-scenarios/mutations/rv64-relocated-changed-subnet.toml \
+#     --script tools/shell-tests/busybox-scenario-gateway.txt
+#
+# The first non-loopback interface is discovered at runtime. The address,
+# prefix, and gateway placeholders are expanded from the selected scenario.
+
+wait "/ # " within 30000
+
+sleep 500
+send "iface=; "
+sleep 100
+send "for p in /sys/class/net/*; do "
+sleep 100
+send "n=${p##*/}; "
+sleep 100
+send "if [ \"$n\" != lo ]; then "
+sleep 100
+send "iface=$n; break; fi; done; "
+sleep 100
+send "[ -n \"$iface\" ] && echo TX_NET_IFACE=$iface\n"
+expect "TX_NET_IFACE=" within 5000
+
+send "/bin/busybox ip link set dev \"$iface\" up && "
+sleep 100
+send "/bin/busybox ip addr add "
+sleep 100
+send "@TX_SCENARIO_ADDRESS@/@TX_SCENARIO_PREFIX@ dev \"$iface\" && "
+sleep 100
+send "echo TX_SCENARIO_ADDR_OK\n"
+expect "TX_SCENARIO_ADDR_OK" within 5000
+
+send "/bin/busybox ping -I \"$iface\" -c 1 @TX_SCENARIO_GATEWAY@\n"
+expect "PING @TX_SCENARIO_GATEWAY@" within 8000
+expect "1 packets transmitted" within 12000
+expect "/ # " within 8000
+
+sleep 500
+quit

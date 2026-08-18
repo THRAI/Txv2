@@ -44,6 +44,7 @@ pub fn step_read_to_user(
         aspace,
         effective_len,
         UserBuffer::Read { dst },
+        start,
         guard,
     )
 }
@@ -64,6 +65,21 @@ pub fn step_write_from_user(
     len: usize,
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
+    step_write_from_user_at(pc, of, aspace, src, len, of.offset(), guard)
+}
+
+/// Variant of [`step_write_from_user`] whose first byte is written at
+/// `start`. The shared file offset is published only after bytes move, so an
+/// append attempt that faults or waits with zero progress leaves it unchanged.
+pub fn step_write_from_user_at(
+    pc: &PageContainer,
+    of: &OpenFile,
+    aspace: &AddressSpace,
+    src: UserPtr<u8>,
+    len: usize,
+    start: u64,
+    guard: &Guard<'_>,
+) -> StepOutcome<usize, ByteProgress> {
     // observe
     // upgrade
     // reserve
@@ -71,7 +87,7 @@ pub fn step_write_from_user(
     // publish
     use crate::page_backed::adapter::step_engine::StepOutcome as V3;
     emit_pagebacked_trace(b"debug.pagebacked.write_user.len", len as i64);
-    emit_pagebacked_trace(b"debug.pagebacked.write_user.offset", of.offset() as i64);
+    emit_pagebacked_trace(b"debug.pagebacked.write_user.offset", start as i64);
     emit_pagebacked_trace(b"debug.pagebacked.write_user.phase", 0);
     if len == 0 {
         return V3::done(0);
@@ -84,7 +100,7 @@ pub fn step_write_from_user(
         emit_pagebacked_trace(b"debug.pagebacked.write_user.err", 2);
         return V3::err(Errno::EINVAL.into());
     };
-    let Some(end) = of.offset().checked_add(len as u64) else {
+    let Some(end) = start.checked_add(len as u64) else {
         emit_pagebacked_trace(b"debug.pagebacked.write_user.err", 3);
         return V3::err(Errno::EINVAL.into());
     };
@@ -92,10 +108,9 @@ pub fn step_write_from_user(
         emit_pagebacked_trace(b"debug.pagebacked.write_user.err", 4);
         return V3::err(Errno::EINVAL.into());
     }
-    let start = of.offset();
     emit_pagebacked_trace(b"debug.pagebacked.write_user.phase", 1);
     let outcome =
-        step_range_with_user_buffer(pc, of, aspace, len, UserBuffer::Write { src }, guard);
+        step_range_with_user_buffer(pc, of, aspace, len, UserBuffer::Write { src }, start, guard);
     emit_pagebacked_trace(b"debug.pagebacked.write_user.phase", 2);
     let advanced_bytes = match &outcome {
         V3::Done(n) => *n,
@@ -137,9 +152,16 @@ enum UserChunkOutcome {
     Copied,
     /// Fatal error (EFAULT, EIO, etc.).
     Fault(Errno),
+    /// User-space materialisation asked the enclosing step to be polled
+    /// again. `bytes` is the prefix already copied by this chunk.
+    Continue { bytes: usize },
     /// User-space page needs async materialisation; yield so the
     /// reactor can re-poll after wake.
-    Blocked { source: u64, interests: u64 },
+    Blocked {
+        bytes: usize,
+        source: u64,
+        interests: u64,
+    },
 }
 
 fn step_range_with_user_buffer(
@@ -148,11 +170,12 @@ fn step_range_with_user_buffer(
     aspace: &AddressSpace,
     len: usize,
     buffer: UserBuffer,
+    start_offset: u64,
     guard: &Guard<'_>,
 ) -> StepOutcome<usize, ByteProgress> {
     use crate::page_backed::adapter::step_engine::{ByteProgress, StepOutcome as V3};
     let mut advanced = 0usize;
-    let mut offset = of.offset();
+    let mut offset = start_offset;
     emit_pagebacked_trace(b"debug.pagebacked.user_range.len", len as i64);
     emit_pagebacked_trace(b"debug.pagebacked.user_range.phase", 0);
     while advanced < len {
@@ -206,20 +229,31 @@ fn step_range_with_user_buffer(
                         of.set_offset(offset);
                         return V3::done(advanced);
                     }
-                    UserChunkOutcome::Blocked { source, interests } => {
+                    UserChunkOutcome::Continue { bytes } => {
+                        let copied = bytes.min(chunk);
+                        advanced += copied;
+                        offset += copied as u64;
+                        if advanced > 0 {
+                            of.set_offset(offset);
+                        }
+                        return V3::continue_with(ByteProgress::new(advanced));
+                    }
+                    UserChunkOutcome::Blocked {
+                        bytes,
+                        source,
+                        interests,
+                    } => {
                         emit_pagebacked_trace(
                             b"debug.pagebacked.user_range.blocked",
                             source as i64,
                         );
-                        if advanced == 0 {
-                            return crate::page_backed::notification::yield_on_wait_source(
-                                ByteProgress::EMPTY,
-                                source,
-                                interests,
-                            );
+                        let copied = bytes.min(chunk);
+                        advanced += copied;
+                        offset += copied as u64;
+                        if advanced > 0 {
+                            emit_pagebacked_trace(b"debug.pagebacked.user_range.phase", 4);
+                            of.set_offset(offset);
                         }
-                        emit_pagebacked_trace(b"debug.pagebacked.user_range.phase", 4);
-                        of.set_offset(offset);
                         return crate::page_backed::notification::yield_on_wait_source(
                             ByteProgress::new(advanced),
                             source,
@@ -341,20 +375,27 @@ fn copy_chunk_user(
                     emit_pagebacked_trace(b"debug.pagebacked.user_copy.phase", 3);
                     UserChunkOutcome::Copied
                 }
-                V3::Done(_) | V3::Continue { .. } => {
+                V3::Done(_) => {
                     emit_pagebacked_trace(b"debug.pagebacked.user_copy.err", 2);
                     UserChunkOutcome::Fault(Errno::EFAULT)
                 }
+                V3::Continue { progress } => UserChunkOutcome::Continue {
+                    bytes: progress.bytes(),
+                },
                 V3::Err(e) => {
                     emit_pagebacked_trace(b"debug.pagebacked.user_copy.err", 3);
                     UserChunkOutcome::Fault(Errno::from(e))
                 }
-                V3::Yield { shape, .. } => {
+                V3::Yield { progress, shape } => {
                     if let Some((source, interests)) =
                         crate::page_backed::notification::wait_source_parts(&shape)
                     {
                         emit_pagebacked_trace(b"debug.pagebacked.user_copy.blocked", source as i64);
-                        UserChunkOutcome::Blocked { source, interests }
+                        UserChunkOutcome::Blocked {
+                            bytes: progress.bytes(),
+                            source,
+                            interests,
+                        }
                     } else {
                         emit_pagebacked_trace(b"debug.pagebacked.user_copy.err", 4);
                         UserChunkOutcome::Fault(Errno::EFAULT)
@@ -378,20 +419,27 @@ fn copy_chunk_user(
                     emit_pagebacked_trace(b"debug.pagebacked.user_copy.phase", 3);
                     UserChunkOutcome::Copied
                 }
-                V3::Done(_) | V3::Continue { .. } => {
+                V3::Done(_) => {
                     emit_pagebacked_trace(b"debug.pagebacked.user_copy.err", 5);
                     UserChunkOutcome::Fault(Errno::EFAULT)
                 }
+                V3::Continue { progress } => UserChunkOutcome::Continue {
+                    bytes: progress.bytes(),
+                },
                 V3::Err(e) => {
                     emit_pagebacked_trace(b"debug.pagebacked.user_copy.err", 6);
                     UserChunkOutcome::Fault(Errno::from(e))
                 }
-                V3::Yield { shape, .. } => {
+                V3::Yield { progress, shape } => {
                     if let Some((source, interests)) =
                         crate::page_backed::notification::wait_source_parts(&shape)
                     {
                         emit_pagebacked_trace(b"debug.pagebacked.user_copy.blocked", source as i64);
-                        UserChunkOutcome::Blocked { source, interests }
+                        UserChunkOutcome::Blocked {
+                            bytes: progress.bytes(),
+                            source,
+                            interests,
+                        }
                     } else {
                         emit_pagebacked_trace(b"debug.pagebacked.user_copy.err", 7);
                         UserChunkOutcome::Fault(Errno::EFAULT)

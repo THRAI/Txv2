@@ -6,7 +6,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tx_ext4_format::capability::{sha256, Tier1Capabilities, Tier1Reject, Tier1Request};
+use tx_ext4_format::capability::{
+    sha256, RwProfile, Tier1Capabilities, Tier1MountFacts, Tier1Reject, Tier1Request,
+    LEGACY_NO_METADATA_CSUM_PROFILE_DESCRIPTOR,
+};
 use tx_ext4_format::mutation::{FsyncStamp, MutationOrigin};
 use tx_ext4_format::ondisk::{Ext4FormatError, ExtentHeader, ExtentNode, Superblock};
 use tx_ext4_format::pager::{BlockImage, DirEntryLite, Ext4Pager, InodeNo, BLOCK_SIZE};
@@ -42,6 +45,151 @@ fn tier1_generated_capability_profile_matches_authority_ledger() {
         Tier1Capabilities::generated().profile_hash(),
         sha256(ledger)
     );
+}
+
+#[test]
+fn legacy_no_metadata_csum_profile_admits_only_the_exact_factory_shape() {
+    let profile = RwProfile::LegacyNoMetadataCsum;
+    let facts = legacy_no_metadata_csum_facts();
+
+    assert_eq!(
+        profile.capabilities().profile_hash(),
+        sha256(LEGACY_NO_METADATA_CSUM_PROFILE_DESCRIPTOR)
+    );
+    assert_eq!(
+        profile.admit_mount(facts),
+        Ok(tx_ext4_format::capability::CapabilityProfileHash(
+            profile.capabilities().profile_hash()
+        ))
+    );
+
+    let mut clean = facts;
+    clean.feature_bits.incompat &= !Superblock::FEATURE_INCOMPAT_RECOVER;
+    assert!(profile.admit_mount(clean).is_ok());
+
+    let mut missing_stable_feature = facts;
+    missing_stable_feature.feature_bits.compat &= !0x0000_0008;
+    assert_eq!(
+        profile.admit_mount(missing_stable_feature),
+        Err(Tier1Reject::ProfileMismatch)
+    );
+
+    let mut metadata_csum = facts;
+    metadata_csum.feature_bits.ro_compat |= Superblock::FEATURE_RO_COMPAT_METADATA_CSUM;
+    metadata_csum.feature_bits.metadata_csum = true;
+    assert_eq!(
+        profile.admit_mount(metadata_csum),
+        Err(Tier1Reject::ProfileMismatch)
+    );
+}
+
+#[test]
+fn legacy_no_metadata_csum_profile_rejects_unknown_bits_and_non_exact_geometry() {
+    let profile = RwProfile::LegacyNoMetadataCsum;
+    let facts = legacy_no_metadata_csum_facts();
+
+    let mut unknown_compat = facts;
+    unknown_compat.feature_bits.compat |= 0x8000_0000;
+    assert_eq!(
+        profile.admit_mount(unknown_compat),
+        Err(Tier1Reject::ProfileMismatch)
+    );
+
+    let mut unknown_incompat = facts;
+    unknown_incompat.feature_bits.incompat |= 0x8000_0000;
+    assert_eq!(
+        profile.admit_mount(unknown_incompat),
+        Err(Tier1Reject::ProfileMismatch)
+    );
+
+    let mut unknown_ro_compat = facts;
+    unknown_ro_compat.feature_bits.ro_compat |= 0x8000_0000;
+    assert_eq!(
+        profile.admit_mount(unknown_ro_compat),
+        Err(Tier1Reject::ProfileMismatch)
+    );
+
+    let mut inode_128 = facts;
+    inode_128.geometry.inode_size = 128;
+    assert_eq!(
+        profile.admit_mount(inode_128),
+        Err(Tier1Reject::ProfileMismatch)
+    );
+
+    let mut block_1k = facts;
+    block_1k.geometry.block_size = 1024;
+    assert_eq!(
+        profile.admit_mount(block_1k),
+        Err(Tier1Reject::ProfileMismatch)
+    );
+
+    let mut external_journal = facts;
+    external_journal.feature_bits.ordered_jbd2 = false;
+    assert_eq!(
+        profile.admit_mount(external_journal),
+        Err(Tier1Reject::ProfileMismatch)
+    );
+}
+
+#[test]
+fn legacy_no_metadata_csum_profile_requires_an_internal_journal() {
+    let profile = RwProfile::LegacyNoMetadataCsum;
+    let mut superblock = legacy_no_metadata_csum_superblock();
+    assert!(profile
+        .admit_mount(Tier1MountFacts::from_superblock(&superblock))
+        .is_ok());
+
+    superblock.journal_inode = 0;
+    assert_eq!(
+        profile.admit_mount(Tier1MountFacts::from_superblock(&superblock)),
+        Err(Tier1Reject::ProfileMismatch)
+    );
+
+    superblock = legacy_no_metadata_csum_superblock();
+    // journal_dev is an external-journal filesystem shape and is not in the
+    // exact legacy filesystem incompat mask.
+    superblock.feature_incompat |= 0x0000_0008;
+    assert_eq!(
+        profile.admit_mount(Tier1MountFacts::from_superblock(&superblock)),
+        Err(Tier1Reject::ProfileMismatch)
+    );
+}
+
+#[test]
+fn rw_profile_default_remains_tier1_without_legacy_fallback() {
+    let facts = legacy_no_metadata_csum_facts();
+
+    assert_eq!(RwProfile::default(), RwProfile::Tier1);
+    assert_eq!(
+        Tier1Capabilities::generated().admit_mount(facts),
+        Err(Tier1Reject::ProfileMismatch)
+    );
+    assert_ne!(
+        RwProfile::Tier1.capabilities().profile_hash(),
+        RwProfile::LegacyNoMetadataCsum
+            .capabilities()
+            .profile_hash()
+    );
+}
+
+fn legacy_no_metadata_csum_facts() -> Tier1MountFacts {
+    Tier1MountFacts::from_superblock(&legacy_no_metadata_csum_superblock())
+}
+
+fn legacy_no_metadata_csum_superblock() -> Superblock {
+    Superblock {
+        log_block_size: 2,
+        inode_size: 256,
+        feature_compat:
+            // has_journal | ext_attr | resize_inode | dir_index
+            0x0000_003c,
+        // filetype | recover | extents | 64bit | flex_bg
+        feature_incompat: 0x0000_02c6,
+        // sparse_super | large_file | huge_file | dir_nlink | extra_isize
+        feature_ro_compat: 0x0000_006b,
+        journal_inode: 8,
+        ..Superblock::default()
+    }
 }
 
 struct VecImage {

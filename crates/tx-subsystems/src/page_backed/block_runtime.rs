@@ -306,6 +306,17 @@ impl BlockSubmissionHandle {
         }
     }
 
+    /// Bounded, value-only queue state used by kernel stall diagnostics.
+    pub(crate) fn diagnostic_counts(&self) -> (usize, usize, usize, usize) {
+        let state = self.0.lock_state();
+        (
+            state.queue.len(),
+            state.tracker.len(),
+            state.tags.len(),
+            state.depth.in_flight(),
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn complete<F>(
         &self,

@@ -14,6 +14,9 @@
 
 - [`PAGE_SUBSTRATE_v1.md`](PAGE_SUBSTRATE_v1.md) — substrate is HAL's primary consumer; §2's deliverables list is now realized here as platform obligations.
 - [`DEVICE.md`](../06_devices/DEVICE.md) — tier-1 devices (PLIC, CLINT/timer, early UART) live in HAL; tier-2 device construction sits above HAL.
+- [`NET_DEVICE_v1.md`](../06_devices/NET_DEVICE_v1.md) — exact immutable
+  resource, one-shot binding, per-device IRQ/DMA, and boot-network ownership
+  contract consumed above HAL.
 - [`00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md`](../00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md) — HAL is *not* a subsystem; it predates the four-module discipline and has its own organization.
 - [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — MAP and HAL/foundation invariants; TLB shootdown ordering is realized by `PmapIf::shootdown` plus the substrate-side post-shootdown accounting.
 
@@ -30,26 +33,36 @@ These decisions are normative. The rest of the document specifies how each one i
 
 2. **Each board has one platform crate.** `tx-hal-<arch>-<board>` is the axHal-style concrete platform module: it owns the linker script, `__start`, bootstrap page table, early console, trap vectors, IRQ controller, timer source, concrete pmap, cache/DMA fences, platform discovery, and power hooks.
 
-3. **Platform selection is static.** A board kernel binary chooses one `ActivePlatform` type at link time. There is no runtime platform dispatch. One board crate produces one kernel binary.
+3. **Platform selection is static; boot facts are data.** A board kernel binary
+   chooses one `ActivePlatform` type at link time. There is no runtime platform
+   dispatch. The selected platform may still publish firmware-derived immutable
+   resource records whose values and ordering are not compile-time constants.
 
-4. **PAGE_SUBSTRATE §2 deliverables become platform obligations.** `BootInfo`, bootstrap page table, bootstrap PT-node allocation, `PlatformInfo`, early console, trap infrastructure, and pmap prepare/commit/shootdown all enter through the statically selected `TxPlatform` axis.
+4. **PAGE_SUBSTRATE §2 deliverables become platform obligations.** `BootInfo`, bootstrap page table, bootstrap PT-node allocation, `PlatformInfo` with its
+   immutable resource seed, early console, trap infrastructure, and pmap
+   prepare/commit/shootdown all enter through the statically selected
+   `TxPlatform` axis.
 
 5. **`PmapIf` and `TrapIf` are first-class HAL traits.** They are not axplat-shaped convenience traits. They carry the proof objects and trap-frame discipline required by txKernel's publication, VM, signal, and syscall models.
 
-6. **`CacheIf`, `DmaIf`, and `SmpIf` are explicit axes.** Cache and DMA are small in v1 but prevent drivers, exec, and VM from smuggling architecture `cfg`. HAL owns only low-level SMP mechanics; the AP coordination protocol belongs to `SMP_v1`.
+6. **`CacheIf`, `DmaIf`, and `SmpIf` are explicit axes.** Every DMA operation
+   carries a device-selected `DmaDomain` or `DmaMapping`; platform-global
+   coherency and identity translation are not driver assumptions. HAL owns only
+   low-level SMP mechanics; the AP coordination protocol belongs to `SMP_v1`.
 
 7. **`linkme` registration is allowed only for typed static dispatch tables.** HAL owns the dispatch shell; semantic handlers remain owned by VM, syscall, signal, scheduler, or device subsystems. Trap-cause dispatch is direct and named, not via linkme.
 
-8. **Dependency direction.** HAL may depend on the meta-framework vocabulary and shared primitive types only. HAL does not depend on substrate, VM, VFS, process, signal, device, or reactor. Substrate and all higher subsystems may depend on the shared HAL interface, never on a concrete platform crate. The board binary is the only place that depends on both a concrete platform crate and the generic kernel crate, and is the only place that selects the `ActivePlatform` type.
+8. **Dependency direction.** HAL may depend on the meta-framework vocabulary and shared primitive types only. HAL does not depend on substrate, VM, VFS, process, signal, device, or reactor. Substrate and all higher subsystems may depend on the shared HAL interface, never on a concrete platform crate. The board binary is the only place that depends on both a concrete platform crate and the generic kernel crate, and is the only place that selects the `ActivePlatform` and upper-layer `ActiveDeviceBundle` types.
 
 9. **No OSTD-style HAL manager.** There is no global HAL service object, late-bound architecture table, or `__ostd_main` handoff. Boot is the H0-H4 sequence in §5; after H3, HAL remains a callable static platform surface, not an initialized subsystem with ownership of semantic resources.
 
 10. **Portable boot shape is mandatory for every board.** New board
     implementations must follow the ArceOS/axplat-style separation in this
     document: the platform crate owns `_start` and raw firmware conventions,
-    the board binary owns only `ActivePlatform` selection plus `rust_entry`,
+    the board binary owns only `ActivePlatform`/`ActiveDeviceBundle` selection
+    plus `rust_entry`,
     `tx_hal::entry::<P, K>` translates into `BootHandoff`, and
-    `tx_kernel::kernel_main::<P>` stays generic. Booting another board must
+    `tx_kernel::kernel_main::<P, D>` stays generic. Booting another board must
     never require adding board imports, runtime architecture dispatch, or
     firmware-register knowledge to `tx-kernel`.
 
@@ -93,6 +106,7 @@ tx-kernel (generic kernel crate)
 tx-kernel-<arch>-<board> (binary crate)
   ├─ depends on: tx-hal, tx-hal-<arch>-<board>, tx-kernel
   ├─ contents: type ActivePlatform = ...::Platform;
+  │            type ActiveDeviceBundle = ...; // upper-layer static composition
   │            impl KernelMain<ActivePlatform> for Kernel { ... }
   │            #[no_mangle] extern "C" fn rust_entry(...)
   └─ one such crate per board; each produces one ELF
@@ -128,12 +142,14 @@ Each board binary's `main.rs` (or equivalent entry crate) names the active platf
 use tx_hal::{BootHandoff, KernelMain};
 
 type ActivePlatform = tx_hal_riscv64_qemu_virt::Platform;
+struct BoardDeviceBundle;
+type ActiveDeviceBundle = BoardDeviceBundle;
 
 struct Kernel;
 
 impl KernelMain<ActivePlatform> for Kernel {
     fn kernel_main(handoff: BootHandoff) -> ! {
-        tx_kernel::kernel_main::<ActivePlatform>(handoff)
+        tx_kernel::kernel_main::<ActivePlatform, ActiveDeviceBundle>(handoff)
     }
 }
 
@@ -150,15 +166,19 @@ Everything else — linker script, `__start` assembly, page-table bootstrap, MMI
 
 Every later board binary must stay this small:
 
-- select exactly one concrete `ActivePlatform`;
+- select exactly one concrete `ActivePlatform` and one local
+  `ActiveDeviceBundle` implementing the upper-layer
+  `StaticDeviceBundle<ActivePlatform>` contract;
 - implement `KernelMain<ActivePlatform>` by tail-calling
-  `tx_kernel::kernel_main::<ActivePlatform>(handoff)`;
+  `tx_kernel::kernel_main::<ActivePlatform, ActiveDeviceBundle>(handoff)`;
 - export `rust_entry(cpu_id, firmware_arg)`;
 - provide panic handling appropriate to the binary crate.
 
 It must not define `_start`, linker symbols, MMIO constants, DTB parsing,
 firmware register decoding, runtime platform tables, or board-selection logic.
-Those belong to the concrete platform crate. This rule is what lets a future
+Those belong to the concrete platform crate. The device bundle contains only
+descriptor-slice composition; it contains no deployment resource values or
+runtime driver registry. This rule is what lets a future
 LA64, M1 Dock, VisionFive2, or hardware-in-loop port reuse the same generic
 kernel mainline.
 
@@ -169,7 +189,8 @@ There is no `Box<dyn TxPlatform>`. There are no `match arch { ... }` blocks in t
 
 - `tx-kernel` having no `#[cfg(target_arch = ...)]` directives outside of vendored low-level helpers
 - `tx-hal` having no concrete arch implementations
-- The board binary being the only crate that names a specific `Platform` type
+- The board binary being the only crate that names a specific `Platform` and
+  its matching upper-layer `StaticDeviceBundle` types
 
 A code-review rule check (`grep -r "#\[cfg(target_arch" tx-kernel/`) is sufficient as a CI gate.
 
@@ -318,9 +339,8 @@ pub trait PlatformConfig {
     /// Cache-line size in bytes.
     const CACHE_LINE_SIZE: usize;
 
-    /// True if the platform has coherent DMA (cache-coherent IO).
-    /// QEMU virt boards: true. VisionFive2: true (JH7110 is coherent).
-    /// 2K1000LA: confirm in board crate.
+    /// Migration/default coherency used only when a resource provider cannot
+    /// yet publish an explicit DmaDomain. New drivers consume the domain fact.
     const DMA_COHERENT: bool;
 }
 
@@ -410,7 +430,7 @@ firmware/reset
  → platform crate _start
  → board binary rust_entry(cpu_id, firmware_arg)
  → tx_hal::entry::<P, K>
- → tx_kernel::kernel_main::<P>(BootHandoff)
+ → tx_kernel::kernel_main::<P, D>(BootHandoff)
 ```
 
 The raw meaning of `cpu_id` and `firmware_arg` is platform-owned. A platform
@@ -457,7 +477,7 @@ The first executable proof for a platform is a serial sentinel:
 txkernel:<P::BOARD>:boot:ok
 ```
 
-The sentinel is emitted by generic `tx_kernel::kernel_main::<P>` after
+The sentinel is emitted by generic `tx_kernel::kernel_main::<P, D>` after
 `P::init_early(handoff)`, `tx_substrate::init::<P>()`, and
 `P::init_later(handoff)` return in the smoke build. It is intentionally derived
 from `P::BOARD` so the generic kernel proves it is using the selected platform
@@ -488,7 +508,7 @@ The platform crate receives control from firmware. The shape of "firmware" varie
 | RV64 qemu-virt | OpenSBI (M-mode) | jumps to S-mode at `0x8020_0000` with `a0 = hart_id`, `a1 = DTB pointer` |
 | RV64 VisionFive2 | U-Boot SPL → OpenSBI | same handoff convention; DTB loaded by U-Boot |
 | LA64 qemu-virt | UEFI or direct kernel load | jumps to entry with `a0 = boot_arg`, `a1 = info_ptr` |
-| LA64 2K1000LA | board firmware (PMON or UEFI) | board-specific; platform crate documents |
+| future LA64 real board | unknown until hardware selection | its future platform crate must document the captured contract; no generic fallback |
 
 H0 ends when control reaches the platform's `__start` symbol with the architecture's normal kernel-entry register conventions.
 
@@ -620,11 +640,17 @@ H2's job is to be the place where cross-platform boot invariants are checked and
 ### 5.4 Stage H3 — generic kernel mainline
 <!-- txdoc:HAL-THE-BOOT-SEQUENCE-STAGE-H3-GENERIC-KERNEL-MAINLINE-1 -->
 
-H3 is `tx_kernel::kernel_main::<P>`, the same code on every board. Its skeleton:
+H3 is `tx_kernel::kernel_main::<P, D>`, the same generic code on every board;
+`P` is the selected platform and `D: StaticDeviceBundle<P>` is the selected
+upper-layer static composition. Its skeleton:
 
 ```rust
 // tx-kernel/src/lib.rs
-pub fn kernel_main<P: TxPlatform>(handoff: BootHandoff) -> ! {
+pub fn kernel_main<P, D>(handoff: BootHandoff) -> !
+where
+    P: TxPlatform,
+    D: StaticDeviceBundle<P>,
+{
     // 1. P::init_early — platform finishes its own setup
     //    (timer base, PLIC/ExtIOI, anything that needs printk live).
     P::init_early(handoff);
@@ -653,9 +679,11 @@ pub fn kernel_main<P: TxPlatform>(handoff: BootHandoff) -> ! {
     reactor::init::<P>();
     scheduler::init::<P>();
 
-    // 7. Downstream subsystems. See H4.
+    // 7. Downstream subsystems. Device init first freezes the final boot
+    //    resource graph (including one-shot bus enumeration), then runs the
+    //    static binder before publishing class registries/IRQ routes. See H4.
     vfs::init::<P>();
-    device::init::<P>();
+    device::init::<P, D>();
     process::init::<P>();
     // ... etc.
 
@@ -697,9 +725,10 @@ pub trait InitIf {
     /// Called from kernel_main after substrate::init returns.
     /// At this point: heap IS available; direct map covers all RAM;
     /// frame allocator is live; FrameMeta exists.
-    /// Platform should: extend the kernel page table to cover any
-    /// platform MMIO regions discovered in PlatformInfo, finalize
-    /// any platform state that needed heap allocation.
+    /// Platform should: finalize platform-private state that needed heap
+    /// allocation. Generic substrate has already mapped the immutable
+    /// resource seed's MMIO records; platform code does not bind semantic
+    /// tier-2 devices here.
     fn init_later(handoff: BootHandoff);
 
     /// Called once on each AP after its low trampoline and early per-CPU
@@ -724,8 +753,9 @@ pub trait InitIf {
 <!-- txdoc:HAL-INITIF-WHAT-INIT-LATER-MAY-DO-BUT-INIT-EARLY-CANNOT-1 -->
 
 - Call `Box::new`, `Vec::new`, etc. The slab is up.
-- Map additional MMIO regions through `PmapIf` (see §10).
-- Read `PlatformInfo.mmio_regions` to discover MMIO that needs mapping.
+- Finalize platform-private mapping/controller state through `PmapIf` (§10).
+- Read immutable `PlatformInfo` facts. It must not mutate the published graph,
+  choose a tier-2 driver, or install a semantic device registration.
 
 ---
 
@@ -829,10 +859,17 @@ The format of the firmware-handed data (DTB on RV64, possibly different on LA64)
 ## 8. PlatformInfoIf
 <!-- txdoc:HAL-PLATFORMINFOIF-1 -->
 
-`PlatformInfoIf` is the second boot-time fact channel: MMIO regions the platform wants the kernel to know about. Distinct from `BootInfo` because:
+`PlatformInfoIf` is the second boot-time fact channel. `BootInfo` describes RAM,
+the kernel image, initrd, and command line. `PlatformInfo` describes CPU/time
+facts and an immutable `DeviceResourceGraph` seed: HAL-owned mappings,
+firmware/static platform devices, their typed resources, and shared DMA
+domains.
 
-- `BootInfo` describes RAM and kernel image — facts substrate needs in phase 1.
-- `PlatformInfo` describes MMIO — facts substrate needs in phase 3 (extend kernel page table to cover MMIO) and tier-2 device init needs.
+Static platform selection and dynamic firmware values are different axes. The
+board binary still selects exactly one `P: TxPlatform` at compile/link time;
+that selected platform parses its boot protocol and publishes whatever valid
+resource facts the current machine supplied. No runtime HAL manager or boxed
+HAL trait object is introduced.
 
 ```rust
 pub trait PlatformInfoIf {
@@ -840,39 +877,37 @@ pub trait PlatformInfoIf {
 }
 
 pub struct PlatformInfo {
+    /// Diagnostic platform-family label. Generic binding must not branch on it.
     pub board: &'static str;
-    pub spi_sd: Option<SpiSdInfo>;
-
-    /// MMIO regions that should be mapped into the kernel page table.
-    /// Includes the early UART, interrupt controller, timer, and any
-    /// platform devices the board has at fixed addresses (e.g.,
-    /// virtio-mmio range on qemu-virt).
-    pub mmio_regions: &'static [MmioRegion],
+    pub device_resources: &'static DeviceResourceGraph,
     pub timebase_frequency_hz: u64,
     pub possible_cpu_count: usize,
 }
-
-pub struct MmioRegion {
-    pub name: &'static str,           // diagnostic only
-    pub phys: PhysRange,
-    pub virt: VirtRange,              // where to map in kernel space
-    pub flags: MmioFlags,
-}
-
-pub struct MmioFlags(pub u32);
-
-impl MmioFlags {
-    pub const DEVICE_NGNRNE: Self = Self(1 << 0); // strongly-ordered device memory
-    pub const DEVICE_NGNRE: Self = Self(1 << 1);  // device memory, gathering allowed
-    pub const READ: Self = Self(1 << 2);
-    pub const WRITE: Self = Self(1 << 3);
-}
 ```
+
+The exact `DeviceResourceGraph`, `PlatformDevice`, `DeviceId`,
+`DeviceResource`, `MmioResource`, `IrqResource`, dependency-reference, and
+`DmaDomain` spelling is normative in
+[`NET_DEVICE_v1.md §2`](../06_devices/NET_DEVICE_v1.md). All fields and nested
+slices use the same boot-owned `'static` storage discipline as `BootInfo`.
+`PlatformInfoIf::platform_info()` returns the same reference for the rest of
+the boot.
+
+The current `PlatformInfo::mmio_regions`, `spi_sd`, `DeviceInfo`, and
+`PlatformInfoIf::devices()` spellings are migration-only compatibility
+projections. While they coexist, a platform must generate them from the same
+resource seed and tests must assert equality. They are removed with the last
+legacy device-binding path; generic drivers must not add new consumers.
 
 ### 8.1 Why MMIO does not go directly to drivers
 <!-- txdoc:HAL-PLATFORMINFOIF-WHY-MMIO-DOES-NOT-GO-DIRECTLY-TO-DRIVERS-1 -->
 
-A driver (UART, virtio-blk, PLIC) does not import `tx_hal_riscv64_qemu_virt::UART_BASE`. It receives its MMIO base through device init, which read `P::platform_info().mmio_regions` and looks up by name. This keeps device code portable across boards even when the same driver runs on different boards with different bases.
+A tier-2 driver does not import a concrete platform MMIO constant and does not
+look up a generated `MmioRegion.name`. After substrate mapping, the one-shot
+device binder selects a `PlatformDevice` by compatible/bus identity and passes
+the matching descriptor's typed decoder the complete device record. The
+decoder requires specification-defined `ResourceRole`s and fails explicitly
+on missing, duplicate, or incompatible resources.
 
 The exception is tier-1 HAL devices (PLIC, CLINT, early UART). These live
 *inside* the platform crate itself; their bases are platform-private. For these,
@@ -883,7 +918,18 @@ those constants.
 ### 8.2 PlatformInfo and substrate phase 3
 <!-- txdoc:HAL-PLATFORMINFOIF-PLATFORMINFO-AND-SUBSTRATE-PHASE-3-1 -->
 
-PAGE_SUBSTRATE phase 3 walks `mmio_regions` and installs page-table mappings via `PmapIf`. This is why `MmioRegion.virt` exists: the platform decides where in kernel virtual space each MMIO region lives, and substrate installs the mapping there.
+PAGE_SUBSTRATE phase 3 maps `DeviceResourceGraph::platform_mmio` plus every
+enabled device's `DeviceResource::Mmio`. It validates range arithmetic and
+deduplicates identical mappings before calling `PmapIf`. Substrate interprets
+only address, mapping, and memory-attribute facts; it does not interpret
+compatible strings, resource roles, clocks, PHYs, or driver policy.
+
+Some buses, notably PCI, can only be enumerated after these host-controller
+mappings exist. The linked static resource-provider set therefore runs once
+after substrate and freezes a final immutable graph before driver matching.
+That one-shot graph completion is specified by
+[`NET_DEVICE_v1.md §2.3`](../06_devices/NET_DEVICE_v1.md); it is tier-2 boot
+discovery, not runtime hotplug.
 
 ### 8.3 Auxv facts
 <!-- txdoc:HAL-PLATFORMINFOIF-AUXV-FACTS-1 -->
@@ -1811,12 +1857,14 @@ pub struct SavedSignalFrame {
 ## 13. IrqIf
 <!-- txdoc:HAL-IRQIF-1 -->
 
-`IrqIf` is the platform's interrupt-controller surface. It owns claim/complete cycles, masking, and per-line handler installation.
+`IrqIf` is the platform's interrupt-controller surface. It owns claim/complete
+cycles, masking, priorities, and controller routing mechanics. It does not own
+the device-to-handler association or any semantic device context.
 
-**Cross-reference.** Handler registration uses an explicit
-`register_irq_handler(irq, fn)` call (not a linkme slice); §13.2.2 records the
-seven-point case. The runtime IRQ path indexes the installed
-`IrqDispatchTable` directly. See §21 for the broader linkme policy.
+**Cross-reference.** Generic kernel/device init builds the final per-line table
+explicitly from bound `IrqRoute`s; §13.2 records publication order and §13.2.2
+records why this is not linkme dispatch. The exact route/context spelling is in
+[`NET_DEVICE_v1.md §4`](../06_devices/NET_DEVICE_v1.md).
 
 ### 13.1 Trait surface
 <!-- txdoc:HAL-IRQIF-TRAIT-SURFACE-1 -->
@@ -1829,22 +1877,18 @@ pub trait IrqIf {
 
     /// Platform-specific IRQ number for the boot console UART.
     ///
-    /// The kernel's `install_irq_handlers::<P>` reads this through
-    /// `<P as IrqIf>::UART_IRQ` to register the UART RX dispatcher
-    /// without naming a board constant directly. Boards that have no
-    /// dedicated UART IRQ (or run on a host-only test platform) keep
-    /// the `0` sentinel default; production boards override (canonical
-    /// RV64 QEMU virt value: `10`, see
-    /// `boards/tx-hal-riscv64-qemu-virt/src/lib.rs::Platform::UART_IRQ`).
+    /// Static fallback for boards whose IRQ routing is compile-time fixed.
     const UART_IRQ: u32 = 0;
 
-    /// Platform-specific persistent-clock alarm IRQ, or zero when absent.
+    /// Runtime UART IRQ fact. Firmware-discovered static platform families
+    /// override this accessor; zero means no proven interrupt route.
+    fn uart_irq() -> u32 { Self::UART_IRQ }
+
+    /// Static fallback persistent-clock alarm IRQ.
     const RTC_IRQ: u32 = 0;
 
-    /// Platform-specific boot network-device IRQ, or zero when no route has
-    /// been proven. RV64 QEMU `virtio1@0x1000_2000` uses PLIC IRQ 2. LA64
-    /// keeps the zero sentinel until its virtio-pci route is established.
-    const NET_IRQ: u32 = 0;
+    /// Runtime persistent-clock IRQ fact; zero means alarm IRQ unsupported.
+    fn rtc_irq() -> u32 { Self::RTC_IRQ }
 
     /// Claim the highest-priority pending IRQ on the current hart.
     /// Called from the trap shell after classify returns
@@ -1867,21 +1911,7 @@ pub trait IrqIf {
     /// silently (e.g., LA64 ExtIOI on simple configurations).
     fn set_priority(irq: u32, priority: u8);
 
-    /// Install the per-line dispatch table built by device init.
-    /// Called once after `tx_kernel::irq::install_irq_handlers::<P>`
-    /// has populated the table via explicit `register_irq_handler`
-    /// calls (see §13.2). Subsequent claim/complete cycles use this
-    /// table.
-    fn install_dispatch_table(table: &'static IrqDispatchTable);
 }
-
-pub struct IrqDispatchTable {
-    /// Entry for each IRQ number, indexed directly.
-    /// None for unhandled IRQs (becomes a kernel warning + mask).
-    pub entries: [Option<IrqHandlerFn>; Self::SIZE],
-}
-
-pub type IrqHandlerFn = fn(irq: u32) -> IrqHandled;
 
 #[derive(Copy, Clone, Debug)]
 pub enum IrqHandled {
@@ -1900,28 +1930,33 @@ pub enum IrqHandled {
 ### 13.2 The registration / installation split
 <!-- txdoc:HAL-IRQIF-THE-REGISTRATION-INSTALLATION-SPLIT-1 -->
 
-txKernel uses **explicit registration** through a `register_irq_handler(irq, fn)` call, not a `linkme`-distributed slice. The function lives at `crates/tx-kernel/src/irq.rs` and mutates a `SpinMutex<IrqDispatchTable>` global. Boot ordering (see `tx-kernel/src/init.rs::install_irq_handlers`) is: register every handler, then publish the table to the platform via `<P as IrqIf>::install_dispatch_table`, then `unmask`. The platform never observes a half-built table.
+txKernel uses **explicit route reservation** through the generic kernel/device
+IRQ module, not a `linkme`-distributed handler slice. Tier-1 UART/RTC routes and
+tier-2 bound-device routes are collected while every source is masked. The
+builder validates duplicate/exclusive/shared rules, freezes one immutable
+upper-layer dispatch table, publishes device registries and that table, and
+only then unmasks committed routes. HAL never imports the table's
+`BoundDeviceKey` or handler context.
 
 ```rust
-// In a virtio-blk driver init:
-register_irq_handler(8 /* PLIC line 8 on qemu-virt */, virtio_blk_irq_handler);
-
-// In tx-kernel/src/init.rs::install_irq_handlers, called once at boot
-// after register_console_hardware has populated CONSOLE_TTY:
-pub(crate) fn install_irq_handlers<P: IrqIf + ConsoleIf>() {
-    register_irq_handler(P::UART_IRQ, uart_rx_irq_handler::<P>);
-    if P::RTC_IRQ != 0 {
-        register_irq_handler(P::RTC_IRQ, rtc_alarm_irq_handler::<P>);
+// Tier-1 compatibility routes are added by generic kernel init. Tier-2 routes
+// are added by the one-shot binder from each device's own IrqResource.
+pub(crate) fn reserve_tier1_irq_routes<P: IrqIf + ConsoleIf>(
+    builder: &mut KernelIrqTableBuilder,
+) -> Result<(), IrqRouteError> {
+    let uart_irq = P::uart_irq();
+    let rtc_irq = P::rtc_irq();
+    if uart_irq != 0 {
+        builder.reserve_tier1(uart_irq, uart_rx_irq_handler::<P>)?;
     }
-    if P::NET_IRQ != 0 {
-        register_irq_handler(P::NET_IRQ, net_rx_irq_handler::<P>);
+    if rtc_irq != 0 {
+        builder.reserve_tier1(rtc_irq, rtc_alarm_irq_handler::<P>)?;
     }
-    <P as IrqIf>::install_dispatch_table(dispatch_table_static());
-    // Set priority and unmask each non-zero registered source only now.
+    Ok(())
 }
 ```
 
-After the explicit `install_dispatch_table` call, the runtime path is:
+After the generic kernel publishes its frozen table, the runtime path is:
 
 ```rust
 // In KernelTrapSink::on_external_irq:
@@ -1929,7 +1964,7 @@ fn on_external_irq(cpu: CpuId, view: TrapFrameMut<'_>) -> TrapAction {
     let irq = P::claim();
     if irq == 0 { return TrapAction::Resume; }  // spurious
 
-    let result = P::dispatch_irq(irq);
+    let result = tx_kernel::irq::dispatch_bound_irq(irq);
 
     if !matches!(result, IrqHandled::DeferredWake) {
         P::complete(irq);
@@ -1946,7 +1981,14 @@ fn on_external_irq(cpu: CpuId, view: TrapFrameMut<'_>) -> TrapAction {
 }
 ```
 
-The runtime path indexes the installed table directly.
+The runtime path indexes the generic kernel's frozen table directly. A missing
+entry is diagnosed and masked. There is no platform callback into device code.
+
+The current `IrqIf::install_dispatch_table`, `NET_IRQ`, and `net_irq()` APIs are
+migration-only compatibility surfaces. `uart_irq()` and `rtc_irq()` remain for
+narrow tier-1 devices; all tier-2 network/block routes migrate to bound
+`IrqResource`s and the compatibility surfaces are removed with the last legacy
+path.
 
 #### 13.2.1 Deferred completion
 <!-- txdoc:HAL-IRQIF-DEFERRED-COMPLETION-1 -->
@@ -1985,23 +2027,23 @@ rejected it for seven reasons:
 1. **Test substitutability.** Tests can build a controlled subset of
    handlers; a linkme slice forces every test binary to link the
    union.
-2. **Boot ordering.** Explicit registration runs in a known order
-   from `init.rs`, so the dispatch table is fully populated before
-   `install_dispatch_table` publishes it. Linker-section ordering
-   is target-dependent and not stable.
+2. **Boot ordering.** Explicit route reservation runs in the one-shot binder,
+   so the dispatch table is validated and frozen before registries are
+   published or sources are unmasked. Linker-section ordering is target-
+   dependent and not a route-order contract.
 3. **No-std / RV64 sections.** The `linkme` machinery depends on
    linker-section behaviour that is fragile on `riscv64gc-unknown-none-elf`
    builds and varies between the host and target linkers used in
    the workspace.
-4. **Discoverability.** `register_irq_handler` calls show up in `grep`
-   and in IDE call graphs; linkme statics do not.
-5. **Mutation.** A `SpinMutex<IrqDispatchTable>` accepts re-registration
-   and conflict detection at boot; a linkme slice is read-only and
-   cannot reject conflicts at registration time.
-6. **Per-platform numbering.** The same handler may attach to
-   different IRQ numbers on different boards; explicit registration
-   reads the number from `<P as IrqIf>::UART_IRQ` (or board-specific
-   constants) at install time.
+4. **Discoverability.** Descriptor `prepare` functions and explicit builder
+   calls show up in source/call graphs; hidden handler slice elements do not.
+5. **Validation.** The builder rejects duplicate routes and invalid
+   exclusive/shared combinations before publication. A read-only handler
+   slice cannot perform that resource-dependent validation.
+6. **Per-device routing.** The same driver may attach to different lines on
+   different devices and boards; tier-2 registration consumes each bound
+   device's immutable `IrqResource`. Tier-1 UART/RTC compatibility routes use
+   their narrow accessors.
 7. **txKernel's "keep trap dispatch out of linkme" rule.** §21
    reserves linkme for tier-2 enumerations (devices, mounts) and
    forbids it for tier-0 trap-shell paths. IRQ dispatch is the
@@ -2204,8 +2246,9 @@ The backend interface is intentionally Unix-nanosecond shaped:
 - `acknowledge_wake_alarm_irq` clears or acknowledges the board-local RTC alarm
   source after `IrqIf` dispatch has identified the IRQ.
 
-If the board exposes an RTC alarm interrupt, it also overrides
-`IrqIf::RTC_IRQ` with the platform IRQ number. The generic kernel may register
+If the board exposes an RTC alarm interrupt, `IrqIf::rtc_irq()` returns the
+platform IRQ number (usually through the `RTC_IRQ` static fallback on
+compile-time-fixed boards). The generic kernel may register
 an RTC IRQ handler for that number, call the typed RTC adapter to acknowledge
 the hardware source, and then publish a device event. HAL must not publish
 `RtcEventMask`, touch `RNode`, inspect open files, or route scheduler wakes.
@@ -2219,8 +2262,8 @@ treated as usable:
   nanoseconds;
 - unsupported set-time or alarm operations return
   `PersistentClockError::Unsupported` rather than silently succeeding;
-- `IrqIf::RTC_IRQ` is zero when no hardware alarm IRQ exists, or names the real
-  interrupt line when one exists;
+- `IrqIf::rtc_irq()` is zero when no hardware alarm IRQ exists, or names the
+  real interrupt line when one exists;
 - `acknowledge_wake_alarm_irq` is hardware-only and can run from IRQ context.
 
 ### 14.3 The timer-interrupt path
@@ -2373,7 +2416,11 @@ pub trait CacheIf {
 <!-- txdoc:HAL-CACHEIF-CONSUMER-LIST-1 -->
 
 - **exec / ELF loader.** After loading executable pages, call `flush_icache_range` over the .text region before the first user-mode entry. Otherwise the i-cache may hold stale data from the previous use of those frames.
-- **DMA.** Drivers call `dcache_clean_range` before handing a buffer to a device (write to memory must be visible to the device) and `dcache_invalidate_range` after the device has written into memory and before the CPU reads it. The `DmaIf` (§17) wraps these in direction-aware helpers.
+- **DMA.** Drivers call the domain-scoped `DmaIf::sync_for_device` and
+  `sync_for_cpu` methods with a live `DmaMapping`. The selected platform uses
+  that mapping's domain coherency and direction to call the required cache
+  primitives; drivers do not call raw cache methods or consult a global
+  coherency flag.
 - **PTE publication.** Replacing or changing an existing translation requires
   `sfence.vma` / `invtlb` through `PmapIf::shootdown`; publishing into a leaf
   proven empty by `PmapReservation` may use `commit_new_kernel_mapping()` to
@@ -2392,7 +2439,11 @@ Because the consumer code is *generic* over `P: TxPlatform`. A driver doesn't kn
 ## 17. DmaIf
 <!-- txdoc:HAL-DMAIF-1 -->
 
-`DmaIf` is the layer where drivers learn whether DMA is coherent and what their physical addresses look like to a device. v1 assumes direct DMA on QEMU boards (DMA address = physical address), but the interface is present so drivers cannot smuggle that assumption.
+`DmaIf` translates and synchronizes memory for one explicit device-selected DMA
+domain. Drivers do not infer translation or coherency from the architecture,
+board, or a platform-global constant. The exact `DmaDomain`, `DmaConstraints`,
+`DmaMapping`, and `DmaError` vocabulary is defined by
+[`NET_DEVICE_v1.md §§2.2, 5`](../06_devices/NET_DEVICE_v1.md).
 
 ```rust
 #[derive(Copy, Clone, Debug)]
@@ -2406,26 +2457,17 @@ pub enum DmaDirection {
 }
 
 pub trait DmaIf: PlatformConfig {
-    /// True if the platform has cache-coherent DMA.
-    /// When true, the sync_for_* methods may be no-ops.
-    /// (PlatformConfig::DMA_COHERENT is the same fact; this is a
-    /// convenience re-export.)
-    const DMA_COHERENT: bool = <Self as PlatformConfig>::DMA_COHERENT;
+    fn map_dma(
+        domain: &'static DmaDomain,
+        paddr: PhysAddr,
+        len: usize,
+        direction: DmaDirection,
+    ) -> Result<DmaMapping, DmaError>;
 
-    /// Translate a physical address to the address the device sees.
-    /// On platforms with no IOMMU and identity DMA: paddr.0 as DmaAddr.
-    /// On platforms with an IOMMU: the IOMMU-translated address.
-    fn phys_to_dma(paddr: PhysAddr) -> DmaAddr;
+    fn unmap_dma(mapping: DmaMapping);
 
-    /// Reverse of phys_to_dma.
-    fn dma_to_phys(daddr: DmaAddr) -> PhysAddr;
-
-    /// Prepare a buffer for device access.
-    /// Direction tells what the device will do with it.
-    fn sync_for_device(paddr: PhysAddr, len: usize, dir: DmaDirection);
-
-    /// Prepare a buffer for CPU access after the device finished.
-    fn sync_for_cpu(paddr: PhysAddr, len: usize, dir: DmaDirection);
+    fn sync_for_device(mapping: &DmaMapping, direction: DmaDirection);
+    fn sync_for_cpu(mapping: &DmaMapping, direction: DmaDirection);
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -2435,29 +2477,39 @@ pub struct DmaAddr(pub u64);
 ### 17.1 v1 expected impls
 <!-- txdoc:HAL-DMAIF-V1-EXPECTED-IMPLS-1 -->
 
-For both qemu-virt RV64 and qemu-virt LA64:
+An identity/coherent target still publishes an explicit direct/coherent
+`DmaDomain`; its `map_dma` validates address width, alignment, length, and
+segment boundaries before returning a mapping, and its sync methods may then
+be no-ops. A non-coherent domain performs direction-aware cache maintenance. A
+managed domain may allocate an IOVA and `unmap_dma` releases it.
 
-- `DMA_COHERENT = true`.
-- `phys_to_dma(p)` = `DmaAddr(p.0)`.
-- `dma_to_phys(d)` = `PhysAddr(d.0)`.
-- `sync_for_device` / `sync_for_cpu` = no-ops.
-
-For VisionFive2: same (JH7110 is coherent).
-
-For 2K1000LA: confirm in board crate. If non-coherent, the sync methods become real `dcache_clean_range` / `dcache_invalidate_range` calls.
+`PlatformConfig::DMA_COHERENT` remains only as a migration/default fact for a
+platform source that cannot yet publish domain data. No new driver may consume
+it. The default is converted into a concrete `DmaDomain` during graph
+construction and is removed when all active platform providers publish domains.
 
 ### 17.2 Why drivers go through DmaIf
 <!-- txdoc:HAL-DMAIF-WHY-DRIVERS-GO-THROUGH-DMAIF-1 -->
 
-A virtio driver does not write `let dma_addr = phys_addr.0;`. It writes:
+A driver first reserves frames against the effective domain constraints, then
+maps and synchronizes the resulting range:
 
 ```rust
-let dma = P::phys_to_dma(buf.phys_addr());
-P::sync_for_device(buf.phys_addr(), buf.len(), DmaDirection::ToDevice);
-queue.push_descriptor(dma, buf.len() as u32);
+let frames = reserve_dma_run(domain, effective, request, policy)?.commit();
+let mapping = P::map_dma(
+    domain,
+    frames.phys_addr(),
+    frames.len(),
+    DmaDirection::ToDevice,
+)?;
+P::sync_for_device(&mapping, DmaDirection::ToDevice);
+queue.push_descriptor(mapping.device_addr(), frames.len() as u32);
 ```
 
-This is portable across coherent/non-coherent boards and across boards with/without IOMMUs (we don't have an IOMMU in v1, but the surface allows one to be added without driver changes).
+Concrete driver state retains the `OwnedFrameRun`, page `DmaPin`s, and
+`DmaMapping` until teardown (kernel-lifetime for tier 2). It never truncates an
+address. Unsupported constraints and mapping exhaustion are typed failures
+before device publication.
 
 ---
 
@@ -2776,9 +2828,16 @@ pub enum InitPhase {
 }
 ```
 
+Device resource-provider and static-driver descriptors do **not** require
+`linkme`. The board binary selects one `StaticDeviceBundle<P>` whose associated
+methods return concrete descriptor slices monomorphized for the selected
+platform. Those slices are enumerated exactly once and are never runtime packet
+or IRQ dispatch tables. See
+[`NET_DEVICE_v1.md §§2.3, 3`](../06_devices/NET_DEVICE_v1.md).
+
 **Not on this list:** `IRQ_HANDLERS`. IRQ handler registration is
-explicit (`tx_kernel::irq::register_irq_handler`), not linkme; see
-§13.2.2 for the seven-point case.
+an explicit product of bound routes, not linkme; see §13.2.2 for the
+seven-point case.
 
 ### 21.3 Forbidden uses
 <!-- txdoc:HAL-LINKME-REGISTRATION-DISCIPLINE-FORBIDDEN-USES-1 -->
@@ -2833,7 +2892,8 @@ The platform crate (e.g., `tx-hal-riscv64-qemu-virt`, `tx-hal-riscv64-visionfive
 ### 22.2 LoongArch 64
 <!-- txdoc:HAL-PER-ARCH-IMPLEMENTATION-NOTES-AND-REQUIRED-COMMITMENTS-LOONGARCH-64-1 -->
 
-The platform crate (e.g., `tx-hal-loongarch64-qemu-virt`, `tx-hal-loongarch64-2k1000la`) must:
+Each concrete LA64 platform crate (currently QEMU; a real-board crate is added
+only after its hardware/firmware contract is known) must:
 
 - **Provide LA64 PmapIf.** 4-level page table (PWCH/PWCL configured for typical 48-bit VA). Direct map established via DMW (Direct Mapping Window) windows.
 
@@ -2881,7 +2941,9 @@ The platform crate (e.g., `tx-hal-loongarch64-qemu-virt`, `tx-hal-loongarch64-2k
   `MonotonicCounterIf::read_ns` reads `stable_counter`;
   `DeadlineTimerIf::set_deadline_ns` writes the `tcfg` CSR.
 
-- **Implement PowerIf via UEFI / firmware-specific port.** On 2K1000LA, this may be a board-specific shutdown register; on qemu-virt, the QEMU exit device.
+- **Implement PowerIf through its captured firmware or board contract.** QEMU
+  uses its selected exit mechanism. A future real board supplies its own typed
+  implementation; generic code does not guess one.
 
 ---
 
@@ -2900,9 +2962,16 @@ What this document does *not* specify:
 
 - **Kernel-mode preemption.** The retired execution draft committed to cooperative async/await in kernelspace. HAL does not provide a "kernel preempt" primitive.
 
-- **IOMMU surface.** v1 platforms have no IOMMU. `DmaIf::phys_to_dma` is identity. When an IOMMU-equipped platform lands, the trait stays the same; the impl changes.
+- **IOMMU controller programming and invalidation policy.** The domain-scoped
+  `DmaIf` can represent a managed address space, but no active v1 target
+  implements one. Adding an IOMMU requires a typed provider/constraint review;
+  it is not permitted to hide device context behind the retired global
+  `phys_to_dma` shape.
 
-- **PCIe / PCI bus.** PCIe ECAM ranges are listed in `PlatformInfo.mmio_regions` but PCI configuration access is the device subsystem's responsibility, not HAL's. v1 boards have no PCIe; tier-2 device init handles virtio-mmio directly.
+- **Runtime PCIe hotplug.** PCI host resources may appear in the immutable HAL
+  seed and a linked device-layer provider may enumerate functions once after
+  substrate mapping. Configuration access, BAR decoding, and function binding
+  remain device work; runtime arrival/removal is tier 3.
 
 - **High-precision tracing clocks.** Tracing uses
   `MonotonicCounterIf::read_ns`. There is no separate fast-path tracing clock.
@@ -2919,6 +2988,9 @@ What this document does *not* specify:
 
 - [`PAGE_SUBSTRATE_v1.md`](PAGE_SUBSTRATE_v1.md) — primary HAL consumer; §2 deliverables list is now realized as platform obligations here.
 - [`DEVICE.md`](../06_devices/DEVICE.md) — tier-1 devices live in HAL; §7 phase table is the H4 expansion.
+- [`NET_DEVICE_v1.md`](../06_devices/NET_DEVICE_v1.md) — final resource types,
+  graph freeze, static binder, per-device IRQ/DMA, network identity, and the LA
+  real-board extension seam.
 - [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — HAL/foundation dependency direction and TLB shootdown ordering; `PmapIf::shootdown` realizes the HAL side, while the wait-for-acks and post-shootdown frame accounting live in the substrate-side aggregator.
 - [`00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md`](../00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md) — HAL is *not* a subsystem; it predates the four-module discipline.
 

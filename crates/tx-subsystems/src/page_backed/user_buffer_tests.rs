@@ -418,6 +418,122 @@ fn pagebacked_step_write_from_user_propagates_efault_without_advance() {
     assert_eq!(pc.size_bytes(), pc.page_count() * USER_PAGE_SIZE as u64);
 }
 
+#[test]
+fn open_file_write_from_user_honors_append_at_logical_eof() {
+    use crate::vfs::execution::OpenFileWriteFromUserOp;
+    use step_engine::{PlaceholderProcessSubject, ScriptCtx, StepOp};
+
+    let _lock = EPOCH_TEST_LOCK
+        .lock()
+        .expect("page-backed append-from-user test lock");
+    setup_host_substrate();
+
+    let pc = PageContainer::new_cap(
+        PageContainerKind::Anon {
+            swap_policy: AnonSwapPolicy::Reclaimable,
+        },
+        1,
+    )
+    .expect("append target page container");
+    write_into_pc(&pc, 0, b"seed");
+    pc.set_size_bytes(4);
+
+    let rnode = RNode::new_cap(
+        FsObjectId::new(901),
+        InodeMeta::new(InodeKind::Regular, 0o100644),
+        RNodeBacking::PageBacked { pc: pc.clone() },
+    )
+    .expect("append target rnode");
+    let file = OpenFile::new_cap(
+        rnode,
+        OpenFileFlags {
+            read: true,
+            write: true,
+            append: true,
+            cloexec: false,
+            nonblocking: false,
+            packet: false,
+        },
+    )
+    .expect("append target open file");
+    assert_eq!(file.offset(), 0, "fresh append fd starts at offset zero");
+
+    let fixture = UserBufferFixture::new(0xB0_0000, 1);
+    fixture.seed_user_bytes(b"++");
+    let mut op = OpenFileWriteFromUserOp {
+        file: &file,
+        aspace: &fixture.aspace,
+        src: fixture.user_ptr(),
+        len: 2,
+        cursor: 0,
+    };
+    let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
+
+    assert_eq!(op.step(&mut ctx), V3Out::Done(2));
+    assert_eq!(file.offset(), 6, "append advances from the prior EOF");
+    assert_eq!(pc.size_bytes(), 6, "append grows logical EOF");
+    assert_eq!(read_from_pc(&pc, 0, 6), b"seed++");
+}
+
+#[test]
+fn open_file_append_efault_preserves_shared_offset() {
+    use crate::vfs::execution::OpenFileWriteFromUserOp;
+    use step_engine::{PlaceholderProcessSubject, ScriptCtx, StepOp};
+
+    let _lock = EPOCH_TEST_LOCK
+        .lock()
+        .expect("page-backed append EFAULT test lock");
+    setup_host_substrate();
+
+    let pc = PageContainer::new_cap(
+        PageContainerKind::Anon {
+            swap_policy: AnonSwapPolicy::Reclaimable,
+        },
+        1,
+    )
+    .expect("append EFAULT page container");
+    write_into_pc(&pc, 0, b"seed");
+    pc.set_size_bytes(4);
+    let rnode = RNode::new_cap(
+        FsObjectId::new(902),
+        InodeMeta::new(InodeKind::Regular, 0o100644),
+        RNodeBacking::PageBacked { pc: pc.clone() },
+    )
+    .expect("append EFAULT rnode");
+    let file = OpenFile::new_cap(
+        rnode,
+        OpenFileFlags {
+            read: true,
+            write: true,
+            append: true,
+            cloexec: false,
+            nonblocking: false,
+            packet: false,
+        },
+    )
+    .expect("append EFAULT open file");
+    file.set_offset(1);
+
+    let empty_aspace = AddressSpace::new();
+    let mut op = OpenFileWriteFromUserOp {
+        file: &file,
+        aspace: &empty_aspace,
+        src: UserPtr::<u8>::new(0x60_0000),
+        len: 2,
+        cursor: 0,
+    };
+    let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
+
+    assert_eq!(op.step(&mut ctx), V3Out::Err(V3Errno::EFAULT));
+    assert_eq!(
+        file.offset(),
+        1,
+        "zero-progress append must not seek to EOF"
+    );
+    assert_eq!(pc.size_bytes(), 4);
+    assert_eq!(read_from_pc(&pc, 0, 4), b"seed");
+}
+
 #[cfg(test)]
 mod step_op_wraps {
     //! PR-2 wave-3 smoke tests for `ReadToUserOp`/`WriteFromUserOp`

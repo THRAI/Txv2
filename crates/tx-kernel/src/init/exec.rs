@@ -75,6 +75,34 @@ fn final_testcode_autorun_enabled<P: tx_hal::TxPlatform>() -> bool {
 /// `tx.runsh` exec restarts allowed before reporting failure. Each restart
 /// re-runs reversible Phase-1 preparation after driving the boot reactor once.
 const RUNSH_EXEC_POLL_BUDGET: usize = 1 << 16;
+const MAX_BOOTSTRAP_EXEC_RESTARTS: usize = 16 * 1024;
+
+/// Restart reversible bootstrap exec preparation after its async dependency
+/// has been serviced. `Deferred` and `Retry` are both pre-PoNR outcomes; a
+/// successful attempt crosses the exec visibility boundary exactly once.
+fn drive_restartable_bootstrap_exec(
+    mut attempt: impl FnMut() -> Result<(), tx_scripts::process::exec::ExecError>,
+    mut service_once: impl FnMut(bool) -> bool,
+) -> Result<(), tx_scripts::process::exec::ExecError> {
+    use tx_scripts::process::exec::ExecError;
+
+    for _ in 0..MAX_BOOTSTRAP_EXEC_RESTARTS {
+        match attempt() {
+            Err(ExecError::Deferred(shape)) => {
+                if !service_once(true) {
+                    return Err(ExecError::Deferred(shape));
+                }
+            }
+            Err(ExecError::Retry) => {
+                if !service_once(false) {
+                    return Err(ExecError::Retry);
+                }
+            }
+            result => return result,
+        }
+    }
+    Err(ExecError::Retry)
+}
 
 impl<P: TxPlatform> CoreInit<P> {
     /// Drive bootstrap exec while file pages are populated through the async
@@ -89,35 +117,30 @@ impl<P: TxPlatform> CoreInit<P> {
         envp: &[&[u8]],
         cred: &tx_subsystems::vfs::Credential,
     ) -> Result<(), tx_scripts::process::exec::ExecError> {
-        use tx_scripts::process::exec::ExecError;
-
-        const MAX_BOOTSTRAP_EXEC_RESTARTS: usize = 16 * 1024;
-        for _ in 0..MAX_BOOTSTRAP_EXEC_RESTARTS {
-            let outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
-                process, thread, path, argv, envp, cred,
-            ));
-            match outcome {
-                Err(ExecError::Deferred(shape)) => {
+        drive_restartable_bootstrap_exec(
+            || {
+                bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
+                    process, thread, path, argv, envp, cred,
+                ))
+            },
+            |deferred| {
+                if deferred {
                     let cpu = <P as tx_hal::SmpIf>::current_cpu_id();
                     P::service_pending_tlb_shootdown();
                     let _ = step_engine::drain_requested_with_budget(64);
                     crate::zones::try_bounded_maintenance_tick();
                     let _ = Self::drain_device_irq_bottom_halves();
                     if Self::boot_reactor_once(cpu).is_none() {
-                        return Err(ExecError::Deferred(shape));
+                        return false;
                     }
                     let _ = Self::drain_device_irq_bottom_halves();
-                }
-                Err(ExecError::Retry) => {
+                    true
+                } else {
                     let cpu = <P as tx_hal::SmpIf>::current_cpu_id();
-                    if Self::boot_reactor_once(cpu).is_none() {
-                        return Err(ExecError::Retry);
-                    }
+                    Self::boot_reactor_once(cpu).is_some()
                 }
-                result => return result,
-            }
-        }
-        Err(ExecError::Retry)
+            },
+        )
     }
 
     /// Initramfs slice: walk `BootInfo::initrd` if present and
@@ -326,6 +349,12 @@ impl<P: TxPlatform> CoreInit<P> {
         // Bootstrap exec runs as init (root) by construction.
         let cred = Credential::root();
         let boot_plan = BootPlan::read::<P>();
+        let alpine_sidecar = boot_plan.args.mode == super::boot_args::BootMode::Alpine
+            && super::MUSL_MOUNT.lock().is_some();
+        if alpine_sidecar {
+            Self::overlay_alpine_image_dirs();
+            Self::populate_alpine_sidecar_links();
+        }
 
         // When the sdcard ext4 mount is present (RV64 QEMU with vda),
         // exec busybox sh to run the oscomp basic-musl test suite.
@@ -420,7 +449,10 @@ impl<P: TxPlatform> CoreInit<P> {
                 // index-pack/upload-pack) assume a real root layout. Bind-mount
                 // the image's /usr,/lib,/bin,/sbin subtrees over the empty rootfs
                 // skeleton so the image behaves as the root fs. Gated to this lane.
-                Self::overlay_image_dirs_for_runsh();
+                if !alpine_sidecar {
+                    Self::overlay_alpine_image_dirs();
+                    Self::populate_alpine_sidecar_links();
+                }
                 let envp: &[&[u8]] = &[
                     b"PATH=/musl/usr/bin:/musl/bin:/musl/usr/sbin:/musl/sbin:/usr/bin:/bin",
                     b"LD_LIBRARY_PATH=/musl/usr/lib:/musl/lib",
@@ -603,7 +635,10 @@ impl<P: TxPlatform> CoreInit<P> {
                 None => tx_hal::console_write_str::<P>("default"),
             }
             tx_hal::console_write_str::<P>("\n");
-            let sdcard_cmd = build_oscomp_sdcard_cmd::<P>();
+            // test-init already owns its DHCP setup. Prefix DHCP only for the
+            // direct sdcard lane so the two entry paths never acquire the same
+            // lease twice.
+            let sdcard_cmd = build_oscomp_sdcard_cmd::<P>(sdcard_test_init == Some(false));
             let sdcard_envp: &[&[u8]] = &[
                 b"PATH=/bin:/usr/bin:/tx-ltp/bin:/musl/glibc:/musl/musl",
                 b"LD_LIBRARY_PATH=/musl/glibc/lib:/lib",
@@ -617,14 +652,14 @@ impl<P: TxPlatform> CoreInit<P> {
             } else {
                 (sdcard_bin, &direct_argv)
             };
-            let outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
+            let outcome = Self::bootstrap_exec_with_file_io(
                 &init,
                 &thread,
                 sdcard_bin,
                 sdcard_argv,
                 sdcard_envp,
                 &cred,
-            ));
+            );
             match outcome {
                 Ok(()) => {
                     Self::write_board_sentinel_prefix();
@@ -666,21 +701,20 @@ impl<P: TxPlatform> CoreInit<P> {
         // a guard at the call site (per
         // `txdoc:VM-3-6-CROSS-ASYNC-WAIT-DISCIPLINE`).
         let argv: &[&[u8]] = &[argv0];
-        let mut outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
-            &init, &thread, init_path, argv, envp, &cred,
-        ));
+        let mut outcome =
+            Self::bootstrap_exec_with_file_io(&init, &thread, init_path, argv, envp, &cred);
         // If /bin/busybox failed, try /bin/sh (symlink → busybox).
         // Some initramfs layouts only resolve correctly through the
         // symlink path.
         if outcome.is_err() && init_path != b"/bin/sh" && init_path != b"/init" {
-            let sh_outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
+            let sh_outcome = Self::bootstrap_exec_with_file_io(
                 &init,
                 &thread,
                 b"/bin/sh",
                 &[b"sh"],
                 envp,
                 &cred,
-            ));
+            );
             if sh_outcome.is_ok() {
                 Self::write_board_sentinel_prefix();
                 tx_hal::console_write_str::<P>(":bootstrap-exec:ok\n");
@@ -789,24 +823,12 @@ impl<P: TxPlatform> CoreInit<P> {
     }
 
     pub(super) fn drain_sbi_console_into_tty() -> usize {
-        // 2026-05-13: bumped from 64 to 512 bytes to swallow whole shell
-        // command lines in a single SBI poll. The 64-byte cap left the
-        // 17-byte tail of an 81-character `ln -s` line stranded in the
-        // UART FIFO until the PLIC RX IRQ fired; the IRQ-deferred drain
-        // path then re-entered `step_ingest` and the `wait_channel.fire`
-        // it issued did not propagate to the parked `sys_read` task
-        // (root cause still under investigation — see the
-        // `tools/shell-tests/busybox-extended.txt` links/chmod-stat
-        // groups). Bumping the SBI buffer ensures most realistic shell
-        // input fits in one `step_ingest` call so the proven SBI-direct
-        // path handles it. The IRQ path stays in place so a quiescent
-        // WFI still wakes promptly when bytes arrive.
-        let mut buf = [0u8; 512];
-        let n = <P as tx_hal::ConsoleIf>::read_bytes(&mut buf);
-        if n == 0 {
-            return 0;
-        }
-        ingest_console_tty_bytes::<P>(&buf[..n])
+        // Polling is a firmware/IRQ fallback, but it must join the same ordered
+        // pending FIFO as the IRQ top half. BSP and AP reactors can both reach
+        // this path; submitting the polled chunk directly would let it overtake
+        // an earlier chunk already buffered by the interrupt handler.
+        let _ = crate::irq::poll_console_rx_into_pending::<P>();
+        crate::irq::drain_uart_rx_pending::<P>()
     }
 
     pub(super) fn run_userspace_reactor_loop() {
@@ -878,13 +900,18 @@ impl<P: TxPlatform> CoreInit<P> {
             P::service_pending_tlb_shootdown();
             // Complete any outstanding controller transaction even if init
             // became a zombie in the preceding reactor poll.
-            let drained_device_before_poll = Self::drain_device_irq_bottom_halves();
+            Self::drain_device_irq_bottom_halves();
             if init.is_zombie() {
                 break;
             }
 
             let had_sbi = Self::drain_sbi_console_into_tty() != 0;
-            if drained_device_before_poll || had_sbi {
+            // A network bottom half wakes the delegate that must consume the
+            // received descriptor. Poll it in this iteration; restarting the
+            // loop here lets a level IRQ reassert forever without running the
+            // delegate. Console input already fed the TTY and may restart the
+            // loop so the blocked reader is reconsidered at the usual boundary.
+            if had_sbi {
                 continue;
             }
 
@@ -953,6 +980,10 @@ impl<P: TxPlatform> CoreInit<P> {
             };
             let ebr_active =
                 drain_stats.reclaimed > 0 || drain_stats.remaining > 0 || vm_recipe_reclaims > 0;
+            let resubmitted_file_io = step.should_idle()
+                && tx_subsystems::device::submit_pending_file_io_service_runtimes() != 0;
+            let woke_unowned_file_io = step.should_idle()
+                && tx_subsystems::device::wake_unowned_file_io_service_runtimes() != 0;
             if step.should_idle()
                 && !drained_device_after_poll
                 && !submitted_child_before_poll
@@ -960,6 +991,8 @@ impl<P: TxPlatform> CoreInit<P> {
                 && !drained_terminal_before_poll
                 && !drained_terminal_after_poll
                 && !ebr_active
+                && !resubmitted_file_io
+                && !woke_unowned_file_io
                 && !init.is_zombie()
             {
                 // Keep one periodic BSP wake while userspace is alive. LA64
@@ -1109,10 +1142,168 @@ impl<P: TxPlatform> CoreInit<P> {
     }
 }
 
-fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OscompDhcpConfigError {
+    InvalidInterface,
+}
+
+fn cmdline_value_from_str<'a>(cmdline: Option<&'a str>, key: &str) -> Option<&'a str> {
+    let cmdline = cmdline?;
+    for token in cmdline.split_ascii_whitespace() {
+        let Some((token_key, value)) = token.split_once('=') else {
+            continue;
+        };
+        if token_key == key && !value.is_empty() {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn oscomp_dhcp_interface_is_safe(interface: &str) -> bool {
+    !interface.is_empty()
+        && interface.len() < 16
+        && interface != "lo"
+        && interface
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+/// Prefix an OSComp sdcard command with opt-in userspace DHCP setup.
+///
+/// This deliberately runs the static BusyBox shipped in the OSComp sdcard and
+/// mutates only runtime network state, `/tmp`, and `/etc/resolv.conf`. In
+/// particular it must not populate `/bin` or replace libc loader links: the
+/// direct OSComp lane's architecture-aware rootfs shims remain authoritative.
+fn append_oscomp_dhcp_bootstrap(
+    cmd: &mut alloc::string::String,
+    network_mode: Option<&str>,
+    interface: Option<&str>,
+) -> Result<(), OscompDhcpConfigError> {
+    use core::fmt::Write as _;
+
+    if network_mode != Some("dhcp") {
+        return Ok(());
+    }
+    let interface = match interface {
+        Some(interface) if oscomp_dhcp_interface_is_safe(interface) => interface,
+        Some(_) => return Err(OscompDhcpConfigError::InvalidInterface),
+        None => "",
+    };
+    let _ = write!(cmd, "; tx_dhcp_selector='{interface}'");
+    cmd.push_str(
+        r#"; tx_bb=/musl/musl/busybox
+[ -x "$tx_bb" ] || tx_bb=/musl/busybox
+if [ ! -x "$tx_bb" ]; then echo 'tx-oscomp-dhcp:fail:no-busybox'; exit 1; fi
+tx_dhcp_iface="$tx_dhcp_selector"
+if [ -n "$tx_dhcp_iface" ]; then
+    if [ ! -e "/sys/class/net/$tx_dhcp_iface" ]; then "$tx_bb" echo 'tx-oscomp-dhcp:fail:invalid-interface'; exit 1; fi
+  else
+    tx_dhcp_count=0
+    for tx_net_path in /sys/class/net/*; do
+      [ -e "$tx_net_path" ] || continue
+      tx_net_candidate=${tx_net_path##*/}
+      [ "$tx_net_candidate" = lo ] && continue
+      tx_dhcp_iface="$tx_net_candidate"
+      tx_dhcp_count=$((tx_dhcp_count + 1))
+    done
+    case "$tx_dhcp_count" in
+      1) ;;
+      0) "$tx_bb" echo 'tx-oscomp-dhcp:fail:no-interface'; exit 1 ;;
+      *) "$tx_bb" echo 'tx-oscomp-dhcp:fail:ambiguous-interface'; exit 1 ;;
+    esac
+  fi
+"$tx_bb" echo "tx-oscomp-dhcp:interface:$tx_dhcp_iface"
+"$tx_bb" mkdir -p /tmp /var/run || { "$tx_bb" echo 'tx-oscomp-dhcp:fail:mkdir'; exit 1; }
+tx_dhcp_hook=/tmp/tx-oscomp-udhcpc.sh
+"$tx_bb" cat > "$tx_dhcp_hook" <<'TX_OSCOMP_UDHCPC'
+#!/bin/sh
+set -e
+bb=/musl/musl/busybox
+[ -x "$bb" ] || bb=/musl/busybox
+resolv_conf=/etc/resolv.conf
+delete_default_routes() {
+    while "$bb" ip -4 route del default dev "$interface" 2>/dev/null; do :; done
+}
+case "$1" in
+    deconfig)
+        delete_default_routes
+        "$bb" ip -4 addr flush dev "$interface"
+        ;;
+    bound|renew)
+        delete_default_routes
+        "$bb" ip -4 addr flush dev "$interface"
+        lease_address=$ip
+        lease_mask=$mask
+        [ -n "$lease_mask" ] || lease_mask=$subnet
+        if [ -n "$lease_mask" ]; then
+            lease_address="$ip/$lease_mask"
+        fi
+        if [ -n "$broadcast" ]; then
+            "$bb" ip -4 addr add "$lease_address" broadcast "$broadcast" dev "$interface"
+        else
+            "$bb" ip -4 addr add "$lease_address" dev "$interface"
+        fi
+        "$bb" ip link set dev "$interface" up
+        for gateway in $router; do
+            "$bb" ip -4 route add default via "$gateway" dev "$interface"
+            break
+        done
+        : > "$resolv_conf.tmp"
+        if [ -n "$search" ]; then
+            printf "search %s\n" "$search" >> "$resolv_conf.tmp"
+        elif [ -n "$domain" ]; then
+            printf "search %s\n" "$domain" >> "$resolv_conf.tmp"
+        fi
+        for nameserver in $dns; do
+            printf "nameserver %s\n" "$nameserver" >> "$resolv_conf.tmp"
+        done
+        "$bb" chmod 0644 "$resolv_conf.tmp"
+        "$bb" mv -f "$resolv_conf.tmp" "$resolv_conf"
+        ;;
+esac
+TX_OSCOMP_UDHCPC
+"$tx_bb" chmod 0755 "$tx_dhcp_hook" || { "$tx_bb" echo 'tx-oscomp-dhcp:fail:hook'; exit 1; }
+"$tx_bb" ip link set dev "$tx_dhcp_iface" up || { "$tx_bb" echo 'tx-oscomp-dhcp:fail:link-up'; exit 1; }
+"$tx_bb" rm -f "/var/run/udhcpc.$tx_dhcp_iface.pid"
+"$tx_bb" udhcpc -f -q -n -t 3 -T 3 -p "/var/run/udhcpc.$tx_dhcp_iface.pid" -i "$tx_dhcp_iface" -s "$tx_dhcp_hook"
+tx_dhcp_status=$?
+tx_dhcp_lease=$("$tx_bb" ip -4 addr show dev "$tx_dhcp_iface" 2>/dev/null | "$tx_bb" awk '/inet / { split($2, addr, "/"); print addr[1]; exit }')
+tx_dhcp_gateway=$("$tx_bb" ip -4 route show default 2>/dev/null | "$tx_bb" awk '/^default / { print $3; exit }')
+tx_dhcp_dns=$("$tx_bb" awk '/^nameserver / { print $2; exit }' /etc/resolv.conf 2>/dev/null)
+if [ "$tx_dhcp_status" -ne 0 ]; then "$tx_bb" echo "tx-oscomp-dhcp:fail:udhcpc:$tx_dhcp_status"; exit 1; fi
+if [ -z "$tx_dhcp_lease" ]; then
+    "$tx_bb" echo 'tx-oscomp-dhcp:fail:no-lease'
+    "$tx_bb" ip -4 addr show dev "$tx_dhcp_iface" 2>/dev/null
+    exit 1
+fi
+if [ -z "$tx_dhcp_gateway" ]; then "$tx_bb" echo 'tx-oscomp-dhcp:fail:no-default-route'; exit 1; fi
+if [ -z "$tx_dhcp_dns" ]; then "$tx_bb" echo 'tx-oscomp-dhcp:fail:no-dns'; exit 1; fi
+"$tx_bb" echo "tx-oscomp-dhcp:lease:$tx_dhcp_lease"
+"$tx_bb" echo 'tx-oscomp-dhcp:ok'"#,
+    );
+    Ok(())
+}
+
+fn build_oscomp_sdcard_prelude(cmdline: Option<&str>) -> alloc::string::String {
     use alloc::string::String;
 
     let mut cmd = String::from("cd /musl/musl 2>/dev/null || cd /musl");
+    let network_mode = cmdline_value_from_str(cmdline, "tx.net.mode");
+    let interface = cmdline_value_from_str(cmdline, "tx.net.iface");
+    if append_oscomp_dhcp_bootstrap(&mut cmd, network_mode, interface).is_err() {
+        cmd.push_str("; echo 'tx-oscomp-dhcp:fail:invalid-interface'; exit 64");
+    }
+    cmd
+}
+
+fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>(
+    direct_sdcard_lane: bool,
+) -> alloc::string::String {
+    let cmdline = direct_sdcard_lane
+        .then_some(<P as tx_hal::BootInfoIf>::boot_info().cmdline)
+        .flatten();
+    let mut cmd = build_oscomp_sdcard_prelude(cmdline);
     let bench_observe_enabled = oscomp_bench_observe_enabled::<P>();
     let bench_observe_threshold = oscomp_bench_observe_threshold::<P>();
     let ltp_args = ltp_args_from_cmdline::<P>();
@@ -1969,16 +2160,7 @@ fn ltp_args_from_cmdline<P: tx_hal::TxPlatform>() -> LtpArgs<'static> {
 }
 
 pub(super) fn cmdline_value<P: tx_hal::TxPlatform>(key: &str) -> Option<&'static str> {
-    let cmdline = <P as tx_hal::BootInfoIf>::boot_info().cmdline?;
-    for token in cmdline.split_ascii_whitespace() {
-        let Some((token_key, value)) = token.split_once('=') else {
-            continue;
-        };
-        if token_key == key && !value.is_empty() {
-            return Some(value);
-        }
-    }
-    None
+    cmdline_value_from_str(<P as tx_hal::BootInfoIf>::boot_info().cmdline, key)
 }
 
 fn cmdline_bool<P: tx_hal::TxPlatform>(key: &str) -> bool {
@@ -2374,6 +2556,115 @@ const LIBCTEST_DYNAMIC_SAFE_CASES: &str =
 mod tests {
     use super::*;
     use alloc::string::String;
+    use core::cell::Cell;
+
+    #[test]
+    fn bootstrap_exec_restart_driver_services_deferred_io_before_retry() {
+        let attempts = Cell::new(0usize);
+        let services = Cell::new(0usize);
+        let shape = tx_substrate::step::YieldShape::on_wait_source(0x105, 0x1);
+
+        let result = drive_restartable_bootstrap_exec(
+            || {
+                let attempt = attempts.get();
+                attempts.set(attempt + 1);
+                if attempt == 0 {
+                    Err(tx_scripts::process::exec::ExecError::Deferred(shape))
+                } else {
+                    Ok(())
+                }
+            },
+            |deferred| {
+                assert!(deferred, "OnWaitSource must take the deferred service path");
+                services.set(services.get() + 1);
+                true
+            },
+        );
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(attempts.get(), 2, "exec preparation restarts exactly once");
+        assert_eq!(services.get(), 1, "the async dependency is serviced once");
+    }
+
+    #[test]
+    fn oscomp_sdcard_prelude_without_dhcp_flag_does_not_run_udhcpc() {
+        let cmd = build_oscomp_sdcard_prelude(None);
+
+        assert!(!cmd.contains("udhcpc"));
+        assert_eq!(cmd, "cd /musl/musl 2>/dev/null || cd /musl");
+    }
+
+    #[test]
+    fn oscomp_sdcard_dhcp_prelude_runs_before_group_payload() {
+        let mut cmd = build_oscomp_sdcard_prelude(Some("tx.net.mode=dhcp"));
+        append_oscomp_glibc_script(&mut cmd, "netperf_testcode.sh");
+
+        let dhcp = cmd.find(" udhcpc ").expect("DHCP client command");
+        let group = cmd
+            .find("netperf_testcode.sh")
+            .expect("selected OSComp group command");
+        assert!(dhcp < group, "DHCP must finish before the group payload");
+    }
+
+    #[test]
+    fn oscomp_sdcard_dhcp_hook_installs_lease_route_and_dns() {
+        let cmd = build_oscomp_sdcard_prelude(Some("tx.net.mode=dhcp"));
+
+        assert!(cmd.contains("lease_mask=$mask"));
+        assert!(cmd.contains("lease_address=\"$ip/$lease_mask\""));
+        assert!(cmd.contains("ip -4 route add default via \"$gateway\""));
+        assert!(cmd.contains("nameserver %s\\n"));
+        assert!(cmd.contains("dhcp:fail:no-lease"));
+        assert!(cmd.contains("dhcp:fail:no-default-route"));
+        assert!(cmd.contains("dhcp:fail:no-dns"));
+    }
+
+    #[test]
+    fn oscomp_sdcard_dhcp_rejects_unsafe_explicit_interface() {
+        let mut cmd = String::new();
+        let result =
+            append_oscomp_dhcp_bootstrap(&mut cmd, Some("dhcp"), Some("eth0;touch-/tmp/owned"));
+
+        assert_eq!(result, Err(OscompDhcpConfigError::InvalidInterface));
+        assert!(cmd.is_empty(), "unsafe selector must not reach the shell");
+
+        let prelude = build_oscomp_sdcard_prelude(Some(
+            "tx.net.mode=dhcp tx.net.iface=eth0;touch-/tmp/owned",
+        ));
+        assert!(prelude.contains("dhcp:fail:invalid-interface"));
+        assert!(!prelude.contains("touch-/tmp/owned"));
+    }
+
+    #[test]
+    fn oscomp_sdcard_dhcp_command_is_address_and_architecture_neutral() {
+        let cmd = build_oscomp_sdcard_prelude(Some("tx.net.mode=dhcp tx.net.iface=enp0s3"));
+
+        for forbidden in ["10.0.2.", "192.168.", "riscv", "loongarch"] {
+            assert!(
+                !cmd.contains(forbidden),
+                "DHCP prelude must not embed deployment literal {forbidden}"
+            );
+        }
+        assert!(cmd.contains("tx_dhcp_selector='enp0s3'"));
+        assert!(cmd.contains("/musl/musl/busybox"));
+    }
+
+    #[test]
+    fn oscomp_sdcard_dhcp_command_is_valid_shell() {
+        let mut cmd = build_oscomp_sdcard_prelude(Some("tx.net.mode=dhcp"));
+        append_oscomp_glibc_script(&mut cmd, "netperf_testcode.sh");
+
+        let status = std::process::Command::new("sh")
+            .arg("-n")
+            .arg("-c")
+            .arg(&cmd)
+            .status()
+            .expect("host shell must be available for command syntax validation");
+        assert!(
+            status.success(),
+            "generated OSComp shell command is invalid"
+        );
+    }
 
     #[test]
     fn filtered_static_only_libctest_case_does_not_run_missing_dynamic_entry() {
@@ -2392,10 +2683,7 @@ mod tests {
 
         assert!(!cmd.contains("./runtest.exe -w entry-static.exe dlopen"));
         assert!(cmd.contains("SKIP entry-static.exe dlopen"));
-        assert!(cmd.contains("../busybox chmod 755 ./libc.so"));
-        assert!(cmd.contains(
-            "(cd lib && ../busybox chmod 755 ./libc.so && ./libc.so ../entry-dynamic.exe dlopen)"
-        ));
+        assert!(cmd.contains("(cd lib && ../entry-dynamic.exe dlopen)"));
     }
 
     #[test]
@@ -2426,13 +2714,8 @@ mod tests {
         let mut cmd = String::new();
         append_full_libctest(&mut cmd);
 
-        assert!(cmd.contains("../busybox chmod 755 ./libc.so"));
-        assert!(cmd.contains(
-            "(cd lib && ../busybox chmod 755 ./libc.so && ./libc.so ../entry-dynamic.exe dlopen)"
-        ));
-        assert!(
-            cmd.contains("(cd lib && ../busybox chmod 755 ./libc.so && ./libc.so ../entry-dynamic.exe tls_get_new_dtv)")
-        );
+        assert!(cmd.contains("(cd lib && ../entry-dynamic.exe dlopen)"));
+        assert!(cmd.contains("(cd lib && ../entry-dynamic.exe tls_get_new_dtv)"));
         assert!(!cmd.contains("./runtest.exe -w entry-dynamic.exe dlopen"));
         assert!(!cmd.contains("./runtest.exe -w entry-dynamic.exe tls_get_new_dtv"));
     }

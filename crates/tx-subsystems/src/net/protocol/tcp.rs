@@ -57,6 +57,15 @@ struct TcpInner {
     protocol_state: RawTcpProtocolState,
     corked_tx: Vec<u8>,
     connect_attempt: Option<TcpConnectAttempt>,
+    /// Reply returned directly by `smoltcp::Socket::process`.
+    ///
+    /// smoltcp uses this path for ACKs that must not wait for its ordinary
+    /// egress polling, notably duplicate/SACK replies for out-of-order data.
+    /// The socket state records that ACK as sent while building the reply, so
+    /// dropping it here prevents a later `dispatch` call from reconstructing
+    /// it. Keep the newest cumulative reply until the selected packet sink
+    /// accepts it.
+    pending_immediate_reply: Option<SmoltcpTcpSegment>,
 }
 
 /// Doc-named owner for the smoltcp TCP socket and its backing buffers.
@@ -143,6 +152,7 @@ impl RawTcpSocket {
                 protocol_state: RawTcpProtocolState::default(),
                 corked_tx: Vec::new(),
                 connect_attempt: None,
+                pending_immediate_reply: None,
             }),
             recv_capacity,
             send_capacity,
@@ -227,7 +237,14 @@ impl RawTcpSocket {
     }
 
     pub fn poll_at(&self, now: smoltcp::time::Instant) -> smoltcp::socket::PollAt {
-        with_context_at(now, None, |cx| self.inner.lock().socket.poll_at(cx))
+        with_context_at(now, None, |cx| {
+            let inner = self.inner.lock();
+            if inner.pending_immediate_reply.is_some() {
+                smoltcp::socket::PollAt::Now
+            } else {
+                inner.socket.poll_at(cx)
+            }
+        })
     }
 
     pub fn enqueue_tx_len(&self, len: usize) -> Option<RawTcpSendReserve> {
@@ -451,6 +468,9 @@ impl RawTcpSocket {
     pub fn dispatch_segment_at(&self, now: smoltcp::time::Instant) -> Option<SmoltcpTcpSegment> {
         with_context_at(now, None, |cx| {
             let inner = &mut *self.inner.lock();
+            if let Some(reply) = inner.pending_immediate_reply.take() {
+                return Some(reply);
+            }
             let socket = &mut inner.socket;
             let mut segment = None;
             let result = socket.dispatch(cx, |_, (ip_repr, tcp_repr)| {
@@ -492,6 +512,16 @@ impl RawTcpSocket {
     ) -> RawTcpDispatchOutcome {
         with_context_at(now, Some(ip_mtu), |cx| {
             let inner = &mut *self.inner.lock();
+            if let Some(reply) = inner.pending_immediate_reply.as_ref() {
+                let sent = transmit(reply);
+                if sent {
+                    inner.pending_immediate_reply = None;
+                }
+                return RawTcpDispatchOutcome {
+                    emitted: Some(sent),
+                    timed_out_connect_attempt: None,
+                };
+            }
             let socket = &mut inner.socket;
             let before = socket.state();
             let mut attempted = None;
@@ -526,11 +556,19 @@ impl RawTcpSocket {
             let before = observe_socket(&inner.socket);
             let recv_before = inner.socket.recv_queue();
             let tcp_repr = segment.tcp.as_repr(&segment.payload);
-            let _reply = if inner.socket.accepts(cx, &segment.ip_repr, &tcp_repr) {
+            let reply = if inner.socket.accepts(cx, &segment.ip_repr, &tcp_repr) {
                 inner.socket.process(cx, &segment.ip_repr, &tcp_repr)
             } else {
                 None
             };
+            if let Some((ip_repr, tcp_repr)) = reply {
+                // `Socket::process` has already advanced `remote_last_ack`
+                // while constructing this reply. Preserve the actual packet
+                // until egress accepts it; ordinary `dispatch` cannot recreate
+                // an immediate out-of-order ACK after that state transition.
+                inner.pending_immediate_reply =
+                    Some(SmoltcpTcpSegment::from_reprs(ip_repr, tcp_repr));
+            }
             let after = observe_socket(&inner.socket);
             let mut publish = SmoltcpTcpProcessPublish::default();
             publish.recv_bytes_added = inner.socket.recv_queue().saturating_sub(recv_before);
@@ -550,7 +588,11 @@ impl RawTcpSocket {
             if before.can_send != after.can_send && after.can_send {
                 publish.send_writable = true;
             }
-            if matches!(segment.tcp.control, TcpControl::Fin) && !protocol_state.is_recv_shut {
+            // Publish EOF only after smoltcp has accepted an in-order FIN.
+            // A raw FIN flag is insufficient: smoltcp intentionally ignores
+            // a FIN that arrives beyond a receive-sequence hole.
+            if !before.recv_fin_received && after.recv_fin_received && !protocol_state.is_recv_shut
+            {
                 protocol_state.is_recv_shut = true;
                 publish.recv_readable = true;
                 publish.recv_closed = true;
@@ -816,6 +858,7 @@ struct SocketProtocolObservation {
     can_send: bool,
     may_send: bool,
     is_active: bool,
+    recv_fin_received: bool,
 }
 
 fn observe_socket(socket: &tcp::Socket<'_>) -> SocketProtocolObservation {
@@ -823,6 +866,7 @@ fn observe_socket(socket: &tcp::Socket<'_>) -> SocketProtocolObservation {
         state: socket.state(),
         can_send: socket.can_send(),
         may_send: socket.may_send(),
+        recv_fin_received: socket.recv_fin_received(),
         is_active: matches!(
             socket.state(),
             tcp::State::Established

@@ -1,7 +1,7 @@
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex, MutexGuard};
 
-use tx_hal::{CpuId, IrqIf, LocalExecutionGuard, PercpuIf, SmpIf};
+use tx_hal::{CpuId, CpuMask, IrqIf, LocalExecutionGuard, PercpuIf, SmpIf};
 use tx_substrate::epoch;
 use tx_substrate::{testing, PublishError, Published};
 
@@ -32,8 +32,12 @@ impl IrqIf for TwoCpuPlatform {
 }
 
 impl SmpIf for TwoCpuPlatform {
-    fn possible_cpu_count() -> usize {
-        2
+    fn possible_cpus() -> CpuMask {
+        CpuMask::from_bits(0b11)
+    }
+
+    fn online_cpus() -> CpuMask {
+        CpuMask::from_bits(0b11)
     }
 }
 

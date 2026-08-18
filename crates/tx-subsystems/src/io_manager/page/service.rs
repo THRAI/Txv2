@@ -279,6 +279,13 @@ pub trait PageServiceBackendContext {
 pub enum PageServiceDrivenWork {
     Completion(PageCompletionRoute),
     BackendSubmission(PageServiceBackendSubmitOutcome),
+    /// Owned L6 accepted no BIO because its queue/depth was transiently full.
+    /// The initial L4 request, owner bundle, and waiter rows remain live so a
+    /// later service turn can safely plan that request again.
+    BackendAdmissionRetry {
+        request: PageIoRequest,
+        failure: PageL6SubmitFailure,
+    },
     BackendSubmitError(PageServiceBackendSubmitError),
     UnplannedSubmission(PageIoRequest),
 }

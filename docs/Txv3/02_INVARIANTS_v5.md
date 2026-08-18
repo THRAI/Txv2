@@ -2,8 +2,8 @@
 
 <!-- txdoc:TXV3-INVARIANTS-V5 -->
 
-**Status.** v5 (Txv3 refresh, 2026-05).
-**Supersedes.** `00_meta-framework/INVARIANTS_v4.md`. v5 carries forward all v4 invariant families unchanged unless explicitly modified, and introduces five new families: SUBJ-*, YIELD-*, DELEGATE-*, SCOPE-*, LANE-*.
+**Status.** v5 (Txv3 refresh, updated 2026-08-04).
+**Supersedes.** `00_meta-framework/INVARIANTS_v4.md`. v5 carries forward all v4 invariant families unchanged unless explicitly modified and is the only landing place for new enforceable families. It includes SUBJ-*, YIELD-*, DELEGATE-*, SCOPE-*, LANE-*, and DEVRES-* additions.
 **Audience.** Subsystem authors, reviewers, lint-infrastructure authors. Each invariant has a stable identifier; lints cite invariants by identifier.
 
 ---
@@ -34,6 +34,7 @@ Catalog of families:
 | **DELEGATE-*** | **OnAgent yield** | **v5, new** |
 | **SCOPE-*** | **ExecutionScope** | **v5, new** |
 | **LANE-*** | **semantic owner API lanes** | **v5, new** |
+| **DEVRES-*** | **immutable device resources and boot binding** | **v5, new** |
 | PID-*, NSVIEW-*, MAP-*, FS-*, etc. | subsystem-specific | v4, preserved |
 
 ---
@@ -236,6 +237,101 @@ internals; owner facades remain unchanged when their backend migrates.
 
 ---
 
+## DEVRES — immutable resources and boot binding (new in v5)
+
+<!-- txdoc:INV-V5-DEVRES -->
+
+DEVRES-1. **Every hardware resource fact has immutable provenance.** The
+selected platform publishes boot-owned resource seeds; linked one-shot
+providers may append bus-enumerated records before one final graph freeze.
+After freeze no tier-2 path mutates the graph.
+
+LINT: resource records require `ResourceOrigin`; reject mutations after graph
+publication or driver-owned copies used as a second source of truth.
+
+DEVRES-2. **`DeviceId` is hardware identity, independent of order, address,
+and projection.** It derives from a provider plus firmware path, complete bus
+identity, or stable platform key. Interface names, discovery ordinals,
+generated MMIO labels, and physical addresses are not identities.
+
+LINT: reject hardware/IRQ/DMA lookup keyed by `eth0`-style strings, ordinal
+regions, fixed placement, or first-device policy.
+
+DEVRES-3. **Static selection and boot discovery are separate.** `P:
+TxPlatform`, the resource-provider set, and the driver set are fixed at link
+time; resource values, device count, one-shot enumeration, matching, and
+binding may vary at boot. Successful tier-2 bindings become `&'static` and are
+never detached. Runtime arrival/removal/reclamation remains tier 3.
+
+LINT: reject runtime HAL managers and dynamic driver registration in tier 2;
+also reject the stale converse that all tier-2 resource values/bindings must be
+hand-authored board statics.
+
+DEVRES-4. **Typed decoders fail rather than guess.** A driver matches only
+compatible/bus identifiers and consumes specification-defined typed roles.
+Missing, duplicate, incompatible, ambiguous, disabled, or unsupported facts
+produce explicit outcomes; no familiar address, IRQ, device, or board fallback
+is allowed.
+
+LINT: generic drivers and binders cannot branch on architecture/board names,
+deployment addresses, PCI placement, generated region names, or resource-list
+order. Protocol constants and explicit test fixtures remain reviewed inputs.
+
+DEVRES-5. **IRQ ownership is per bound device and role.** An `IrqRoute`
+retains `DeviceId`, role, and immutable bound context from reservation through
+top half, bottom half, device acknowledgement, and controller completion. A
+singleton network IRQ and namespace-name hardware lookup are forbidden.
+
+LINT: reject `NET_IRQ`/`net_irq()`-style tier-2 APIs and bottom halves that
+resolve a device through an interface name; require duplicate/shared route
+validation before unmask.
+
+DEVRES-6. **DMA is device/domain scoped.** Allocation consumes an explicit
+`DmaDomain` and effective `DmaConstraints`; mapping and cache transitions carry
+a live `DmaMapping`. `DmaPin` proves residency only. Address truncation,
+implicit identity translation, and platform-global coherency assumptions are
+forbidden.
+
+LINT: driver DMA calls require a domain/mapping; constrained allocation must
+return a typed failure when no satisfying run/mapping exists.
+
+DEVRES-7. **Device transport and network policy have different owners.** A NIC
+registration owns packet transport and hardware identity. Interface name and
+ifindex are namespace projections. Addresses, prefixes, routes, and neighbors
+belong to namespace/FIB control-plane state; DNS/proxy/DHCP protocol state is
+userspace-owned.
+
+LINT: HAL/drivers/generic boot runtime cannot embed deployment IP, route,
+neighbor, DNS, proxy, QEMU topology, or private shadow-network truth.
+
+DEVRES-8. **Boot binding publishes atomically after complete reservation.** The
+one-shot binder validates and reserves all fallible graph, driver, DMA, IRQ,
+and registry state while sources are masked. Commit is bounded/infallible;
+registries and the IRQ table become visible before arming/unmasking or firing
+events. Candidate-local failure may coexist with later healthy bindings;
+global corruption/capacity failure publishes none.
+
+LINT: reject collapsed init paths that allocate or probe after publication,
+unmask before route/registration visibility, or leave partially published
+class registries after a global failure.
+
+DEVRES-9. **An unknown board is an unsupported extension, not a fictional
+profile.** A new board supplies one concrete platform seed and linked provider,
+driver, and host-profile inputs through the common seam. Until its facts are
+captured, no guessed target, boot protocol, controller, MMIO, IRQ, driver, or
+success result is registered.
+
+LINT: synthetic providers may prove the seam, but generic code cannot special-
+case a future board and an empty graph cannot synthesize a device.
+
+**ARCH-3 review.** `DEVRES-*` is a new closed lint family because resource
+provenance, binding lifetime, IRQ/DMA ownership, and network-policy separation
+cross HAL, substrate, device, and net boundaries. Keeping the rules only in one
+driver plan would make them unenforceable. The family adds no zone evidence,
+step outcome, runtime HAL dispatch, or universal domain-object API.
+
+---
+
 ## ASYNC — preserved from v4
 
 <!-- txdoc:INV-V5-ASYNC -->
@@ -285,6 +381,7 @@ All v4 invariants in these families hold unchanged in v5. Cross-references in th
 | DELEGATE | new family, 9 invariants |
 | SCOPE | new family, 7 invariants |
 | LANE | new family, 10 invariants |
+| DEVRES | new family, 9 invariants; immutable resource/binder, per-device IRQ/DMA, network-policy ownership |
 | STEP-1 | rephrased over four-variant outcome |
 | STEP-3 | rephrased over `StepProgress` monoid |
 | SCRIPT-V5-1..3 | new sub-rules for upper/lower split |

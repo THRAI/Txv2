@@ -1,0 +1,25 @@
+schema = "tx.network-scenario.v1"
+name = "default-qemu-user-rv64"
+target = "qemu-rv64"
+
+[device]
+transport = "virtio-mmio"
+
+[device.selector]
+kind = "device-id"
+value = "boot-nic"
+
+[device.placement]
+kind = "virtio-mmio"
+bus = "virtio-mmio-bus.1"
+
+[backend]
+kind = "qemu-user"
+id = "net0"
+network = "10.0.2.0/24"
+dhcp_start = "10.0.2.15"
+gateway = "10.0.2.2"
+dns = "10.0.2.3"
+
+[guest]
+kind = "kernel-default"

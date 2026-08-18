@@ -119,6 +119,7 @@ use tx_subsystems::vfs::FsOps;
 /// ordinary buffered-I/O path.  Keep main's window so direct-I/O admission and
 /// whole-file service ranges do not truncate normal compiler/linker outputs.
 const EXT4_FILE_INITIAL_PAGE_WINDOW: u64 = 65536;
+pub(crate) const EXT4_FILE_PAGE_CAP: u64 = EXT4_FILE_INITIAL_PAGE_WINDOW;
 
 /// Factory for `MountOutput::fs_ops`.
 ///

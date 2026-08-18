@@ -28,6 +28,8 @@ static RECIPE_CHUNK_ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
 const VM_RECIPE_PUBLISH_SHAPE_METRICS: bool = cfg!(tx_vm_recipe_publish_shape_metrics);
 const VM_RECIPE_NODE_ALLOC_METRICS: bool = cfg!(tx_vm_recipe_node_alloc_metrics);
 const VM_RECIPE_PHASE_METRICS: bool = cfg!(tx_vm_recipe_phase_metrics);
+const RECIPE_RETIRE_MAINTENANCE_BUDGET: usize = 64;
+const RECIPE_RETIRE_MAINTENANCE_ATTEMPTS: usize = 4;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(in crate::vm) struct RecipeDebugTotals {
@@ -221,6 +223,29 @@ impl RecipeIndex {
         }
     }
 
+    /// Build an address-space recipe index before that address space becomes
+    /// visible to readers.
+    ///
+    /// Fork uses this constructor after deriving every child CoW entry from a
+    /// stable parent snapshot.  Publishing each entry through a temporary
+    /// child `RecipeIndex` would retire roots that no reader could ever have
+    /// observed and can exhaust the fixed local publication-retire pool when
+    /// a process has many private VMAs.  Construct the immutable tree locally
+    /// and create its first publication only after the complete child shape is
+    /// available.
+    pub(in crate::vm) fn from_unpublished_entries(entries: Vec<VmEntry>) -> Self {
+        let (tree, _) = tree_from_entries(entries);
+        Self {
+            current: Published::try_new(tree).expect("unpublished RecipeIndex allocation"),
+            publication_sequence: AtomicU64::new(0),
+            mutation: vm_spin_mutex((), b"debug.lock.vm.recipe_index.mutation"),
+            #[cfg(test)]
+            last_publish_touched_entries: AtomicUsize::new(0),
+            #[cfg(test)]
+            last_publish_leaf_splits: AtomicUsize::new(0),
+        }
+    }
+
     /// Borrow the published tree under the caller-supplied epoch guard. The
     /// returned reference is valid for the guard's lifetime.
     fn pinned<'g>(&'g self, guard: &'g Guard<'_>) -> &'g RecipeTree {
@@ -319,7 +344,29 @@ impl RecipeIndex {
         touched_entries: usize,
         node_allocs: usize,
     ) -> Result<(), VmMapError> {
-        let replacement = self.current.prepare_replace(next).map_err(|_| {
+        // Recipe rewrites can run inside a syscall's existing EBR read window.
+        // The generic `PublishReservation::commit` retry path drains the
+        // three-bag ring on backpressure, but that drain cannot complete two
+        // epoch advances while the outer reader remains active. Reserve an
+        // independent CPU-local retire record before publishing, matching the
+        // resident-root protocol used by page-backed storage.
+        let retire = (0..RECIPE_RETIRE_MAINTENANCE_ATTEMPTS)
+            .find_map(
+                |attempt| match tx_substrate::epoch::try_reserve_local_retire() {
+                    Ok(reservation) => Some(Ok(reservation)),
+                    Err(tx_substrate::epoch::EpochError::LocalRetireExhausted)
+                        if attempt + 1 < RECIPE_RETIRE_MAINTENANCE_ATTEMPTS =>
+                    {
+                        let _ = tx_substrate::epoch::drain_with_budget(
+                            RECIPE_RETIRE_MAINTENANCE_BUDGET,
+                        );
+                        None
+                    }
+                    Err(_) => Some(Err(VmMapError::WouldBlock)),
+                },
+            )
+            .unwrap_or(Err(VmMapError::WouldBlock))?;
+        let replacement = self.current.prepare_detached(next).map_err(|_| {
             emit_recipe_phase_count(b"debug.vm.recipe.phase.publish_alloc_error", 1);
             VmMapError::NoFreeRange
         })?;
@@ -343,7 +390,9 @@ impl RecipeIndex {
         let _ = touched_entries;
         #[cfg(not(test))]
         let _ = node_allocs;
-        replacement.commit();
+        self.current
+            .commit_reserved(replacement, retire)
+            .expect("RecipeIndex mutation lock must serialize reserved publication");
         self.publication_sequence
             .store(committed_sequence, Ordering::Release);
         Ok(())

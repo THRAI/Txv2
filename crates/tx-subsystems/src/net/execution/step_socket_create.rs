@@ -81,6 +81,13 @@ pub fn step_socket_create_in_namespace(
         if payload.set_packet_protocol(protocol).is_err() {
             return StepOutcome::Err(Errno::EINVAL);
         }
+        if payload
+            .socket_table()
+            .register_packet_socket(identity.clone())
+            .is_err()
+        {
+            return StepOutcome::Err(Errno::ENOMEM);
+        }
     }
 
     StepOutcome::Done(identity)

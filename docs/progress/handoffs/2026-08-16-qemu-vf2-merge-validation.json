@@ -1,0 +1,129 @@
+{
+  "schema": "tx.progress.handoff.v1",
+  "id": "2026-08-16-qemu-vf2-merge-validation",
+  "title": "Close the QEMU and VF2 merge after QEMU, VF2, and LA2K1000 validation",
+  "created": "2026-08-16",
+  "from": "codex-01a00a3b-f64c-7c43-9ee0-6512899dcc80",
+  "status": "closed",
+  "plan": "docs/progress/plans/2026-08-16-qemu-vf2-worktree-merge.json",
+  "current_state": [
+    "The integration branch codex/qemu-vf2-integration preserves both source histories. Merge commit 64fbbca1f has QEMU source 37d38778fd9d5bbf7fa9dfe3489206d0f54de66a and VF2 source e619fe098df0b20f2edb2d30f78d63c8158d68ed as ancestors. The first-parent semantic fix chain is 2c8a54901 signal pending scan, 7d67c753b fork-fd rollback, 072b29fd5 VM transient user-copy outcomes, 4ca8c64a1 file-fault Continue preservation, 6badf1031 initial read-admission retry, 11dc36d9e stale fetch retry, and cb275b28c owner-post wake linearization.",
+    "Merged code commit cb275b28cf304634344b5c253a3f23e86d35c0c2 is the common source for every final QEMU and physical-board artifact. The progress commits after cb275b28c contain only durable acceptance records. No source history was squashed, rewritten, or dropped.",
+    "Fresh RV64 QEMU formal acceptance is target/qemu-merge-accept/rv-external-final3-cb275b28c/rv64.full-stepwise.result.json. It records PASS for four-hart direct-root RW, Vim/GCC/Rust, the exact full GitHub clone of https://github.com/LLLPPPS/tx-push-test.git, local commit/fsck, parallel I/O, fsync/syncfs, same-disk RO hash replay, final e2fsck -fn=0, and unchanged mother image SHA-256 d547220caf7b3ce4c1d67560bbed66f4ee491d10718d1ea3e55741019aef5eb4.",
+    "Fresh LA64 QEMU formal acceptance is target/qemu-merge-accept/la-external-final9-cb275b28c/la64.full-stepwise.result.json. It records the same complete matrix with the exact real clone, final e2fsck -fn=0, and unchanged mother image SHA-256 57c64d68d12aed1e503cc54753ea27f8c38936d6dde78d7c28dfc155763e25ca.",
+    "Physical VF2 used the unique cb275b28c uImage SHA-256 1075540b44a97f300395b6c608473b319399b986c4ca9701eda3a4d56305e495. After the user stopped and deleted an unnecessary 31.7 GB full-card backup, they explicitly authorized writing the existing Alpine image. The source prefix SHA-256 d547220c...ef5eb4 was verified, whole-device ext4 was expanded offline to 1 GiB, and final e2fsck -fn passed. The board then completed a genuine full clone at /proj/vf2-cb275b28c with HEAD 9d41e640f7686b8891744e232297341494de2e7d, 7830 objects, clean status, and git fsck; Vim/GCC/Rust and physical power-cycle RO persistence passed.",
+    "VF2 RW evidence is msp/serial/2026-08-17-vf2-merge-cb275b28c-postflash.log with SHA-256 69ff0f0882cb550484ca92feca90aeee113154f0cc579b8fe489e04c30957424. VF2 RO evidence is msp/serial/2026-08-17-vf2-merge-cb275b28c-postflash-ro-reboot.log with SHA-256 ce87b5ba906d67e5b3c3c9ef2a65a9f56bb7bd45ab2d18cd54b130694d1abacf.",
+    "Physical LA2K1000 used /srv/tftp/txv2/txv2-la2k1000-merge-cb275b28c-5b2675e5.uimage, 8978128 bytes, SHA-256 5b2675e5d1693bbaa215130f5812aa2063c3b0d9ff7b5a26c4a7e5ba1f066373. Every boot passed U-Boot iminfo and the exact Kingchuxing 32GB W010, 62533296 x 512 SATA identity. Two harts, AHCI, DWMAC, sda1 ext4 root, and boot:ok passed.",
+    "The first LA RW attempt used the planned legacy-nocsum profile and was correctly rejected with EOPNOTSUPP. A zero-write RO raw-superblock witness found compat 0x003c, incompat 0x02c6, and ro_compat 0x046b with METADATA_CSUM. This exactly selects the existing default Tier1 profile rather than legacy-nocsum, so no kernel gate was broadened and no media rewrite was performed. Default Tier1 RW then passed.",
+    "LA default-Tier1 RW completed the exact genuine GitHub clone with HEAD 9d41e640f7686b8891744e232297341494de2e7d, 7830 objects, clean status, and git fsck. Existing /proj/onsite-tool-check sources were used: Vim returned 0 with unchanged source hash, GCC rebuilt and ran, and rustc rebuilt in 3m12.19s and ran. After sync and the user's physical reset, root mounted RO, a touch probe failed and remained absent, all four hashes matched, both programs ran, and clone origin/HEAD/clean/fsck reproduced.",
+    "LA initial RO and failed-profile log is msp/serial/2026-08-17-la2k1000-merge-cb275b28c-ro.log, 24932 bytes, SHA-256 89291c6fc0431301a616505510a1f72097cdbbf9535c1d32362e53ae8464ea57. The complete diagnosis, Tier1 RW, and final RO log is msp/serial/2026-08-17-la2k1000-merge-cb275b28c-profile-diag.log, 66760 bytes, SHA-256 f2c2249a35343a479b4c29de737ab841d24ee25ab0c34af19873d66118cea340. Detailed diagnosis is msp/debug-logs/2026-08-17-la2k1000-tier1-profile-and-merge-acceptance.md.",
+    "All target-specific acceptance gates are green. The source branch feature/portable-net-vf2-dwmac is fast-forwarded to the final validated integration tip after the progress catch-up commit. codex/vf2-file-io-runtime-rebind-fix remains at e619fe098. Nothing is pushed, and no remote is changed."
+  ],
+  "changed_files": [
+    {
+      "path": "crates/tx-subsystems/src/process/structure.rs",
+      "reason": "Preserve VF2 disposition-aware wait interruption while scanning every deliverable pending signal after the QEMU/VF2 merge."
+    },
+    {
+      "path": "crates/tx-subsystems/src/process/execution.rs",
+      "reason": "Roll back explicit OpenFile references on every failed fork path after a cloned fd snapshot."
+    },
+    {
+      "path": "crates/tx-subsystems/src/vm/user_access.rs",
+      "reason": "Preserve typed transient user-copy outcomes and exact-length copy semantics required by real Git/rustc workloads."
+    },
+    {
+      "path": "crates/tx-subsystems/src/page_backed/mod.rs",
+      "reason": "Preserve backend Continue and retry safe initial read-admission pressure without weakening terminal backend EAGAIN."
+    },
+    {
+      "path": "crates/tx-substrate/src/wait_source.rs",
+      "reason": "Linearize pending owner wake publication with subscriber registration and close the LA64 Git index-pack lost-wake race."
+    },
+    {
+      "path": "docs/progress/STATUS.md",
+      "reason": "Record final four-target merge acceptance and remaining baseline-only debt."
+    },
+    {
+      "path": "docs/progress/plans/2026-08-16-qemu-vf2-worktree-merge.json",
+      "reason": "Close the execution plan after RV64 QEMU, LA64 QEMU, VF2, and LA2K1000 all passed."
+    },
+    {
+      "path": "docs/progress/handoffs/2026-08-16-qemu-vf2-merge-validation.json",
+      "reason": "Freeze exact merge ancestry, artifact hashes, evidence paths, physical reset results, and branch-advance constraints."
+    }
+  ],
+  "verification": [
+    {
+      "command": "git merge-base --is-ancestor 37d38778fd9d5bbf7fa9dfe3489206d0f54de66a cb275b28cf304634344b5c253a3f23e86d35c0c2; git merge-base --is-ancestor e619fe098df0b20f2edb2d30f78d63c8158d68ed cb275b28cf304634344b5c253a3f23e86d35c0c2",
+      "status": "passed",
+      "notes": "Both frozen source tips remain ancestors of the validated merged code."
+    },
+    {
+      "command": "Focused merged host matrix",
+      "status": "passed",
+      "notes": "Signal, fork fd rollback, ext4 pager and settlement, File-I/O runtime, kernel drain, drive, VF2 MMC, exec stack, procfs, tx-fs, dup/F_DUPFD, writev, rename-over, newfstatat, and statx focused serial tests all passed."
+    },
+    {
+      "command": "Fresh RV64 QEMU full stepwise acceptance from cb275b28c",
+      "status": "passed",
+      "notes": "Result JSON records exact real clone, Vim/GCC/Rust, persistence, final e2fsck 0, and unchanged mother hash."
+    },
+    {
+      "command": "Fresh LA64 QEMU full stepwise acceptance from cb275b28c",
+      "status": "passed",
+      "notes": "Result JSON records exact real clone, Vim/GCC/Rust, persistence, final e2fsck 0, and unchanged mother hash."
+    },
+    {
+      "command": "Physical VF2 RW, user power cycle, and independent RO replay from cb275b28c",
+      "status": "passed",
+      "notes": "Expanded 1 GiB media, exact real clone, Vim/GCC/Rust, sync, physical power cycle, hashes, binaries, and Git fsck all passed."
+    },
+    {
+      "command": "Physical LA2K1000 RO, default-Tier1 RW, user reset, and final RO replay from cb275b28c",
+      "status": "passed",
+      "notes": "Exact disk/uImage gates, feature diagnosis, real clone, Vim/GCC/Rust, sync, RO write rejection, hashes, binaries, and Git fsck all passed."
+    },
+    {
+      "command": "cargo -q xtask unit",
+      "status": "failed",
+      "notes": "The failure set matches the recorded pre-merge baseline: tx-shims shared-state tests and two tx-kernel libctest command assertions. No target acceptance regression was added."
+    },
+    {
+      "command": "cargo xtask progress validate",
+      "status": "failed",
+      "notes": "The changed plan and handoff parse under their schemas; the global validator still stops at the pre-existing docs/progress/plans/2026-07-24-network-time-integration.json legacy status value completed."
+    },
+    {
+      "command": "cargo xtask lint docs",
+      "status": "failed",
+      "notes": "Only the pre-existing broken-link and stale-vocabulary baseline remains; the final progress files are checked separately with JSON parsing and git diff --check."
+    }
+  ],
+  "next_actions": [
+    {
+      "id": "post-merge-maintenance",
+      "title": "Preserve evidence and address unrelated repository debt separately",
+      "paths": [
+        "docs/progress/plans/2026-07-24-network-time-integration.json"
+      ],
+      "notes": "Do not mix the legacy progress-schema, unit shared-state, bridge, or docs-link cleanup into this validated merge. Push only if the user separately requests it."
+    }
+  ],
+  "caveats": [
+    "The local msp/debug-logs and msp/serial evidence is intentionally untracked and must not be staged or committed.",
+    "The unrelated untracked .codex/ and target-partition-io/ paths in /home/msp/learning/Txv2 remain untouched.",
+    "The VF2 acceptance medium was explicitly overwritten and expanded only after user authorization; preserve the new /proj/vf2-cb275b28c evidence before any future persistent workload.",
+    "The LA sda1 partition spans about 27.8 GiB, but its ext4 filesystem is still about 690 MiB and had about 27.8 MiB free after clone. Do not start another large persistent workload without a capacity decision.",
+    "LA legacy-nocsum must not be hard-coded for this current disk. Re-observe the on-media feature tuple if factory Linux or another kernel may have changed filesystem or journal features.",
+    "A Vim save emitted one tolerated syscall-EIO diagnostic while returning 0 and preserving the exact source hash. It did not block this acceptance, but the diagnostic remains in the frozen serial log.",
+    "No repository branch was pushed and no credential-bearing serial output was requested or retained."
+  ],
+  "links": [
+    "docs/progress/STATUS.md",
+    "docs/progress/plans/2026-08-16-qemu-vf2-worktree-merge.json",
+    "msp/debug-logs/2026-08-17-la2k1000-tier1-profile-and-merge-acceptance.md",
+    "target/qemu-merge-accept/rv-external-final3-cb275b28c/rv64.full-stepwise.result.json",
+    "target/qemu-merge-accept/la-external-final9-cb275b28c/la64.full-stepwise.result.json"
+  ]
+}

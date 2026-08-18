@@ -125,6 +125,167 @@ fn emit_clone_path_duration(name: &[u8], start: Option<u64>) {
     emit_clone_path_count(name, duration);
 }
 
+#[derive(Clone, Copy)]
+struct CloneTidWritePlan {
+    parent: Option<u64>,
+    child: Option<u64>,
+    ranges: [Option<UserRange>; 2],
+}
+
+impl CloneTidWritePlan {
+    fn new(parent: Option<u64>, child: Option<u64>) -> Result<Self, Errno> {
+        let parent_range = parent
+            .map(|ptr| covering_user_range(ptr, core::mem::size_of::<i32>()).ok_or(Errno::EFAULT))
+            .transpose()?;
+        let child_range = child
+            .map(|ptr| covering_user_range(ptr, core::mem::size_of::<i32>()).ok_or(Errno::EFAULT))
+            .transpose()?;
+        Ok(Self {
+            parent,
+            child,
+            ranges: [parent_range, child_range],
+        })
+    }
+
+    fn range_slice(&self, storage: &mut [UserRange; 2]) -> usize {
+        let mut count = 0;
+        for range in self.ranges.into_iter().flatten() {
+            storage[count] = range;
+            count += 1;
+        }
+        count
+    }
+
+    fn validate(&self, aspace: &AddressSpace, guard: &RangeGuard<'_>) -> Result<(), Errno> {
+        for ptr in [self.parent, self.child].into_iter().flatten() {
+            aspace
+                .validate_user_write_resident_reserved(UserPtr::<i32>::new(ptr as usize), guard)?;
+        }
+        Ok(())
+    }
+
+    fn write(
+        &self,
+        aspace: &AddressSpace,
+        tid: i32,
+        reservation: Option<&RangeGuard<'_>>,
+    ) -> Result<(), Errno> {
+        if let Some(guard) = reservation {
+            for ptr in [self.parent, self.child].into_iter().flatten() {
+                aspace.write_user_resident_reserved(
+                    UserPtr::<i32>::new(ptr as usize),
+                    tid,
+                    guard,
+                )?;
+            }
+            return Ok(());
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            for ptr in [self.parent, self.child].into_iter().flatten() {
+                bootstrap_write_user(aspace, ptr, tid)?;
+            }
+            Ok(())
+        }
+        #[cfg(target_os = "none")]
+        {
+            Err(Errno::EIO)
+        }
+    }
+}
+
+fn clone_tid_write_plan(
+    clone_parent_settid: bool,
+    parent_ptr: u64,
+    clone_child_settid: bool,
+    child_ptr: u64,
+) -> Result<CloneTidWritePlan, Errno> {
+    CloneTidWritePlan::new(
+        (clone_parent_settid && parent_ptr != 0).then_some(parent_ptr),
+        (clone_child_settid && child_ptr != 0).then_some(child_ptr),
+    )
+}
+
+fn try_reserve_clone_tid_writes<'a>(
+    aspace: &'a AddressSpace,
+    plan: &CloneTidWritePlan,
+) -> Option<Result<Option<RangeGuard<'a>>, Errno>> {
+    #[cfg(not(target_os = "none"))]
+    {
+        if [plan.parent, plan.child]
+            .into_iter()
+            .flatten()
+            .any(|ptr| ptr >= FULL_USER_V1_TOP as u64)
+        {
+            return Some(Ok(None));
+        }
+    }
+    let mut storage = [UserRange::full_user_v1(); 2];
+    let count = plan.range_slice(&mut storage);
+    if count == 0 {
+        return Some(Ok(None));
+    }
+    for range in storage[..count].iter().copied() {
+        match aspace.reserve_user_range_for_access(range, UserAccessKind::Write) {
+            step_engine::StepOutcome::Done(()) => {}
+            step_engine::StepOutcome::Err(errno) => {
+                return Some(Err(Errno::from(errno)));
+            }
+            step_engine::StepOutcome::Continue { .. } | step_engine::StepOutcome::Yield { .. } => {
+                return None
+            }
+        }
+    }
+    let start = storage[..count]
+        .iter()
+        .map(|range| range.start().as_usize())
+        .min()
+        .expect("non-empty clone TID range set");
+    let end = storage[..count]
+        .iter()
+        .map(|range| range.end().as_usize())
+        .max()
+        .expect("non-empty clone TID range set");
+    let covering = match UserRange::new_aligned(UserVirtAddr(start), end - start) {
+        Ok(range) => range,
+        Err(_) => return Some(Err(Errno::EFAULT)),
+    };
+    match aspace
+        .range_lock()
+        .acquire_step_rich(covering, LockMode::Materializer)
+    {
+        AcquireResult::Acquired(guard) => match plan.validate(aspace, &guard) {
+            Ok(()) => Some(Ok(Some(guard))),
+            Err(errno) => Some(Err(errno)),
+        },
+        AcquireResult::WouldBlock(_) => None,
+    }
+}
+
+async fn reserve_clone_tid_writes<'a>(
+    aspace: &'a AddressSpace,
+    plan: &CloneTidWritePlan,
+) -> Result<Option<RangeGuard<'a>>, Errno> {
+    #[cfg(not(target_os = "none"))]
+    {
+        if [plan.parent, plan.child]
+            .into_iter()
+            .flatten()
+            .any(|ptr| ptr >= FULL_USER_V1_TOP as u64)
+        {
+            return Ok(None);
+        }
+    }
+    let mut storage = [UserRange::full_user_v1(); 2];
+    let count = plan.range_slice(&mut storage);
+    if count == 0 {
+        return Ok(None);
+    }
+    let guard = reserve_user_write_transaction(aspace, &storage[..count]).await?;
+    plan.validate(aspace, &guard)?;
+    Ok(Some(guard))
+}
+
 fn emit_clone_path_count(name: &[u8], value: u64) {
     if !clone_path_metrics_enabled() {
         return;
@@ -314,16 +475,16 @@ pub(super) fn sys_getpid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
 /// v1 has a fixed single-node test/kernel shape. Write CPU 0 and
 /// NUMA node 0 when requested; the cache pointer is obsolete on Linux
 /// and ignored.
-pub(super) fn sys_getcpu<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_getcpu(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let cpu_uaddr = args[0];
     let node_uaddr = args[1];
     if cpu_uaddr != 0 {
-        if let Err(errno) = bootstrap_write_user::<u32>(&ctx.aspace, cpu_uaddr, 0) {
+        if let Err(errno) = bootstrap_write_user_wait(&ctx.aspace, cpu_uaddr, 0u32).await {
             return SyscallResult::error_from(errno);
         }
     }
     if node_uaddr != 0 {
-        if let Err(errno) = bootstrap_write_user::<u32>(&ctx.aspace, node_uaddr, 0) {
+        if let Err(errno) = bootstrap_write_user_wait(&ctx.aspace, node_uaddr, 0u32).await {
             return SyscallResult::error_from(errno);
         }
     }
@@ -531,7 +692,7 @@ pub(super) async fn sys_execve<'a, P: PmapIf + EntropyIf + AuxvIf + tx_hal::Cons
     let path_buf = match read_user_cstr_wait(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX).await {
         Ok(buf) => buf,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
-        Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
+        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
 
     if is_identity_noop_helper(&path_buf) {
@@ -835,6 +996,21 @@ pub(super) fn sys_clone_oneshot<P: PmapIf>(
 
     let tls = if clone_settls { tls_arg } else { 0 };
 
+    // Reserve every TID output before creating or attaching the child.  A
+    // fork/munmap collision therefore makes the one-shot lane defer without
+    // side effects, and an invalid pointer cannot leave an unpublished thread
+    // attached to the process.
+    let tid_write_plan =
+        match clone_tid_write_plan(clone_parent_settid, args[2], clone_child_settid, ctid_arg) {
+            Ok(plan) => plan,
+            Err(errno) => return Some(SyscallResult::error_from(errno)),
+        };
+    let tid_write_reservation = match try_reserve_clone_tid_writes(&ctx.aspace, &tid_write_plan) {
+        Some(Ok(reservation)) => reservation,
+        Some(Err(errno)) => return Some(SyscallResult::error_from(errno)),
+        None => return None,
+    };
+
     // ── CLONE_THREAD fast path ─────────────────────────────────
     // Create a new thread within the calling process — no new
     // ProcessIdentity is created.
@@ -868,37 +1044,29 @@ pub(super) fn sys_clone_oneshot<P: PmapIf>(
         // userspace. Linux semantics: write `child_tid` (as i32)
         // before the child is scheduled.
         let parent_settid_start = clone_path_clock_now();
-        if clone_parent_settid {
-            let ptid_ptr = args[2];
-            if ptid_ptr != 0 {
-                let _ = super::user_copy::bootstrap_write_user(
-                    &ctx.aspace,
-                    ptid_ptr,
-                    child_thread.tid.0 as i32,
-                );
-            }
-        }
+        let tid_write = tid_write_plan.write(
+            &ctx.aspace,
+            child_thread.tid.0 as i32,
+            tid_write_reservation.as_ref(),
+        );
         emit_clone_path_duration(
             b"debug.clone_path.sys_clone.parent_settid_ns",
             parent_settid_start,
         );
         emit_clone_marker(b"debug.clone.parent_settid.after");
-        let child_settid_start = clone_path_clock_now();
-        if clone_child_settid {
-            let ctid_ptr = ctid_arg;
-            if ctid_ptr != 0 {
-                let _ = super::user_copy::bootstrap_write_user(
-                    &ctx.aspace,
-                    ctid_ptr,
-                    child_thread.tid.0 as i32,
-                );
-            }
+        if let Err(errno) = tid_write {
+            // Validation and the covering reservation make this unreachable
+            // unless the VM transaction contract is violated. Do not publish
+            // the child in that case.
+            return Some(SyscallResult::error_from(errno));
         }
+        let child_settid_start = clone_path_clock_now();
         emit_clone_path_duration(
             b"debug.clone_path.sys_clone.child_settid_ns",
             child_settid_start,
         );
         emit_clone_marker(b"debug.clone.child_settid.after");
+        drop(tid_write_reservation);
 
         // Hand the child thread to the reactor.
         emit_clone_marker(b"debug.clone.reactor_submit.before");
@@ -993,7 +1161,10 @@ pub(super) fn sys_clone_oneshot<P: PmapIf>(
     );
     let child_tid = child_thread.tid.0 as i32;
     if clone_parent_settid && args[2] != 0 {
-        let _ = super::user_copy::bootstrap_write_user(&ctx.aspace, args[2], child_tid);
+        if let Err(errno) = super::user_copy::bootstrap_write_user(&ctx.aspace, args[2], child_tid)
+        {
+            return Some(SyscallResult::error_from(errno));
+        }
     }
     if clone_child_cleartid && ctid_arg != 0 {
         if let Some(payload) = child_thread.payload_cap() {
@@ -1004,7 +1175,11 @@ pub(super) fn sys_clone_oneshot<P: PmapIf>(
         let child_aspace = child.aspace_cap().expect(
             ":clone:no-child-aspace: kernel-invariant violation, fresh child has no aspace",
         );
-        let _ = super::user_copy::bootstrap_write_user(&child_aspace, ctid_arg, child_tid);
+        if let Err(errno) =
+            super::user_copy::bootstrap_write_user(&child_aspace, ctid_arg, child_tid)
+        {
+            return Some(SyscallResult::error_from(errno));
+        }
     }
 
     // Hand the child's leader thread to the reactor. Panics with
@@ -1054,19 +1229,39 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
     let clone_newnet = (flags & CLONE_NEWNET) != 0;
     let clone_newns = (flags & CLONE_NEWNS) != 0;
 
-    let allowed_mask = SIGCHLD
-        | CLONE_SETTLS
-        | CLONE_VM
-        | CLONE_VFORK
-        | CLONE_SIGHAND
-        | CLONE_FILES
-        | CLONE_FS
-        | CLONE_NEWIPC
-        | CLONE_NEWNET
-        | CLONE_NEWNS
-        | CLONE_CHILD_CLEARTID
-        | CLONE_CHILD_SETTID
-        | CLONE_PARENT_SETTID;
+    let allowed_mask = if clone_thread {
+        if !clone_sighand || clone_newipc {
+            return SyscallResult::Error(EINVAL_VALUE);
+        }
+        SIGCHLD
+            | CLONE_THREAD
+            | CLONE_VM
+            | CLONE_SIGHAND
+            | CLONE_SETTLS
+            | CLONE_CHILD_CLEARTID
+            | CLONE_CHILD_SETTID
+            | CLONE_PARENT_SETTID
+            | CLONE_FILES
+            | CLONE_FS
+            | CLONE_DETACHED
+            | CLONE_SYSVSEM
+            | CLONE_NEWCGROUP
+            | CLONE_NEWUTS
+    } else {
+        SIGCHLD
+            | CLONE_SETTLS
+            | CLONE_VM
+            | CLONE_VFORK
+            | CLONE_SIGHAND
+            | CLONE_FILES
+            | CLONE_FS
+            | CLONE_NEWIPC
+            | CLONE_NEWNET
+            | CLONE_NEWNS
+            | CLONE_CHILD_CLEARTID
+            | CLONE_CHILD_SETTID
+            | CLONE_PARENT_SETTID
+    };
     if flags & !allowed_mask != 0 {
         return SyscallResult::Error(EINVAL_VALUE);
     }
@@ -1088,6 +1283,64 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
     let (tls_arg, ctid_arg) = (args[3], args[4]);
 
     let tls = if clone_settls { tls_arg } else { 0 };
+
+    if clone_thread {
+        let tid_write_plan = match clone_tid_write_plan(
+            clone_parent_settid,
+            args[2],
+            clone_child_settid,
+            ctid_arg,
+        ) {
+            Ok(plan) => plan,
+            Err(errno) => return SyscallResult::error_from(errno),
+        };
+        let tid_write_reservation =
+            match reserve_clone_tid_writes(&ctx.aspace, &tid_write_plan).await {
+                Ok(reservation) => reservation,
+                Err(errno) => return SyscallResult::error_from(errno),
+            };
+
+        let parent_payload = match ctx.thread.payload_cap() {
+            Some(payload) => payload,
+            None => return SyscallResult::Error(ESRCH_VALUE),
+        };
+        let parent_signal_mask = parent_payload.signal_mask();
+        let ctid_ptr = if clone_child_cleartid { ctid_arg } else { 0 };
+        let mut script_ctx = crate::KernelScriptCtx::new();
+        let mut op = tx_subsystems::process::CloneThreadOp {
+            process: &ctx.process,
+            parent_user_ctx: &parent_user_ctx,
+            parent_signal_mask,
+            stack: stack as usize,
+            tls: tls as usize,
+            ctid_ptr,
+        };
+        let child_thread = match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+            Ok(Ok(thread)) => thread,
+            Ok(Err(tx_subsystems::process::ForkError::ParentZombie)) => {
+                return SyscallResult::Error(ESRCH_VALUE);
+            }
+            Ok(Err(tx_subsystems::process::ForkError::Busy)) => {
+                return SyscallResult::Error(EAGAIN_VALUE);
+            }
+            Ok(Err(_)) => return SyscallResult::Error(ENOMEM_VALUE),
+            Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
+        };
+        if let Err(errno) = tid_write_plan.write(
+            &ctx.aspace,
+            child_thread.tid.0 as i32,
+            tid_write_reservation.as_ref(),
+        ) {
+            return SyscallResult::error_from(errno);
+        }
+        drop(tid_write_reservation);
+        let child_submit =
+            reactor_submit::submit_child_thread(ctx.process.clone(), child_thread.clone());
+        return SyscallResult::CloneReturn {
+            value: child_thread.tid.0 as i64,
+            child_submit,
+        };
+    }
 
     // ── Non-CLONE_THREAD process fork ─────────────────────────────
     //
@@ -1141,7 +1394,11 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
     );
     let child_tid = child_thread.tid.0 as i32;
     if clone_parent_settid && args[2] != 0 {
-        let _ = super::user_copy::bootstrap_write_user(&ctx.aspace, args[2], child_tid);
+        if let Err(errno) =
+            super::user_copy::bootstrap_write_user_wait(&ctx.aspace, args[2], child_tid).await
+        {
+            return SyscallResult::error_from(errno);
+        }
     }
     if clone_child_cleartid && ctid_arg != 0 {
         if let Some(payload) = child_thread.payload_cap() {
@@ -1152,7 +1409,11 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
         let child_aspace = child.aspace_cap().expect(
             ":clone:no-child-aspace: kernel-invariant violation, fresh child has no aspace",
         );
-        let _ = super::user_copy::bootstrap_write_user(&child_aspace, ctid_arg, child_tid);
+        if let Err(errno) =
+            super::user_copy::bootstrap_write_user_wait(&child_aspace, ctid_arg, child_tid).await
+        {
+            return SyscallResult::error_from(errno);
+        }
     }
     let child_submit = reactor_submit::submit_child_thread(child.clone(), child_thread.clone());
 
@@ -1279,13 +1540,13 @@ pub(super) async fn sys_wait4<'a, P: tx_hal::TimeIf>(
         // WNOHANG: one-shot poll, no waiting.
         match step_waitpid_nohang(&ctx.process, target) {
             Ok((child_pid, status)) => {
-                if let Err(result) = write_wait4_rusage_if_requested(ctx, rusage_uaddr) {
+                if let Err(result) = write_wait4_rusage_if_requested(ctx, rusage_uaddr).await {
                     return result;
                 }
                 if wstatus_uaddr != 0 {
                     let word = status.wait_status_word();
                     if let Err(errno) =
-                        bootstrap_write_user::<i32>(&ctx.aspace, wstatus_uaddr, word)
+                        bootstrap_write_user_wait::<i32>(&ctx.aspace, wstatus_uaddr, word).await
                     {
                         return SyscallResult::error_from(errno);
                     }
@@ -1325,12 +1586,14 @@ pub(super) async fn sys_wait4<'a, P: tx_hal::TimeIf>(
     .await
     {
         Ok(Ok((child_pid, status))) => {
-            if let Err(result) = write_wait4_rusage_if_requested(ctx, rusage_uaddr) {
+            if let Err(result) = write_wait4_rusage_if_requested(ctx, rusage_uaddr).await {
                 return result;
             }
             if wstatus_uaddr != 0 {
                 let word = status.wait_status_word();
-                if let Err(errno) = bootstrap_write_user::<i32>(&ctx.aspace, wstatus_uaddr, word) {
+                if let Err(errno) =
+                    bootstrap_write_user_wait::<i32>(&ctx.aspace, wstatus_uaddr, word).await
+                {
                     return SyscallResult::error_from(errno);
                 }
             }
@@ -1345,7 +1608,7 @@ pub(super) async fn sys_wait4<'a, P: tx_hal::TimeIf>(
     }
 }
 
-fn write_wait4_rusage_if_requested(
+async fn write_wait4_rusage_if_requested(
     ctx: &SyscallCtx<'_>,
     rusage_uaddr: u64,
 ) -> Result<(), SyscallResult> {
@@ -1353,7 +1616,9 @@ fn write_wait4_rusage_if_requested(
         return Ok(());
     }
     let zeros = [0u8; RUSAGE_BYTES];
-    bootstrap_copy_to_user(&ctx.aspace, rusage_uaddr, &zeros).map_err(SyscallResult::error_from)
+    bootstrap_copy_to_user_wait(&ctx.aspace, rusage_uaddr, &zeros)
+        .await
+        .map_err(SyscallResult::error_from)
 }
 
 async fn yield_after_reap() {
@@ -1511,7 +1776,7 @@ pub(super) fn sys_set_robust_list<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
 /// registered head/len for the current thread is enough for both
 /// private and process-shared robust mutex tests; non-current tids are
 /// resolved through the global pid/tid namespace when available.
-pub(super) fn sys_get_robust_list<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_get_robust_list(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let pid = args[0];
     let head_out = args[1];
     let len_out = args[2];
@@ -1531,10 +1796,10 @@ pub(super) fn sys_get_robust_list<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     let head = payload.robust_list_head.lock().unwrap_or(0);
     let len = *payload.robust_list_len.lock() as u64;
 
-    if let Err(errno) = bootstrap_write_user::<u64>(&ctx.aspace, head_out, head) {
+    if let Err(errno) = bootstrap_write_user_wait(&ctx.aspace, head_out, head).await {
         return SyscallResult::Error(errno_to_i32(errno));
     }
-    if let Err(errno) = bootstrap_write_user::<u64>(&ctx.aspace, len_out, len) {
+    if let Err(errno) = bootstrap_write_user_wait(&ctx.aspace, len_out, len).await {
         return SyscallResult::Error(errno_to_i32(errno));
     }
     SyscallResult::Return(0)
@@ -1563,7 +1828,7 @@ fn affinity_error_to_syscall(
 /// v1 supports the single-`u64` CPU mask shape used by txKernel's HAL
 /// `CpuMask`. `pid == 0` targets the calling thread; otherwise the numeric
 /// pid is interpreted as a tid, matching Linux's per-thread affinity ABI.
-pub(super) fn sys_sched_setaffinity<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_sched_setaffinity(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let tid = match affinity_tid_arg(args[0], ctx) {
         Ok(tid) => tid,
         Err(err) => return err,
@@ -1576,7 +1841,7 @@ pub(super) fn sys_sched_setaffinity<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) ->
     if mask_ptr == 0 {
         return SyscallResult::Error(EFAULT_VALUE);
     }
-    let mask = match bootstrap_read_user::<u64>(&ctx.aspace, mask_ptr) {
+    let mask = match bootstrap_read_user_wait::<u64>(&ctx.aspace, mask_ptr).await {
         Ok(mask) => mask,
         Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
     };
@@ -1587,7 +1852,7 @@ pub(super) fn sys_sched_setaffinity<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) ->
 }
 
 /// `sched_getaffinity(pid, cpusetsize, mask)`.
-pub(super) fn sys_sched_getaffinity<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_sched_getaffinity(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let tid = match affinity_tid_arg(args[0], ctx) {
         Ok(tid) => tid,
         Err(err) => return err,
@@ -1604,13 +1869,13 @@ pub(super) fn sys_sched_getaffinity<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) ->
         Ok(mask) => mask,
         Err(err) => return affinity_error_to_syscall(err),
     };
-    match bootstrap_write_user::<u64>(&ctx.aspace, mask_ptr, mask) {
+    match bootstrap_write_user_wait(&ctx.aspace, mask_ptr, mask).await {
         Ok(()) => SyscallResult::Return(core::mem::size_of::<u64>() as i64),
         Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
     }
 }
 
-pub(super) fn sys_getrusage<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_getrusage(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let who = args[0] as i32;
     let usage = args[1];
     if !matches!(who, RUSAGE_SELF | RUSAGE_CHILDREN | RUSAGE_THREAD) {
@@ -1620,7 +1885,7 @@ pub(super) fn sys_getrusage<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
         return SyscallResult::Error(EFAULT_VALUE);
     }
     let raw = [0u8; RUSAGE_BYTES];
-    match bootstrap_copy_to_user(&ctx.aspace, usage, &raw) {
+    match bootstrap_copy_to_user_wait(&ctx.aspace, usage, &raw).await {
         Ok(()) => SyscallResult::Return(0),
         Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
     }
@@ -1700,7 +1965,7 @@ fn sched_policy_for_tid(tid: u32) -> u32 {
         .unwrap_or(&SCHED_NORMAL_ATTR)
 }
 
-pub(super) fn sys_sched_setattr<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_sched_setattr(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let pid = args[0];
     let attr_ptr = args[1];
     let flags = args[2];
@@ -1712,7 +1977,7 @@ pub(super) fn sys_sched_setattr<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
         Err(err) => return err,
     };
 
-    let mut attr = match bootstrap_read_user::<SchedAttrLayout>(&ctx.aspace, attr_ptr) {
+    let mut attr = match bootstrap_read_user_wait::<SchedAttrLayout>(&ctx.aspace, attr_ptr).await {
         Ok(attr) => attr,
         Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
     };
@@ -1741,7 +2006,7 @@ pub(super) fn sys_sched_setattr<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
     SyscallResult::Return(0)
 }
 
-pub(super) fn sys_sched_getattr<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_sched_getattr(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let pid = args[0];
     let attr_ptr = args[1];
     let size = args[2] as u32;
@@ -1758,13 +2023,13 @@ pub(super) fn sys_sched_getattr<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
         .get(&tid)
         .copied()
         .unwrap_or_else(sched_attr_default);
-    match bootstrap_write_user::<SchedAttrLayout>(&ctx.aspace, attr_ptr, attr) {
+    match bootstrap_write_user_wait(&ctx.aspace, attr_ptr, attr).await {
         Ok(()) => SyscallResult::Return(0),
         Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
     }
 }
 
-pub(super) fn sys_sched_setscheduler<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_sched_setscheduler(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let tid = match sched_tid_arg(args[0], ctx) {
         Ok(tid) => tid,
         Err(err) => return err,
@@ -1777,7 +2042,7 @@ pub(super) fn sys_sched_setscheduler<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -
     if param_ptr == 0 {
         return SyscallResult::Error(EFAULT_VALUE);
     }
-    let param = match bootstrap_read_user::<SchedParamLayout>(&ctx.aspace, param_ptr) {
+    let param = match bootstrap_read_user_wait::<SchedParamLayout>(&ctx.aspace, param_ptr).await {
         Ok(param) => param,
         Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
     };
@@ -1800,7 +2065,7 @@ pub(super) fn sys_sched_getscheduler<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -
     SyscallResult::Return(sched_policy_for_tid(tid) as i64)
 }
 
-pub(super) fn sys_sched_setparam<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_sched_setparam(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let tid = match sched_tid_arg(args[0], ctx) {
         Ok(tid) => tid,
         Err(err) => return err,
@@ -1809,7 +2074,7 @@ pub(super) fn sys_sched_setparam<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     if param_ptr == 0 {
         return SyscallResult::Error(EFAULT_VALUE);
     }
-    let param = match bootstrap_read_user::<SchedParamLayout>(&ctx.aspace, param_ptr) {
+    let param = match bootstrap_read_user_wait::<SchedParamLayout>(&ctx.aspace, param_ptr).await {
         Ok(param) => param,
         Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
     };
@@ -1823,7 +2088,7 @@ pub(super) fn sys_sched_setparam<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     SyscallResult::Return(0)
 }
 
-pub(super) fn sys_sched_getparam<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_sched_getparam(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let tid = match sched_tid_arg(args[0], ctx) {
         Ok(tid) => tid,
         Err(err) => return err,
@@ -1837,7 +2102,7 @@ pub(super) fn sys_sched_getparam<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
         .get(&tid)
         .copied()
         .unwrap_or(SchedParamLayout { sched_priority: 0 });
-    match bootstrap_write_user::<SchedParamLayout>(&ctx.aspace, param_ptr, param) {
+    match bootstrap_write_user_wait(&ctx.aspace, param_ptr, param).await {
         Ok(()) => SyscallResult::Return(0),
         Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
     }
@@ -1853,17 +2118,19 @@ pub(super) fn sys_sched_yield() -> SyscallResult {
 /// ENOSYS (the unimplemented default) made NUMA-aware userspace bail: the la
 /// cyclictest build probes the policy here and aborted with "unable to get
 /// scheduler parameters". A benign success lets it proceed.
-pub(super) fn sys_get_mempolicy<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_get_mempolicy(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let mode_ptr = args[0];
     let nodemask_ptr = args[1];
     let maxnode = args[2];
     if mode_ptr != 0 {
-        if let Err(errno) = bootstrap_write_user::<i32>(&ctx.aspace, mode_ptr, 0) {
+        if let Err(errno) = bootstrap_write_user_wait(&ctx.aspace, mode_ptr, 0i32).await {
             return SyscallResult::Error(errno_to_i32(errno));
         }
     }
     if nodemask_ptr != 0 && maxnode >= 1 {
-        let _ = bootstrap_write_user::<u64>(&ctx.aspace, nodemask_ptr, 1);
+        if let Err(errno) = bootstrap_write_user_wait(&ctx.aspace, nodemask_ptr, 1u64).await {
+            return SyscallResult::Error(errno_to_i32(errno));
+        }
     }
     SyscallResult::Return(0)
 }
@@ -1888,7 +2155,10 @@ pub(super) fn sys_sched_get_priority_min(args: [u64; 6]) -> SyscallResult {
     }
 }
 
-pub(super) fn sys_sched_rr_get_interval<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_sched_rr_get_interval(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'_>,
+) -> SyscallResult {
     if let Err(err) = sched_tid_arg(args[0], ctx) {
         return err;
     }
@@ -1897,7 +2167,7 @@ pub(super) fn sys_sched_rr_get_interval<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>
         return SyscallResult::Error(EFAULT_VALUE);
     }
     let raw = [0u8; 16];
-    match bootstrap_copy_to_user(&ctx.aspace, interval, &raw) {
+    match bootstrap_copy_to_user_wait(&ctx.aspace, interval, &raw).await {
         Ok(()) => SyscallResult::Return(0),
         Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
     }
@@ -1966,7 +2236,7 @@ fn clamp_nice(prio: i32) -> i32 {
     prio.clamp(NICE_MIN, NICE_MAX)
 }
 
-pub(super) fn sys_prctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_prctl(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     const PR_SET_PDEATHSIG: u64 = 1;
     const PR_GET_PDEATHSIG: u64 = 2;
     const PR_GET_DUMPABLE: u64 = 3;
@@ -2008,7 +2278,7 @@ pub(super) fn sys_prctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                 return SyscallResult::Error(EFAULT_VALUE);
             }
             let sig = *PR_PDEATHSIG.lock().get(&ctx.process.pid.0).unwrap_or(&0);
-            match bootstrap_write_user::<i32>(&ctx.aspace, ptr, sig) {
+            match bootstrap_write_user_wait::<i32>(&ctx.aspace, ptr, sig).await {
                 Ok(()) => SyscallResult::Return(0),
                 Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
             }
@@ -2035,7 +2305,7 @@ pub(super) fn sys_prctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                 return SyscallResult::Error(EFAULT_VALUE);
             }
             let mut comm = [0u8; 16];
-            if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut comm, ptr) {
+            if let Err(errno) = bootstrap_copy_from_user_wait(&ctx.aspace, &mut comm, ptr).await {
                 return SyscallResult::Error(errno_to_i32(errno));
             }
             comm[15] = 0;
@@ -2051,7 +2321,7 @@ pub(super) fn sys_prctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                 return SyscallResult::Error(EFAULT_VALUE);
             }
             let comm = ctx.process.comm();
-            match bootstrap_copy_to_user(&ctx.aspace, ptr, &comm) {
+            match bootstrap_copy_to_user_wait(&ctx.aspace, ptr, &comm).await {
                 Ok(()) => SyscallResult::Return(0),
                 Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
             }
@@ -2078,7 +2348,7 @@ pub(super) fn sys_prctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             if ptr == 0 {
                 return SyscallResult::Error(EFAULT_VALUE);
             }
-            match bootstrap_write_user::<i32>(&ctx.aspace, ptr, 0) {
+            match bootstrap_write_user_wait::<i32>(&ctx.aspace, ptr, 0).await {
                 Ok(()) => SyscallResult::Return(0),
                 Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
             }
@@ -2119,7 +2389,7 @@ pub(super) fn sys_prctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                 .lock()
                 .get(&ctx.process.pid.0)
                 .unwrap_or(&0);
-            match bootstrap_write_user::<i32>(&ctx.aspace, ptr, flag) {
+            match bootstrap_write_user_wait::<i32>(&ctx.aspace, ptr, flag).await {
                 Ok(()) => SyscallResult::Return(0),
                 Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
             }

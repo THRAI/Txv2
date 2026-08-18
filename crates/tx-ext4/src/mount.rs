@@ -5,7 +5,8 @@ use alloc::sync::Arc;
 use tx_ext4_format::pager::BlockImage;
 use tx_ext4_format::pager::Ext4Pager;
 use tx_ext4_format::{
-    capability::{CapabilityProfileHash, Tier1Capabilities, Tier1MountFacts},
+    capability::{CapabilityProfileHash, RwProfile, Tier1MountFacts},
+    journal::{Jbd2Features, JBD2_BLOCK_SUPERBLOCK_V2},
     ondisk::Superblock,
 };
 use tx_subsystems::execution::Errno;
@@ -116,7 +117,31 @@ pub fn mount_ext4_read_write<I>(image: I) -> Result<MountedExt4<I>, Errno>
 where
     I: BlockImage + Send + 'static,
 {
-    open_ext4_with_backend_planner(image, false, None)
+    mount_ext4_read_write_with_profile(image, RwProfile::Tier1)
+}
+
+/// Mount ext4 read-write under one explicitly selected admission profile.
+///
+/// There is no fallback between profiles. This plain backend retains the
+/// historical Tier 1 behavior and rejects
+/// [`RwProfile::LegacyNoMetadataCsum`]; factory filesystems must use
+/// [`mount_ext4_read_write_with_discovered_journal_profile`] so replay and the
+/// mutation journal runtime cannot be bypassed.
+pub fn mount_ext4_read_write_with_profile<I>(
+    image: I,
+    profile: RwProfile,
+) -> Result<MountedExt4<I>, Errno>
+where
+    I: BlockImage + Send + 'static,
+{
+    // The legacy profile is only safe through the discovered-journal path,
+    // which validates JBD2 features, replays recovery, and installs the
+    // mutation runtime. A plain writable backend would bypass every one of
+    // those durability gates.
+    if profile != RwProfile::Tier1 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    open_ext4_with_backend_planner_and_mapping_profile(image, false, None, None, profile)
 }
 
 /// Recover an image's on-disk JBD2 state, then mount it through the legacy
@@ -226,22 +251,12 @@ pub fn mount_ext4_read_write_with_mutation_journal_io_manager_planner<I>(
 where
     I: BlockImage + Send + 'static,
 {
-    let mutation_provider = Ext4PagerMutationPlanSource::new();
-    let source = runtime.source();
-    let metadata_runtime = Arc::clone(&runtime);
-    let binding = Ext4PlannerBinding::with_plan_sources(
+    mount_ext4_read_write_with_mutation_journal_io_manager_planner_profile(
+        image,
         geometry,
-        source.clone(),
-        JournalMutationWriteSource::new(mutation_provider.clone(), runtime),
-    );
-    let mounted = open_ext4_with_planner_binding(image, false, binding)?;
-    mounted.backend.disable_legacy_writeback();
-    mutation_provider.bind(&mounted.backend);
-    mounted
-        .backend
-        .bind_metadata_mutation_runtime(metadata_runtime);
-    source.bind_settlement_observer(mounted.backend.clone());
-    Ok(mounted)
+        runtime,
+        RwProfile::Tier1,
+    )
 }
 
 /// Build a mutation-journal mount from the image's own JBD2 geometry.
@@ -254,10 +269,37 @@ pub fn mount_ext4_read_write_with_discovered_journal<I>(
 where
     I: BlockImage + Send + 'static,
 {
-    validate_tier1_rw_profile(&image)?;
+    mount_ext4_read_write_with_discovered_journal_profile(
+        image,
+        geometry,
+        device,
+        pool,
+        RwProfile::Tier1,
+    )
+}
+
+/// Build a mutation-journal mount under an explicitly selected filesystem and
+/// journal profile. All filesystem and JBD2 feature checks complete before
+/// replay, recovery-state publication, or any other block write.
+pub fn mount_ext4_read_write_with_discovered_journal_profile<I>(
+    image: I,
+    geometry: Ext4BlockGeometry,
+    device: DeviceKey,
+    pool: JournalPagePool,
+    profile: RwProfile,
+) -> Result<MountedExt4<I>, Errno>
+where
+    I: BlockImage + Send + 'static,
+{
+    validate_rw_profile(&image, profile)?;
     let mut pager = Ext4Pager::open(image).map_err(|_| Errno::EIO)?;
     let superblock = pager.superblock();
     let journal_geometry = pager.journal_geometry().map_err(|_| Errno::EIO)?;
+    validate_rw_journal_profile(
+        profile,
+        journal_geometry.superblock.block_type,
+        journal_geometry.features,
+    )?;
     let mut image = pager.into_inner();
     let _recovery =
         recover_if_required(&mut image, &superblock, &journal_geometry).map_err(|_| Errno::EIO)?;
@@ -281,7 +323,9 @@ where
         )
         .map_err(|_| Errno::EIO)?,
     );
-    mount_ext4_read_write_with_mutation_journal_io_manager_planner(image, geometry, runtime)
+    mount_ext4_read_write_with_mutation_journal_io_manager_planner_profile(
+        image, geometry, runtime, profile,
+    )
 }
 
 fn open_ext4_with_backend_planner<I>(
@@ -320,10 +364,29 @@ fn open_ext4_with_backend_planner_and_mapping<I>(
 where
     I: BlockImage + Send + 'static,
 {
+    open_ext4_with_backend_planner_and_mapping_profile(
+        image,
+        read_only,
+        backend_planner,
+        extent_mapping,
+        RwProfile::Tier1,
+    )
+}
+
+fn open_ext4_with_backend_planner_and_mapping_profile<I>(
+    image: I,
+    read_only: bool,
+    backend_planner: Option<Arc<dyn BackendPlanner>>,
+    extent_mapping: Option<Arc<crate::planner::Ext4MappingTable>>,
+    profile: RwProfile,
+) -> Result<MountedExt4<I>, Errno>
+where
+    I: BlockImage + Send + 'static,
+{
     let profile_hash = if read_only {
         None
     } else {
-        Some(validate_tier1_rw_profile(&image)?)
+        Some(validate_rw_profile(&image, profile)?)
     };
     let backend = Ext4FsInstance::open_with_backend_planner_and_mapping(
         image,
@@ -348,11 +411,111 @@ where
     })
 }
 
-fn validate_tier1_rw_profile<I: BlockImage>(image: &I) -> Result<CapabilityProfileHash, Errno> {
+fn validate_rw_profile<I: BlockImage>(
+    image: &I,
+    profile: RwProfile,
+) -> Result<CapabilityProfileHash, Errno> {
     let mut block = [0; tx_ext4_format::pager::BLOCK_SIZE];
     image.read_block(0, &mut block).map_err(|_| Errno::EIO)?;
     let superblock = Superblock::parse(&block[1024..2048]).map_err(|_| Errno::EIO)?;
-    Tier1Capabilities::generated()
+    profile
         .admit_mount(Tier1MountFacts::from_superblock(&superblock))
         .map_err(|_| Errno::EOPNOTSUPP)
+}
+
+fn validate_tier1_rw_profile<I: BlockImage>(image: &I) -> Result<CapabilityProfileHash, Errno> {
+    validate_rw_profile(image, RwProfile::Tier1)
+}
+
+fn validate_rw_journal_profile(
+    profile: RwProfile,
+    superblock_type: u32,
+    features: Jbd2Features,
+) -> Result<(), Errno> {
+    if profile == RwProfile::LegacyNoMetadataCsum
+        && (superblock_type != JBD2_BLOCK_SUPERBLOCK_V2 || features != Jbd2Features::REVOKE_64BIT)
+    {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    Ok(())
+}
+
+fn mount_ext4_read_write_with_mutation_journal_io_manager_planner_profile<I>(
+    image: I,
+    geometry: Ext4BlockGeometry,
+    runtime: Arc<JournalMutationRuntime>,
+    profile: RwProfile,
+) -> Result<MountedExt4<I>, Errno>
+where
+    I: BlockImage + Send + 'static,
+{
+    let mutation_provider = Ext4PagerMutationPlanSource::new();
+    let source = runtime.source();
+    let metadata_runtime = Arc::clone(&runtime);
+    let binding = Ext4PlannerBinding::with_plan_sources(
+        geometry,
+        source.clone(),
+        JournalMutationWriteSource::new(mutation_provider.clone(), runtime),
+    );
+    let mounted = open_ext4_with_backend_planner_and_mapping_profile(
+        image,
+        false,
+        Some(binding.planner()),
+        Some(binding.mapping()),
+        profile,
+    )?;
+    mounted.backend.disable_legacy_writeback();
+    mutation_provider.bind(&mounted.backend);
+    mounted
+        .backend
+        .bind_metadata_mutation_runtime(metadata_runtime);
+    source.bind_settlement_observer(mounted.backend.clone());
+    Ok(mounted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_journal_profile_is_exact_and_never_falls_back() {
+        assert_eq!(
+            validate_rw_journal_profile(
+                RwProfile::LegacyNoMetadataCsum,
+                JBD2_BLOCK_SUPERBLOCK_V2,
+                Jbd2Features::REVOKE_64BIT,
+            ),
+            Ok(())
+        );
+        for features in [
+            Jbd2Features::NONE,
+            Jbd2Features::REVOKE,
+            Jbd2Features::BLOCK_64BIT,
+        ] {
+            assert_eq!(
+                validate_rw_journal_profile(
+                    RwProfile::LegacyNoMetadataCsum,
+                    JBD2_BLOCK_SUPERBLOCK_V2,
+                    features,
+                ),
+                Err(Errno::EOPNOTSUPP)
+            );
+        }
+        assert_eq!(
+            validate_rw_journal_profile(
+                RwProfile::LegacyNoMetadataCsum,
+                tx_ext4_format::journal::JBD2_BLOCK_SUPERBLOCK_V1,
+                Jbd2Features::REVOKE_64BIT,
+            ),
+            Err(Errno::EOPNOTSUPP)
+        );
+        assert_eq!(
+            validate_rw_journal_profile(
+                RwProfile::Tier1,
+                tx_ext4_format::journal::JBD2_BLOCK_SUPERBLOCK_V1,
+                Jbd2Features::NONE,
+            ),
+            Ok(())
+        );
+    }
 }

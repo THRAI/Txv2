@@ -554,20 +554,28 @@ impl SpinLock {
     }
 
     fn lock(&self) -> SpinGuard<'_> {
-        self.lock_with_progress(|| {})
+        let mut wait = crate::sync::SpinWait::new();
+        while self
+            .held
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            wait.tick();
+        }
+        SpinGuard { lock: self }
     }
 
     fn lock_with_progress<F>(&self, mut progress: F) -> SpinGuard<'_>
     where
         F: FnMut(),
     {
+        let mut wait = crate::sync::SpinWait::new();
         while self
             .held
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            progress();
-            core::hint::spin_loop();
+            wait.tick_with(&mut progress);
         }
         SpinGuard { lock: self }
     }

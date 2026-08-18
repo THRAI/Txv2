@@ -101,7 +101,7 @@ pub(super) async fn sys_getrandom<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
 }
 
 /// `sethostname(name, len)` — Linux generic ABI `__NR_sethostname = 161`.
-pub(super) fn sys_sethostname<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_sethostname(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let name_uaddr = args[0];
     let len = args[1] as usize;
 
@@ -114,7 +114,9 @@ pub(super) fn sys_sethostname<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
 
     let mut next = [0u8; UTSNAME_FIELD];
     if len != 0 {
-        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut next[..len], name_uaddr) {
+        if let Err(errno) =
+            bootstrap_copy_from_user_wait(&ctx.aspace, &mut next[..len], name_uaddr).await
+        {
             return SyscallResult::error_from(errno);
         }
     }
@@ -137,13 +139,13 @@ pub(super) fn sys_sethostname<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
 ///   `loongarch64`) so musl's architecture probes see the right target.
 ///
 /// SAFETY: kernel-buffer exemption (mirrors `sys_getresuid`).
-pub(super) fn sys_uname<'a, P: AuxvIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_uname<P: AuxvIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let buf_uaddr = args[0];
     if buf_uaddr == 0 {
         return SyscallResult::Error(EFAULT_VALUE);
     }
     let utsname = build_utsname_for_machine(P::arch_auxv_facts().platform);
-    if let Err(errno) = bootstrap_write_user::<UtsnameLayout>(&ctx.aspace, buf_uaddr, utsname) {
+    if let Err(errno) = bootstrap_write_user_wait(&ctx.aspace, buf_uaddr, utsname).await {
         return SyscallResult::error_from(errno);
     }
     SyscallResult::Return(0)
@@ -163,7 +165,7 @@ pub(super) fn sys_uname<'a, P: AuxvIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
 /// Unknown resource ids return `-EINVAL`. Null `old_rlim` is OK (the
 /// arm just reports back via the return value) — Linux only requires
 /// the writeback when `old_rlim` is non-null.
-pub(super) fn sys_prlimit64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_prlimit64(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let pid = args[0] as u32;
     let resource = args[1] as u32;
     let new_uaddr = args[2];
@@ -176,7 +178,8 @@ pub(super) fn sys_prlimit64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
     }
 
     if matches!(resource, RLIMIT_NOFILE | RLIMIT_MEMLOCK) && new_uaddr != 0 {
-        let new_limit = match bootstrap_read_user::<RlimitLayout>(&ctx.aspace, new_uaddr) {
+        let new_limit = match bootstrap_read_user_wait::<RlimitLayout>(&ctx.aspace, new_uaddr).await
+        {
             Ok(limit) => limit,
             Err(errno) => return SyscallResult::error_from(errno),
         };
@@ -231,19 +234,19 @@ pub(super) fn sys_prlimit64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
     };
 
     if old_uaddr != 0 {
-        if let Err(errno) = bootstrap_write_user::<RlimitLayout>(&ctx.aspace, old_uaddr, limit) {
+        if let Err(errno) = bootstrap_write_user_wait(&ctx.aspace, old_uaddr, limit).await {
             return SyscallResult::error_from(errno);
         }
     }
     SyscallResult::Return(0)
 }
 
-pub(super) fn sys_getrlimit<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
-    sys_prlimit64([0, args[0], 0, args[1], 0, 0], ctx)
+pub(super) async fn sys_getrlimit(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    sys_prlimit64([0, args[0], 0, args[1], 0, 0], ctx).await
 }
 
-pub(super) fn sys_setrlimit<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
-    sys_prlimit64([0, args[0], args[1], 0, 0, 0], ctx)
+pub(super) async fn sys_setrlimit(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    sys_prlimit64([0, args[0], args[1], 0, 0, 0], ctx).await
 }
 
 #[repr(C)]

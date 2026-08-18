@@ -3,7 +3,7 @@ use core::marker::PhantomData;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 
-use tx_hal::{PlatformInfoIf, TxPlatform};
+use tx_hal::{MmioRegion, PciFunctionId, PlatformInfoIf, TxPlatform};
 use tx_substrate::step::{NoProgress, StepOutcome};
 use tx_substrate::SpinMutex;
 use tx_subsystems::execution::{Errno, Guard};
@@ -52,8 +52,7 @@ pub struct VirtioMmioNet<P: TxPlatform, const QUEUE_SIZE: usize> {
 }
 
 pub struct VirtioPciNet<P: TxPlatform, const QUEUE_SIZE: usize> {
-    ecam_region_name: &'static str,
-    mmio32_region_name: &'static str,
+    source: PciNetSource,
     inner: SpinMutex<
         Option<VirtioNetRawState<P, virtio_drivers::transport::pci::PciTransport, QUEUE_SIZE>>,
     >,
@@ -62,6 +61,18 @@ pub struct VirtioPciNet<P: TxPlatform, const QUEUE_SIZE: usize> {
     mtu: AtomicU16,
     stats: VirtioNetStats,
     _platform: PhantomData<fn() -> P>,
+}
+
+#[derive(Clone, Copy)]
+enum PciNetSource {
+    LegacyNames {
+        ecam: &'static str,
+        mmio32: &'static str,
+    },
+    Function {
+        ecam: MmioRegion,
+        function: PciFunctionId,
+    },
 }
 
 struct VirtioNetRawState<P: TxPlatform, T: Transport, const QUEUE_SIZE: usize> {
@@ -165,8 +176,22 @@ impl<P: TxPlatform, const QUEUE_SIZE: usize> VirtioMmioNet<P, QUEUE_SIZE> {
 impl<P: TxPlatform, const QUEUE_SIZE: usize> VirtioPciNet<P, QUEUE_SIZE> {
     pub const fn new(ecam_region_name: &'static str, mmio32_region_name: &'static str) -> Self {
         Self {
-            ecam_region_name,
-            mmio32_region_name,
+            source: PciNetSource::LegacyNames {
+                ecam: ecam_region_name,
+                mmio32: mmio32_region_name,
+            },
+            inner: SpinMutex::new(None),
+            initialized: AtomicBool::new(false),
+            mac: AtomicU64::new(0),
+            mtu: AtomicU16::new(DEFAULT_MTU),
+            stats: VirtioNetStats::new(),
+            _platform: PhantomData,
+        }
+    }
+
+    pub const fn from_function(ecam: MmioRegion, function: PciFunctionId) -> Self {
+        Self {
+            source: PciNetSource::Function { ecam, function },
             inner: SpinMutex::new(None),
             initialized: AtomicBool::new(false),
             mac: AtomicU64::new(0),
@@ -181,10 +206,17 @@ impl<P: TxPlatform, const QUEUE_SIZE: usize> VirtioPciNet<P, QUEUE_SIZE> {
             return Ok(());
         }
 
-        let ecam = pci::mmio_region::<P>(self.ecam_region_name).map_err(VirtioNetError::Pci)?;
-        let mmio32 = pci::mmio_region::<P>(self.mmio32_region_name).map_err(VirtioNetError::Pci)?;
-        let transport =
-            pci::find_virtio_net_transport::<P>(ecam, mmio32).map_err(VirtioNetError::Pci)?;
+        let transport = match self.source {
+            PciNetSource::LegacyNames { ecam, mmio32 } => {
+                let ecam = pci::mmio_region::<P>(ecam).map_err(VirtioNetError::Pci)?;
+                let mmio32 = pci::mmio_region::<P>(mmio32).map_err(VirtioNetError::Pci)?;
+                pci::find_virtio_net_transport::<P>(ecam, mmio32)
+            }
+            PciNetSource::Function { ecam, function } => {
+                pci::open_virtio_net_transport_at::<P>(ecam, function)
+            }
+        }
+        .map_err(VirtioNetError::Pci)?;
         init_raw_device(self, transport)
     }
 

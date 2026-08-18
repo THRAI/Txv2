@@ -75,6 +75,8 @@ pub enum Errno {
     EISCONN,
     EISDIR,
     ELOOP,
+    /// Per-process file-descriptor table limit reached. Linux value: 24.
+    EMFILE,
     ENAMETOOLONG,
     ENODEV,
     ENOEXEC,
@@ -151,6 +153,7 @@ impl Errno {
             Errno::EISCONN => 106,
             Errno::EISDIR => 21,
             Errno::ELOOP => 40,
+            Errno::EMFILE => 24,
             Errno::ENAMETOOLONG => 36,
             Errno::ENODEV => 19,
             Errno::ENOEXEC => 8,

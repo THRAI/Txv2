@@ -46,7 +46,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use reactor_entry::userspace::SyscallRequest;
-use tx_hal::{AuxvIf, CacheIf, EntropyIf, IpiKind, PmapIf, SmpIf, TimeIf};
+use tx_hal::{AuxvIf, CacheIf, EntropyIf, IpiKind, PmapIf, SmpIf, TimeIf, UserPtr};
 use tx_observe::encode::{
     arg_value_tag, encode_arg_value, encode_syscall_enter, encode_syscall_exit, syscall_enter_tag,
     syscall_exit_tag,
@@ -66,9 +66,9 @@ use tx_subsystems::page_backed::{
     AnonSwapPolicy, PageContainer, PageContainerKind, TruncateOp as FdTruncateOp,
 };
 use tx_subsystems::process::{
-    process_by_pid, seed_child_leader_context, step_waitpid_nohang, ChdirOp, ChdirOutcome, CloseOp,
-    Dup3Op, DupOp, ExitStatus, FcntlDupFdOp, FcntlFdOp, GetcwdOp, Pgid, Pid, ProcessIdentity,
-    SetpgidOp, SetsidOp, WaitError, WaitTarget,
+    process_by_pid, process_group_by_pgid, seed_child_leader_context, step_waitpid_nohang, ChdirOp,
+    ChdirOutcome, CloseOp, Dup3Op, DupOp, ExitStatus, FcntlDupFdOp, FcntlFdOp, GetcwdOp, Pgid, Pid,
+    ProcessIdentity, SetpgidOp, SetsidOp, WaitError, WaitTarget,
 };
 use tx_subsystems::reactor_submit;
 use tx_subsystems::signal::{
@@ -83,12 +83,13 @@ use tx_subsystems::thread_runtime::{
 };
 use tx_subsystems::tty::execution::{
     step_ioctl_tcgets, step_ioctl_tcsets, step_ioctl_tiocgpgrp, step_ioctl_tiocgwinsz,
-    step_ioctl_tiocnotty, step_ioctl_tiocsctty_for_process, step_ioctl_tiocspgrp,
+    step_ioctl_tiocnotty, step_ioctl_tiocsctty_for_process, step_ioctl_tiocspgrp_for_process,
     step_ioctl_tiocswinsz, IoctlCaller,
 };
 use tx_subsystems::tty::structure::{Termios, Winsize};
 use tx_subsystems::vfs::composite::{
-    AccessOp, ChmodOp, ChownOp, MknodOp, NanosleepOp, RenameOp, StatOp, StatxOp, StatxResult,
+    AccessOp, ChmodOp, ChownOp, LstatOp, LstatxOp, MknodOp, NanosleepOp, RenameOp, StatOp, StatxOp,
+    StatxResult,
 };
 use tx_subsystems::vfs::structure::{
     Credential, FsNotifyInstance, FsNotifyKind, InodeKind, InodeMeta, OpenFileBacking,
@@ -100,8 +101,9 @@ use tx_subsystems::vfs::{
     OpenOp, ResolveOpenTargetInMountNamespaceOp, ResolveOpenTargetOp, TruncateFsObjectOp,
 };
 use tx_subsystems::vm::{
-    AddressSpace, MadviseAdvice, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking,
-    VmEntryFlags, VmMapError, VmMapRequest, VmRemapRequest, FULL_USER_V1_TOP, USER_PAGE_SIZE,
+    AcquireResult, AddressSpace, LockMode, MadviseAdvice, MapPlacement, Prot, RangeGuard,
+    UserAccessKind, UserRange, UserVirtAddr, VmBacking, VmEntryFlags, VmMapError, VmMapRequest,
+    VmRemapRequest, FULL_USER_V1_TOP, USER_PAGE_SIZE,
 };
 use tx_subsystems::wait_source;
 
@@ -437,15 +439,17 @@ pub(super) fn next_stdio_fd_below_nofile(
     }
 }
 
-/// Required sigsetsize per Linux RV64 generic ABI: 8 bytes (a single
-/// `u64` bitset matching `tx_subsystems::signal::SignalMask`'s
-/// internal representation). `rt_sigprocmask` / `rt_sigaction`
-/// reject any other value with `-EINVAL`.
+/// Native sigset width for the Linux generic 64-bit ABI: one `u64` matching
+/// `tx_subsystems::signal::SignalMask`'s internal representation.
+///
+/// LoongArch old-world compatibility accepts a 16-byte userspace sigset at
+/// the syscall boundary, retains the supported low word, and clears the high
+/// word on output. Other targets continue to require this native 8-byte size.
 pub(super) const SIGSETSIZE_BYTES: u64 = 8;
 /// Minimum alternate signal stack size (Linux: MINSIGSTKSZ = 2048).
 pub(super) const MINSIGSTKSZ: u64 = 2048;
-/// Size of the kernel `struct sigaction` exchanged via `rt_sigaction`
-/// on the RV64/LA64 generic ABI.
+/// Size of the native kernel `struct sigaction` exchanged via `rt_sigaction`
+/// on the RV64/LoongArch new-world generic ABI.
 ///
 /// Both architectures include `asm-generic/signal.h` without defining
 /// `SA_RESTORER`, so the kernel ABI contains exactly three 64-bit words:
@@ -458,7 +462,9 @@ pub(super) const MINSIGSTKSZ: u64 = 2048;
 /// };
 /// ```
 ///
-/// In particular this is **not** libc's public 152-byte `struct sigaction`.
+/// LoongArch old-world uses a separate 32-byte wire image with a 16-byte
+/// sigset; that compatibility layout is selected and encoded in `signal.rs`.
+/// This constant is **not** libc's public 152-byte `struct sigaction`.
 /// Glibc translates that public object to this 24-byte kernel image before
 /// issuing syscall 134. Writing a fourth word here corrupts the wrapper's
 /// stack and makes concurrent signal delivery fail nondeterministically.
@@ -661,7 +667,13 @@ pub fn dispatch_pthread_hot_oneshot(
     let prev = install_observation_parent(l0_span);
     let result = match req.nr {
         NR_FUTEX => sys_futex_oneshot(req.args, ctx)?,
-        NR_RT_SIGPROCMASK => sys_rt_sigprocmask(req.args, ctx),
+        NR_RT_SIGPROCMASK => match sys_rt_sigprocmask_oneshot(req.args, ctx) {
+            Some(result) => result,
+            None => {
+                restore_observation_parent(prev);
+                return None;
+            }
+        },
         NR_SET_TID_ADDRESS => sys_set_tid_address(req.args, ctx),
         _ => unreachable!("pthread hot dispatch prefilter covers all arms"),
     };
@@ -698,8 +710,13 @@ pub fn dispatch_clone_oneshot<P: PmapIf>(
     let l0_span = emit_syscall_enter(req);
     let prev = install_observation_parent(l0_span);
     let ctx = SyscallCtx::new(process.clone(), thread.clone(), aspace.clone());
-    let result = sys_clone_oneshot::<P>(req.args, &ctx)
-        .expect("dispatch_clone_oneshot prefilters process-fork async clone");
+    let result = match sys_clone_oneshot::<P>(req.args, &ctx) {
+        Some(result) => result,
+        None => {
+            restore_observation_parent(prev);
+            return None;
+        }
+    };
     restore_observation_parent(prev);
     emit_syscall_exit(l0_span, &result);
     Some(result)
@@ -805,7 +822,13 @@ pub fn dispatch_thread_aspace_oneshot(
     }
     let l0_span = emit_syscall_enter(req);
     let prev = install_observation_parent(l0_span);
-    let result = sys_rt_sigprocmask_thread_aspace(req.args, thread, aspace);
+    let result = match sys_rt_sigprocmask_thread_aspace(req.args, thread, aspace) {
+        Some(result) => result,
+        None => {
+            restore_observation_parent(prev);
+            return None;
+        }
+    };
     restore_observation_parent(prev);
     emit_syscall_exit(l0_span, &result);
     Some(result)
@@ -825,7 +848,13 @@ pub fn dispatch_thread_payload_aspace_oneshot(
     }
     let l0_span = emit_syscall_enter(req);
     let prev = install_observation_parent(l0_span);
-    let result = sys_rt_sigprocmask_thread_payload_aspace(req.args, thread, payload, aspace);
+    let result = match sys_rt_sigprocmask_thread_payload_aspace(req.args, thread, payload, aspace) {
+        Some(result) => result,
+        None => {
+            restore_observation_parent(prev);
+            return None;
+        }
+    };
     restore_observation_parent(prev);
     emit_syscall_exit(l0_span, &result);
     Some(result)
@@ -929,14 +958,11 @@ where
         }
         NR_MMAP => dispatch_vm_try_oneshot(req, aspace),
         NR_GETPPID => dispatch_cap_only_immediate(req, process),
-        // Pure queries / clock reads: never yield, never touch
-        // VFS/VM/reactor state. They reuse the same Lane-1 immediate
-        // handlers the generic dispatcher runs; serving them from the
-        // trap shell skips the full run_thread reactor round-trip
-        // (~576us measured end-to-end for getpid under TCG). The trap
-        // shell only routes here when no signal is pending (see
-        // `direct_syscall_preconditions`), so AST delivery timing is
-        // unchanged.
+        // Pure scalar queries and resident clock writebacks. Clock calls are
+        // not actually VM-free: they write a timespec/timeval into userspace.
+        // Their one-shot handlers therefore return `None` on a RangeLock or
+        // materialisation collision, allowing the ordinary wait-capable
+        // syscall future to finish the write without leaking `EIO`.
         NR_GETPID | NR_GETTID | NR_GETUID | NR_GETEUID | NR_GETGID | NR_GETEGID
         | NR_CLOCK_GETTIME | NR_GETTIMEOFDAY => {
             let l0_span = emit_syscall_enter(req);
@@ -948,8 +974,8 @@ where
                 nr if nr == NR_GETEUID => sys_geteuid(&ctx),
                 nr if nr == NR_GETGID => sys_getgid(&ctx),
                 nr if nr == NR_GETEGID => sys_getegid(&ctx),
-                nr if nr == NR_CLOCK_GETTIME => sys_clock_gettime::<P>(req.args, &ctx),
-                nr if nr == NR_GETTIMEOFDAY => sys_gettimeofday::<P>(req.args, &ctx),
+                nr if nr == NR_CLOCK_GETTIME => sys_clock_gettime_oneshot::<P>(req.args, &ctx)?,
+                nr if nr == NR_GETTIMEOFDAY => sys_gettimeofday_oneshot::<P>(req.args, &ctx)?,
                 _ => unreachable!("direct query prefilter covers all arms"),
             };
             emit_syscall_exit(l0_span, &result);
@@ -1069,10 +1095,9 @@ fn emit_writev_hot_trace(name: &[u8], value: i64) {
 /// This handles the libcbench tmpfile shape without allocating and polling the
 /// broad async `sys_writev` future. It is deliberately a narrow prefilter:
 /// non-PageBacked fds return `None` and continue through the existing async
-/// dispatcher. PageBacked writes that unexpectedly need to yield surface
-/// `EAGAIN`; the current PageBacked user-buffer path materializes
-/// synchronously, so that is a defensive future-backend branch rather than the
-/// libcbench path.
+/// dispatcher. A zero-progress PageBacked `Yield` also returns `None`, so the
+/// waiting async dispatcher owns the wait/retry rather than exposing a
+/// kernel-internal scheduling boundary as userspace `EAGAIN`.
 pub fn dispatch_writev_pagebacked_oneshot(
     req: &SyscallRequest,
     ctx: &SyscallCtx<'_>,
@@ -1081,11 +1106,10 @@ pub fn dispatch_writev_pagebacked_oneshot(
         return None;
     }
 
+    emit_writev_hot_trace(b"debug.writev.pagebacked_dispatch.enter", req.nr as i64);
+    let result = sys_writev_pagebacked_oneshot(req.args, ctx)?;
     let l0_span = emit_syscall_enter(req);
     let prev = install_observation_parent(l0_span);
-    emit_writev_hot_trace(b"debug.writev.pagebacked_dispatch.enter", req.nr as i64);
-    let result =
-        sys_writev_pagebacked_oneshot(req.args, ctx).unwrap_or(SyscallResult::Error(EAGAIN_VALUE));
     emit_writev_hot_trace(b"debug.writev.pagebacked_dispatch.after", req.nr as i64);
     restore_observation_parent(prev);
     emit_syscall_exit(l0_span, &result);
@@ -1142,8 +1166,10 @@ pub fn dispatch_fs_hot_oneshot<P: tx_hal::ConsoleIf>(
     if req.nr == NR_STATX {
         return sys_statx_post_handoff_oneshot(req.args, ctx);
     }
+    if req.nr == NR_FSTAT {
+        return sys_fstat_cached_oneshot(req.args, ctx);
+    }
     let result = match req.nr {
-        NR_FSTAT => sys_fstat::<P>(req.args, ctx),
         NR_FCNTL => sys_fcntl(req.args, ctx),
         NR_LSEEK => sys_lseek(
             req.args[0] as u32,
@@ -1158,8 +1184,9 @@ pub fn dispatch_fs_hot_oneshot<P: tx_hal::ConsoleIf>(
             req.args[2] as u32,
             ctx,
         ),
-        NR_GETCWD => sys_getcwd(req.args, ctx),
-        NR_IOCTL => sys_ioctl(req.args, ctx),
+        // ioctl includes user-memory transfers; let the wait-capable dispatcher
+        // own it so VM range contention cannot escape as EIO.
+        NR_IOCTL => return None,
         NR_FADVISE64_64 => sys_fadvise64(req.args, ctx),
         NR_READAHEAD => sys_readahead(req.args, ctx),
         NR_SYNC_FILE_RANGE => sys_sync_file_range(req.args, ctx),
@@ -1335,40 +1362,42 @@ where
         nr if nr == NR_GETGID => return sys_getgid(ctx),
         nr if nr == NR_GETEGID => return sys_getegid(ctx),
         nr if nr == NR_GETGROUPS => return sys_getgroups(req.args),
-        nr if nr == NR_GETRESUID => return sys_getresuid(req.args, ctx),
-        nr if nr == NR_GETRESGID => return sys_getresgid(req.args, ctx),
+        nr if nr == NR_GETRESUID => return sys_getresuid(req.args, ctx).await,
+        nr if nr == NR_GETRESGID => return sys_getresgid(req.args, ctx).await,
         nr if nr == NR_GETPRIORITY => return sys_getpriority(req.args, ctx),
         nr if nr == NR_SETPRIORITY => return sys_setpriority(req.args, ctx),
-        nr if nr == NR_TIMES => return sys_times::<P>(req.args, ctx),
-        nr if nr == NR_GETTIMEOFDAY => return sys_gettimeofday::<P>(req.args, ctx),
-        nr if nr == NR_GETITIMER => return sys_getitimer::<P>(req.args, ctx),
-        nr if nr == NR_SETITIMER => return sys_setitimer::<P>(req.args, ctx),
-        nr if nr == NR_SETTIMEOFDAY => return sys_settimeofday::<P>(req.args, ctx),
+        nr if nr == NR_TIMES => return sys_times::<P>(req.args, ctx).await,
+        nr if nr == NR_GETTIMEOFDAY => return sys_gettimeofday::<P>(req.args, ctx).await,
+        nr if nr == NR_GETITIMER => return sys_getitimer::<P>(req.args, ctx).await,
+        nr if nr == NR_SETITIMER => return sys_setitimer::<P>(req.args, ctx).await,
+        nr if nr == NR_SETTIMEOFDAY => return sys_settimeofday::<P>(req.args, ctx).await,
         nr if nr == NR_UMASK => return sys_umask(req.args, ctx),
-        nr if nr == NR_UNAME => return sys_uname::<P>(req.args, ctx),
-        nr if nr == NR_SETHOSTNAME => return sys_sethostname(req.args, ctx),
-        nr if nr == NR_PRLIMIT64 => return sys_prlimit64(req.args, ctx),
-        nr if nr == NR_GETRLIMIT => return sys_getrlimit(req.args, ctx),
-        nr if nr == NR_SETRLIMIT => return sys_setrlimit(req.args, ctx),
-        nr if nr == NR_GETRUSAGE => return sys_getrusage(req.args, ctx),
+        nr if nr == NR_UNAME => return sys_uname::<P>(req.args, ctx).await,
+        nr if nr == NR_SETHOSTNAME => return sys_sethostname(req.args, ctx).await,
+        nr if nr == NR_PRLIMIT64 => return sys_prlimit64(req.args, ctx).await,
+        nr if nr == NR_GETRLIMIT => return sys_getrlimit(req.args, ctx).await,
+        nr if nr == NR_SETRLIMIT => return sys_setrlimit(req.args, ctx).await,
+        nr if nr == NR_GETRUSAGE => return sys_getrusage(req.args, ctx).await,
         nr if nr == NR_RT_SIGRETURN => return sys_rt_sigreturn(ctx),
-        nr if nr == NR_SCHED_GETATTR => return sys_sched_getattr(req.args, ctx),
-        nr if nr == NR_SCHED_SETATTR => return sys_sched_setattr(req.args, ctx),
-        nr if nr == NR_SCHED_GETAFFINITY => return sys_sched_getaffinity(req.args, ctx),
-        nr if nr == NR_SCHED_SETAFFINITY => return sys_sched_setaffinity(req.args, ctx),
-        nr if nr == NR_SCHED_SETSCHEDULER => return sys_sched_setscheduler(req.args, ctx),
-        nr if nr == NR_SCHED_SETPARAM => return sys_sched_setparam(req.args, ctx),
+        nr if nr == NR_SCHED_GETATTR => return sys_sched_getattr(req.args, ctx).await,
+        nr if nr == NR_SCHED_SETATTR => return sys_sched_setattr(req.args, ctx).await,
+        nr if nr == NR_SCHED_GETAFFINITY => return sys_sched_getaffinity(req.args, ctx).await,
+        nr if nr == NR_SCHED_SETAFFINITY => return sys_sched_setaffinity(req.args, ctx).await,
+        nr if nr == NR_SCHED_SETSCHEDULER => return sys_sched_setscheduler(req.args, ctx).await,
+        nr if nr == NR_SCHED_SETPARAM => return sys_sched_setparam(req.args, ctx).await,
         nr if nr == NR_SCHED_GETSCHEDULER => return sys_sched_getscheduler(req.args, ctx),
-        nr if nr == NR_SCHED_GETPARAM => return sys_sched_getparam(req.args, ctx),
-        nr if nr == NR_GET_MEMPOLICY => return sys_get_mempolicy(req.args, ctx),
+        nr if nr == NR_SCHED_GETPARAM => return sys_sched_getparam(req.args, ctx).await,
+        nr if nr == NR_GET_MEMPOLICY => return sys_get_mempolicy(req.args, ctx).await,
         nr if nr == NR_SCHED_YIELD => return sys_sched_yield(),
         nr if nr == NR_SCHED_GET_PRIORITY_MAX => return sys_sched_get_priority_max(req.args),
         nr if nr == NR_SCHED_GET_PRIORITY_MIN => return sys_sched_get_priority_min(req.args),
-        nr if nr == NR_SCHED_RR_GET_INTERVAL => return sys_sched_rr_get_interval(req.args, ctx),
-        nr if nr == NR_PRCTL => return sys_prctl(req.args, ctx),
+        nr if nr == NR_SCHED_RR_GET_INTERVAL => {
+            return sys_sched_rr_get_interval(req.args, ctx).await
+        }
+        nr if nr == NR_PRCTL => return sys_prctl(req.args, ctx).await,
         nr if nr == NR_SET_TID_ADDRESS => return sys_set_tid_address(req.args, ctx),
         nr if nr == NR_SET_ROBUST_LIST => return sys_set_robust_list(req.args, ctx),
-        nr if nr == NR_GET_ROBUST_LIST => return sys_get_robust_list(req.args, ctx),
+        nr if nr == NR_GET_ROBUST_LIST => return sys_get_robust_list(req.args, ctx).await,
         nr if nr == NR_RESTART_SYSCALL => return SyscallResult::Error(ENOSYS_VALUE),
         nr if nr == NR_MADVISE => return sys_madvise(req.args, ctx),
         nr if nr == NR_MLOCK => return sys_mlock(req.args, ctx).await,
@@ -1438,8 +1467,8 @@ where
         nr if nr == NR_RECVMSG => sys_recvmsg::<P>(req.args, ctx).await,
         nr if nr == NR_SENDMMSG => sys_sendmmsg(req.args, ctx).await,
         nr if nr == NR_RECVMMSG => sys_recvmmsg::<P>(req.args, ctx).await,
-        nr if nr == NR_SETITIMER => time::sys_setitimer::<P>(req.args, ctx),
-        nr if nr == NR_GETITIMER => time::sys_getitimer::<P>(req.args, ctx),
+        nr if nr == NR_SETITIMER => time::sys_setitimer::<P>(req.args, ctx).await,
+        nr if nr == NR_GETITIMER => time::sys_getitimer::<P>(req.args, ctx).await,
         nr if nr == NR_SENDFILE64 => sys_sendfile64(req.args, ctx).await,
         nr if nr == NR_PPOLL => sys_ppoll::<P>(req.args, ctx).await,
         nr if nr == NR_PSELECT6 => sys_pselect6::<P>(req.args, ctx).await,
@@ -1447,17 +1476,17 @@ where
         nr if nr == NR_EXIT => sys_exit(req.args, ctx).await,
         nr if nr == NR_EXIT_GROUP => sys_exit_group(req.args, ctx),
         nr if nr == NR_BRK => sys_brk(req.args, ctx).await,
-        nr if nr == NR_RT_SIGPROCMASK => sys_rt_sigprocmask(req.args, ctx),
-        nr if nr == NR_RT_SIGACTION => sys_rt_sigaction(req.args, ctx),
-        nr if nr == NR_RT_SIGPENDING => sys_rt_sigpending(req.args, ctx),
+        nr if nr == NR_RT_SIGPROCMASK => sys_rt_sigprocmask(req.args, ctx).await,
+        nr if nr == NR_RT_SIGACTION => sys_rt_sigaction(req.args, ctx).await,
+        nr if nr == NR_RT_SIGPENDING => sys_rt_sigpending(req.args, ctx).await,
         nr if nr == NR_RT_SIGSUSPEND => return sys_rt_sigsuspend::<P>(req.args, ctx).await,
         nr if nr == NR_RT_SIGQUEUEINFO => sys_rt_sigqueueinfo(req.args, ctx),
         nr if nr == NR_RT_SIGTIMEDWAIT => sys_rt_sigtimedwait::<P>(req.args, ctx).await,
-        nr if nr == NR_SIGALTSTACK => sys_sigaltstack(req.args, ctx),
+        nr if nr == NR_SIGALTSTACK => sys_sigaltstack(req.args, ctx).await,
         nr if nr == NR_CAPGET => sys_capget(req.args, ctx),
         nr if nr == NR_CAPSET => sys_capset(req.args, ctx),
         nr if nr == NR_PIDFD_OPEN => sys_pidfd_open(req.args, ctx),
-        nr if nr == NR_PIDFD_SEND_SIGNAL => sys_pidfd_send_signal(req.args, ctx),
+        nr if nr == NR_PIDFD_SEND_SIGNAL => sys_pidfd_send_signal(req.args, ctx).await,
         nr if nr == NR_FCNTL => sys_fcntl(req.args, ctx),
         nr if nr == NR_SHMCTL => sys_shmctl(req.args, ctx),
         nr if nr == NR_MSGCTL => sys_msgctl(req.args, ctx),
@@ -1474,8 +1503,8 @@ where
         nr if nr == NR_SETSID => sys_setsid(ctx),
         nr if nr == NR_SET_TID_ADDRESS => sys_set_tid_address(req.args, ctx),
         nr if nr == NR_SET_ROBUST_LIST => sys_set_robust_list(req.args, ctx),
-        nr if nr == NR_GET_ROBUST_LIST => sys_get_robust_list(req.args, ctx),
-        nr if nr == NR_GETCPU => sys_getcpu(req.args, ctx),
+        nr if nr == NR_GET_ROBUST_LIST => sys_get_robust_list(req.args, ctx).await,
+        nr if nr == NR_GETCPU => sys_getcpu(req.args, ctx).await,
         nr if nr == NR_PERSONALITY => sys_personality(req.args, ctx),
         // Wave 2 of the DAC + setuid slice — Part 3 (cred-mutation /
         // cred-reading arms). Each wraps a Wave 1 `cred::step_*`
@@ -1604,9 +1633,9 @@ where
         // `nanosleep` / `clock_nanosleep` park the task on the reactor
         // timer queue for real-duration sleeps; zero-duration and
         // past-deadline cases short-circuit immediately.
-        nr if nr == NR_CLOCK_GETTIME => sys_clock_gettime::<P>(req.args, ctx),
-        nr if nr == NR_CLOCK_SETTIME => sys_clock_settime::<P>(req.args, ctx),
-        nr if nr == NR_CLOCK_GETRES => sys_clock_getres(req.args, ctx),
+        nr if nr == NR_CLOCK_GETTIME => sys_clock_gettime::<P>(req.args, ctx).await,
+        nr if nr == NR_CLOCK_SETTIME => sys_clock_settime::<P>(req.args, ctx).await,
+        nr if nr == NR_CLOCK_GETRES => sys_clock_getres(req.args, ctx).await,
         nr if nr == NR_NANOSLEEP => sys_nanosleep::<P>(req.args, ctx).await,
         nr if nr == NR_CLOCK_NANOSLEEP => sys_clock_nanosleep::<P>(req.args, ctx).await,
         // Slice 5 of the shell-prompt roadmap — `ioctl(2)` + TTY
@@ -1616,14 +1645,14 @@ where
         // step functions exist; the arm decodes `request` and
         // dispatches. Non-TTY fds and unknown request codes return
         // `-ENOTTY` per Linux's `man ioctl_tty`.
-        nr if nr == NR_IOCTL => sys_ioctl(req.args, ctx),
+        nr if nr == NR_IOCTL => sys_ioctl(req.args, ctx).await,
         // Slice 6 of the shell-prompt roadmap — stat family
         // (`fstat` / `newfstatat` / `getdents64` / `getcwd` / `chdir`
         // / `umask`). `fchdir` returns `-ENOSYS` (carryover; OpenFile
         // has no DEntry hint to install via step_chdir).
-        nr if nr == NR_FSTAT => sys_fstat::<P>(req.args, ctx),
+        nr if nr == NR_FSTAT => sys_fstat::<P>(req.args, ctx).await,
         nr if nr == NR_NEWFSTATAT => sys_newfstatat::<P>(req.args, ctx).await,
-        nr if nr == NR_GETCWD => sys_getcwd(req.args, ctx),
+        nr if nr == NR_GETCWD => sys_getcwd(req.args, ctx).await,
         nr if nr == NR_CHDIR => sys_chdir(req.args, ctx).await,
         nr if nr == NR_FCHDIR => sys_fchdir::<P>(req.args, ctx).await,
         nr if nr == NR_STATFS => sys_statfs::<P>(req.args, ctx).await,
@@ -1750,14 +1779,17 @@ where
         // existing signalfd. Returns the fd. The companion
         // signalfd-shaped read(2) arm lives in sys_read after the
         // ufd discriminator.
-        nr if nr == NR_SIGNALFD => sys_signalfd(req.args, ctx),
-        nr if nr == NR_SIGNALFD4 => sys_signalfd4(
-            req.args[0] as i32,
-            req.args[1],
-            req.args[2],
-            req.args[3] as u32,
-            ctx,
-        ),
+        nr if nr == NR_SIGNALFD => sys_signalfd(req.args, ctx).await,
+        nr if nr == NR_SIGNALFD4 => {
+            sys_signalfd4(
+                req.args[0] as i32,
+                req.args[1],
+                req.args[2],
+                req.args[3] as u32,
+                ctx,
+            )
+            .await
+        }
         // eventfd2(init_val, flags) — mints an eventfd.
         nr if nr == NR_EVENTFD2 => sys_eventfd2(req.args[0], req.args[1] as u32, ctx),
         // timerfd_create(clockid, flags) — mints a timerfd.
@@ -1765,16 +1797,19 @@ where
             sys_timerfd_create(req.args[0] as u32, req.args[1] as u32, ctx)
         }
         // timerfd_settime(fd, flags, new_value, old_value).
-        nr if nr == NR_TIMERFD_SETTIME => sys_timerfd_settime::<P>(
-            req.args[0] as u32,
-            req.args[1] as u32,
-            req.args[2],
-            req.args[3],
-            ctx,
-        ),
+        nr if nr == NR_TIMERFD_SETTIME => {
+            sys_timerfd_settime::<P>(
+                req.args[0] as u32,
+                req.args[1] as u32,
+                req.args[2],
+                req.args[3],
+                ctx,
+            )
+            .await
+        }
         // timerfd_gettime(fd, curr_value).
         nr if nr == NR_TIMERFD_GETTIME => {
-            sys_timerfd_gettime::<P>(req.args[0] as u32, req.args[1], ctx)
+            sys_timerfd_gettime::<P>(req.args[0] as u32, req.args[1], ctx).await
         }
         // POSIX timer syscalls.
         nr if nr == NR_TIMER_CREATE => {
@@ -1797,13 +1832,16 @@ where
         // epoll_wait wrapper calls epoll_pwait with a null mask on
         // these targets.
         nr if nr == NR_EPOLL_CREATE1 => sys_epoll_create1(req.args[0] as u32, ctx),
-        nr if nr == NR_EPOLL_CTL => sys_epoll_ctl(
-            req.args[0] as u32,
-            req.args[1] as u32,
-            req.args[2] as u32,
-            req.args[3],
-            ctx,
-        ),
+        nr if nr == NR_EPOLL_CTL => {
+            sys_epoll_ctl(
+                req.args[0] as u32,
+                req.args[1] as u32,
+                req.args[2] as u32,
+                req.args[3],
+                ctx,
+            )
+            .await
+        }
         nr if nr == NR_EPOLL_PWAIT => {
             sys_epoll_wait::<P>(
                 req.args[0] as u32,
@@ -1964,6 +2002,7 @@ pub(super) fn errno_to_i32(errno: Errno) -> i32 {
         Errno::EISDIR => 21,
         Errno::ELIBBAD => 80,
         Errno::ELOOP => 40,
+        Errno::EMFILE => EMFILE_VALUE,
         Errno::EMLINK => 31,
         Errno::ENAMETOOLONG => 36,
         Errno::ENODEV => 19,

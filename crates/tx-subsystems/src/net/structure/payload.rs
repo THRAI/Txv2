@@ -850,9 +850,18 @@ impl SocketPayload {
     pub fn io_snapshot(&self) -> SocketIoState {
         SocketIoState {
             recv_len: self.raw_recv_available(),
+            recv_ready: self.recv_ready(),
             send_space: self.raw_send_available(),
             accept_pending: self.tcp_backlog.lock().connected_len(),
         }
+    }
+
+    /// Whether receive would consume a queued record or byte.
+    ///
+    /// Keep this separate from `io_snapshot().recv_len`: datagram protocols
+    /// can have a readable record whose payload length is zero.
+    pub fn recv_ready(&self) -> bool {
+        self.raw_recv_ready()
     }
 
     pub fn unix_peer_cred(&self) -> Option<UnixPeerCred> {
@@ -1685,6 +1694,16 @@ impl SocketPayload {
         }
     }
 
+    fn raw_recv_ready(&self) -> bool {
+        match &self.imp {
+            // A queued zero-length UDP datagram is readable even though the
+            // payload byte count is zero. smoltcp's record queue is the
+            // authoritative source for this protocol.
+            SocketImpl::Udp(raw_udp) => raw_udp.recv_ready(),
+            _ => self.raw_recv_available() != 0,
+        }
+    }
+
     fn raw_send_available(&self) -> usize {
         if let Some(raw_packet) = self.imp.packet() {
             return raw_packet.send_available();
@@ -1800,6 +1819,7 @@ const fn default_family_for_kind(kind: SocketKind) -> AddressFamily {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SocketIoState {
     pub recv_len: usize,
+    pub recv_ready: bool,
     pub send_space: usize,
     pub accept_pending: usize,
 }

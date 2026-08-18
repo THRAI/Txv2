@@ -4,7 +4,7 @@ use super::*;
 use crate::adapter::step_engine::{
     self as step_engine, guard, page_allocator, reserve_for, sign_for, Cap, StepOutcome,
 };
-use crate::linux_syscall::clear_stat_meta_overrides;
+use crate::linux_syscall::{clear_stat_meta_overrides, dispatch_fs_lookup_hot};
 use alloc::sync::Arc;
 use alloc::vec;
 use tx_fs::tmpfs::{Tmpfs, TMPFS_ROOT_OBJECT_ID};
@@ -22,8 +22,8 @@ use tx_subsystems::vfs::structure::{
 };
 use tx_subsystems::vfs::{FsOps, OpenFile};
 use tx_subsystems::vm::{
-    MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntryFlags, VmMapRequest,
-    USER_PAGE_SIZE,
+    AcquireResult, LockMode, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntryFlags,
+    VmMapRequest, USER_PAGE_SIZE,
 };
 
 use crate::linux_syscall::{
@@ -437,6 +437,57 @@ fn dispatch_newfstatat_at_symlink_nofollow_stats_link() {
     drop(path);
 }
 
+/// Git and `find` use `newfstatat(..., AT_SYMLINK_NOFOLLOW)` as `lstat`.
+/// A dangling final symlink must therefore stat successfully as the link
+/// itself instead of following its missing target and returning `ENOENT`.
+#[test]
+fn dispatch_newfstatat_nofollow_stats_dangling_symlink() {
+    let _setup = stat_setup();
+    let (root_dentry, tmpfs, _root_rnode, root_mount) = build_tmpfs_root();
+    let owner_cred = Credential {
+        uid: 0,
+        gid: 0,
+        effective_caps: CapabilitySet::FULL,
+    };
+    let link_id = {
+        let guard = guard();
+        match tmpfs.symlink(
+            TMPFS_ROOT_OBJECT_ID,
+            b"probe-link",
+            b"missing-target",
+            &owner_cred,
+            &guard,
+        ) {
+            StepOutcome::Done((id, _meta)) => id,
+            other => panic!("symlink probe-link -> missing-target: {other:?}"),
+        }
+    };
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry, root_mount);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let path = nul_terminate(b"/probe-link");
+    let mut statbuf = vec![0u8; STAT_BYTES];
+    let req = SyscallRequest::new(
+        NR_NEWFSTATAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            statbuf.as_mut_ptr() as u64,
+            crate::linux_syscall::AT_SYMLINK_NOFOLLOW as u64,
+            0,
+            0,
+        ],
+    );
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Return(0));
+    assert_eq!(
+        read_u32_at(&statbuf, STAT_MODE_OFF) as u16 & 0o170000,
+        S_IFLNK
+    );
+    assert_eq!(read_u64_at(&statbuf, STAT_INO_OFF), link_id.as_u64());
+    drop(path);
+}
+
 /// `newfstatat(AT_FDCWD, "/missing", &statbuf, 0)` surfaces the
 /// walker's `Errno::ENOENT` as `-ENOENT`.
 #[test]
@@ -653,6 +704,54 @@ fn direct_statx_reads_resident_cached_fd_without_reactor_handoff() {
     assert_eq!(read_u16_at(&statxbuf, STATX_MODE_OFF) & 0o170000, 0o010000);
 }
 
+/// An overlapping VM writer is a transient scheduling condition. The
+/// synchronous statx lane must decline it, then the async lane waits and
+/// retries instead of leaking `EIO` to Cargo.
+#[test]
+fn statx_output_waits_for_range_writer_instead_of_returning_eio() {
+    let _setup = stat_setup();
+    let (root_dentry, _tmpfs, _root_rnode, root_mount) = build_tmpfs_root();
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry, root_mount);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let path_uaddr = map_resident_user_bytes(&ctx, 0x63b0_0000, b"/\0");
+    let statx_uaddr = map_resident_user_bytes(&ctx, 0x63b0_1000, &[0]);
+    let request = SyscallRequest::new(
+        NR_STATX,
+        [
+            AT_FDCWD as i64 as u64,
+            path_uaddr,
+            0,
+            crate::linux_syscall::numbers::STATX_BASIC_STATS as u64,
+            statx_uaddr,
+            0,
+        ],
+    );
+    let output_page =
+        UserRange::containing_page(UserVirtAddr(statx_uaddr as usize)).expect("statx page");
+    let writer = match ctx
+        .aspace
+        .range_lock()
+        .acquire_step_rich(output_page, LockMode::ExclusiveWriter)
+    {
+        AcquireResult::Acquired(writer) => writer,
+        AcquireResult::WouldBlock(_) => panic!("fresh output page range must be writable"),
+    };
+
+    assert_eq!(
+        dispatch_fs_hot_oneshot::<ShimsTestPmap>(&request, &ctx),
+        None,
+        "range contention must fall through to the wait-capable statx lane"
+    );
+
+    drop(writer);
+
+    assert_eq!(
+        block_on(dispatch_fs_lookup_hot::<ShimsTestPmap>(request, &ctx)),
+        Some(SyscallResult::Return(0))
+    );
+}
+
 /// `statx(fd, "", AT_EMPTY_PATH, STATX_BASIC_STATS, statxbuf)`
 /// mirrors `fstat(fd)`. LA64 musl may use this fd form for its public
 /// `fstat(2)` wrapper.
@@ -754,6 +853,55 @@ fn dispatch_statx_at_symlink_nofollow_stats_link() {
     let ctx = make_ctx(proc_cap, thread);
 
     let path = nul_terminate(b"/link");
+    let mut statxbuf = vec![0u8; STATX_BYTES];
+    let req = SyscallRequest::new(
+        NR_STATX,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            crate::linux_syscall::AT_SYMLINK_NOFOLLOW as u64,
+            crate::linux_syscall::numbers::STATX_BASIC_STATS as u64,
+            statxbuf.as_mut_ptr() as u64,
+            0,
+        ],
+    );
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Return(0));
+    let mode = read_u16_at(&statxbuf, STATX_MODE_OFF);
+    assert_eq!(mode & 0o170000, S_IFLNK, "expected S_IFLNK; got {mode:#o}");
+    assert_eq!(read_u64_at(&statxbuf, STATX_INO_OFF), link_id.as_u64());
+    drop(path);
+}
+
+/// LA64 BusyBox `find` uses `statx(..., AT_SYMLINK_NOFOLLOW)` as `lstat`.
+/// Git's dangling symlink capability probe must stat as the link itself rather
+/// than following the absent target and returning `ENOENT`.
+#[test]
+fn dispatch_statx_nofollow_stats_dangling_symlink() {
+    let _setup = stat_setup();
+    let (root_dentry, tmpfs, _root_rnode, root_mount) = build_tmpfs_root();
+    let owner_cred = Credential {
+        uid: 0,
+        gid: 0,
+        effective_caps: CapabilitySet::FULL,
+    };
+    let link_id = {
+        let guard = guard();
+        match tmpfs.symlink(
+            TMPFS_ROOT_OBJECT_ID,
+            b"probe-link",
+            b"missing-target",
+            &owner_cred,
+            &guard,
+        ) {
+            StepOutcome::Done((id, _meta)) => id,
+            other => panic!("symlink probe-link -> missing-target: {other:?}"),
+        }
+    };
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry, root_mount);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let path = nul_terminate(b"/probe-link");
     let mut statxbuf = vec![0u8; STATX_BYTES];
     let req = SyscallRequest::new(
         NR_STATX,

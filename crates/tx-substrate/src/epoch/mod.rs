@@ -125,6 +125,22 @@ pub mod testing {
         }
     }
 
+    pub fn try_advance_with_publication_fence_hooks_for_test(
+        after_publication_fence: impl FnMut(),
+        before_participant_scan: impl FnMut(tx_hal::CpuId),
+    ) -> AdvanceTestResult {
+        let result = super::domain::try_advance_with_publication_fence_hooks_for_test(
+            after_publication_fence,
+            before_participant_scan,
+        );
+        AdvanceTestResult {
+            advanced: result.advanced,
+            scan_attempts: result.scan_attempts,
+            version_before: result.version_before,
+            version_after: result.version_after,
+        }
+    }
+
     pub fn drain_requested_for_test(cpu: tx_hal::CpuId) -> bool {
         super::domain::drain_requested_for_test(cpu)
     }
@@ -174,18 +190,18 @@ pub fn guard() -> Guard<'static> {
     domain::guard()
 }
 
-/// Borrow the current CPU's active epoch guard without modifying epoch counters.
+/// Borrow the current CPU's active epoch window as a real nested guard.
 ///
 /// Returns `Some(guard)` when the current CPU already holds a guard
-/// (`local_epoch != 0`).  The returned guard has a no-op Drop: it does not
-/// call `local.leave()` or decrement `active_guards`.
+/// (`local_epoch != 0`). The returned guard increments the balanced guard
+/// depth and owns a membership pin; Drop releases both contributions. It may
+/// therefore safely outlive the outer guard that was active at the call site.
 ///
 /// Returns `None` if no guard is currently held; the caller should fall back
 /// to `epoch::guard()`.
 ///
-/// Use this when code must satisfy an `&Guard` API but is called from within
-/// an existing epoch window and creating a nested guard would violate the
-/// EBR no-nesting invariant.
+/// Use this when code must satisfy an `&Guard` API from within an existing
+/// synchronous epoch window.
 pub fn borrow_current_guard() -> Option<Guard<'static>> {
     domain::borrow_guard()
 }

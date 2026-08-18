@@ -131,27 +131,32 @@ impl<P: TxPlatform> CoreInit<P> {
         Self::finish_terminal_thread_reactor_drain(&drained)
     }
 
-    fn finish_terminal_thread_reactor_drain(drained: &[boot_runtime::TaskKey]) -> bool {
+    pub(super) fn finish_terminal_thread_reactor_drain(drained: &[boot_runtime::TaskKey]) -> bool {
         if drained.is_empty() {
             return false;
         }
         emit_child_submit_marker("debug.child_submit.terminal_drain", drained.len() as i64);
 
+        // File-I/O service diagnostics must follow the same generation-checked
+        // task lifetime as the reactor table. Keeping only TaskId would let a
+        // later occupant of a reused slot inherit a stale `file_io=1` label.
+        let file_io_removed = unregister_file_io_service_reactor_tasks(drained);
+
         let mut tasks = THREAD_REACTOR_TASKS.lock();
         let before = tasks.len();
         tasks.retain(|(_, task)| !drained.iter().any(|drained_task| drained_task == task));
-        let removed = before.saturating_sub(tasks.len());
-        if removed != 0 {
+        let thread_tasks_removed = before.saturating_sub(tasks.len());
+        if thread_tasks_removed != 0 {
             bench_child_add::<P>(
                 "terminal_drained",
                 &BENCH_CHILD_TERMINAL_DRAIN,
-                removed as u64,
+                thread_tasks_removed as u64,
                 256,
             );
         }
         drop(tasks);
 
-        if removed != 0 && step_engine::borrow_current_guard().is_none() {
+        if thread_tasks_removed != 0 && step_engine::borrow_current_guard().is_none() {
             // A completed thread can release a ProcessPayload whose deferred
             // destructor drops the fd table; those OpenFile caps then enter a
             // fresh EBR grace period before their pipe endpoint destructors
@@ -179,13 +184,13 @@ impl<P: TxPlatform> CoreInit<P> {
                 "debug.child_submit.vm_recipe_reclaimed",
                 vm_recipe_reclaims as i64,
             );
-        } else if removed != 0 {
+        } else if thread_tasks_removed != 0 {
             emit_child_submit_marker(
                 "debug.child_submit.ebr_deferred_active_guard",
-                removed as i64,
+                thread_tasks_removed as i64,
             );
         }
-        removed != 0
+        thread_tasks_removed != 0 || file_io_removed != 0
     }
 
     pub(super) fn set_thread_reactor_affinity(

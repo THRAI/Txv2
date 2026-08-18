@@ -36,6 +36,44 @@ fn service_spin_wait_progress() {
     }
 }
 
+/// Install the selected platform's lock-free spin progress callback.
+///
+/// The callback is static for the lifetime of the kernel; it only services
+/// lock-free architecture progress (notably LA64 TLB shootdown mailboxes).
+#[doc(hidden)]
+pub fn install_platform_spin_progress<P: tx_hal::PmapIf>() {
+    install_spin_wait_progress(P::service_pending_tlb_shootdown);
+}
+
+/// Per-wait contention state shared by substrate spin loops.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SpinWait {
+    spins: usize,
+}
+
+impl SpinWait {
+    pub const fn new() -> Self {
+        Self { spins: 0 }
+    }
+
+    #[inline(always)]
+    pub fn tick(&mut self) {
+        self.tick_with(service_spin_wait_progress);
+    }
+
+    #[inline(always)]
+    pub fn tick_with<F>(&mut self, mut progress: F)
+    where
+        F: FnMut(),
+    {
+        self.spins = self.spins.wrapping_add(1);
+        if self.spins & 63 == 0 {
+            progress();
+        }
+        core::hint::spin_loop();
+    }
+}
+
 pub struct SpinMutex<T, M = LockMetricsOff> {
     locked: AtomicBool,
     value: UnsafeCell<T>,
@@ -148,24 +186,23 @@ impl<T, M: LockMetricsMode> SpinMutex<T, M> {
     /// Acquire the lock while periodically running a non-blocking progress
     /// hook.
     ///
-    /// This is intentionally opt-in. Architecture code can use it at locks
-    /// which participate in a synchronous cross-CPU protocol (for example a
-    /// maskable software-IPI TLB shootdown) without imposing HAL work on every
-    /// ordinary kernel spin lock.
+    /// Architecture code can use this at waits which already own their
+    /// progress operation. Ordinary [`Self::lock`] acquisitions use the
+    /// platform callback installed during substrate initialization.
     #[inline]
     pub fn lock_with_progress<F>(&self, mut progress: F) -> SpinMutexGuard<'_, T, M>
     where
         F: FnMut(),
     {
         let mut timing = M::Timing::start(&self.metrics);
+        let mut wait = SpinWait::new();
         while self
             .locked
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
             timing.spin();
-            progress();
-            core::hint::spin_loop();
+            wait.tick_with(&mut progress);
         }
         timing.acquired(self);
         SpinMutexGuard {

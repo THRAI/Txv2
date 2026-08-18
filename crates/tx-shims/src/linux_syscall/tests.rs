@@ -1282,6 +1282,75 @@ fn dispatch_thread_aspace_oneshot_handles_rt_sigprocmask_only() {
 }
 
 #[test]
+fn rt_sigprocmask_vm_contention_defers_without_mutating_mask() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let aspace = proc_cap.aspace_cap().expect("alive aspace");
+    let page = tx_subsystems::vm::UserRange::new_aligned(
+        tx_subsystems::vm::UserVirtAddr(0x2_0000),
+        tx_subsystems::vm::USER_PAGE_SIZE,
+    )
+    .expect("signal-set page");
+    aspace
+        .try_mmap(tx_subsystems::vm::VmMapRequest::fixed(
+            page,
+            tx_subsystems::vm::MapPlacement::RequireFree,
+            tx_subsystems::vm::Prot::READ_WRITE,
+            tx_subsystems::vm::VmEntryFlags::PRIVATE,
+            tx_subsystems::vm::VmBacking::PrivateAnon,
+        ))
+        .expect("map signal-set page");
+    assert!(matches!(
+        aspace.reserve_user_range_for_access(page, tx_subsystems::vm::UserAccessKind::Write,),
+        step_engine::StepOutcome::Done(())
+    ));
+    let guard = step_engine::guard();
+    assert!(matches!(
+        aspace.write_user(tx_hal::UserPtr::<u64>::new(0x2_0000), 1u64 << 9, &guard),
+        step_engine::StepOutcome::Done(())
+    ));
+    drop(guard);
+
+    let holder = match aspace
+        .range_lock()
+        .acquire_step_rich(page, tx_subsystems::vm::LockMode::ExclusiveWriter)
+    {
+        tx_subsystems::vm::AcquireResult::Acquired(guard) => guard,
+        _ => panic!("exclusive signal-set holder must acquire"),
+    };
+    let request = SyscallRequest::new(NR_RT_SIGPROCMASK, [2, 0x2_0000, 0x2_0008, 8, 0, 0]);
+    assert_eq!(
+        dispatch_thread_aspace_oneshot(&request, &thread, &aspace),
+        None
+    );
+    assert_eq!(
+        thread
+            .payload_cap()
+            .expect("thread payload alive")
+            .signal_mask()
+            .raw_bits(),
+        0,
+        "a deferred user copy must not install the new mask"
+    );
+
+    drop(holder);
+    let ctx = make_ctx(proc_cap, thread.clone());
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(request, &ctx)),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        thread
+            .payload_cap()
+            .expect("thread payload alive")
+            .signal_mask()
+            .raw_bits(),
+        1u64 << 9
+    );
+}
+
+#[test]
 fn dispatch_thread_payload_aspace_oneshot_reuses_resolved_payload() {
     let _setup = setup();
     let proc_cap = bootstrap();

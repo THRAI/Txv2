@@ -477,6 +477,8 @@ pub struct RenameOp<'a> {
     pub oldpath: &'a [u8],
     pub newpath: &'a [u8],
     pub cred: &'a Credential,
+    /// Owned, pre-resolved retry state. Caps and inline names may cross a
+    /// yield; guard-scoped witnesses and reservations are deliberately absent.
     pub state: Option<(Cap<DEntry>, InlineName, Cap<DEntry>, InlineName)>,
 }
 
@@ -491,7 +493,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for RenameOp<'a> {
         // reserve — N/A: rename reserves zone slots via FsOps
         // commit
         // publish — N/A: no signal attachments
-        let (old_parent, old_name, new_parent, new_name) = match self.state.take() {
+        let (old_parent, old_name, new_parent, new_name) = match self.state.clone() {
             Some(p) => p,
             None => {
                 let rooted_at = self.rooted_at.clone();
@@ -543,9 +545,6 @@ impl<'a, I: SubjectIdentity> StepOp<I> for RenameOp<'a> {
         outcome
     }
 }
-
-impl OneShotStepOp<ProcessIdentity> for RenameOp<'_> {}
-impl OneShotStepOp<crate::process::ProcessIdentity> for RenameOp<'_> {}
 
 // ============================================================================
 // TruncateOp — truncate / ftruncate

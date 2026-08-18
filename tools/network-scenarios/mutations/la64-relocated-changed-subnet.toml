@@ -1,0 +1,46 @@
+schema = "tx.network-scenario.v1"
+name = "la64-relocated-changed-subnet"
+target = "qemu-la64"
+
+[device]
+transport = "virtio-pci"
+
+[device.selector]
+kind = "device-id"
+value = "boot-nic"
+
+[device.placement]
+kind = "virtio-pci"
+slot = 5
+function = 0
+
+[[auxiliary]]
+id = "old-location-decoy"
+kind = "virtio-rng-pci"
+order = "before-network"
+
+[auxiliary.placement]
+kind = "virtio-pci"
+slot = 2
+function = 0
+
+[[auxiliary]]
+id = "post-network-rng"
+kind = "virtio-rng-pci"
+order = "after-network"
+
+[auxiliary.placement]
+kind = "virtio-pci"
+slot = 7
+function = 0
+
+[backend]
+kind = "qemu-user"
+id = "mutation-net"
+network = "172.31.44.0/24"
+dhcp_start = "172.31.44.77"
+gateway = "172.31.44.9"
+dns = "172.31.44.10"
+
+[guest]
+kind = "dhcp"

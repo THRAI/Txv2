@@ -11,6 +11,13 @@ use super::ZoneError;
 const STATE_MASK: u64 = 0x7;
 const HAS_NEXT_BIT: u64 = 1 << 3;
 const GENERATION_EXHAUSTED_BIT: u64 = 1 << 4;
+/// Internal one-shot ownership bit for the EBR reclaim callback.
+///
+/// This deliberately does not add another public lifecycle state: observers
+/// must continue to treat the slot as Retiring until its destructor has run
+/// and the generation is advanced. Only the callback which atomically sets
+/// this bit may touch the payload or return the slot to the allocator.
+const RECLAIM_CLAIMED_BIT: u64 = 1 << 5;
 const RETAIN_SHIFT: u64 = 16;
 const RETAIN_MASK: u64 = 0xffff_ffff;
 const GENERATION_SHIFT: u64 = 48;
@@ -74,6 +81,10 @@ impl SlotWord {
         self.0 & GENERATION_EXHAUSTED_BIT != 0
     }
 
+    pub(crate) fn reclaim_claimed(self) -> bool {
+        self.0 & RECLAIM_CLAIMED_BIT != 0
+    }
+
     pub fn retiring_next_raw(self) -> Option<u32> {
         self.has_next().then_some(self.retain())
     }
@@ -107,6 +118,14 @@ impl SlotWord {
         Self(self.with_retain(0).0 & !HAS_NEXT_BIT)
     }
 
+    pub(crate) fn with_reclaim_claimed(self) -> Self {
+        Self(self.0 | RECLAIM_CLAIMED_BIT)
+    }
+
+    fn clear_reclaim_claimed(self) -> Self {
+        Self(self.0 & !RECLAIM_CLAIMED_BIT)
+    }
+
     pub fn inc_retain(self) -> Result<Self, ZoneError> {
         let retain = self.retain();
         if retain == u32::MAX {
@@ -124,7 +143,10 @@ impl SlotWord {
     }
 
     pub fn next_free_generation(self) -> Self {
-        let cleared = self.clear_retiring_link().with_state(SlotState::Free);
+        let cleared = self
+            .clear_retiring_link()
+            .clear_reclaim_claimed()
+            .with_state(SlotState::Free);
         if self.generation() == u16::MAX {
             Self(cleared.0 | GENERATION_EXHAUSTED_BIT)
         } else {
@@ -149,6 +171,27 @@ impl SlotMeta {
         SlotWord(self.word.load(ordering))
     }
 
+    /// Atomically acquire the one-shot right to reclaim a Retiring payload.
+    ///
+    /// Returning `None` is the release-safe outcome for a stale key or a
+    /// duplicate callback: the caller must not inspect or destruct the value.
+    pub(crate) fn try_claim_reclaim(&self, expected_generation: u16) -> Option<SlotWord> {
+        loop {
+            let current = self.load(Ordering::Acquire);
+            if current.state() != SlotState::Retiring
+                || current.generation() != expected_generation
+                || current.reclaim_claimed()
+            {
+                return None;
+            }
+            let claimed = current.with_reclaim_claimed();
+            match self.compare_exchange(current, claimed, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Some(claimed),
+                Err(_) => continue,
+            }
+        }
+    }
+
     pub fn compare_exchange(
         &self,
         current: SlotWord,
@@ -160,5 +203,41 @@ impl SlotMeta {
             .compare_exchange(current.raw(), new.raw(), success, failure)
             .map(SlotWord)
             .map_err(SlotWord)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::{SlotMeta, SlotState};
+
+    #[test]
+    fn concurrent_reclaim_claim_has_exactly_one_winner() {
+        let meta = SlotMeta::free();
+        let free = meta.load(Ordering::Acquire);
+        meta.compare_exchange(
+            free,
+            free.with_state(SlotState::Retiring),
+            Ordering::Release,
+            Ordering::Relaxed,
+        )
+        .expect("test metadata enters Retiring");
+
+        let ready = std::sync::Barrier::new(3);
+        let winners = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    ready.wait();
+                    if meta.try_claim_reclaim(free.generation()).is_some() {
+                        winners.fetch_add(1, Ordering::AcqRel);
+                    }
+                });
+            }
+            ready.wait();
+        });
+
+        assert_eq!(winners.load(Ordering::Acquire), 1);
     }
 }

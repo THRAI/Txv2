@@ -1,0 +1,343 @@
+{
+  "schema": "tx.progress.plan.v1",
+  "id": "2026-08-04-portable-network-device",
+  "title": "Four-mode portable network devices and real HTTPS clone",
+  "status": "complete",
+  "created": "2026-08-04",
+  "updated": "2026-08-05",
+  "owner": "msp-and-codex",
+  "summary": "Replace board, topology, and network configuration hardcoding with one typed path for RV64 QEMU, LA64 QEMU, and VisionFive 2, while freezing a tested compile/link-time hook for an unspecified future LA real board.",
+  "scope": {
+    "in": [
+      "active HAL, page-substrate, device, invariant, and net-device design contracts",
+      "typed firmware and PCI device resource discovery",
+      "boot-time static driver matching and binding",
+      "per-device interrupt routing and DMA constraints",
+      "RV64 virtio-mmio and LA64 virtio-pci migration",
+      "external boot network configuration and scenario rendering",
+      "generic DWMAC core and StarFive glue",
+      "compile/link-time LA real-board resource-provider and xtask-profile extension hook",
+      "hermetic HTTPS Git and real-board remote clone verification"
+    ],
+    "out": [
+      "runtime HAL selection",
+      "hotplug, detach, and driver unloading",
+      "untyped firmware property bags",
+      "advanced automatic multi-uplink policy",
+      "inventing or implementing a specific LA real-board profile before its model is known",
+      "unrelated socket or filesystem redesign"
+    ],
+    "write_sets": [
+      {
+        "owner": "phase-owner",
+        "paths": [
+          "docs/design",
+          "crates/tx-hal",
+          "crates/tx-substrate",
+          "crates/tx-drivers",
+          "crates/tx-subsystems/src/net",
+          "crates/tx-kernel/src/devices.rs",
+          "crates/tx-kernel/src/irq.rs",
+          "crates/tx-kernel/src/init/net.rs",
+          "boards",
+          "xtask",
+          "tools"
+        ],
+        "notes": "Claim a narrower disjoint write set before each phase; do not implement phases concurrently across shared APIs."
+      }
+    ]
+  },
+  "context": {
+    "design_docs": [
+      "docs/Txv3/01_CONCEPTS_v5.md",
+      "docs/Txv3/02_INVARIANTS_v5.md",
+      "docs/Txv3/03_STEP_MODEL_v2.md",
+      "docs/design/00_meta-framework/INVARIANTS_v4.md",
+      "docs/design/00_meta-framework/MODULE_MAP_v1.md",
+      "docs/design/01_substrate/HAL_v1.md",
+      "docs/design/01_substrate/PAGE_SUBSTRATE_v1.md",
+      "docs/design/06_devices/DEVICE.md",
+      "docs/design/06_devices/NET_DEVICE_v1.md"
+    ],
+    "progress_refs": [
+      "docs/progress/research/2026-08-04-portable-network-device-plan.md",
+      "docs/progress/research/2026-08-04-portable-network-phase0-readiness.md",
+      "docs/progress/research/2026-08-03-network-reading-baseline.md",
+      "docs/progress/research/2026-08-04-userspace-dhcp-client-plan.md",
+      "docs/progress/plans/2026-08-04-userspace-dhcp-client.json"
+    ],
+    "external_refs": [
+      "https://doc-en.rvspace.org/VisionFive2/PG_Ethernet/JH7110_SDK/device_driver_config_ethernet.html",
+      "https://raw.githubusercontent.com/torvalds/linux/master/arch/riscv/boot/dts/starfive/jh7110.dtsi",
+      "https://raw.githubusercontent.com/torvalds/linux/master/drivers/net/ethernet/stmicro/stmmac/dwmac-starfive.c"
+    ]
+  },
+  "steps": [
+    {
+      "id": "phase-0",
+      "title": "Specify the portable resource and network contracts",
+      "status": "complete",
+      "depends_on": [],
+      "paths": [
+        "docs/design/00_meta-framework/INVARIANTS_v4.md",
+        "docs/Txv3/02_INVARIANTS_v5.md",
+        "docs/design/01_substrate/HAL_v1.md",
+        "docs/design/01_substrate/PAGE_SUBSTRATE_v1.md",
+        "docs/design/06_devices/DEVICE.md",
+        "docs/design/06_devices/NET_DEVICE_v1.md",
+        "docs/design/INDEX.md"
+      ],
+      "verification": [
+        "implementation-readiness audit reports ready: yes",
+        "active Markdown link and stale-vocabulary checks introduce no new findings"
+      ],
+      "notes": "No driver implementation starts before this phase closes. Name the static LA real-board extension seam, but do not invent a concrete board profile or resource value."
+    },
+    {
+      "id": "phase-1",
+      "title": "Add scenario-driven portability lint and mutation tests",
+      "status": "complete",
+      "depends_on": [
+        "phase-0"
+      ],
+      "paths": [
+        "xtask",
+        "tools",
+        "boards"
+      ],
+      "verification": [
+        "cargo xtask lint net-portability",
+        "negative snippets reject deployment hardcoding and positive snippets permit sourced protocol constants",
+        "deterministic topology mutations fail against the legacy path for the expected reasons"
+      ],
+      "notes": "One NetworkScenario record now feeds QEMU, shell-test, guest cmdline, host backend, and expectations. The focused lint/schema/consumer tests are green; the repository lint is intentionally red with the enumerated legacy migration debt until phase-5."
+    },
+    {
+      "id": "phase-2",
+      "title": "Implement typed resource graph, binding, per-device IRQ, and DMA",
+      "status": "complete",
+      "depends_on": [
+        "phase-1"
+      ],
+      "paths": [
+        "crates/tx-hal",
+        "crates/tx-substrate",
+        "crates/tx-drivers",
+        "crates/tx-subsystems/src/net",
+        "crates/tx-subsystems/src/device.rs",
+        "crates/tx-subsystems/src/device_binding.rs",
+        "crates/tx-kernel/src/devices.rs",
+        "crates/tx-kernel/src/devices/binder.rs",
+        "crates/tx-kernel/src/devices/runtime.rs",
+        "crates/tx-kernel/src/irq.rs",
+        "crates/tx-kernel/src/irq/device.rs",
+        "crates/tx-kernel/src/init.rs"
+      ],
+      "verification": [
+        "cargo -q xtask unit",
+        "zero, one, multiple, reordered, duplicate, missing-resource, failed-first, IRQ-routing, and DMA-constraint host tests",
+        "an architecture-neutral synthetic platform provider binds through the common path without a generic-kernel branch"
+      ],
+      "notes": "Typed graph, DMA reservation, pre-reserved bound index, per-device IRQ table, rollback-safe block/net registry tokens, static binder, compile-time CoreInit hook, RV64 firmware dual publication, one-shot runtime snapshot, class-registry commit, post-publication activation/unmask, and typed-top-half-first legacy fallback are implemented. Focused binder/runtime/IRQ tests pass 13/13, 2/2, and 10/10; the full tx-kernel library is 140/143 with only the three recorded unrelated baseline failures. Concrete VirtIO/DWMAC adapters remain in their target phases; no staging NIC or guessed resource fallback is accepted."
+    },
+    {
+      "id": "phase-3",
+      "title": "Migrate RV64 QEMU virtio-mmio",
+      "status": "complete",
+      "depends_on": [
+        "phase-2"
+      ],
+      "paths": [
+        "boards/tx-hal-riscv64-qemu-virt",
+        "boards/tx-kernel-riscv64-qemu-virt",
+        "crates/tx-drivers/src/virtio/dma.rs",
+        "crates/tx-kernel/src/devices.rs",
+        "crates/tx-kernel/src/irq.rs",
+        "xtask",
+        "tools/network-scenarios",
+        "tools/shell-tests"
+      ],
+      "verification": [
+        "cargo xtask full-build --target rv64-qemu --no-image",
+        "RV64 reordered, relocated, decoy, zero-NIC, and multi-NIC scenarios",
+        "scenario-sourced BusyBox gateway ping through the typed IRQ and constrained DMA path"
+      ],
+      "notes": "The board bundle links one descriptor-only VirtIO-MMIO network adapter. Each successful instance decodes MMIO, IRQ, and DMA-domain reference from the same firmware PlatformDevice; the driver matches compatible/type rather than an address or ordinal, publishes every discovered NIC, activates interrupts only after registry/runtime publication, and carries the exact BoundDeviceKey through deferred IRQ completion. RV64 full-build passes. Actual QEMU witnesses pass for zero NIC, a relocated NIC with old-location and post-network decoys plus a changed subnet, constrained-DMA gateway ping, and two simultaneously published NICs. Focused graph/DMA/adapter tests pass; tx-kernel is 144/147 with only the three recorded unrelated baseline failures. Full xtask tests are 259/267 with eight unrelated pre-existing time-layering/time-wake failures. HTTPS Git acceptance remains deliberately deferred to phase-9 per the requested execution order."
+    },
+    {
+      "id": "phase-4",
+      "title": "Migrate LA64 QEMU virtio-pci",
+      "status": "complete",
+      "depends_on": [
+        "phase-3"
+      ],
+      "paths": [
+        "boards/tx-hal-loongarch64-qemu-virt",
+        "crates/tx-drivers/src/virtio/pci.rs",
+        "crates/tx-kernel/src/devices.rs",
+        "crates/tx-kernel/src/irq.rs",
+        "xtask"
+      ],
+      "verification": [
+        "cargo xtask full-build --target la64-qemu --no-image",
+        "LA64 relocated, reordered, failed-first, zero-NIC, and multi-NIC scenarios"
+      ],
+      "notes": "LA64 now publishes one typed PCI host seed containing ECAM, MMIO32, and an explicit DMA domain. The provider enumerates every VirtIO network function and freezes its exact BDF, PCI identity, config window, allocated BARs, dynamically swizzled INTx IRQ, and DMA-domain reference into one PlatformDevice; the driver reopens that exact function instead of scanning for the first network device. Actual LA64 QEMU witnesses pass with the network device relocated from slot 2 to slot 5, RNG decoys before and after it, a changed subnet and gateway ping, explicit zero-NIC boot, and two simultaneously published NICs. Focused PCI adapter tests pass 4/4, LA HAL tests pass 66/66, driver PCI tests pass 1/1, scenario tests pass 12/12, and the LA64 full-build passes. The full tx-kernel library is 148/151 with only the same two libctest chmod assertions and thread-future size-budget baseline failures. The common binder's failed-first rollback test remains the architecture-neutral witness for a failed candidate before a healthy device."
+    },
+    {
+      "id": "phase-5",
+      "title": "Remove legacy hardcoded paths and enforce the portability gate",
+      "status": "complete",
+      "depends_on": [
+        "phase-4"
+      ],
+      "paths": [
+        "crates/tx-hal",
+        "crates/tx-kernel",
+        "boards",
+        "xtask",
+        "tools"
+      ],
+      "verification": [
+        "cargo xtask lint net-portability",
+        "retired architecture match, singleton IRQ, fixed-interface, staging NIC, ordinal-region, and fixed-placement APIs are absent"
+      ],
+      "notes": "Removed the legacy architecture-selected network initializer, staging NIC, fixed boot address/route seeding, global NET_IRQ, first-device/name fallback, and fixed production QEMU placement. Deferred IRQ completion now carries the exact bound key and registration. Legacy fixed-topology runners live only as explicit test fixtures, while compatibility entry points invoke them through bash. The net-portability gate is part of fast CI and reports zero findings. RV64 and LA64 both pass relocated/changed-subnet gateway, zero-NIC, and reordered two-NIC real-QEMU witnesses; both target full-builds pass. tx-hal IRQ types were split into a facade-preserving module so this work did not raise the architecture file-size ratchet."
+    },
+    {
+      "id": "phase-6",
+      "title": "Make namespace and FIB state authoritative for boot networking",
+      "status": "complete",
+      "depends_on": [
+        "phase-5"
+      ],
+      "paths": [
+        "crates/tx-kernel/src/init/net.rs",
+        "crates/tx-kernel/src/init/boot_args.rs",
+        "crates/tx-subsystems/src/net",
+        "xtask",
+        "tools"
+      ],
+      "verification": [
+        "static boot, userspace, DHCP-produced, and unconfigured scenarios",
+        "QEMU user, TAP, and bridge scenarios change network values without a kernel rebuild",
+        "source address and route match current namespace and FIB state"
+      ],
+      "notes": "BootNetRuntime no longer selects a physical NIC or seeds private IPv4/IPv6 addresses and routes. Published devices become namespace-visible through the typed registry; rtnetlink/ip or udhcpc owns link, address, route, and neighbor state. The changed-subnet QEMU witnesses configure the discovered interface from scenario inputs and reach the matching gateway without rebuilding the kernel; zero-NIC boot remains valid. DNS, proxies, and repository URL remain external inputs, and remote Git acceptance remains phase-9."
+    },
+    {
+      "id": "phase-7",
+      "title": "Freeze and test the deferred LA real-board hook",
+      "status": "complete",
+      "depends_on": [
+        "phase-6"
+      ],
+      "paths": [
+        "docs/design/01_substrate/HAL_v1.md",
+        "docs/design/06_devices",
+        "crates/tx-hal",
+        "boards",
+        "xtask"
+      ],
+      "verification": [
+        "a synthetic additional platform supplies complete, missing, and reordered resources through the common interface",
+        "no generic device, IRQ, DMA, network-policy, or Git-test branch is needed for the synthetic provider",
+        "no fictional LA board target, resource value, boot protocol, or driver is registered"
+      ],
+      "notes": "The compile-time StaticDeviceBundle/provider seam is architecture-neutral and has synthetic complete, empty, reordered, failed-first, and additional-provider witnesses. No generic kernel device/IRQ/DMA/network-policy branch or fictional LA board profile was added. Actual LA real-board resources remain intentionally deferred until its model is known and connected."
+    },
+    {
+      "id": "phase-8",
+      "title": "Implement generic DWMAC core and StarFive glue",
+      "status": "complete",
+      "depends_on": [
+        "phase-7"
+      ],
+      "paths": [
+        "crates/tx-drivers",
+        "boards/tx-hal-riscv64-qemu-virt",
+        "crates/tx-kernel/src/devices.rs",
+        "crates/tx-kernel/src/irq.rs"
+      ],
+      "verification": [
+        "typed resource decoder and missing-resource negative tests",
+        "descriptor, ring, DMA, cache-transition, PHY, and IRQ lifecycle tests",
+        "cold-board link, counters, neighbor, ICMP, TCP, HTTP, sustained transfer, and balanced IRQ accounting"
+      ],
+      "notes": "The generic 64-entry DWMAC ring, portable DMA publication barrier, typed StarFive resource binding, PHY/link setup, bounded RX IRQ masking, and Linux stmmac exclusive-tail/refill/restart sequence are implemented without controller ordinal, bootloader-state, PHY-address, DMA-window, MAC, IP, or topology literals. VF2 cold boots reached link and static userspace configuration, direct 4.71 MiB HTTP completed, public ICMP/DNS/HTTPS completed, and no RBU/RPS snapshot appeared during the final public witness. The remaining public stall was proven by pcap to be a generic TCP immediate-ACK integration bug, not a DWMAC ring failure."
+    },
+    {
+      "id": "phase-9",
+      "title": "Complete hermetic and real remote HTTPS Git acceptance",
+      "status": "complete",
+      "depends_on": [
+        "phase-8"
+      ],
+      "paths": [
+        "tools",
+        "docs/progress"
+      ],
+      "verification": [
+        "local trusted HTTPS Git succeeds and invalid time or CA fails safely",
+        "remote repository ls-remote succeeds with certificate verification enabled",
+        "parameterized shallow clone succeeds on the real board",
+        "serial log, scenario, resource summary, and resulting commit identifier are preserved"
+      ],
+      "notes": "The existing parameterized QEMU HTTPS/DHCP witness remains the stable hermetic path. On VF2, certificate-verified wget to GitHub returned 0, git ls-remote returned HEAD f5dea58cc1057f2b076cdb90b446c2c21d91171e, and a parameterized timestamped destination received a depth-1 clone of https://github.com/oscomp/xv6-riscv.git; git fsck --full returned 0. Serial evidence is preserved in /tmp/vf2-linux-tail-20260805.log and the local operation ledger."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo xtask progress validate",
+      "status": "not-run",
+      "notes": "Run whenever this operational plan changes."
+    },
+    {
+      "command": "cargo xtask lint net-portability",
+      "status": "passed",
+      "notes": "Phase-5 closure: txdoc:INV-V5-DEVRES findings: 0."
+    },
+    {
+      "command": "cargo -q xtask unit",
+      "status": "failed",
+      "notes": "Build passed; tx-ext4 37/37 and tx-scripts 167/167 passed. tx-kernel retained the three recorded unrelated failures (two libctest chmod assertions and the run_thread future-size budget), and tx-shims retained its existing failure set; no Phase-2 focused test regressed."
+    },
+    {
+      "command": "cargo test -p tx-subsystems out_of_order_data_preserves_immediate_ack_until_egress_accepts_it -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "The regression preserves an immediate out-of-order ACK across sink backpressure and advances the cumulative ACK after the missing segment arrives."
+    },
+    {
+      "command": "cargo check -p tx-subsystems",
+      "status": "passed",
+      "notes": "The generic TCP adapter change compiles; only unrelated existing warnings remain."
+    },
+    {
+      "command": "cargo xtask build --target rv64-qemu --release && cargo xtask image vf2-uimage --release",
+      "status": "passed",
+      "notes": "Produced VF2 image SHA-256 253459e8504a230bc482c236b015bc091fc6eba3b0be532b6ca4c75e4c68e096."
+    },
+    {
+      "command": "git clone --depth 1 https://github.com/oscomp/xv6-riscv.git <timestamped-devshm-destination> && git fsck --full --no-progress",
+      "status": "passed",
+      "notes": "VF2 real-board clone completed 84 objects at HEAD f5dea58cc1057f2b076cdb90b446c2c21d91171e; fsck returned 0."
+    }
+  ],
+  "risks": [
+    "The active tier-2 device contract currently rejects the required boot-time matching model; phase-0 must resolve this explicitly.",
+    "A flat or untyped resource bag would move hardcoding rather than remove it.",
+    "Keeping the legacy singleton IRQ or staging NIC as a fallback would mask incomplete platform migration.",
+    "A hook without a synthetic provider test could look extensible while still requiring future generic-kernel edits.",
+    "External Git availability is nondeterministic, so it cannot replace hermetic trusted-HTTPS coverage.",
+    "Firmware can omit required facts; probe must fail diagnostically instead of inventing defaults."
+  ],
+  "blockers": [
+    "The workspace unit gate retains unrelated pre-existing tx-shims failures plus two tx-kernel libctest chmod assertions and the run_thread future-size budget failure; the focused portable-network and TCP immediate-ACK witnesses are green.",
+    "The repository-wide progress validator remains blocked by the unrelated 2026-07-24-network-time-integration.json status value `completed`; the changed plan parses as JSON and uses only schema-valid `complete` states.",
+    "The docs lint retains its existing stale-vocabulary warnings and 31 broken links; it did not identify the new status or portable-network plan entries."
+  ],
+  "handoff": {
+    "needed": false,
+    "path": null
+  }
+}

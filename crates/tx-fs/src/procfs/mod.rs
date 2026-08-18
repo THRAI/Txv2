@@ -9,7 +9,10 @@ use tx_hal::UserPtr;
 pub mod adapter;
 mod read;
 
-pub use read::{procfs_register_boot_cmdline, procfs_register_uptime_clock, procfs_set_mounts};
+pub use read::{
+    procfs_register_boot_cmdline, procfs_register_cpuinfo_provider, procfs_register_uptime_clock,
+    procfs_set_mounts, CpuInfoSnapshot,
+};
 
 use adapter::step_engine::{Cap, NoProgress, StepOutcome};
 use tx_subsystems::execution::{Errno, Guard};
@@ -1905,10 +1908,14 @@ mod tests {
         }
     }
 
-    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn setup() -> std::sync::MutexGuard<'static, ()> {
-        let guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // The host epoch harness models one CPU.  Serialize procfs with the
+        // other tx-fs tests that acquire epoch guards, rather than only with
+        // other procfs cases, so parallel `cargo test` cannot manufacture two
+        // independent readers on synthetic CPU 0.
+        let guard = crate::test_support::FS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         tx_test_support::init_host();
         tx_subsystems::cross_crate_test_support::reset_init_process();
         tx_subsystems::cross_crate_test_support::reset_pid_counter();
@@ -2128,6 +2135,44 @@ mod tests {
         );
         let pid_mounts = read::render(pid_mounts_id);
         assert_eq!(pid_mounts, mounts);
+    }
+
+    #[test]
+    fn procfs_status_reports_active_syscall_diagnostic() {
+        let _setup = setup();
+        bootstrap_procfs_test_init_process();
+        let process = process::process_by_pid(Pid(1)).expect("init process");
+        let thread = process.nth_thread(0).expect("init leader");
+        let payload = thread.payload_cap().expect("live thread payload");
+
+        payload.begin_syscall_diagnostic(215, 0x3e3f_600000, 0x1_0000);
+        let status = read::render(pid_status_id(Pid(1)));
+        payload.end_syscall_diagnostic();
+
+        assert!(status.contains("TxSyscallTid:\t1\n"), "{status}");
+        assert!(status.contains("TxSyscallNr:\t215\n"), "{status}");
+        assert!(
+            status.contains("TxSyscallArg0:\t0x3e3f600000\n"),
+            "{status}"
+        );
+        assert!(status.contains("TxSyscallArg1:\t0x10000\n"), "{status}");
+        assert!(status.contains("TxRangeActive:\t0\n"), "{status}");
+        assert!(status.contains("TxRangePendingWriters:\t0\n"), "{status}");
+        assert!(status.contains("TxRangeWaitSource:\t0x"), "{status}");
+    }
+
+    #[test]
+    fn procfs_stat_exposes_linux_field_count_for_busybox_ps() {
+        let _setup = setup();
+        bootstrap_procfs_test_init_process();
+
+        let stat = read::render(pid_stat_id(Pid(1)));
+        let fields: Vec<_> = stat.split_ascii_whitespace().collect();
+
+        assert_eq!(fields.len(), 52, "incomplete /proc/<pid>/stat: {stat}");
+        assert_eq!(fields[0], "1");
+        assert_eq!(fields[19], "1", "field 20 is num_threads");
+        assert_eq!(fields[37], "17", "field 38 is exit_signal");
     }
 
     #[test]

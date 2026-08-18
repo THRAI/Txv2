@@ -21,6 +21,10 @@ use tx_services::time::{
 use tx_substrate::wake::{MailboxEvent, TaskMailbox};
 use tx_subsystems::cred::{step_setresuid, Uid};
 use tx_subsystems::signal::{SigDisposition, Signum};
+use tx_subsystems::vm::{
+    AcquireResult, LockMode, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntryFlags,
+    VmMapRequest,
+};
 
 const E_INVAL: i32 = 22;
 const E_FAULT: i32 = 14;
@@ -182,6 +186,29 @@ fn time_setup() -> (TestSetup, Cap<ProcessIdentity>, Cap<ThreadIdentity>) {
     (setup, proc_cap, thread)
 }
 
+fn map_time_output_page(ctx: &SyscallCtx<'_>, uaddr: usize) -> u64 {
+    let range = UserRange::new_aligned(UserVirtAddr(uaddr), USER_PAGE_SIZE).expect("time range");
+    ctx.aspace
+        .try_mmap(VmMapRequest::fixed(
+            range,
+            MapPlacement::FixedReplace,
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ))
+        .expect("map time output page");
+    let guard = guard();
+    assert_eq!(
+        ctx.aspace.copy_to_user(
+            tx_hal::UserPtr::<u8>::new(uaddr),
+            &[0; core::mem::size_of::<TestTimespec>()],
+            &guard,
+        ),
+        StepOutcome::Done(core::mem::size_of::<TestTimespec>())
+    );
+    uaddr as u64
+}
+
 /// `clock_gettime(CLOCK_MONOTONIC, ts)` succeeds and writes a
 /// `(tv_sec, tv_nsec)` pair derived from the platform clock.
 /// `ShimsTestPmap::read_ns()` starts at 5_000_000_000 ns
@@ -206,6 +233,49 @@ fn dispatch_clock_gettime_monotonic_writes_timespec_to_user() {
         (0..1_000_000_000).contains(&ts.tv_nsec),
         "tv_nsec must be in [0, 1e9): got {}",
         ts.tv_nsec,
+    );
+}
+
+/// A concurrent fork/VM writer must make the trap-local clock fast path
+/// decline. Once the writer releases, the canonical syscall path completes
+/// instead of preserving a stale EIO from the failed one-shot attempt. The VM
+/// waiter's actual Pending-to-Ready transition is covered in tx-subsystems,
+/// outside this crate's host-pointer compatibility fallback.
+#[test]
+fn clock_gettime_waits_for_vm_writer_instead_of_returning_eio() {
+    let (_setup, proc_cap, thread) = time_setup();
+    let ctx = make_ctx(proc_cap, thread);
+    let ts_uaddr = map_time_output_page(&ctx, 0x63c0_0000);
+    let request = SyscallRequest::new(
+        NR_CLOCK_GETTIME,
+        [CLOCK_MONOTONIC as u64, ts_uaddr, 0, 0, 0, 0],
+    );
+    let output_page =
+        UserRange::containing_page(UserVirtAddr(ts_uaddr as usize)).expect("clock output page");
+    let writer = match ctx
+        .aspace
+        .range_lock()
+        .acquire_step_rich(output_page, LockMode::ExclusiveWriter)
+    {
+        AcquireResult::Acquired(writer) => writer,
+        AcquireResult::WouldBlock(_) => panic!("fresh clock page must accept writer"),
+    };
+
+    assert_eq!(
+        dispatch_direct_trap_oneshot::<ShimsTestPmap>(
+            &request,
+            &ctx.process,
+            &ctx.thread,
+            &ctx.aspace,
+        ),
+        None,
+        "direct clock path must fall through on VM contention"
+    );
+
+    drop(writer);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(request, &ctx)),
+        SyscallResult::Return(0)
     );
 }
 

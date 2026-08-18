@@ -1,6 +1,6 @@
 //! Private three-bag retirement storage.
 
-use crate::zone::SlotKey;
+use crate::zone::RetiredSlot;
 
 use super::domain::EpochError;
 use super::RcuHead;
@@ -9,7 +9,7 @@ pub(crate) const EPOCH_BAG_COUNT: usize = 3;
 
 pub(crate) struct EpochBag {
     pub(crate) epoch: u64,
-    pub(crate) zone_head: Option<SlotKey>,
+    pub(crate) zone_head: Option<RetiredSlot>,
     pub(crate) zone_count: usize,
     pub(crate) rcu_head: *mut RcuHead,
     pub(crate) rcu_count: usize,

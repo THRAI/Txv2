@@ -295,7 +295,6 @@ impl TaskTable {
         }
         let future = task.future.take().ok_or(TakeRunnableError::Missing)?;
         task.status = TaskStatus::Polling;
-        task.wake_state.clear();
         task.consume_ast_markers();
         let wake_state = Arc::clone(&task.wake_state);
         let mailbox = Arc::clone(&task.mailbox);

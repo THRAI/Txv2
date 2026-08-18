@@ -1,8 +1,8 @@
 //! IRQ dispatch plus deferred UART and virtio-net bottom halves.
 //!
 //! tx-kernel owns one global `IrqDispatchTable`. Boot-time
-//! `install_irq_handlers::<P>()` populates the platform-declared UART, RTC,
-//! and network slots, then publishes the table to the platform via
+//! `install_irq_handlers::<P>()` populates the platform-declared UART and RTC
+//! slots, then publishes the table to the platform via
 //! `<P as IrqIf>::install_dispatch_table`.
 //!
 //! Per Open Q #4 (`docs/progress/plans/2026-05-06-pre-elf-runtime-completion.md`)
@@ -10,9 +10,8 @@
 //! subset, boot ordering is preserved, and IRQ dispatch stays out of
 //! linker-section magic.
 //!
-//! Per Open Q #6 the UART IRQ number flows through
-//! `<P as IrqIf>::UART_IRQ`; tx-kernel never names a board constant
-//! directly.
+//! Tier-2 device IRQs flow through the boot-frozen typed device table rather
+//! than platform-global accessors. tx-kernel never names a board constant.
 //!
 //! # IRQ-context safety
 //!
@@ -28,8 +27,12 @@
 //! half ACKs the level-triggered device before completing the original claim
 //! on its claimant hart.
 
+pub mod device;
+
 use crate::adapter::step_engine::{spin_mutex, SpinMutex};
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{
+    AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+};
 use tx_hal::{
     ConsoleIf, CpuId, IrqDispatchTable, IrqHandled, IrqHandlerFn, IrqIf, TxPlatform,
     IRQ_DISPATCH_TABLE_SIZE,
@@ -37,6 +40,20 @@ use tx_hal::{
 use tx_services::time::{platform::HalRtcDevice, RtcDeviceOps as TimeRtcDeviceOps};
 use tx_substrate::wake::MailboxSchedulerHint;
 use tx_subsystems::device::RtcEventMask;
+use tx_subsystems::device_binding::{BoundDeviceKey, BoundDeviceRegistration, DeviceIrqContext};
+use tx_subsystems::net::NetDeviceRegistration;
+
+/// Dispatch through the boot-frozen typed table first, then retain the legacy
+/// HAL table as a migration fallback for UART, RTC, and not-yet-bound devices.
+pub(crate) fn dispatch_external_irq<P: TxPlatform>(irq: u32) -> IrqHandled {
+    if let Some(runtime) = crate::devices::runtime::device_runtime_snapshot() {
+        let handled = runtime.outcome.irq_table.dispatch_irq(irq);
+        if !matches!(handled, IrqHandled::NotMine) {
+            return handled;
+        }
+    }
+    P::dispatch_irq(irq)
+}
 
 /// The single global IRQ dispatch table tx-kernel publishes to the
 /// platform. The platform crate stores a raw `&'static
@@ -80,22 +97,129 @@ impl UartRxPending {
 static UART_RX_PENDING: SpinMutex<UartRxPending> =
     spin_mutex(UartRxPending::new(), b"debug.lock.kernel.uart_rx_pending");
 
+/// Logical CPU that owns the singleton boot console's ordered RX ingest.
+///
+/// This is installed from the BSP's [`tx_hal::BootHandoff`]. Logical CPU 0
+/// is not necessarily an S-mode hart: VisionFive 2 reserves hart 0 for its
+/// management core and boots txKernel on hart 1.
+static CONSOLE_RX_OWNER_CPU: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn install_console_rx_owner(cpu: CpuId) {
+    CONSOLE_RX_OWNER_CPU.store(cpu.0, Ordering::Release);
+}
+
+/// Single task-context owner for the pending-buffer-to-TTY handoff.
+///
+/// Both BSP and AP reactors drain device bottom halves. The pending lock only
+/// serializes the snapshot: without a wider owner, one hart can snapshot an
+/// earlier chunk, lose the race into the line discipline, and submit it after
+/// a later chunk. Contenders must not spin because the owner may be running on
+/// another hart and may itself need cross-hart progress.
+static CONSOLE_RX_INGEST_OWNED: AtomicBool = AtomicBool::new(false);
+
+struct ConsoleRxIngestGuard;
+
+impl Drop for ConsoleRxIngestGuard {
+    fn drop(&mut self) {
+        CONSOLE_RX_INGEST_OWNED.store(false, Ordering::Release);
+    }
+}
+
+fn try_acquire_console_rx_ingest() -> Option<ConsoleRxIngestGuard> {
+    CONSOLE_RX_INGEST_OWNED
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .ok()
+        .map(|_| ConsoleRxIngestGuard)
+}
+
+fn pending_uart_rx_nonempty<P: IrqIf>() -> bool {
+    let _local_execution = P::exclude_local_execution();
+    UART_RX_PENDING.lock().len != 0
+}
+
+fn restore_pending_uart_rx_front<P: IrqIf>(bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    let _local_execution = P::exclude_local_execution();
+    let mut pending = UART_RX_PENDING.lock();
+    let restore_len = bytes.len().min(UART_RX_PENDING_CAP);
+    let retained_new = pending.len.min(UART_RX_PENDING_CAP - restore_len);
+    pending.bytes.copy_within(..retained_new, restore_len);
+    pending.bytes[..restore_len].copy_from_slice(&bytes[..restore_len]);
+    pending.len = restore_len + retained_new;
+}
+
+/// Non-blocking single-reader ownership for the platform console RX source.
+///
+/// The UART IRQ top half and the reactor's polling fallback both call
+/// `ConsoleIf::read_bytes`.  On a 16550-style UART, checking `LSR.DR` and
+/// consuming `RBR` are separate MMIO accesses.  Without one shared owner an
+/// IRQ (or another hart) can consume `RBR` after a poller observed `DR`, then
+/// the resumed poller reads the stale receive register and submits the byte a
+/// second time.  IRQ context must never wait for task context, so contenders
+/// skip this drain and let the current owner consume the FIFO.
+static CONSOLE_RX_READER_OWNED: AtomicBool = AtomicBool::new(false);
+static UART_RX_IRQ_DEFERRED_MASKED: AtomicBool = AtomicBool::new(false);
+
+struct ConsoleRxReaderGuard;
+
+impl Drop for ConsoleRxReaderGuard {
+    fn drop(&mut self) {
+        CONSOLE_RX_READER_OWNED.store(false, Ordering::Release);
+    }
+}
+
+/// Try to drain bytes from the one platform console RX source.
+///
+/// Returns zero when another IRQ/hart/reactor poll currently owns the source.
+/// Polling therefore remains available as a firmware/IRQ fallback without
+/// allowing two consumers to overlap the platform's hardware read sequence.
+enum ConsoleRxReadResult {
+    Read(usize),
+    Busy,
+}
+
+fn try_read_console_bytes_result<P: ConsoleIf>(buf: &mut [u8]) -> ConsoleRxReadResult {
+    if buf.is_empty() {
+        return ConsoleRxReadResult::Read(0);
+    }
+    if CONSOLE_RX_READER_OWNED
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return ConsoleRxReadResult::Busy;
+    }
+
+    let _reader = ConsoleRxReaderGuard;
+    ConsoleRxReadResult::Read(<P as ConsoleIf>::read_bytes(buf))
+}
+
+#[cfg(test)]
+pub(crate) fn try_read_console_bytes<P: ConsoleIf>(buf: &mut [u8]) -> usize {
+    match try_read_console_bytes_result::<P>(buf) {
+        ConsoleRxReadResult::Read(n) => n,
+        ConsoleRxReadResult::Busy => 0,
+    }
+}
+
 const DEFERRED_IRQ_IDLE: u8 = 0;
 const DEFERRED_IRQ_PUBLISHING: u8 = 1;
 const DEFERRED_IRQ_PENDING: u8 = 2;
 const DEFERRED_IRQ_DRAINING: u8 = 3;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy)]
 struct DeferredIrqClaim {
     irq: u32,
     owner: CpuId,
+    bound: BoundDeviceKey,
+    registration: &'static NetDeviceRegistration,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy)]
 enum DeferredIrqDrain {
     Idle,
     Owned(DeferredIrqClaim),
-    WrongHart { owner: CpuId },
+    WrongHart,
 }
 
 /// One hart's lock-free deferred controller claim.
@@ -108,6 +232,8 @@ struct DeferredIrqSlot {
     phase: AtomicU8,
     irq: AtomicU32,
     owner: AtomicUsize,
+    bound: AtomicU32,
+    registration: AtomicPtr<NetDeviceRegistration>,
 }
 
 impl DeferredIrqSlot {
@@ -116,6 +242,8 @@ impl DeferredIrqSlot {
             phase: AtomicU8::new(DEFERRED_IRQ_IDLE),
             irq: AtomicU32::new(0),
             owner: AtomicUsize::new(0),
+            bound: AtomicU32::new(0),
+            registration: AtomicPtr::new(core::ptr::null_mut()),
         }
     }
 
@@ -133,6 +261,12 @@ impl DeferredIrqSlot {
         );
         self.irq.store(claim.irq, Ordering::Relaxed);
         self.owner.store(claim.owner.0, Ordering::Relaxed);
+        self.bound
+            .store(u32::from(claim.bound.0), Ordering::Relaxed);
+        self.registration.store(
+            core::ptr::from_ref(claim.registration).cast_mut(),
+            Ordering::Relaxed,
+        );
         self.phase.store(DEFERRED_IRQ_PENDING, Ordering::Release);
     }
 
@@ -142,7 +276,7 @@ impl DeferredIrqSlot {
         }
         let owner = CpuId(self.owner.load(Ordering::Relaxed));
         if owner != current {
-            return DeferredIrqDrain::WrongHart { owner };
+            return DeferredIrqDrain::WrongHart;
         }
         if self
             .phase
@@ -156,15 +290,20 @@ impl DeferredIrqSlot {
         {
             return DeferredIrqDrain::Idle;
         }
+        let registration = self.registration.load(Ordering::Relaxed);
+        assert!(
+            !registration.is_null(),
+            "published deferred IRQ claim has no device registration"
+        );
         DeferredIrqDrain::Owned(DeferredIrqClaim {
             irq: self.irq.load(Ordering::Relaxed),
             owner,
+            bound: BoundDeviceKey(
+                u16::try_from(self.bound.load(Ordering::Relaxed))
+                    .expect("published bound-device key fits u16"),
+            ),
+            registration: unsafe { &*registration },
         })
-    }
-
-    fn retry(&self, claim: DeferredIrqClaim) {
-        self.assert_draining(claim);
-        self.phase.store(DEFERRED_IRQ_PENDING, Ordering::Release);
     }
 
     /// Release software ownership immediately before controller completion.
@@ -177,6 +316,9 @@ impl DeferredIrqSlot {
         self.assert_draining(claim);
         self.irq.store(0, Ordering::Relaxed);
         self.owner.store(0, Ordering::Relaxed);
+        self.bound.store(0, Ordering::Relaxed);
+        self.registration
+            .store(core::ptr::null_mut(), Ordering::Relaxed);
         self.phase.store(DEFERRED_IRQ_IDLE, Ordering::Release);
     }
 
@@ -184,12 +326,20 @@ impl DeferredIrqSlot {
         debug_assert_eq!(self.phase.load(Ordering::Acquire), DEFERRED_IRQ_DRAINING);
         debug_assert_eq!(self.irq.load(Ordering::Relaxed), claim.irq);
         debug_assert_eq!(self.owner.load(Ordering::Relaxed), claim.owner.0);
+        debug_assert_eq!(self.bound.load(Ordering::Relaxed), u32::from(claim.bound.0));
+        debug_assert_eq!(
+            self.registration.load(Ordering::Relaxed).cast_const(),
+            core::ptr::from_ref(claim.registration),
+        );
     }
 
     #[cfg(test)]
     fn reset(&self) {
         self.irq.store(0, Ordering::Relaxed);
         self.owner.store(0, Ordering::Relaxed);
+        self.bound.store(0, Ordering::Relaxed);
+        self.registration
+            .store(core::ptr::null_mut(), Ordering::Relaxed);
         self.phase.store(DEFERRED_IRQ_IDLE, Ordering::Release);
     }
 }
@@ -202,13 +352,14 @@ static NET_RX_DEFERRED_CLAIMS: [DeferredIrqSlot; tx_hal::MAX_HARTS] =
 static NET_IRQ_CLAIMS: AtomicU64 = AtomicU64::new(0);
 static NET_IRQ_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
 static NET_IRQ_WRONG_HART_DRAINS: AtomicU64 = AtomicU64::new(0);
-static NET_IRQ_MISSING_DEVICE_DRAINS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct NetIrqStats {
     pub claims: u64,
     pub completions: u64,
     pub wrong_hart_drains: u64,
+    /// Retained for the observation record layout. Typed top halves resolve
+    /// the registration before publishing a claim, so this remains zero.
     pub missing_device_drains: u64,
 }
 
@@ -217,7 +368,7 @@ pub(crate) fn net_irq_stats() -> NetIrqStats {
         claims: NET_IRQ_CLAIMS.load(Ordering::Acquire),
         completions: NET_IRQ_COMPLETIONS.load(Ordering::Acquire),
         wrong_hart_drains: NET_IRQ_WRONG_HART_DRAINS.load(Ordering::Acquire),
-        missing_device_drains: NET_IRQ_MISSING_DEVICE_DRAINS.load(Ordering::Acquire),
+        missing_device_drains: 0,
     }
 }
 
@@ -258,6 +409,9 @@ pub fn reset_dispatch_table_for_test() {
 pub fn reset_pending_uart_rx_for_test() {
     let mut pending = UART_RX_PENDING.lock();
     pending.len = 0;
+    CONSOLE_RX_READER_OWNED.store(false, Ordering::Release);
+    CONSOLE_RX_INGEST_OWNED.store(false, Ordering::Release);
+    CONSOLE_RX_OWNER_CPU.store(0, Ordering::Release);
 }
 
 #[cfg(test)]
@@ -268,7 +422,6 @@ pub fn reset_pending_net_irq_for_test() {
     NET_IRQ_CLAIMS.store(0, Ordering::Release);
     NET_IRQ_COMPLETIONS.store(0, Ordering::Release);
     NET_IRQ_WRONG_HART_DRAINS.store(0, Ordering::Release);
-    NET_IRQ_MISSING_DEVICE_DRAINS.store(0, Ordering::Release);
 }
 
 /// Snapshot the handler currently registered for `irq`, if any.
@@ -312,48 +465,71 @@ fn dispatch_table_static() -> &'static IrqDispatchTable {
 /// the platform. One-shot; called from `init.rs` after
 /// `register_console_hardware` has populated the `CONSOLE_TTY` slot.
 pub(crate) fn install_irq_handlers<P: TxPlatform>() {
-    let uart_irq = <P as IrqIf>::UART_IRQ;
-    register_irq_handler(uart_irq, uart_rx_irq_handler::<P>);
-    let rtc_irq = <P as IrqIf>::RTC_IRQ;
+    let uart_irq = <P as IrqIf>::uart_irq();
+    if uart_irq != 0 {
+        register_irq_handler(uart_irq, uart_rx_irq_handler::<P>);
+    }
+    let rtc_irq = <P as IrqIf>::rtc_irq();
     if rtc_irq != 0 {
         tx_fs::devfs::rtc_event_source_id();
         register_irq_handler(rtc_irq, rtc_alarm_irq_handler::<P>);
     }
-    let net_irq = <P as IrqIf>::NET_IRQ;
-    if net_irq != 0 {
-        register_irq_handler(net_irq, net_rx_irq_handler::<P>);
-    }
     <P as IrqIf>::install_dispatch_table(dispatch_table_static());
-    <P as IrqIf>::set_priority(uart_irq, 1);
-    <P as IrqIf>::unmask(uart_irq);
+    if uart_irq != 0 {
+        <P as IrqIf>::set_priority(uart_irq, 1);
+        <P as IrqIf>::unmask(uart_irq);
+    }
     if rtc_irq != 0 {
         <P as IrqIf>::set_priority(rtc_irq, 1);
         <P as IrqIf>::unmask(rtc_irq);
     }
-    if net_irq != 0 {
-        <P as IrqIf>::set_priority(net_irq, 1);
-        <P as IrqIf>::unmask(net_irq);
-    }
 }
 
-/// Virtio-net IRQ top half.
-///
-/// The driver ACK path takes locks, so IRQ context only publishes the claimed
-/// IRQ and claimant hart. `DeferredWake` tells the trap dispatcher to leave
-/// controller completion outstanding; the controller gateway then throttles
-/// this source until [`drain_net_rx_irq`] clears the device and completes the
-/// claim from the same hart.
-pub fn net_rx_irq_handler<P: TxPlatform>(irq: u32) -> IrqHandled {
+/// Per-device network top half used by the boot-frozen typed IRQ table.
+/// Device ACK and queue polling remain in task context; the retained bound key
+/// selects the exact registration without a namespace-name lookup.
+pub fn typed_net_rx_irq_handler<P: TxPlatform>(
+    context: &'static DeviceIrqContext,
+    irq: u32,
+) -> IrqHandled {
     assert_eq!(
-        irq,
-        <P as IrqIf>::NET_IRQ,
-        "network handler received the wrong IRQ",
+        irq, context.route.resource.line,
+        "typed network handler received the wrong IRQ",
     );
+    let Some(registration) = crate::devices::runtime::device_runtime_snapshot()
+        .and_then(|runtime| runtime.outcome.bound_devices.get(context.bound))
+        .and_then(|bound| match bound.registration {
+            BoundDeviceRegistration::Net(registration) => Some(registration),
+            BoundDeviceRegistration::Char(_)
+            | BoundDeviceRegistration::Block(_)
+            | BoundDeviceRegistration::Controller => None,
+        })
+    else {
+        return IrqHandled::NotMine;
+    };
+    publish_deferred_net_claim::<P>(irq, context.bound, registration)
+}
+
+fn publish_deferred_net_claim<P: TxPlatform>(
+    irq: u32,
+    bound: BoundDeviceKey,
+    registration: &'static NetDeviceRegistration,
+) -> IrqHandled {
     let owner = <P as tx_hal::SmpIf>::current_cpu_id();
     let slot = NET_RX_DEFERRED_CLAIMS
         .get(owner.0)
         .expect("network IRQ claimant hart exceeds MAX_HARTS");
-    slot.publish(DeferredIrqClaim { irq, owner });
+    // PLIC keeps a claimed source unavailable until completion, but simple
+    // level controllers such as the 2K1000 LIOINTC only expose STATUS & ENABLE.
+    // Mask before deferring so the asserted device source cannot be claimed a
+    // second time while this hart's one deferred slot still owns the first.
+    <P as IrqIf>::mask(irq);
+    slot.publish(DeferredIrqClaim {
+        irq,
+        owner,
+        bound,
+        registration,
+    });
     NET_IRQ_CLAIMS.fetch_add(1, Ordering::AcqRel);
     IrqHandled::DeferredWake
 }
@@ -370,22 +546,17 @@ pub(crate) fn drain_net_rx_irq<P: TxPlatform>() -> bool {
     };
     let claim = match slot.begin_drain(current) {
         DeferredIrqDrain::Idle => return false,
-        DeferredIrqDrain::WrongHart { .. } => {
+        DeferredIrqDrain::WrongHart => {
             NET_IRQ_WRONG_HART_DRAINS.fetch_add(1, Ordering::Relaxed);
             return false;
         }
         DeferredIrqDrain::Owned(claim) => claim,
     };
 
-    let Some(registration) = tx_subsystems::net::net_device_by_name(b"eth0") else {
-        NET_IRQ_MISSING_DEVICE_DRAINS.fetch_add(1, Ordering::Relaxed);
-        slot.retry(claim);
-        return false;
-    };
-
-    let _ = registration.ops.ack_interrupt_and_fire();
+    let _ = claim.registration.ops.ack_interrupt_and_fire();
     slot.release_before_completion(claim);
     <P as IrqIf>::complete(claim.irq);
+    <P as IrqIf>::unmask(claim.irq);
     NET_IRQ_COMPLETIONS.fetch_add(1, Ordering::AcqRel);
     true
 }
@@ -418,35 +589,75 @@ pub fn rtc_alarm_irq_handler<P: TxPlatform>(_irq: u32) -> IrqHandled {
 /// therefore must NOT call `epoch::guard()`.  All TTY line-discipline
 /// work is deferred to `drain_uart_rx_pending`.
 ///
-/// Returns `IrqHandled::Wake` when bytes were buffered (reactor should
-/// reschedule the blocked `read` future).  Returns `IrqHandled::Done`
-/// for spurious or already-drained IRQs.  Returns
-/// `IrqHandled::NotMine` if the console TTY hasn't been registered yet
-/// (defensive check against a stray pre-boot IRQ).
-pub fn uart_rx_irq_handler<P: ConsoleIf>(_irq: u32) -> IrqHandled {
-    let mut buf = [0u8; UART_RX_DRAIN_MAX];
-    let n = <P as ConsoleIf>::read_bytes(&mut buf);
+/// Returns `IrqHandled::Wake` when bytes were buffered or the level source was
+/// masked for task-context recovery. Returns `IrqHandled::Done` only for
+/// spurious or already-drained IRQs.
+/// The handler is installed only after the console TTY is published, so the
+/// top half does not acquire the task-context console-cap lock.
+enum ConsoleRxBufferResult {
+    Buffered(usize),
+    Empty,
+    MustDefer,
+}
+
+fn buffer_console_rx<P: ConsoleIf, const DRAIN_MAX: usize>() -> ConsoleRxBufferResult {
+    // IRQ context must never wait for a task-context holder on another hart.
+    // Leave the FIFO untouched on contention; the top-half caller masks the
+    // level source until task context releases the shared state and rearms it.
+    let Some(mut pending) = UART_RX_PENDING.try_lock() else {
+        return ConsoleRxBufferResult::MustDefer;
+    };
+    let space = UART_RX_PENDING_CAP - pending.len;
+    if space == 0 {
+        return ConsoleRxBufferResult::MustDefer;
+    }
+    let mut buf = [0u8; DRAIN_MAX];
+    let n = match try_read_console_bytes_result::<P>(&mut buf[..space.min(DRAIN_MAX)]) {
+        ConsoleRxReadResult::Read(n) => n,
+        ConsoleRxReadResult::Busy => return ConsoleRxBufferResult::MustDefer,
+    };
     if n == 0 {
         // Spurious IRQ or FIFO already drained.
-        return IrqHandled::Done;
-    }
-    if crate::init::console_tty().is_none() {
-        // Pre-boot race: TTY not yet registered. Discard the bytes and
-        // return NotMine so the caller knows the IRQ was unexpected.
-        return IrqHandled::NotMine;
+        return ConsoleRxBufferResult::Empty;
     }
     // Buffer bytes for non-IRQ ingestion. Bytes that overflow the
     // pending buffer (UART_RX_PENDING_CAP) are silently dropped — this
     // is acceptable for a boot console where the reactor loop drains
     // frequently.
-    let mut pending = UART_RX_PENDING.lock();
     let start = pending.len;
-    let space = UART_RX_PENDING_CAP - start;
-    let copy = n.min(space);
-    let end = start + copy;
-    pending.bytes[start..end].copy_from_slice(&buf[..copy]);
+    let end = start + n;
+    pending.bytes[start..end].copy_from_slice(&buf[..n]);
     pending.len = end;
-    IrqHandled::Wake
+    ConsoleRxBufferResult::Buffered(n)
+}
+
+pub fn uart_rx_irq_handler<P: TxPlatform>(irq: u32) -> IrqHandled {
+    match buffer_console_rx::<P, UART_RX_DRAIN_MAX>() {
+        ConsoleRxBufferResult::Buffered(_) => IrqHandled::Wake,
+        ConsoleRxBufferResult::Empty => IrqHandled::Done,
+        ConsoleRxBufferResult::MustDefer => {
+            // The source is level-triggered. Leaving it enabled while the FIFO
+            // is still asserted can trap-loop on the interrupted lock holder.
+            UART_RX_IRQ_DEFERRED_MASKED.store(true, Ordering::Release);
+            <P as IrqIf>::mask(irq);
+            IrqHandled::Wake
+        }
+    }
+}
+
+/// Poll the console FIFO into the same ordered buffer used by the IRQ top
+/// half. Direct polling must not bypass pending bytes and submit a newer chunk
+/// to the TTY first.
+pub(crate) fn poll_console_rx_into_pending<P: TxPlatform>() -> usize {
+    // The polling fallback shares `UART_RX_PENDING` with the level-triggered
+    // IRQ top half. Keep local IRQs excluded across the whole FIFO drain so an
+    // interrupt cannot repeatedly re-enter while this context owns the pending
+    // lock and leave the interrupted holder unable to resume.
+    let _local_execution = <P as IrqIf>::exclude_local_execution();
+    match buffer_console_rx::<P, UART_RX_PENDING_CAP>() {
+        ConsoleRxBufferResult::Buffered(n) => n,
+        ConsoleRxBufferResult::Empty | ConsoleRxBufferResult::MustDefer => 0,
+    }
 }
 
 /// Drain any bytes buffered by `uart_rx_irq_handler` into the boot
@@ -464,22 +675,80 @@ pub fn uart_rx_irq_handler<P: ConsoleIf>(_irq: u32) -> IrqHandled {
 /// the SBI poll buffer fills first. See the 2026-05-13 sizing note on
 /// `drain_sbi_console_into_tty` for why we keep both paths.
 pub(crate) fn drain_uart_rx_pending<P: tx_hal::TxPlatform>() -> usize {
-    // Snapshot and clear the pending buffer under the lock, then
-    // release before calling step_ingest (which takes its own locks).
-    let (bytes, n) = {
-        let mut pending = UART_RX_PENDING.lock();
-        if pending.len == 0 {
-            return 0;
-        }
-        let mut snapshot = [0u8; UART_RX_PENDING_CAP];
-        snapshot[..pending.len].copy_from_slice(&pending.bytes[..pending.len]);
-        let n = pending.len;
-        pending.len = 0;
-        (snapshot, n)
+    // The boot console is a singleton routed to the boot hart on the supported
+    // SMP platforms. Keep its deferred line-discipline and echo path on that
+    // same hart: an AP may help run the reactor, but it must not take console
+    // ownership between two boot-hart UART interrupts. The boot hart is
+    // recorded from BootHandoff rather than assumed to be logical CPU 0.
+    if <P as tx_hal::SmpIf>::current_cpu_id().0 != CONSOLE_RX_OWNER_CPU.load(Ordering::Acquire) {
+        return 0;
+    }
+
+    let Some(ingest_owner) = try_acquire_console_rx_ingest() else {
+        return 0;
     };
 
-    crate::init::ingest_console_tty_bytes::<P>(&bytes[..n])
+    let mut ingest_owner = Some(ingest_owner);
+    let mut processed = 0usize;
+    loop {
+        // Snapshot and clear the pending buffer under the lock, then release
+        // before calling step_ingest (which takes its own locks). Keep the
+        // wider ingest ownership until every chunk observed here is submitted,
+        // so another reactor cannot overtake this one between snapshots.
+        let Some((bytes, n)) = (|| {
+            // The UART top half takes this same lock in IRQ context. Exclude
+            // local interrupt execution while task context owns it, otherwise
+            // a UART interrupt on this hart can spin forever on the interrupted
+            // holder.
+            let local_execution = <P as IrqIf>::exclude_local_execution();
+            let mut pending = UART_RX_PENDING.lock();
+            if pending.len == 0 {
+                return None;
+            }
+            let mut snapshot = [0u8; UART_RX_PENDING_CAP];
+            snapshot[..pending.len].copy_from_slice(&pending.bytes[..pending.len]);
+            let n = pending.len;
+            pending.len = 0;
+            // End the IRQ-off section before the 512-byte snapshot is moved
+            // into the closure result.
+            drop(pending);
+            drop(local_execution);
+            Some((snapshot, n))
+        })() else {
+            // Release before the final recheck. A producer that appended
+            // before this release may have woken a contender that observed us
+            // as the owner and returned; the recheck either reclaims ownership
+            // and drains that byte or observes a successor already doing so.
+            drop(ingest_owner.take());
+            if !pending_uart_rx_nonempty::<P>() {
+                break;
+            }
+            let Some(next_owner) = try_acquire_console_rx_ingest() else {
+                break;
+            };
+            ingest_owner = Some(next_owner);
+            continue;
+        };
+
+        let consumed = crate::init::ingest_console_tty_bytes::<P>(&bytes[..n]);
+        processed = processed.saturating_add(consumed);
+        if consumed != n {
+            restore_pending_uart_rx_front::<P>(&bytes[consumed.min(n)..n]);
+            break;
+        }
+    }
+    // No pending-buffer, reader, ingest, or TTY lock may remain held when the
+    // level source is reopened. If the hardware FIFO is still non-empty, the
+    // fresh IRQ can now make progress instead of re-entering a lock holder.
+    drop(ingest_owner);
+    if UART_RX_IRQ_DEFERRED_MASKED.swap(false, Ordering::AcqRel) {
+        let irq = <P as IrqIf>::uart_irq();
+        if irq != 0 {
+            <P as IrqIf>::unmask(irq);
+        }
+    }
+    processed
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -1564,7 +1564,14 @@ pub(crate) fn map_format_error(err: Ext4FormatError) -> Errno {
         }
         Ext4FormatError::OutOfBounds => Errno::ENOENT,
         Ext4FormatError::Unsupported => Errno::ENOSYS,
+        Ext4FormatError::ExtentTreeFull { .. } => Errno::EFBIG,
         Ext4FormatError::WouldBlock => Errno::EAGAIN,
+        Ext4FormatError::ReadOnly => Errno::EROFS,
+        Ext4FormatError::Io => Errno::EIO,
+        Ext4FormatError::NotEmpty => Errno::ENOTEMPTY,
+        Ext4FormatError::IsDirectory => Errno::EISDIR,
+        Ext4FormatError::NotDirectory => Errno::ENOTDIR,
+        Ext4FormatError::InvalidInput => Errno::EINVAL,
     }
 }
 

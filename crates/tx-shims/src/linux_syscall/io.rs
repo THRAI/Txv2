@@ -143,9 +143,10 @@ fn read_static_chardev_immediate(
     if len == 0 {
         return Some(SyscallResult::Return(0));
     }
-    if let Err(errno) = bootstrap_copy_to_user(aspace, buf_ptr as u64, &STATIC_ZERO_READ_BUF[..len])
-    {
-        return Some(SyscallResult::error_from(errno));
+    match bootstrap_copy_to_user_oneshot(aspace, buf_ptr as u64, &STATIC_ZERO_READ_BUF[..len]) {
+        Some(Ok(())) => {}
+        Some(Err(errno)) => return Some(SyscallResult::error_from(errno)),
+        None => return None,
     }
     Some(SyscallResult::Return(len as i64))
 }
@@ -474,8 +475,8 @@ enum PselectTimeout {
     Poll,
 }
 
-fn pselect_timeout_policy<'a>(
-    ctx: &SyscallCtx<'a>,
+async fn pselect_timeout_policy(
+    ctx: &SyscallCtx<'_>,
     timeout_ptr: u64,
 ) -> Result<PselectTimeout, i32> {
     if timeout_ptr == 0 {
@@ -483,7 +484,9 @@ fn pselect_timeout_policy<'a>(
     }
 
     let mut bytes = [0u8; 16];
-    bootstrap_copy_from_user(&ctx.aspace, &mut bytes, timeout_ptr).map_err(errno_to_i32)?;
+    bootstrap_copy_from_user_wait(&ctx.aspace, &mut bytes, timeout_ptr)
+        .await
+        .map_err(errno_to_i32)?;
     let sec = i64::from_le_bytes(bytes[0..8].try_into().unwrap());
     let nsec = i64::from_le_bytes(bytes[8..16].try_into().unwrap());
     if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
@@ -625,17 +628,12 @@ fn fdset_word_count(nfds: u64) -> u64 {
     nfds.div_ceil(64)
 }
 
-fn fdset_contains<'a>(ctx: &SyscallCtx<'a>, set_ptr: u64, fd: u64) -> Result<bool, i32> {
-    if set_ptr == 0 {
-        return Ok(false);
-    }
+fn fdset_contains(words: &[u64], fd: u64) -> bool {
     let word_idx = fd / 64;
     let bit = fd % 64;
-    let mut bytes = [0u8; 8];
-    bootstrap_copy_from_user(&ctx.aspace, &mut bytes, set_ptr + word_idx * 8)
-        .map_err(errno_to_i32)?;
-    let word = u64::from_le_bytes(bytes);
-    Ok(word & (1u64 << bit) != 0)
+    words
+        .get(word_idx as usize)
+        .is_some_and(|word| word & (1u64 << bit) != 0)
 }
 
 fn fdset_set(words: &mut [u64], fd: u64) {
@@ -644,12 +642,32 @@ fn fdset_set(words: &mut [u64], fd: u64) {
     words[word_idx] |= 1u64 << bit;
 }
 
-fn fdset_write<'a>(ctx: &SyscallCtx<'a>, set_ptr: u64, words: &[u64]) -> Result<(), i32> {
+async fn fdset_read(
+    ctx: &SyscallCtx<'_>,
+    set_ptr: u64,
+    word_count: usize,
+) -> Result<alloc::vec::Vec<u64>, i32> {
+    let mut words = alloc::vec![0u64; word_count];
+    if set_ptr == 0 || word_count == 0 {
+        return Ok(words);
+    }
+    for (idx, word) in words.iter_mut().enumerate() {
+        let mut bytes = [0u8; 8];
+        bootstrap_copy_from_user_wait(&ctx.aspace, &mut bytes, set_ptr + (idx as u64) * 8)
+            .await
+            .map_err(errno_to_i32)?;
+        *word = u64::from_le_bytes(bytes);
+    }
+    Ok(words)
+}
+
+async fn fdset_write(ctx: &SyscallCtx<'_>, set_ptr: u64, words: &[u64]) -> Result<(), i32> {
     if set_ptr == 0 {
         return Ok(());
     }
     for (idx, word) in words.iter().enumerate() {
-        bootstrap_copy_to_user(&ctx.aspace, set_ptr + (idx as u64) * 8, &word.to_le_bytes())
+        bootstrap_copy_to_user_wait(&ctx.aspace, set_ptr + (idx as u64) * 8, &word.to_le_bytes())
+            .await
             .map_err(errno_to_i32)?;
     }
     Ok(())
@@ -738,7 +756,9 @@ pub(super) async fn sys_writev<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
         for i in 0..iovcnt as u64 {
             let ent_ptr = iov_ptr.wrapping_add(i * IOVEC_BYTES);
             let mut ent_bytes = [0u8; IOVEC_BYTES as usize];
-            if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut ent_bytes, ent_ptr) {
+            if let Err(errno) =
+                bootstrap_copy_from_user_wait(&ctx.aspace, &mut ent_bytes, ent_ptr).await
+            {
                 return SyscallResult::error_from(errno);
             }
             let base = u64::from_le_bytes(ent_bytes[0..8].try_into().unwrap());
@@ -750,7 +770,7 @@ pub(super) async fn sys_writev<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
             let old_len = combined.len();
             combined.resize(old_len + len as usize, 0);
             if let Err(errno) =
-                bootstrap_copy_from_user(&ctx.aspace, &mut combined[old_len..], base)
+                bootstrap_copy_from_user_wait(&ctx.aspace, &mut combined[old_len..], base).await
             {
                 return SyscallResult::error_from(errno);
             }
@@ -763,7 +783,9 @@ pub(super) async fn sys_writev<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     for i in 0..iovcnt as u64 {
         let ent_ptr = iov_ptr.wrapping_add(i * IOVEC_BYTES);
         let mut ent_bytes = [0u8; IOVEC_BYTES as usize];
-        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut ent_bytes, ent_ptr) {
+        if let Err(errno) =
+            bootstrap_copy_from_user_wait(&ctx.aspace, &mut ent_bytes, ent_ptr).await
+        {
             if total > 0 {
                 return SyscallResult::Return(total);
             }
@@ -806,9 +828,10 @@ pub(super) async fn sys_writev<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
 /// PageBacked-only synchronous `writev(2)` lane.
 ///
 /// This is intentionally narrower than [`sys_writev`]: it claims only regular
-/// PageBacked fds and only when each PageBacked write completes without a
-/// `Yield`. Other fd kinds, and future PageBacked backends that need to park,
-/// return `None` so the async `sys_writev` path remains the semantic fallback.
+/// PageBacked fds. A zero-progress `Yield` returns `None` so the async
+/// `sys_writev` path owns the wait; a partial-progress `Yield` returns the
+/// committed prefix as a Linux short write so that fallback cannot replay it.
+/// Other fd kinds also return `None`.
 pub(super) fn sys_writev_pagebacked_oneshot<'a>(
     args: [u64; 6],
     ctx: &SyscallCtx<'a>,
@@ -850,18 +873,26 @@ pub(super) fn sys_writev_pagebacked_oneshot<'a>(
     if !file.flags().write {
         return Some(SyscallResult::Error(EINVAL_VALUE));
     }
-
     const IOVEC_BYTES: u64 = 16;
     let mut total: i64 = 0;
     for i in 0..iovcnt as u64 {
         let ent_ptr = iov_ptr.wrapping_add(i * IOVEC_BYTES);
-        let mut ent_bytes = [0u8; IOVEC_BYTES as usize];
-        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut ent_bytes, ent_ptr) {
-            if total > 0 {
-                return Some(SyscallResult::Return(total));
-            }
-            return Some(SyscallResult::error_from(errno));
-        }
+        let ent_bytes =
+            match bootstrap_read_user_oneshot::<[u8; IOVEC_BYTES as usize]>(&ctx.aspace, ent_ptr) {
+                Some(Ok(bytes)) => bytes,
+                Some(Err(errno)) => {
+                    if total > 0 {
+                        return Some(SyscallResult::Return(total));
+                    }
+                    return Some(SyscallResult::error_from(errno));
+                }
+                None => {
+                    if total > 0 {
+                        return Some(SyscallResult::Return(total));
+                    }
+                    return None;
+                }
+            };
         let base = u64::from_le_bytes(ent_bytes[0..8].try_into().unwrap());
         let len = u64::from_le_bytes(ent_bytes[8..16].try_into().unwrap()) as usize;
         if len == 0 {
@@ -897,12 +928,21 @@ pub(super) fn sys_writev_pagebacked_oneshot<'a>(
         }
 
         let guard = crate::adapter::step_engine::guard();
-        match tx_subsystems::page_backed::step_write_from_user(
+        // Select append EOF only once the iovec and its user range have been
+        // validated. The offset-aware helper publishes the position only
+        // after bytes move, preserving the old offset on zero-progress Yield.
+        let start = if file.flags().append && total == 0 {
+            pc.size_bytes()
+        } else {
+            file.offset()
+        };
+        match tx_subsystems::page_backed::step_write_from_user_at(
             &pc,
             &file,
             &ctx.aspace,
             tx_hal::UserPtr::<u8>::new(base as usize),
             len,
+            start,
             &guard,
         ) {
             tx_substrate::step::StepOutcome::Done(n) => {
@@ -929,7 +969,8 @@ pub(super) fn sys_writev_pagebacked_oneshot<'a>(
                 }
                 return Some(SyscallResult::error_from(errno));
             }
-            tx_substrate::step::StepOutcome::Yield { .. } => {
+            tx_substrate::step::StepOutcome::Yield { progress, .. } => {
+                total += progress.bytes() as i64;
                 if total > 0 {
                     return Some(SyscallResult::Return(total));
                 }
@@ -987,7 +1028,9 @@ where
     for i in 0..iovcnt as u64 {
         let ent_ptr = iov_ptr.wrapping_add(i * IOVEC_BYTES);
         let mut ent_bytes = [0u8; IOVEC_BYTES as usize];
-        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut ent_bytes, ent_ptr) {
+        if let Err(errno) =
+            bootstrap_copy_from_user_wait(&ctx.aspace, &mut ent_bytes, ent_ptr).await
+        {
             if total > 0 {
                 return SyscallResult::Return(total);
             }
@@ -1583,7 +1626,7 @@ where
         return SyscallResult::Return(0);
     }
 
-    let timeout = match pselect_timeout_policy(ctx, timeout_ptr) {
+    let timeout = match pselect_timeout_policy(ctx, timeout_ptr).await {
         Ok(wait) => wait,
         Err(errno) => return SyscallResult::Error(errno),
     };
@@ -1594,6 +1637,21 @@ where
         PselectTimeout::Infinite | PselectTimeout::Poll => None,
     };
     let word_count = fdset_word_count(nfds);
+    // Snapshot each fd_set once at syscall entry. The old implementation
+    // copied the same 64-bit word once per descriptor, multiplying user-copy
+    // and RangeLock work by `nfds` and making large selects needlessly slow.
+    let read_interest = match fdset_read(ctx, readfds, word_count as usize).await {
+        Ok(words) => words,
+        Err(errno) => return SyscallResult::Error(errno),
+    };
+    let write_interest = match fdset_read(ctx, writefds, word_count as usize).await {
+        Ok(words) => words,
+        Err(errno) => return SyscallResult::Error(errno),
+    };
+    let except_interest = match fdset_read(ctx, exceptfds, word_count as usize).await {
+        Ok(words) => words,
+        Err(errno) => return SyscallResult::Error(errno),
+    };
     let mut yielded_before_wait = false;
     let (read_ready, write_ready, except_ready, ready_count) = loop {
         drive_loopback_pending();
@@ -1616,18 +1674,9 @@ where
         let mut effective_deadline_ns = timeout_deadline_ns;
 
         for fd in 0..nfds {
-            let want_read = match fdset_contains(ctx, readfds, fd) {
-                Ok(v) => v,
-                Err(errno) => return SyscallResult::Error(errno),
-            };
-            let want_write = match fdset_contains(ctx, writefds, fd) {
-                Ok(v) => v,
-                Err(errno) => return SyscallResult::Error(errno),
-            };
-            let want_except = match fdset_contains(ctx, exceptfds, fd) {
-                Ok(v) => v,
-                Err(errno) => return SyscallResult::Error(errno),
-            };
+            let want_read = fdset_contains(&read_interest, fd);
+            let want_write = fdset_contains(&write_interest, fd);
+            let want_except = fdset_contains(&except_interest, fd);
             if !want_read && !want_write && !want_except {
                 continue;
             }
@@ -1910,13 +1959,13 @@ where
         tx_reactor::yield_now().await;
     }
 
-    if let Err(errno) = fdset_write(ctx, readfds, &read_ready) {
+    if let Err(errno) = fdset_write(ctx, readfds, &read_ready).await {
         return SyscallResult::Error(errno);
     }
-    if let Err(errno) = fdset_write(ctx, writefds, &write_ready) {
+    if let Err(errno) = fdset_write(ctx, writefds, &write_ready).await {
         return SyscallResult::Error(errno);
     }
-    if let Err(errno) = fdset_write(ctx, exceptfds, &except_ready) {
+    if let Err(errno) = fdset_write(ctx, exceptfds, &except_ready).await {
         return SyscallResult::Error(errno);
     }
 
@@ -2811,7 +2860,8 @@ where
             return SyscallResult::Error(EINVAL_VALUE);
         }
         if let Err(errno) =
-            bootstrap_copy_to_user(&ctx.aspace, buf_ptr as u64, &STATIC_ZERO_READ_BUF[..len])
+            bootstrap_copy_to_user_wait(&ctx.aspace, buf_ptr as u64, &STATIC_ZERO_READ_BUF[..len])
+                .await
         {
             return SyscallResult::error_from(errno);
         }
@@ -3065,12 +3115,16 @@ fn positioned_io_check(file: &OpenFile, write: bool) -> Result<(), i32> {
     Ok(())
 }
 
-fn read_iovec_entry(ctx: &SyscallCtx<'_>, iov_ptr: u64, idx: u64) -> Result<(u64, u64), Errno> {
+async fn read_iovec_entry(
+    ctx: &SyscallCtx<'_>,
+    iov_ptr: u64,
+    idx: u64,
+) -> Result<(u64, u64), Errno> {
     const IOVEC_BYTES: u64 = 16;
 
     let ent_ptr = iov_ptr.wrapping_add(idx * IOVEC_BYTES);
     let mut ent_bytes = [0u8; IOVEC_BYTES as usize];
-    bootstrap_copy_from_user(&ctx.aspace, &mut ent_bytes, ent_ptr)?;
+    bootstrap_copy_from_user_wait(&ctx.aspace, &mut ent_bytes, ent_ptr).await?;
     let base = u64::from_le_bytes(ent_bytes[0..8].try_into().unwrap());
     let len = u64::from_le_bytes(ent_bytes[8..16].try_into().unwrap());
     Ok((base, len))
@@ -3100,7 +3154,7 @@ where
     const MAX_RW_COUNT: u64 = 0x7fff_f000;
     let mut total: i64 = 0;
     for i in 0..iovcnt as u64 {
-        let (base, len) = match read_iovec_entry(ctx, iov_ptr, i) {
+        let (base, len) = match read_iovec_entry(ctx, iov_ptr, i).await {
             Ok(entry) => entry,
             Err(errno) => {
                 if total > 0 {
@@ -3162,7 +3216,7 @@ pub(super) async fn sys_pwritev<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
     const MAX_RW_COUNT: u64 = 0x7fff_f000;
     let mut total: i64 = 0;
     for i in 0..iovcnt as u64 {
-        let (base, len) = match read_iovec_entry(ctx, iov_ptr, i) {
+        let (base, len) = match read_iovec_entry(ctx, iov_ptr, i).await {
             Ok(entry) => entry,
             Err(errno) => {
                 if total > 0 {
@@ -3395,7 +3449,9 @@ pub(super) async fn sys_sendfile64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     if offset_ptr != 0 {
         // Read the offset from userspace.
         let mut off_bytes = [0u8; 8];
-        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut off_bytes, offset_ptr) {
+        if let Err(errno) =
+            bootstrap_copy_from_user_wait(&ctx.aspace, &mut off_bytes, offset_ptr).await
+        {
             return SyscallResult::error_from(errno);
         }
         let signed_offset = i64::from_le_bytes(off_bytes);
@@ -3413,10 +3469,12 @@ pub(super) async fn sys_sendfile64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     // Output writes at the output file's current cursor.
     let out_offset = out_file.offset();
 
-    // Single-shot page copy (non-blocking for v1).
-    let guard = tx_substrate::epoch::guard();
-    let outcome = step_copy_file_range(&in_pc, in_offset, &out_pc, out_offset, count, &guard);
-    drop(guard);
+    // Single-shot page copy (non-blocking for v1). Keep the !Send guard out
+    // of the async state machine before the optional offset writeback awaits.
+    let outcome = {
+        let guard = tx_substrate::epoch::guard();
+        step_copy_file_range(&in_pc, in_offset, &out_pc, out_offset, count, &guard)
+    };
 
     let transferred = match outcome {
         tx_substrate::step::StepOutcome::Done(n) => n,
@@ -3440,7 +3498,7 @@ pub(super) async fn sys_sendfile64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     if needs_offset_writeback {
         let new_off = in_offset + transferred as u64;
         let bytes = new_off.to_le_bytes();
-        if let Err(_errno) = bootstrap_copy_to_user(&ctx.aspace, offset_ptr, &bytes) {
+        if let Err(_errno) = bootstrap_copy_to_user_wait(&ctx.aspace, offset_ptr, &bytes).await {
             // On partial success, Linux prefers to return the byte
             // count rather than the fault error.
             return SyscallResult::Return(transferred as i64);
@@ -3503,7 +3561,7 @@ pub(super) async fn sys_copy_file_range<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>
     };
 
     let in_offset = if off_in_ptr != 0 {
-        match bootstrap_read_user::<u64>(&ctx.aspace, off_in_ptr) {
+        match bootstrap_read_user_wait::<u64>(&ctx.aspace, off_in_ptr).await {
             Ok(offset) => offset,
             Err(errno) => return SyscallResult::error_from(errno),
         }
@@ -3511,7 +3569,7 @@ pub(super) async fn sys_copy_file_range<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>
         in_file.offset()
     };
     let out_offset = if off_out_ptr != 0 {
-        match bootstrap_read_user::<u64>(&ctx.aspace, off_out_ptr) {
+        match bootstrap_read_user_wait::<u64>(&ctx.aspace, off_out_ptr).await {
             Ok(offset) => offset,
             Err(errno) => return SyscallResult::error_from(errno),
         }
@@ -3519,9 +3577,14 @@ pub(super) async fn sys_copy_file_range<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>
         out_file.offset()
     };
 
-    let guard = tx_substrate::epoch::guard();
-    let outcome = step_copy_file_range(&in_pc, in_offset, &out_pc, out_offset, len, &guard);
-    drop(guard);
+    // Keep the !Send EBR guard inside a lexical scope that ends before any
+    // user-memory writeback can await. An explicit `drop(guard)` is not
+    // sufficient for async-generator Send analysis when `outcome` is kept
+    // alive across the later suspension points.
+    let outcome = {
+        let guard = tx_substrate::epoch::guard();
+        step_copy_file_range(&in_pc, in_offset, &out_pc, out_offset, len, &guard)
+    };
 
     let transferred = match outcome {
         tx_substrate::step::StepOutcome::Done(n) => n,
@@ -3536,14 +3599,18 @@ pub(super) async fn sys_copy_file_range<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>
         let new_in = in_offset + transferred as u64;
         let new_out = out_offset + transferred as u64;
         if off_in_ptr != 0 {
-            if let Err(_errno) = bootstrap_write_user::<u64>(&ctx.aspace, off_in_ptr, new_in) {
+            if let Err(_errno) =
+                bootstrap_write_user_wait::<u64>(&ctx.aspace, off_in_ptr, new_in).await
+            {
                 return SyscallResult::Return(transferred as i64);
             }
         } else {
             in_file.advance_offset(transferred as u64);
         }
         if off_out_ptr != 0 {
-            if let Err(_errno) = bootstrap_write_user::<u64>(&ctx.aspace, off_out_ptr, new_out) {
+            if let Err(_errno) =
+                bootstrap_write_user_wait::<u64>(&ctx.aspace, off_out_ptr, new_out).await
+            {
                 return SyscallResult::Return(transferred as i64);
             }
         } else {

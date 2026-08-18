@@ -708,14 +708,58 @@ fn dispatch_ioctl_tiocspgrp_on_unbound_tty_returns_neg_einval() {
     let _setup = ioctl_setup();
     let _ops = install_capturing_console();
     let (proc_cap, thread) = fresh_proc_thread();
+    let child = step_fork::<ShimsTestPmap>(&proc_cap, false, false).expect("fork child");
+    tx_subsystems::process::step_setpgid(&child, tx_subsystems::process::Pgid(child.pid.0))
+        .expect("create child process group");
     proc_cap.set_fd(0, Some(tx_fs::devfs::open_console_for_init()));
     let ctx = make_ctx(proc_cap, thread);
 
-    let new_pgrp: u32 = 7;
+    let new_pgrp = child.pid.0;
     let argp = &new_pgrp as *const u32 as u64;
     let req = SyscallRequest::new(NR_IOCTL, [0, TIOCSPGRP as u64, argp, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Error(E_INVAL));
+}
+
+/// A successful TIOCSPGRP must replace the canonical typed foreground-pgrp
+/// reference, not only the cached numeric pgid. VINTR/SIGINT delivery follows
+/// this reference, so leaving it stale makes Ctrl-C miss a foreground child.
+#[test]
+fn dispatch_ioctl_tiocspgrp_rebinds_typed_foreground_group() {
+    let _setup = ioctl_setup();
+    let _ops = install_capturing_console();
+    let (proc_cap, thread) = fresh_proc_thread();
+    proc_cap.set_fd(0, Some(tx_fs::devfs::open_console_for_init()));
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    let bind = SyscallRequest::new(NR_IOCTL, [0, TIOCSCTTY as u64, 0, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(bind, &ctx)),
+        SyscallResult::Return(0)
+    );
+
+    let child = step_fork::<ShimsTestPmap>(&proc_cap, false, false).expect("fork child");
+    tx_subsystems::process::step_setpgid(&child, tx_subsystems::process::Pgid(child.pid.0))
+        .expect("create child process group");
+    let child_pgrp = child.pgrp_cap();
+
+    let new_pgrp = child.pid.0;
+    let argp = &new_pgrp as *const u32 as u64;
+    let set = SyscallRequest::new(NR_IOCTL, [0, TIOCSPGRP as u64, argp, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(set, &ctx)),
+        SyscallResult::Return(0)
+    );
+
+    let tty = proc_cap
+        .pgrp_cap()
+        .session_cap()
+        .controlling_tty_cap()
+        .expect("TIOCSCTTY installed controlling tty");
+    let foreground = tty
+        .foreground_pgrp_cap()
+        .expect("TIOCSPGRP installed typed foreground pgrp");
+    assert_eq!(foreground.key(), child_pgrp.key());
 }
 
 /// `ioctl(tty_fd, TIOCNOTTY, 0)` against a TTY whose session is

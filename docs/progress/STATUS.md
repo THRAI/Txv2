@@ -1,3 +1,30 @@
+- 2026-08-18 (**实板分支合入 main 后的等待协议与 RV vDSO 回归已闭环**).
+  本轮继续审计未提交的
+  `integration/portable-net-vf2-dwmac-main` 三方合并，重点沿用户拷贝、缺页、
+  RangeLock、wait-source、futex、reactor 唤醒和 vDSO 时间路径检查偶发卡死与
+  `std::time` EIO。**Changed**：用户区间等待观察到完成源已退休时改为重新做
+  语义检查，不再把内核等待源生命周期竞态泄漏为用户态 EIO；补充同窗口回归。
+  RV vDSO 的 coarse-clock 成功路径增加显式完成跳转，避免落入 ENOSYS；构建脚本
+  在 musl cross assembler 缺失时可使用 freestanding-compatible 的 GNU RISC-V
+  binutils，release 内核现嵌入实际 4 KiB vDSO，而非 stub。设备发现、绑定事务、
+  typed IRQ、DMA、EBR 和 file-I/O owner 路径复核后保持现有设计，没有增加常驻
+  轮询或粗粒度锁。**Verification**：新增 wait-source 退休回归 1/1、vDSO
+  coarse 跳转回归 1/1；`tx-hal` 12/12、`tx-drivers` 49/49、RV HAL 121/121、
+  LA QEMU HAL 75/75、LA2K1000 HAL 31/31；RV/LA QEMU release 与 LA2K1000
+  kernel-only release 均通过。`cargo -q xtask unit` 中 tx-kernel 201/201、
+  tx-ext4 102/102（另 2 ignored）、tx-scripts 171/171；仅剩 clean main 已有的
+  37 项 tx-shims 共享状态失败。最终使用 QEMU 9.2.1、release、4 GiB、8 核并
+  直接写已有决赛镜像运行完整 RV 流：CAgent 10/10，BuildStorm 编译成功
+  （998.40 s，产物 1,681,000 bytes），init 最终报告
+  `cagent_rc=0 buildstorm_rc=0`，日志为
+  `target/oscomp/rv-full-portable-merge-audit-vdso-r5-20260818.log`。
+  **Residual risk**：typed IRQ 表允许共享 IRQ，但每 hart 的 deferred-network
+  claim 目前只有一个槽；若未来同一 IRQ 同时挂接两块都要求延迟处理的物理网卡，
+  需改为有界队列或在资源图验证阶段拒绝。当前 QEMU、VF2 与 2K1000 支持配置均为
+  单物理网卡独占该线路。**Next**：创建合并提交前复核 staged/unstaged 边界；
+  平台及物理板结果仍需用该提交重新验证。**Blocker**：无新增代码阻塞，merge
+  尚未提交。
+
 - 2026-08-17 (**恢复初赛 lmbench 无 shebang 包装脚本的直接执行，原 LA64 页表
   登记表耗尽已越过**). 初赛镜像的 `/tmp/hello` 实际是 51-byte shell 包装脚本
   `/code/lmbench_src/bin/build/lmbench_all hello "$@"`，且没有 shebang；7 月 exec
@@ -18544,3 +18571,110 @@
   增大 bag/table/port 容量掩盖。**Blocker**：尚未定位是谁把
   `epoch=0` 与非空 publication head 组合出来，也尚未获授权实现该修复；恢复
   计划继续 blocked。
+- 2026-08-01 (**当前 HEAD 的 LA64 Git 路径复验通过**). **Changed**：未修改
+  内核代码；在 `feature-network-refactor-recovery` 的 `067381d145c8` 上重建
+  LA64 debug ELF，并使用本地 hostname Git HTTP/HTTPS 服务器执行独立
+  guest 验证。**Verification**：`cargo xtask build --target la64-qemu` 通过；
+  `TX_GIT_NET_TIMEOUT=360 bash tools/verify-git-net-la64.sh` 为 8/8（Git
+  binary、init/add/commit、file content、HTTP clone、HTTPS/TLS clone、push、
+  pull、DNS），串口证据为 `/tmp/verifygit-usuZCv/serial.log`。**Next**：PR 可将
+  LA64 Git 列为当前 HEAD 已验证能力；如需声称整个 LA64 网络栈全面通过，
+  仍应分别引用 netperf/iperf 等专项证据。**Blocker**：Git 路径无阻塞。
+- 2026-08-01 (**本地 Git 交互启动脚本切换到 LA64**). **Changed**：将被
+  `.gitignore` 排除的 `local-images/git/boot.sh` 改为使用 LA64 debug ELF、
+  LoongArch64 Alpine 镜像、`qemu-system-loongarch64 -cpu la464` 和 PCI
+  VirtIO block/net；原 RV64 参数与 QEMU 命令均保留为注释，方便人工切回。
+  **Verification**：`bash -n local-images/git/boot.sh` 通过；QEMU、`debugfs`、
+  LA64 内核 ELF 和镜像路径均存在。**Next**：由用户手动执行
+  `bash local-images/git/boot.sh` 完成交互启动。**Blocker**：无；按要求未在本次
+  任务中启动 QEMU。
+- 2026-08-01 (**LA64 GitHub TLS 证书“尚未生效”的墙钟根因已修复**).
+  `dd9435f3` 将 persistent-clock seed 移到
+  `tx_subsystems::vdso::init_vdso()?` 之后；LA64 使用 vDSO stub 并在 `?`
+  处提前返回，所以 RTC 根本未读，而 RV64 有 vDSO 镜像不受影响。
+  **Changed**：persistent-clock seed 改为先于可失败的 vDSO 镜像初始化；
+  LA64 QEMU RTC IRQ 从错误的 GSI 67 对齐官方 QEMU 9.2.1 的 GSI 70；
+  RTC host 测试改用原始 QEMU TOY 位域；增加 `clock` 探针；LA64 Git
+  gate 不再关闭 SSL，而是注入本地证书作为显式 CA。**Verification**：修复后
+  host/guest epoch 为 `1785579416/1785579417`，只差一秒，且仍然输出
+  `vdso:init:fail:stub`；LA64 HAL 53/53，timekeeper seed 1/1，LA64 build 通过，
+  `clock` 探针通过，开启 CA/证书日期校验的 LA64 Git gate 8/8，日志
+  `/tmp/verifygit-lEqnUu/serial.log`。全仓 unit 仍只被已记录的三个无关
+  tx-shims 失败与八个 tx-ext4 `with_target` 编译错误阻塞；arch/docs/
+  progress 全局门仍分别受已记录的 92 项 ratchet、23 个断链和一个非法
+  `completed` 状态阻塞，均未指向本次改动。**Next**：
+  用已重建的 LA64 debug ELF 重启后直接重试原 GitHub clone，无需手工
+  `date -s` 或关闭 SSL。**Blocker**：该 RTC/TLS 路径无阻塞；详情见
+  `msp/debug-logs/2026-08-01-la64-github-tls-clock.md`。
+- 2026-08-01 (**LA64 GitHub clone 卡死的 PCH-PIC/ExtIOI 根因已修复**).
+  外部 `ls-remote` 在 DNS、代理 CONNECT、TLS 与请求发送之后卡住；QEMU
+  事件证明 virtio-net 已拉起 PCH pin 18，但 PCH HTMSI vector 复位为 0，
+  因而错误投递到 ExtIOI 0，而 HAL 解屏蔽的是 ExtIOI 18。**Changed**：
+  LA64 发布经 QEMU GPEX slot-2 INTA swizzle 证明的 `NET_IRQ=82`；PCH source
+  解屏蔽前写入 `vector[pin]=ext_irq`；`eth0` 发布后启用设备通知；维护中的
+  LA64 QEMU 启动面固定 block/net PCI slot 1/2；Git gate 增加真实 IRQ
+  claim/complete 检查，诊断脚本增加外部 `ls-remote`/完整 clone witness，
+  两个脚本都自动回收临时磁盘并在复制失败时立即退出。**Verification**：
+  LA64 HAL 55/55；LA64 build；默认协议 GitHub `ls-remote` rc 0；完整 xv6
+  clone 收取 7780 objects/17.46 MiB、解析 4127 deltas 后 rc 0；LA64 本地
+  Git/IRQ gate 9/9，`claims=79=completions`、wrong-hart/missing-device 均 0；
+  xtask qemu 33/33、oscomp 2/2。`cargo xtask lint docs` 仍只报告既有 23 个
+  断链与 6 个 stale-vocabulary warning，本次两个文档不在失败清单。**Next**：
+  用户可用重建后的 LA64 debug ELF
+  直接复跑交互式 clone；之前记录的 LA64 TCP_CRR publication/EBR 问题仍是
+  独立事项。**Blocker**：本次 clone/IRQ 路径无阻塞。详细证据见
+  `docs/progress/research/2026-08-01-la64-virtio-net-irq-route.md` 与本地总账
+  `msp/debug-logs/2026-08-01-la64-xv6-clone-operation-ledger.md`。
+- 2026-08-17 (**远端实板分支已在独立 main 基线分支完成语义合并与编译验收**).
+  在 `main@937901d1` 新建 `integration/portable-net-vf2-dwmac-main`，将本地
+  `portable-net-vf2-dwmac` 先快进对齐到
+  `origin/feature/portable-net-vf2-dwmac@e76e3d38`，再执行保留真实父代的
+  三方合并；当前仍处于未提交 merge 状态。冲突处理以 main 的文件系统、
+  VM、调度和 syscall 架构为权威，只吸收上板分支的静态设备资源图、一次性
+  绑定事务、实例化 IRQ 上下文、VF2 DWMAC5/MMC/JH7110/PLIC 适配，以及
+  2K1000 U-Boot/FDT/LIOINTC/SMP/AHCI/DWMAC3/非一致 DMA/分区根文件系统
+  适配；没有引入运行时 HAL manager 或动态 platform 对象。人工审计同时
+  修复了合并造成的 `writev` 重复执行、rename 延迟销毁丢失、file-I/O service
+  重绑、owner wake 竞态、LA64 userspace 入口符号错配，以及宿主 HAL/FS
+  测试共享静态状态的并发冲突。VF2 MMC 源码继续保留对 Chronix/Del0n1x
+  GPLv3 实现的移植说明；DWMAC3/5 为 TxKernel 独立驱动，并注明仅对照 Linux
+  stmmac/U-Boot 的硬件语义。**Verification**：`cargo -q xtask unit` 编译并
+  执行，合并后相对 clean main 没有新增失败；`tx-shims` 645/682，37 项均为
+  main 已有失败子集，`tx-ext4` 102/102（另 2 ignored），`tx-scripts`
+  171/171，`tx-kernel` 仅保留 main 已有的 2 项字符串断言失败。补充专项为
+  `tx-fs` 114/114、`tx-hal` 资源图 12/12、`tx-drivers` 49/49、设备绑定
+  31/31、RV64 HAL 121/121、LA64 QEMU HAL 75/75、2K1000 HAL 31/31；
+  `cargo -q xtask lint net-portability` 为 0 findings；RV64 QEMU、LA64 QEMU
+  release 构建和 2K1000 实板 `--kernel-only --release` 构建通过。2K1000
+  默认内嵌-initrd 模式按链接脚本预期因越过已验证的 `0x98800000` transport
+  边界而拒绝链接，实板发布应继续使用教程规定的 kernel-only + U-Boot
+  外置 initrd 流程。未生成或改写任何测试/上板镜像。**Next**：人工检查
+  staged merge 后创建合并提交，再分别进行 QEMU 回归与两块实板复验。
+- 2026-08-17 (**main/实板分支自动合并结果完成第二轮语义审计**).
+  三方交集中共有 81 个双方同时修改的文件，不能把无冲突或 `-Xours`
+  选中结果直接视为正确。本轮逐项复核设备发现→候选绑定→注册表发布→驱动
+  激活→控制器解屏蔽、根介质选择→分区句柄→ext4 挂载，以及 EBR→owner
+  wake→file-I/O service→页缓存/VM 的跨模块路径。**Changed**：修复四个网卡
+  adapter 直接使用全设备 `BoundDeviceKey` 命名的问题；序号改为按设备类别
+  独立提交，因此 2K1000 上先绑定 AHCI 不会再把首块 GMAC 发布成 `eth1`。
+  合并 file-I/O service 两边各自保留一半的等待协议：继续采用 main 的即时
+  work/backend wait 公平性，同时在订阅后重新验证上板分支的 owner-live
+  latch，避免 retirement-before-subscription 丢唤醒；恢复真实 wake 的
+  `waits_ready` 统计。诊断查询同时校验 reactor task generation，防止槽位
+  复用后把新任务误报成旧 file-I/O owner。修复合并后测试适配遗漏的分区
+  `Result` 解包和销毁计数器初始化，并恢复被 ours 选择丢掉的 raw-bus
+  selected-bit/refire 与 VM 跨页短拷贝回归。确认保持 main 原实现的三个文件
+  是有意选择：`fs_path` 已包含同等 chmod/chown 且多出 fd 变体，TCP loopback
+  测试覆盖强于实板分支，bus queue 生产实现相同；`bdevfs/mod.rs` 采用实板版
+  仅为导出 MBR parser。**Verification**：`cargo -q xtask unit` 相对 clean
+  main 无新增失败；设备 binder 14/14、file-I/O owner 竞态/claim 重投专项、
+  raw-bus 和 VM 短拷贝专项通过；`cargo fmt --all -- --check`、
+  `cargo -q xtask lint net-portability`（0 findings）、RV64 QEMU release、LA64
+  QEMU release、2K1000 kernel-only release 均通过；`tx-subsystems` 1668 个
+  lib test 均可编译枚举。批量直接运行全部 net unit 会因共享初始 netns/zone
+  测试状态互相污染而失败，单项复核可通过，因此不把该批量结果冒充网络
+  回归证据。**Residual risk**：本轮没有启动 QEMU 或操作镜像，也没有实板
+  复验；QEMU `vda` 继续按名称选择 main 的同步 pager，而物理介质选择异步
+  journal binder，这是保住决赛编译性能的明确兼容边界，后续宜改为块设备
+  capability 而不是名称判断。VF2 MMC 和 QEMU legacy block 尚未迁入 typed
+  binder，属于已知迁移边界，不是本轮自动合并遗漏。

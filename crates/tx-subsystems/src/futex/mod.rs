@@ -641,9 +641,8 @@ fn step_futex_wait_masked_with_tid(
     let observed: u32 = match aspace.read_user(UserPtr::<u32>::new(uaddr as usize), guard) {
         StepOutcome::Done(v) => v,
         StepOutcome::Err(e) => return StepOutcome::Err(e),
-        StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
-            return StepOutcome::Err(Errno::EFAULT);
-        }
+        StepOutcome::Yield { progress, shape } => return StepOutcome::Yield { progress, shape },
+        StepOutcome::Continue { progress } => return StepOutcome::Continue { progress },
     };
     if observed != val {
         emit_futex_debug_sample(
@@ -670,9 +669,10 @@ fn step_futex_wait_masked_with_tid(
         {
             StepOutcome::Done(v) => v,
             StepOutcome::Err(e) => return StepOutcome::Err(e),
-            StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
-                return StepOutcome::Err(Errno::EFAULT);
+            StepOutcome::Yield { progress, shape } => {
+                return StepOutcome::Yield { progress, shape };
             }
+            StepOutcome::Continue { progress } => return StepOutcome::Continue { progress },
         };
         if observed_again != val {
             emit_futex_debug_sample(
@@ -1369,6 +1369,23 @@ impl<I: SubjectIdentity> StepOp<I> for FutexWaitOp<'_> {
         if let Some(source_id) = self.registered_source_id {
             return step_engine::yield_until_wake(source_id, self.interest_mask);
         }
+        let word_range = match crate::vm::UserRange::containing_page(crate::vm::UserVirtAddr(
+            self.uaddr as usize,
+        )) {
+            Ok(range) => range,
+            Err(_) => return StepOutcome::Err(Errno::EFAULT),
+        };
+        match self
+            .aspace
+            .reserve_user_range_for_access(word_range, crate::vm::UserAccessKind::Read)
+        {
+            StepOutcome::Done(()) => {}
+            StepOutcome::Err(errno) => return StepOutcome::Err(errno),
+            StepOutcome::Continue { progress } => return StepOutcome::Continue { progress },
+            StepOutcome::Yield { progress, shape } => {
+                return StepOutcome::Yield { progress, shape };
+            }
+        }
         let guard =
             tx_substrate::epoch::borrow_current_guard().unwrap_or_else(adapter::step_engine::guard);
         let outcome = step_futex_wait_masked_with_tid(
@@ -1380,7 +1397,9 @@ impl<I: SubjectIdentity> StepOp<I> for FutexWaitOp<'_> {
             self.tid,
             self.private,
         );
-        if let Some(source) = notification::yielded_wait_source(&outcome) {
+        if let Some(source) = notification::yielded_wait_source(&outcome).filter(|source| {
+            exact_waiter_registered(self.aspace, self.uaddr, self.private, source.raw())
+        }) {
             self.waiting = true;
             self.registered_source_id = Some(source.raw());
         }
@@ -1394,6 +1413,11 @@ impl<I: SubjectIdentity> StepOp<I> for FutexWaitOp<'_> {
                     if exact_waiter_registered(self.aspace, self.uaddr, self.private, source_id) {
                         return Ok(());
                     }
+                } else {
+                    // A VM range-lock wake asks the operation to retry the
+                    // futex value check. It is not a futex wake and must not
+                    // complete FUTEX_WAIT.
+                    return Ok(());
                 }
                 self.unregister();
                 self.waiting = false;
@@ -2196,6 +2220,62 @@ mod tests {
                 }
                 other => panic!("expected Yield::OnWaitSource, got {other:?}"),
             }
+        }
+
+        #[test]
+        fn futex_wait_op_retries_vm_range_lock_wake_without_completing_wait() {
+            use crate::vm::{AcquireResult, LockMode, UserRange, UserVirtAddr, USER_PAGE_SIZE};
+
+            let _setup = setup();
+            let (aspace, uaddr) = setup_aspace_with_word(0xa100_0000, 7);
+            let range = UserRange::new_aligned(UserVirtAddr(uaddr as usize), USER_PAGE_SIZE)
+                .expect("futex word range");
+            aspace
+                .pmap()
+                .teardown_range(range)
+                .expect("remove resident PTE while retaining private backing");
+            let writer = match aspace
+                .range_lock()
+                .acquire_step_rich(range, LockMode::ExclusiveWriter)
+            {
+                AcquireResult::Acquired(writer) => writer,
+                AcquireResult::WouldBlock(_) => panic!("exclusive writer should acquire"),
+            };
+
+            let mut op = FutexWaitOp {
+                uaddr,
+                aspace: &aspace,
+                val: 7,
+                interest_mask: FUTEX_WAKE_MASK,
+                tid: None,
+                woken: false,
+                waiting: false,
+                registered_source_id: None,
+                private: true,
+            };
+            let mut ctx = ScriptCtx::<ProcessIdentity>::new();
+            assert!(matches!(op.step(&mut ctx), StepOutcome::Yield { .. }));
+            assert!(
+                op.registered_source_id.is_none(),
+                "a VM range-lock source must not be recorded as a futex waiter"
+            );
+
+            <FutexWaitOp<'_> as StepOp<ProcessIdentity>>::apply_resume(
+                &mut op,
+                ResumeOutcome::Retry,
+            )
+            .expect("range-lock retry resume");
+            assert!(!op.woken, "a VM wake must not complete FUTEX_WAIT");
+
+            drop(writer);
+            match op.step(&mut ctx) {
+                StepOutcome::Yield { .. } => {}
+                other => panic!("retry should publish futex waiter, got {other:?}"),
+            }
+            assert!(
+                op.registered_source_id.is_some(),
+                "the retry must publish the real futex waiter"
+            );
         }
 
         #[test]

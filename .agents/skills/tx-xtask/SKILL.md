@@ -23,7 +23,8 @@ binary disagree, the binary wins.
 | Decode a syscall trace from serial log | `cargo xtask trap-trace --serial PATH --syscalls` |
 | Run guest shell scenarios | `cargo xtask shell-test --target rv64-qemu --script PATH` |
 | Validate progress JSON records | `cargo xtask progress validate` |
-| Run an architecture / docs / boundary lint | `cargo xtask lint arch\|docs\|unused\|boundary\|invariants` |
+| Run an architecture / docs / boundary lint | `cargo xtask lint arch\|docs\|unused\|boundary\|invariants\|net-portability` |
+| Render a relocated network topology | `cargo xtask qemu --target TARGET --profile PROFILE --net-scenario PATH --dry-run` |
 | Decode a `.txtrace` file → JSON | `cargo xtask observe replay --file PATH` |
 | Decode a `.txtrace` file → Perfetto | `cargo xtask observe pftrace --file PATH --output OUT` |
 
@@ -74,6 +75,11 @@ Architecture/discipline linters. Kinds:
 - `unused` — unused-symbol detector.
 - `boundary` — substrate/reactor-call ratchet (post-adapter enforcement;
   fails if outside-adapter call count regresses).
+- `net-portability` — reports architecture branches, singleton network IRQs,
+  deployment literals, fixed QEMU placement, and other portability debt. Its
+  focused unit tests must stay green; during the staged migration the full
+  repository scan is intentionally red. Add it to CI only when Phase 5 closes
+  the remaining findings.
 - `kernel-user-layouts` — extracts pinned musl RV64/LA64 C layouts for every
   registered kernel/user candidate, requires registered Rust-backed
   production `#[repr(C)]` kernel/user ABI structs to implement
@@ -155,6 +161,11 @@ Default target is `rv64-qemu`. `smoke` is the minimal kernel boot;
 
 Runs guest shell scenarios from a script file. Flags:
 
+- `--net none|user|tap:IFNAME|bridge:BRIDGE` — select a compatibility backend;
+  NIC placement still comes from the target's versioned default scenario.
+- `--net-scenario PATH` — use one strict external scenario for placement,
+  backend, guest cmdline, and expected results; conflicts with explicit
+  `--net`.
 - `--group NAME[,NAME...]` — run only the named test group(s).
 - `--list-groups` — print available group names from the script.
 - `--keep-going` — don't stop on first failure.

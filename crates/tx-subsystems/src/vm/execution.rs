@@ -24,7 +24,7 @@ use crate::vm::checks::{
     require_fault_publication, require_fault_recipe, require_map_admission, require_remap_shape,
 };
 use crate::vm::pmap::PmapBatchPage;
-use crate::vm::structure::{PrivatePageError, PrivatePageSet, VmPageOff};
+use crate::vm::structure::{PrivatePageError, PrivatePageSet, RecipeIndex, VmPageOff};
 use crate::vm::{
     AccessMode, AddressSpace, LockMode, MapPlacement, PmapPublishOutcome, Prot, RangeGuard,
     UserRange, UserVirtAddr, VmBacking, VmEntry, VmEntryBacking, VmFault, VmFaultError,
@@ -223,21 +223,21 @@ impl AddressSpace {
         parent: &AddressSpace,
         _full_guard: RangeGuard<'_>,
     ) -> Result<AddressSpace, VmMapError> {
-        let guard = step_engine::guard();
         let parent_recipes = parent.recipes_snapshot();
-        let child_recipes = parent.recipes.clone_shared(&guard);
-        let child = AddressSpace::new_with_recipes_for_platform::<P>(child_recipes)?;
+        let mut child_recipe_entries = Vec::with_capacity(parent_recipes.len());
         let mut private_protections = Vec::new();
         let mut inherited_ranges = Vec::new();
 
-        for entry in parent_recipes {
+        for entry in &parent_recipes {
             let private = !entry.flags.shared;
             let range = entry.range;
-            if let (true, Some(parent_set)) = (private, entry.private()) {
+            let child_entry = if let (true, Some(parent_set)) = (private, entry.private()) {
                 let child_set = parent_set.fork_share().map_err(VmMapError::Private)?;
-                let child_entry = entry.clone().with_private(Some(child_set));
-                child.recipes.replace_entry(child_entry)?;
-            }
+                entry.clone().with_private(Some(child_set))
+            } else {
+                entry.clone()
+            };
+            child_recipe_entries.push(child_entry);
             if private {
                 private_protections.push((range, entry.prot.without_write()));
                 if entry.prot.write {
@@ -245,6 +245,13 @@ impl AddressSpace {
                 }
             }
         }
+
+        // The child cannot be observed before this point. Build its complete
+        // immutable recipe tree in memory and publish it once; per-entry
+        // publication here only retires unreachable intermediate roots and
+        // couples fork progress to the global EBR grace period.
+        let child_recipes = RecipeIndex::from_unpublished_entries(child_recipe_entries);
+        let child = AddressSpace::new_with_recipes_for_platform::<P>(child_recipes)?;
 
         // One fork owns the full parent range lock, so all private PTE
         // demotions form one pmap transaction and one cross-hart shootdown.
@@ -271,6 +278,7 @@ impl AddressSpace {
         }
         let _ = child.pmap.publish_new_pages_best_effort(inherited_pages);
 
+        let guard = step_engine::guard();
         child.stats.store(child.recipes.stats(&guard));
         Ok(child)
     }
@@ -444,22 +452,15 @@ impl AddressSpace {
                         await_fault_wait(self, token).await;
                         continue;
                     }
-                    Err(VmFaultError::StaleRecipe) => continue 'resolve,
-                    // Resident-root publication is deliberately fallible
-                    // under transient writer/retire-credit contention. The
-                    // PageContainer reports that condition as EAGAIN; it is
-                    // not a backing I/O failure and must not become SIGSEGV.
-                    // Drop the materialization guard at the call boundary,
-                    // service EBR once, and yield so the competing publisher
-                    // or file-I/O task can make progress before retrying the
-                    // same resolved recipe.
-                    Err(VmFaultError::PageCache(crate::page_backed::PageCacheError::Backend(
-                        crate::execution::Errno::EAGAIN,
-                    ))) => {
+                    Ok(FaultScriptPublish::Retry) => {
+                        // PageBacked `Continue` is transient publication
+                        // pressure, not a backend errno. Service bounded EBR
+                        // work, yield once, then retry this resolved recipe.
                         let _ = tx_substrate::epoch::drain_with_budget(64);
                         tx_reactor::yield_now().await;
                         continue;
                     }
+                    Err(VmFaultError::StaleRecipe) => continue 'resolve,
                     // A private-page CAS loser also asks the fault script to
                     // restart after yielding; the recipe may have changed.
                     Err(VmFaultError::WouldBlock) => {
@@ -559,7 +560,8 @@ impl AddressSpace {
             }
         };
         let page = outcome.page_range.start().containing_page();
-        if let Some(existing) = self.pmap.lookup(page) {
+        let existing = self.pmap.lookup(page);
+        if let Some(existing) = existing {
             if existing.prot.permits(outcome.access) {
                 self.pmap.refresh_page_translation(page)?;
                 emit_vm_trace(b"debug.vm.fault.materialize.coalesced", 1);
@@ -568,6 +570,22 @@ impl AddressSpace {
                     replaced: false,
                 }));
             }
+        }
+        // Fork can inherit a resident private page which is authoritative in
+        // the pmap but has no row in the recipe's PrivatePageSet (notably a
+        // page first populated through a direct kernel user-copy lane).  A
+        // normal user-mode write reaches this fault path, not user_access's
+        // copy_to_user path.  Seed the inherited frame before materializing
+        // the write, otherwise a private-anon page is recreated as zero (or a
+        // private file page is recreated from the file) and the fork snapshot
+        // is silently lost.
+        if outcome.access == AccessMode::Write {
+            crate::vm::user_access::seed_inherited_private_frame(
+                &outcome.entry,
+                outcome.page_range.start().as_usize(),
+                existing,
+            )
+            .map_err(|_| VmFaultError::BackingMismatch)?;
         }
         let materialization = match ufd_reply {
             Some(DelegateReply::Ufd(UfdReply::Copy {
@@ -590,6 +608,11 @@ impl AddressSpace {
                         drop(guard);
                         emit_vm_trace(b"debug.vm.fault.materialize.wait", 1);
                         return Ok(FaultScriptPublish::Wait(token));
+                    }
+                    VmFaultMaterializationStep::Retry => {
+                        drop(guard);
+                        emit_vm_trace(b"debug.vm.fault.materialize.retry", 1);
+                        return Ok(FaultScriptPublish::Retry);
                     }
                     VmFaultMaterializationStep::Err(error) => {
                         emit_vm_trace(b"debug.vm.fault.materialize.err", 1);
@@ -692,6 +715,7 @@ impl AddressSpace {
             emit_vm_trace(b"debug.vm.fault.prefault.phase", 3);
             let materialization = match outcome.materialize_pagebacked_step(&guard) {
                 VmFaultMaterializationStep::Done(materialization) => materialization,
+                VmFaultMaterializationStep::Retry => break,
                 VmFaultMaterializationStep::Blocked(_) | VmFaultMaterializationStep::Err(_) => {
                     break;
                 }
@@ -1537,6 +1561,7 @@ enum FaultScriptResolve {
 
 enum FaultScriptPublish {
     Done(PmapPublishOutcome),
+    Retry,
     Wait(WaitToken),
 }
 

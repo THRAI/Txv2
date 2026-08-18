@@ -24,9 +24,11 @@ members = [
     "boards/tx-hal-riscv64-qemu-virt",
     "boards/tx-hal-riscv64-m1dock-mock",
     "boards/tx-hal-loongarch64-qemu-virt",
+    "boards/tx-hal-loongarch64-2k1000",
     "boards/tx-kernel-riscv64-qemu-virt",
     "boards/tx-kernel-riscv64-m1dock-mock",
     "boards/tx-kernel-loongarch64-qemu-virt",
+    "boards/tx-kernel-loongarch64-2k1000",
 ]
 exclude = [
     "external/smoltcp-asterinas",

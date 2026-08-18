@@ -4,17 +4,27 @@
 
 **Status.** v1 (2026-04-24). Draft.
 
-**Purpose.** Specify the device subsystem for txKernel. Devices on our targets divide into three tiers with sharply different machinery: tier 1 lives in the HAL below the object model, tier 2 is statically composed per-board with no zone-allocated entities, and tier 3 (the dynamic matching framework) is deferred. This document fixes the tier-1 and tier-2 surface, names the four routes by which device data reaches userspace through VFS, and leaves tier 3 as a closed placeholder with a shape sketch.
+**Purpose.** Specify the device subsystem for txKernel. Devices divide into
+three tiers with sharply different lifetimes: tier 1 lives in HAL below the
+object model; tier 2 uses a compile/link-time provider/driver set, one-shot boot
+discovery/binding, and static-lifetime registrations; tier 3 owns future runtime
+arrival/removal/reclamation and remains deferred. This document also names the
+four VFS routes for device data.
 
 **Audience.** Board-bringup authors, driver-crate authors, reviewers auditing what needs `Cap` and what does not, anyone wondering where `i_fops` went.
 
-**Targets.** qemu-riscv64-virt, qemu-loongarch64, VisionFive 2 (JH7110), 2K1000LA.
+**Targets.** RV64 QEMU, LA64 QEMU, VisionFive 2 (JH7110), and a deferred LA
+real-board extension seam whose concrete hardware is intentionally unspecified.
 
 **Companion documents.**
 
 - [`01_CONCEPTS_v5.md`](../../Txv3/01_CONCEPTS_v5.md) — reference hierarchy and authoritative bindings. The tier-2 static-table decision is consistent with §3: `'static` references sit outside the reference hierarchy because there is no slot to pin.
 - [`object_model_v2.md`](../00_meta-framework/object_model_v2.md) §3 (entities), §8.1.1 (bifurcation). Tier-2 bindings are *not entities*; tier 3's `DynamicCharDevice` (deferred) would be.
-- [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — BIF-*, PRED-*, SIG-*. This document introduces no new invariants; it uses existing ones and explicitly notes where the entity-centric rules do not apply.
+- [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — BIF-*, PRED-*,
+  SIG-*, and the canonical `DEVRES-*` resource/binding rules.
+- [`NET_DEVICE_v1.md`](NET_DEVICE_v1.md) — exact resource types, graph freeze,
+  static descriptor/binder, per-device IRQ/DMA, network identity/configuration,
+  and LA real-board hook.
 - [`PAGE_BACKED_v1.md`](../03_memory-vm/PAGE_BACKED_v1.md) §2 — `RNodeBacking`; §11.1 retires `i_fops` / `i_ops`. This document specifies what replaces them for devices, including a **revision to `StructPayload::CharDevice`** (§5.2) to hold `&'static CharDeviceBinding` rather than `Cap<CharDeviceBinding>`.
 - [`SIGNAL_ATTACHMENTS_v1.md`](../04_process-signals/SIGNAL_ATTACHMENTS_v1.md) §3.9 — **closes the Device/Driver placeholder rows** with tier-2-specific attachments (§10).
 - [`SUBSYSTEM_ANATOMY_v2_1.md`](../00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md) — the four-module layout. The device subsystem follows it in a reduced form; see §8.
@@ -32,7 +42,9 @@ DEVICE is mostly the negative case for the policy-zone rule:
 | Device declaration | Public type | Reclamation role |
 |---|---|---|
 | Tier-1 HAL device | platform static interface | below object model, no zone |
-| Tier-2 board device binding | `&'static CharDeviceBinding` / `&'static BlockDeviceRegistration` | static fact, no zone or cap |
+| platform/final resource record | `&'static PlatformDevice` | immutable platform/device fact, no zone or cap |
+| Tier-2 bound device | `&'static BoundDevice` | boot-frozen static binding, no zone or cap |
+| Tier-2 class registration | `&'static CharDeviceBinding` / `&'static BlockDeviceRegistration` / `&'static NetDeviceRegistration` | static registration, no zone or cap |
 | devfs RNode | `Cap<RNode>` owned by VFS/PageBacked | zone-derived file identity, not device identity |
 | Page-backed device content | `Cap<PageContainer>` when a driver builds one at init | page-content entity, owned by PAGE_BACKED |
 | Pseudo-device schema | `&'static PseudoDevSchema` | projection schema, no zone |
@@ -54,11 +66,23 @@ Linux's device model — `struct device`, `struct device_driver`, `struct bus_ty
 - **Heterogeneous bus composition** (ACPI + PCI + platform + USB + I²C + …).
 - **Driver unloading as a user-facing operation.**
 
-Our target set is three boards with known-at-compile-time peripherals plus qemu-virt. On these targets, the set of devices is a property of the board, the driver choice for each is a property of the board, and both are fixed at the moment the kernel image is linked. No enumeration is required to discover them; no matching is required to claim them.
+txKernel still produces a per-platform kernel image, so its platform
+implementation, resource-provider implementations, and driver implementations
+are fixed when the image is linked. The **values and multiplicity** of devices
+are not necessarily link-time facts: firmware may reorder nodes, a bus may
+enumerate different functions, one machine may expose zero or several matching
+NICs, and each instance may carry a different IRQ/DMA domain.
 
-Linux has the machinery it has because it ships one kernel image across every supported architecture, every supported peripheral, every supported bus topology. We do not. A per-board kernel image is fine, and it lets us collapse most of the device model into a static table.
+Tier 2 therefore collapses lifecycle rather than hardware topology. It performs
+one bounded boot discovery/matching transaction, freezes the result, publishes
+`&'static` registrations, and never detaches them. This is enough for fixed
+on-board controllers and boot-enumerated QEMU PCI/VirtIO without importing
+Linux's runtime driver core.
 
-This document formalizes that collapse while preserving one narrow escape hatch — tier 3 — for the case where we eventually need runtime discovery (PCIe slots on VJ2, future hot-swap stories). Tier 3 is deferred, not denied; its shape is sketched in §9 so that adding it later does not require reshaping what we build now.
+Tier 3 remains the escape hatch for device arrival/removal after the boot graph
+is frozen, hotplug event delivery, driver unloading, and reclaimable device
+identity. Those lifecycle problems are deferred, not conflated with tier-2
+boot discovery.
 
 ---
 
@@ -95,21 +119,30 @@ written as `P::read_ns()`, `P::set_deadline_ns(deadline)`, `P::claim()`, and
 
 <!-- txdoc:DEVICE-TIER-2-STATIC-DEVICES-1 -->
 
-**Examples.** Per-board on-chip peripherals: UARTs, SD/MMC controllers, GMAC Ethernet, SDHCI, RTC. Plus qemu's virtio devices at known MMIO addresses.
+**Examples.** Firmware-described on-chip UART/SD/MMC/GMAC/RTC controllers,
+VirtIO-MMIO devices, and PCI functions enumerated once during boot.
 
 **Characteristics.**
 
-- Created at tier-2 init, which runs once after `substrate::init()` returns and before userspace starts.
-- The set of devices is declared in a static table in the board crate.
-- Each device is represented by an `&'static` struct. Not zone-allocated. Not refcounted. Cannot be reclaimed.
+- The provider and driver implementation sets are linked statically. Resource
+  values and the resulting device set come from the immutable boot graph.
+- Resource providers enumerate at most once after required MMIO mappings exist;
+  the graph is frozen before matching.
+- The binder runs once after `substrate::init()` and before userspace.
+- Every successful `BoundDevice` and class registration is `&'static`, not
+  zone-allocated/refcounted, and cannot be reclaimed or detached.
 - Appear in `/dev` via the devfs projection (§6).
 - The driver's ops are a `&'static` vtable (`CharDeviceOps`, `BlockDeviceOps`). One vtable per driver type, shared across all instances.
 
 **Home.** Three places:
 
-- `drivers/<driver-crate>/` — driver crates, each defining `pub static <n>_OPS: CharDeviceOps = ...;` and per-instance state types.
-- `boards/<board>/devices.rs` — per-board instantiation of `CharDeviceBinding` / `BlockDeviceRegistration` statics referencing driver vtables and chip-specific state.
-- `frame/device/` — the subsystem skeleton that consumes the static tables and publishes them to devfs (§8).
+- `drivers/<driver-crate>/` — concrete ops/state types and a linked
+  `StaticDriverDescriptor` whose typed decoder/prepare function owns the
+  driver-specific resource contract.
+- `tx-hal-<arch>-<board>` — immutable platform resource seed; no semantic
+  registration and no driver selection.
+- `frame/device/` — final graph builder, one-shot binder, per-class registries,
+  and projections (§8).
 
 **Not an entity.** Per object_model §3, entities are zone-allocated things with identity retention, reclamation, and possibly bifurcation into Identity/Payload. A tier-2 `CharDeviceBinding` is none of these. It is a configuration record with attached behavior — closer to a Linux `__initdata` driver table than to a `struct device`. The pillar pattern (BIF / PRED / WIT / OBL / SIG) does not apply because there is no zone slot to audit.
 
@@ -117,13 +150,17 @@ written as `P::read_ns()`, `P::set_deadline_ns(deadline)`, `P::claim()`, and
 
 <!-- txdoc:DEVICE-TIER-3-DISCOVERED-DEVICES-1 -->
 
-**Examples (aspirational).** Anything plugged into the VJ2 PCIe slot at runtime. USB devices. Hot-plugged cards.
+**Examples (aspirational).** Anything arriving in a real-board PCIe slot after
+the boot graph freezes, USB devices, and hot-plugged cards.
 
 **Status.** **Deferred.** No tier-3 machinery ships in v1. §9 records the shape so that introducing it later is additive, not restructuring.
 
 **Why deferred.** The targets we care about reach "working busybox + gcc + nginx" with tier 1 + tier 2 alone. SSH-over-Ethernet for debugging real boards is tier-2 (on-chip GMAC). The class of devices that genuinely requires tier 3 — USB peripherals, plug-in PCIe cards — is not on the critical path.
 
-**Interaction with tier 2.** Bus enumerators (PCIe, USB) that would produce tier-3 nodes do not exist in v1. The PCIe host controller itself, when present as an on-chip peripheral, is tier-2; it is registered but not walked.
+**Interaction with tier 2.** A linked provider may walk a boot bus once and add
+fixed-lifetime records before the graph freeze. That includes PCI enumeration
+needed by LA64 QEMU. Re-scanning for arrivals, removal, or hotplug notification
+after freeze is tier 3. USB hotplug and plug-in PCIe lifecycle remain deferred.
 
 ---
 
@@ -131,11 +168,17 @@ written as `P::read_ns()`, `P::set_deadline_ns(deadline)`, `P::claim()`, and
 
 <!-- txdoc:DEVICE-THE-STATIC-BINDING-COMMITMENT-1 -->
 
-**DEV-1 (no dynamic bindings for tier 1 or tier 2).** Tier-1 and tier-2 devices are represented exclusively by `&'static` references. No `Cap<T>`, no `PayloadCap<T>`, no zone allocation. This applies to:
+**DEV-1 (static lifetime after one-shot binding).** Tier-1 interfaces,
+immutable resource graphs, successful tier-2 bindings, and tier-2 registrations
+are represented by `&'static` references. Boot-time matching and preparation
+may use private linear reservations, but no published tier-2 object uses
+`Cap<T>`, `PayloadCap<T>`, `Weak<T>`, or zone allocation. This applies to:
 
 - Driver vtables (`CharDeviceOps`, `BlockDeviceOps`, `NetDeviceOps`).
-- Per-driver-instance state (`Ns16550aState`, `VirtioBlkState`, ...) — defined as `static`s in the board crate.
+- Final per-driver-instance state (`Ns16550aState`, `VirtioBlkState`, ...),
+  committed/leaked to `'static` only after all fallible preparation succeeds.
 - The binding structs that tie a devt/name to a driver (`CharDeviceBinding`, `BlockDeviceRegistration`).
+- `BoundDevice`, `NetDeviceRegistration`, and immutable IRQ handler contexts.
 - Pseudo-device projection schemas (`NULL_SCHEMA`, `ZERO_SCHEMA`).
 
 **Rationale.** Entities in the object model exist so that reclamation can be reasoned about. Tier-1 and tier-2 devices on our targets do not reclaim — they live as long as the kernel does. Making them entities would add `Cap`/`PayloadCap` machinery with nothing for it to count. The pillar audit in prior design discussion confirmed this directly: the BIF bifurcation pattern applies to entities admitting `structural ⟂ payload` with independent reclamation lifetimes, and tier-2 devices admit neither an independent structural lifetime nor an independent payload lifetime.
@@ -144,7 +187,10 @@ written as `P::read_ns()`, `P::set_deadline_ns(deadline)`, `P::claim()`, and
 
 **Corollary (no device-side ENODEV-on-unplug).** Because tier-2 devices cannot disappear, operations on open fds against them cannot return ENODEV for reasons of driver death. They can return ENODEV, EIO, etc. for operation-specific reasons the driver decides, but the device-vs-driver-lifecycle error class does not exist in v1.
 
-**Tier 3 exception.** When tier 3 is added (§9), discovered devices will be zone-allocated with the full Identity/Payload factoring. The static-binding commitment applies only to tier 1 and tier 2.
+**Tier 3 exception.** When tier 3 is added (§9), runtime-arriving/removable
+devices use zone-allocated Identity/Payload factoring. The word “discovered” by
+itself does not imply tier 3: the lifetime boundary is whether discovery occurs
+inside the one-shot boot graph freeze or after it.
 
 ---
 
@@ -168,7 +214,11 @@ Class is not a runtime discriminant on a single type — each class has its own 
 
 **PageBackedDevice** is mostly one case: a framebuffer. The producing tier-2 driver builds a `PageContainer` with `Device { base_ppn, page_count, device: <registration ref> }` at init and installs it in a fixed RNode. Opens of the devfs entry return fds on that pre-existing RNode. Reads / writes / mmap go through uniform page-backed dispatch; no ops vtable is involved.
 
-Net is class-separate because it does not route through VFS file operations at all. `NetDeviceRegistration` is consumed by the socket subsystem's packet layer (future smoltcp integration), not by any devfs code. It is mentioned here for completeness; the detailed net-device contract lives in the net subsystem spec.
+Net is class-separate because it does not route through VFS file operations.
+`NetDeviceRegistration` is consumed by the network subsystem's packet layer,
+then projected into a namespace with an independently assigned ifindex/name.
+The canonical contract is [`NET_DEVICE_v1.md`](NET_DEVICE_v1.md); hardware and
+IRQ paths use `DeviceId`, never the projection name.
 
 ---
 
@@ -249,13 +299,13 @@ The binding struct:
 ```rust
 // frame/device/structure/char.rs
 pub struct CharDeviceBinding {
+    pub device_id: DeviceId,
+    pub bound: BoundDeviceKey,
     pub devt: DevT,
     pub name: FixedName<32>,
     pub class: DeviceClass,                    // always Char here
     pub ops: &'static CharDeviceOps,
     pub driver_state: &'static (dyn Any + Send + Sync),
-    pub mmio_regions: &'static [MmioRegion],
-    pub irqs: &'static [IrqHandle],
     pub readable_wire: RawQueue,               // static-backed; see §12.3
     pub uevent_wire: RawPort,                  // static-backed
 }
@@ -271,7 +321,13 @@ pub struct CharDeviceOps {
 
 **Used by.** `/dev/ttyS*_raw` (rare — normally wrapped by TTY), `/dev/random`, `/dev/urandom`, `/dev/input/*`, `/dev/kmsg`, and the internal char-device handle that a hardware TTY's `TtyTransport::Hardware` refers to.
 
-**Instance state.** Lives in `driver_state: &'static dyn Any`. Each concrete driver provides a `static <n>_STATE: <DriverStateType> = ...;` in the board crate (or `pub static` in the driver crate if truly stateless). Internal mutability (atomics, `Mutex`) is the norm because `&'static` does not allow `&mut` access.
+**Instance state.** Lives in `driver_state: &'static dyn Any`. A descriptor's
+prepare function allocates the concrete state and validates typed resources;
+the bind reservation converts it to `'static` only at commit. The state retains
+its concrete MMIO view, DMA owners/mapping, and other driver-specific evidence.
+The class registration exposes `DeviceId`/`BoundDeviceKey`, not raw anonymous
+MMIO/IRQ lists. Internal mutability remains normal because `&'static` does not
+allow `&mut` access.
 
 ### 5.3 Route C — PageBacked via bdev-fs
 
@@ -287,12 +343,12 @@ Block devices are modeled as files in a pseudo-filesystem called **bdev-fs** (sp
 ```rust
 // frame/device/structure/block.rs
 pub struct BlockDeviceRegistration {
+    pub device_id: DeviceId,
+    pub bound: BoundDeviceKey,
     pub devt: DevT,
     pub name: FixedName<32>,
     pub ops: &'static BlockDeviceOps,
     pub driver_state: &'static (dyn Any + Send + Sync),
-    pub mmio_regions: &'static [MmioRegion],
-    pub irqs: &'static [IrqHandle],
     pub uevent_wire: RawPort,
     pub io_complete_wire: RawQueue,            // fires on request completion from IRQ
 }
@@ -403,7 +459,9 @@ It is **not** itself an entity, beyond the `MountIdentity`/`MountPayload` pair t
 3. If `parent` is `/dev/input` and `name` matches a registered input-class char device, return that.
 4. Otherwise ENOENT.
 
-The registry scan is a linear walk over the static `BINDINGS` slices (one per class). Linear is fine: the total count is on the order of 20 per board.
+The registry scan is a linear walk over the immutable class slices published by
+the boot binder. Linear is acceptable for the bounded tier-2 capacity; no
+lookup depends on original graph or descriptor order.
 
 ### 6.4 RNode materialization
 
@@ -459,79 +517,70 @@ The device subsystem comes up in a strict order relative to substrate, VFS, and 
 | Phase | When | What happens | Preconditions |
 |---|---|---|---|
 | **0** | Bootloader → kernel entry | Tier-1 HAL-device init: PLIC / timer / early UART. Enables `printk`. | Nothing |
-| **1** | `substrate::init()` runs | Zones, frame allocator, slab. Builds `Cap<T>` machinery. | Phase 0 |
+| **1** | `substrate::init()` runs | Zones, frame allocator, slab, and mappings for every MMIO record in the immutable platform seed. | Phase 0; `PlatformInfo` seed published |
 | **2** | `vfs::init()` runs | Root tmpfs mounted; VFS operational for tier-2 registration to construct PCs. | Phase 1 |
-| **3** | `device::init()` runs | Walks the board's static BINDINGS tables; invokes each driver's `step_init` to poke registers, claim IRQs, allocate DMA buffers. After this, all tier-2 devices are live. | Phase 2 |
-| **4** | `devfs::init()` runs | Mounts devfs at `/dev`. Lookups start resolving. | Phase 3 |
-| **5** | `bdev_fs::init()` runs | Mounts bdev-fs. Block-device PCs become constructible. | Phase 3 |
-| **6** | `tty::init()` runs | Tier-2 TTYs registered against their underlying char bindings. `/dev/ttyS0`, `/dev/console` become openable. | Phase 3, 4 |
+| **3A** | `device::freeze_resource_graph()` | Runs linked static resource providers once and freezes the final immutable graph. | Phase 1 mappings; all sources masked |
+| **3B** | `drive_oneshot(DeviceBootBindOp)` | Matches the linked static driver set; validates/decodes resources; reserves all driver/DMA/IRQ/registry state; records candidate-local failures; atomically publishes successful class registries and the kernel IRQ table; then arms devices and unmasks only committed routes. | Phase 2, 3A |
+| **4** | `devfs::init()` runs | Mounts devfs at `/dev`. Lookups start resolving. | Phase 3B |
+| **5** | `bdev_fs::init()` runs | Mounts bdev-fs. Block-device PCs become constructible. | Phase 3B |
+| **6** | `tty::init()` runs | Tier-2 TTYs registered against their underlying char bindings. `/dev/ttyS0`, `/dev/console` become openable. | Phase 3B, 4 |
 | **7** | `exec::init_userspace()` | `init` runs. Userspace can open `/dev/*`. | Phase 6 |
+
+Phase 3B follows observe → upgrade/check → reserve → commit → publish. All
+fallible allocations, hardware probing, DMA mapping, and IRQ conflict checks
+complete before the publication boundary. After reserve succeeds, commit is
+bounded and infallible. A candidate-local failure does not suppress later
+healthy devices; corrupt graphs or global registry/IRQ capacity failures abort
+the whole publication transaction.
 
 ### 7.2 The board's role
 
 <!-- txdoc:DEVICE-THE-BOARD-S-ROLE-1 -->
 
-Each supported board provides:
+Each supported platform and board binary provide three narrowly separated
+inputs:
+
+1. the selected platform's immutable
+   `PlatformInfo::device_resources` seed;
+2. one local `ActiveDeviceBundle: StaticDeviceBundle<ActivePlatform>` selected
+   by the board binary; its resource-provider slice may include a one-shot bus
+   enumerator when required;
+3. that bundle's concrete `StaticDriverDescriptor<ActivePlatform>` slice,
+   whose entries are monomorphized through the same selected platform.
+
+The board does **not** hand-construct semantic bindings with deployment MMIO or
+IRQ values. A schematic platform seed is:
 
 ```rust
-// boards/<board>/devices.rs
-
-/// Instance state for each device, as `static`s.
-pub static UART0_STATE: Ns16550aState = Ns16550aState { mmio_base: 0x1000_0000, ... };
-pub static VIRTIO_BLK0_STATE: VirtioBlkState = VirtioBlkState { mmio_base: 0x1000_1000, ... };
-// ...
-
-pub static CONSOLE_READABLE_WIRE: StaticRawQueue = StaticRawQueue::new();
-pub static CONSOLE_UEVENT_WIRE: StaticRawPort = StaticRawPort::new();
-
-/// Bindings: one per tier-2 device, referencing driver vtables + per-instance state.
-pub static UART0_BINDING: CharDeviceBinding = CharDeviceBinding {
-    devt: DevT::new(MAJ_TTY_S, 0),
-    name: FixedName::from_bytes(b"ttyS0_raw"),    // wrapped by TTY; ttyS0 is the wrapper
-    class: DeviceClass::Char,
-    ops: &ns16550a::OPS,
-    driver_state: &UART0_STATE,
-    mmio_regions: &[MmioRegion { base: 0x1000_0000, len: 0x100 }],
-    irqs: &[IrqHandle { plic_num: 10 }],
-    readable_wire: CONSOLE_READABLE_WIRE.raw(),
-    uevent_wire: CONSOLE_UEVENT_WIRE.raw(),
-};
-
-pub static VIRTIO_BLK0_REGISTRATION: BlockDeviceRegistration = BlockDeviceRegistration { ... };
-
-// ...
-
-/// The tables device::init() walks.
-pub static CHAR_BINDINGS: &[&'static CharDeviceBinding] = &[
-    &UART0_BINDING,
-    &RANDOM_BINDING,
-    // ...
-];
-
-pub static BLOCK_REGISTRATIONS: &[&'static BlockDeviceRegistration] = &[
-    &VIRTIO_BLK0_REGISTRATION,
-];
-
-pub static PSEUDO_DEVICES: &[PseudoDeviceEntry] = &[
-    PseudoDeviceEntry { devt: DevT::new(MAJ_MEM, 3), name: "null",  schema: &NULL_SCHEMA },
-    PseudoDeviceEntry { devt: DevT::new(MAJ_MEM, 5), name: "zero",  schema: &ZERO_SCHEMA },
-    PseudoDeviceEntry { devt: DevT::new(MAJ_MEM, 7), name: "full",  schema: &FULL_SCHEMA },
-];
+// tx-hal-<arch>-<board>/platform_info.rs
+impl PlatformInfoIf for Platform {
+    fn platform_info() -> &'static PlatformInfo {
+        // Built once in boot-owned static storage from this platform's actual
+        // firmware/static provider. The accessor never mutates it.
+        boot_static_platform_info()
+    }
+}
 ```
 
-`device::init()` iterates these slices and calls a per-class registration helper on each entry, which:
+The real seed contains only typed records defined by
+[`NET_DEVICE_v1.md §2`](NET_DEVICE_v1.md); the example deliberately contains no
+deployable address, IRQ, device count, interface name, or network policy. The
+board diagnostic name and discovered values never participate in generic
+matching.
 
-- Adds the binding reference to the device subsystem's class-specific index (a small slice sidecar keyed by devt).
-- Invokes `binding.ops.step_init(binding)` if the driver declares one, to poke registers and claim IRQs.
-- Wires `binding.irqs` into the PLIC handler table, with the handler calling into driver code that fires `binding.readable_wire` (or equivalent) on completion.
-
-Everything runs once and never again.
+`device::init()` freezes the graph, then the generic binder consumes resource
+records and descriptors. It assigns immutable `BoundDeviceKey`s, produces
+class registrations, retains per-device IRQ/DMA evidence, validates whole-table
+uniqueness/capacity, and publishes once. Everything runs once and never again.
 
 ### 7.3 What tier 3 would add
 
 <!-- txdoc:DEVICE-WHAT-TIER-3-WOULD-ADD-1 -->
 
-A tier-3 implementation (deferred, §9) would run *after* phase 7 or as a reactor-scheduled task. It would walk buses (PCIe, USB) to discover new nodes, match them to dynamically-registered drivers, and publish the results into a parallel zone-allocated device registry that devfs's lookup would additionally consult. Tier 3 does not disturb the tier-1/tier-2 machinery above.
+A tier-3 implementation (deferred, §9) runs after the phase-3A graph freeze or
+as a reactor task. It detects runtime arrivals/removals, matches against a
+runtime registry, and publishes reclaimable zone entities into a parallel
+index. It must not mutate or pretend to extend the immutable tier-2 graph.
 
 ---
 
@@ -544,17 +593,18 @@ The device subsystem follows `SUBSYSTEM_ANATOMY` §1 in reduced form, because it
 ```
 frame/device/
     structure/
+        resource.rs           final DeviceResourceGraph view + validation
+        binding.rs            StaticDriverDescriptor, BoundDevice/Key, reports
         char.rs               CharDeviceBinding, CharDeviceOps
         block.rs              BlockDeviceRegistration, BlockDeviceOps
         net.rs                NetDeviceRegistration, NetDeviceOps
         pseudo.rs             PseudoDevSchema, PseudoDeviceEntry
-        mmio.rs               MmioRegion, IrqHandle (shared address-range/IRQ types)
-        index.rs              class-keyed registry slices (e.g. `CHAR_BINDINGS`)
-                              that mirror the board's exports; populated at device::init
+        index.rs              immutable bound-device and class registries
     checks/                   (empty — no witness production for &'static tables;
                                the ref itself is the evidence.)
     execution/
-        step_init.rs          device::init() — walks board tables, claims IRQs.
+        graph_freeze.rs       runs linked resource providers once, freezes graph
+        device_boot_bind.rs   OneShotStepOp; match/decode/reserve/commit/publish
         step_char_read.rs     Helper wrappers that adapt driver step_* functions
         step_char_write.rs    to the script-side dispatch signature, if needed.
                               (Mostly unnecessary — the driver's ops are called
@@ -569,19 +619,16 @@ drivers/
         ops.rs                  static OPS: CharDeviceOps = ...;
         state.rs                struct Ns16550aState { ... }
         irq.rs                  IRQ handler body
+        descriptor.rs           STATIC_DRIVER_DESCRIPTORS entry + typed decoder
     virtio_blk/
     virtio_net/
     ...
 
-boards/
-    qemu_riscv64_virt/
-        devices.rs            Per-board BINDINGS tables (see §7.2).
-        irq_map.rs            PLIC interrupt number assignments.
-    visionfive2/
-        devices.rs
-        irq_map.rs
-    loongson_2k1000la/
-        devices.rs
+tx-hal-<arch>-<board>/
+    platform_info.rs          immutable PlatformInfo/resource seed producer
+
+resource providers/
+    pci/                      optional one-shot enumerator linked by a board
 
 frame/devfs/
     structure.rs              Trivial — devfs MountPayload is a marker type.
@@ -594,13 +641,20 @@ frame/bdev_fs/
     (see BDEV_FS.md)
 ```
 
-### 8.1 What's in `structure/` vs the board crate
+### 8.1 What's in `structure/` vs platform and driver crates
 
 <!-- txdoc:DEVICE-WHAT-S-STRUCTURE-BOARD-CRATE-1 -->
 
-- `structure/` defines *types* (`CharDeviceBinding` the struct, `CharDeviceOps` the struct). No instances.
-- `boards/<board>/devices.rs` defines *instances* (`static UART0_BINDING: CharDeviceBinding = ...`). No types.
-- `drivers/<crate>/` defines *vtables and state types* (`static OPS: CharDeviceOps = ...; struct Ns16550aState { ... }`). Vtables are type-generic; state is per-driver.
+- `tx-hal` defines semantic-free resource fact types; a concrete platform
+  publishes instances as immutable seeds.
+- `structure/` defines binder and class-registration types and owns the final
+  frozen graph/indexes. It does not define board resource values.
+- `drivers/<crate>/` defines vtables/state plus a static descriptor and typed
+  resource decoder. Per-instance state is reserved during binding and becomes
+  `'static` only at commit.
+- The board binary selects one platform and a small local
+  `StaticDeviceBundle<P>` composition over linked provider/driver crates. It
+  does not construct generic-kernel bindings or IRQ maps.
 
 The three-way split matches Tock's [kernel / chips / boards] layout, applied to our [types / drivers / boards] axis. Each is a Cargo crate boundary in the workspace.
 
@@ -617,8 +671,12 @@ This section is a **shape sketch**, not a specification. It names the types and 
 <!-- txdoc:DEVICE-WHAT-TIER-3-ADDS-1 -->
 
 - A zone `dyn_char_device` holding `DynamicCharDeviceIdentity` / `DynamicCharDevicePayload` pairs. These *are* entities, with full Identity/Payload bifurcation per object_model §8.1.1.
-- A runtime driver-registration system. Each dynamic driver crate declares a `DriverDescriptor` with a `matches(&PropertyBag) -> bool` predicate and a `probe(node) -> Result<DriverInstance>` entry point. Bind-rule-ish, Fuchsia DFv2-shaped, but simpler (no IDL, no IPC, no process isolation).
-- Bus enumerators: `substrate::bus::pci` (walks PCIe ecam), `substrate::bus::usb` (xHCI host driver consumer), possibly `substrate::bus::platform_dt` for DT-walking on boards that want it.
+- A runtime driver-registration system distinct from tier-2
+  `StaticDriverDescriptor`. Its exact typed matching/lifecycle API requires a
+  separate design review; an untyped arbitrary `PropertyBag` is not approved by
+  this sketch.
+- Runtime bus monitoring and arrival/removal event sources. One-shot boot PCI
+  enumeration may already exist in tier 2; re-scan/hotplug ownership is new.
 - A `uevent_port` publication from each `DynamicCharDeviceIdentity` for userspace udev-equivalent code.
 
 ### 9.2 Where it plugs in
@@ -633,7 +691,10 @@ This section is a **shape sketch**, not a specification. It names the types and 
 
 <!-- txdoc:DEVICE-WHY-DEFER-1 -->
 
-The incremental work is bounded and self-contained. Bus enumerators, bind rules, and the dynamic registry can be added in a future v2 without reshaping anything written here. No tier-2 driver crate needs modification; no board file needs modification; the script-side dispatch gets one new match arm.
+The tier-2 resource graph and static registrations stay immutable. Tier 3 adds
+a parallel reclaimable index and lifecycle without changing their ownership;
+drivers that opt into hotplug may need a separate runtime descriptor/teardown
+adapter. No runtime path may mutate tier-2 records as a shortcut.
 
 Deferring avoids building machinery before knowing what it's for — the target workload (Linux 2.6 parity for busybox / gcc / nginx / ssh) has no tier-3 requirement.
 
@@ -652,7 +713,8 @@ This section **closes `SIGNAL_ATTACHMENTS.md §3.9`'s placeholder rows** for tie
 `CharDeviceBinding` and `BlockDeviceRegistration` host wires for readiness and hot-plug-style events, even though tier-2 devices do not themselves hot-plug. The wires exist because:
 
 - Drivers fire `readable_wire` from IRQ handlers to wake poll/epoll subscribers.
-- `uevent_port` fires once, at `device::init()` time, so that any userspace `udev` watching the port sees the devices it would have seen in Linux (a niceness for porting existing userland; the actual attachment of new devices happens only during init in v1).
+- `uevent_port` fires once after the binder publishes the final registry, so an
+  observer never sees an event for a half-bound device.
 
 Because these wires live on `&'static` hosts, they must be constructed by `const` constructors. See §12.3.
 
@@ -664,9 +726,9 @@ Because these wires live on `&'static` hosts, they must be constructed by `const
 |---|---|---|---|---|---|---|---|
 | `CharDeviceBinding` (static) | RawQueue | `readable_wire` | Driver-observed data available (IRQ path) | `set(HasData)` | driver IRQ handler → `binding.readable_wire.fire(...)` | poll/select/epoll | — (readiness hint, not projection change) |
 | `CharDeviceBinding` (static) | RawQueue | `writable_wire` (optional, per driver) | Driver TX ring has space | `set(HasSpace)` | driver IRQ handler or step-write path | poll/select/epoll | — |
-| `CharDeviceBinding` (static) | RawPort | `uevent_port` | Device registered at `device::init()` | `fire(UEvent::Add{devt, name})` | `device::step_init` | udev-equivalent (if any) | — (one-shot at boot) |
+| `CharDeviceBinding` (static) | RawPort | `uevent_port` | Device registry atomically published | `fire(UEvent::Add{devt, name})` | binder publish stage | udev-equivalent (if any) | — (one-shot at boot) |
 | `BlockDeviceRegistration` (static) | RawQueue | `io_complete_wire` | Disk I/O request completed | `set(Complete{tag})` | driver IRQ handler | in-flight coroutines waiting in `step_read_blocks` / `step_write_blocks` | — |
-| `BlockDeviceRegistration` (static) | RawPort | `uevent_port` | Device registered at `device::init()` | `fire(UEvent::Add{devt, name})` | `device::step_init` | udev-equivalent | — |
+| `BlockDeviceRegistration` (static) | RawPort | `uevent_port` | Device registry atomically published | `fire(UEvent::Add{devt, name})` | binder publish stage | udev-equivalent | — |
 
 ### 10.3 BIF-5 check
 
@@ -699,7 +761,10 @@ These are aggregated under the tracing catalog's `(any) tracing` row in `SIGNAL_
 
 <!-- txdoc:DEVICE-PER-TARGET-DEVICE-INVENTORIES-1 -->
 
-Target-specific tables. The board crate for each target provides exactly these devices at v1.
+These tables are expected user-visible examples and diagnostics, not generic
+binding input. Firmware/bus records remain authoritative for count, placement,
+IRQ, DMA, and availability; a missing device is not synthesized to satisfy an
+inventory row.
 
 ### 11.1 qemu-riscv64-virt
 
@@ -710,7 +775,7 @@ Target-specific tables. The board crate for each target provides exactly these d
 | `/dev/null`, `/dev/zero`, `/dev/full` | Pseudo | (none) | Route A |
 | `/dev/random`, `/dev/urandom` | Char | `random` (chacha-seeded) | Route B |
 | `/dev/kmsg` | Char | kernel log ring | Route B |
-| `/dev/ttyS0`, `/dev/console` | TTY (hw) | `ns16550a` at 0x1000_0000 | TTY wraps Char |
+| `/dev/ttyS0`, `/dev/console` | TTY (hw) | `ns16550a` | TTY wraps Char |
 | `/dev/vda`, `/dev/vda1`, ... | Block | `virtio_blk` at virtio-mmio bus | Route C, partitions via BDEV_FS |
 | `/dev/fb0` | Framebuffer | `virtio_gpu` | Route D; deferred if display not needed |
 | `/dev/input/event0` | Char | `virtio_input` | Route B; optional |
@@ -721,7 +786,9 @@ Net: `virtio_net` provides a `NetDeviceRegistration`; does not appear in `/dev`.
 
 <!-- txdoc:DEVICE-QEMU-LOONGARCH64-1 -->
 
-Same inventory as qemu-riscv64-virt modulo IRQ controller (LoongArch ExtIOI instead of PLIC) and architecture-specific trap/timer code in HAL. Driver crates (virtio-*) are shared.
+Expected userspace classes broadly match RV64 QEMU, while the one-shot PCI
+provider supplies the actual function/BAR/IRQ facts. Generic code does not fix
+the network function to a PCI slot or infer it from block-device order.
 
 ### 11.3 VisionFive 2 (JH7110)
 
@@ -733,16 +800,21 @@ Same inventory as qemu-riscv64-virt modulo IRQ controller (LoongArch ExtIOI inst
 | `/dev/random`, `/dev/urandom` | Char | `random` | |
 | `/dev/kmsg` | Char | kernel log ring | |
 | `/dev/ttyS0`, `/dev/console` | TTY (hw) | `jh7110_uart` (8250-variant) | |
-| `/dev/mmcblk0`, `/dev/mmcblk0p*` | Block | `dw_sdhci` (DesignWare SDHCI) | Gnarly chip-specific init; longest pole in VJ2 bringup |
-| `/dev/eth0` | (Net) | `jh7110_gmac` + `yt8521_phy` | Not in /dev; consumed by net subsystem |
+| `/dev/mmcblk0`, `/dev/mmcblk0p*` | Block | `dw_sdhci` (DesignWare SDHCI) | chip-specific glue consumes typed resources |
+| namespace-assigned interface | (Net) | generic DWMAC + StarFive glue + discovered PHY | Not in `/dev`; name is a projection |
 
-USB (DWC2 / xHCI) and PCIe slot devices are **tier 3 (deferred)**. The PCIe host controller is registered as tier 2 but its enumeration walk does not run in v1.
+USB hotplug and plug-in PCIe lifecycle are **tier 3 (deferred)**.
 
-### 11.4 Loongson 2K1000LA
+### 11.4 Future LA real-board hook
 
-<!-- txdoc:DEVICE-LOONGSON-2K1000LA-1 -->
+<!-- txdoc:DEVICE-FUTURE-LA-REAL-BOARD-1 -->
 
-Shape equivalent to VJ2 with LoongArch-specific register maps. UART, SD/MMC, and Ethernet all have tier-2 drivers; USB and PCIe-slot devices deferred.
+No concrete inventory is claimed. When hardware is selected, its platform
+crate publishes the same immutable resource seed and its board binary selects
+a local bundle over the required linked provider/driver descriptors. Until then the repository defines only
+the seam and synthetic complete/missing/reordered/empty graph tests from
+[`NET_DEVICE_v1.md §8`](NET_DEVICE_v1.md); it does not guess firmware, boot
+protocol, controller, address, IRQ, or interface.
 
 ---
 
@@ -750,7 +822,11 @@ Shape equivalent to VJ2 with LoongArch-specific register maps. UART, SD/MMC, and
 
 <!-- txdoc:DEVICE-SUMMARY-RETIREMENTS-REVISIONS-1 -->
 
-This document makes the following changes to prior specs. Each is a tightening that existing text allows without contradiction; no breaking invariant change is introduced.
+This document records compatibility revisions. The 2026-08-04 resource/binder
+update deliberately replaces the earlier assumption that all tier-2 values and
+bindings are hand-authored in a board table. Static lifetime remains; resource
+provenance and one-shot boot binding are now explicit and governed by
+`DEVRES-*`.
 
 ### 12.1 `PAGE_BACKED_v1.md §2` — `StructPayload::CharDevice` field type
 
@@ -802,11 +878,15 @@ later dynamic device/VFS integration, not the static registration rows above.
 
 ---
 
-## 13. Open questions
+## 13. Nonblocking decisions and follow-ups
 
 <!-- txdoc:DEVICE-OPEN-QUESTIONS-1 -->
 
-**13.1 Whether `driver_state: &'static dyn Any` is the right level of type erasure.** Alternatives: generics on `CharDeviceBinding` (ugly across the registry slice), a driver-side-only concrete type with a cast helper (cleaner at the driver site, same erasure at the subsystem site). No correctness difference; ergonomic decision deferred to implementation.
+**13.1 Driver-state erasure decision.** Class registries retain the existing
+`driver_state: &'static (dyn Any + Send + Sync)` spelling. Concrete state is
+created by `StaticDriverDescriptor<P>::prepare`, remains private in
+`DeviceBindReservation<P>`, and is exposed as `'static` only at commit. A later
+typed-erasure cleanup may change ergonomics but does not block this contract.
 
 **13.2 Major/minor number allocation policy.** v1 hard-codes devt values in the board file. A small "major-number registry" (much like Linux's `Documentation/admin-guide/devices.txt` but generated at compile time from the board's table) would catch collisions at build time. Nice-to-have; not blocking.
 
@@ -823,6 +903,8 @@ later dynamic device/VFS integration, not the static registration rows above.
 - [`01_CONCEPTS_v5.md`](../../Txv3/01_CONCEPTS_v5.md) §2.5, §3.
 - [`object_model_v2.md`](../00_meta-framework/object_model_v2.md) §3, §8.1.1.
 - [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — BIF-*, PRED-*, SIG-*.
+- [`NET_DEVICE_v1.md`](NET_DEVICE_v1.md) — typed resource/binding, IRQ/DMA,
+  network projection/configuration, and target-extension contract.
 - [`PAGE_BACKED_v1.md`](../03_memory-vm/PAGE_BACKED_v1.md) §2, §11.
 - [`PAGE_SUBSTRATE_v1.md`](../01_substrate/PAGE_SUBSTRATE_v1.md) — frame allocator, FrameMeta, slab.
 - [`SIGNAL_ATTACHMENTS_v1.md`](../04_process-signals/SIGNAL_ATTACHMENTS_v1.md) §3.9 (closed by §10 above).

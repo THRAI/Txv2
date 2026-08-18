@@ -539,16 +539,31 @@ impl WaitSource {
         mask: InterestMask,
         limit: usize,
         hint: MailboxSchedulerHint,
-        mut post: F,
+        post: F,
     ) -> usize
     where
         F: FnMut(&TaskMailbox, MailboxEvent, MailboxSchedulerHint) -> bool,
+    {
+        self.notify_limit_emit_with_owner_post_inner(mask, limit, hint, post, || {})
+    }
+
+    fn notify_limit_emit_with_owner_post_inner<F, H>(
+        &self,
+        mask: InterestMask,
+        limit: usize,
+        hint: MailboxSchedulerHint,
+        mut post: F,
+        after_snapshot: H,
+    ) -> usize
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent, MailboxSchedulerHint) -> bool,
+        H: FnOnce(),
     {
         if limit == 0 || mask.raw() == 0 {
             return 0;
         }
 
-        let deliveries = {
+        let (deliveries, pending_latched) = {
             let mut subs = self.subscribers.lock();
             self.record_notification();
             let mut deliveries = Vec::new();
@@ -568,8 +583,10 @@ impl WaitSource {
             if undelivered != 0 {
                 self.pending_mask.fetch_or(undelivered, Ordering::AcqRel);
             }
-            deliveries
+            let pending_latched = deliveries.is_empty();
+            (deliveries, pending_latched)
         };
+        after_snapshot();
 
         let mut posted = 0usize;
         for (mailbox, generation, interests) in deliveries {
@@ -589,6 +606,9 @@ impl WaitSource {
                     );
                 }
             }
+        }
+        if posted == 0 && !pending_latched {
+            self.pending_mask.fetch_or(mask.raw(), Ordering::AcqRel);
         }
         posted
     }

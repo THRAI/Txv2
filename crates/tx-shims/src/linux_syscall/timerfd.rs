@@ -22,8 +22,8 @@ use super::numbers::{
     TFD_CLOEXEC_FLAG, TFD_NONBLOCK_FLAG, TFD_TIMER_ABSTIME_FLAG, TFD_TIMER_CANCEL_ON_SET_FLAG,
 };
 use super::{
-    bootstrap_copy_to_user, bootstrap_read_user, bootstrap_write_user, errno_to_i32, SyscallCtx,
-    SyscallResult, EAGAIN_VALUE, EBADF_VALUE, EINVAL_VALUE, ENOMEM_VALUE,
+    bootstrap_copy_to_user_wait, bootstrap_read_user_wait, bootstrap_write_user_wait, errno_to_i32,
+    SyscallCtx, SyscallResult, EAGAIN_VALUE, EBADF_VALUE, EINVAL_VALUE, ENOMEM_VALUE,
 };
 use crate::adapter::step_engine::{
     self as step_engine, ByteProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
@@ -144,7 +144,7 @@ pub(super) fn sys_timerfd_create<'a>(
 /// - `Return(0)` on success.
 /// - `Error(EBADF)` if `fd` doesn't name a timerfd.
 /// - `Error(EFAULT)` if `new_value` or `old_value` pointer is bad.
-pub(super) fn sys_timerfd_settime<'a, P>(
+pub(super) async fn sys_timerfd_settime<'a, P>(
     fd: u32,
     flags: u32,
     new_value_ptr: u64,
@@ -170,7 +170,11 @@ where
     let abstime = (flags & TFD_TIMER_ABSTIME_FLAG) != 0;
 
     // Read new_value from userspace.
-    let new_bytes = match bootstrap_read_user::<[u8; ITIMERSPEC_BYTES]>(&ctx.aspace, new_value_ptr)
+    let new_bytes = match bootstrap_read_user_wait::<[u8; ITIMERSPEC_BYTES]>(
+        &ctx.aspace,
+        new_value_ptr,
+    )
+    .await
     {
         Ok(bytes) => bytes,
         Err(errno) => return SyscallResult::error_from(errno),
@@ -219,8 +223,12 @@ where
     // Write old_value back to userspace if requested.
     if let Some(old) = old_spec {
         let old_bytes = old.to_bytes();
-        if let Err(errno) =
-            bootstrap_write_user::<[u8; ITIMERSPEC_BYTES]>(&ctx.aspace, old_value_ptr, old_bytes)
+        if let Err(errno) = bootstrap_write_user_wait::<[u8; ITIMERSPEC_BYTES]>(
+            &ctx.aspace,
+            old_value_ptr,
+            old_bytes,
+        )
+        .await
         {
             return SyscallResult::error_from(errno);
         }
@@ -240,7 +248,7 @@ where
 /// - `Return(0)` on success.
 /// - `Error(EBADF)` if `fd` doesn't name a timerfd.
 /// - `Error(EFAULT)` if `curr_value` pointer is bad.
-pub(super) fn sys_timerfd_gettime<'a, P>(
+pub(super) async fn sys_timerfd_gettime<'a, P>(
     fd: u32,
     curr_value_ptr: u64,
     ctx: &SyscallCtx<'a>,
@@ -263,7 +271,8 @@ where
     };
     let bytes = spec.to_bytes();
     if let Err(errno) =
-        bootstrap_write_user::<[u8; ITIMERSPEC_BYTES]>(&ctx.aspace, curr_value_ptr, bytes)
+        bootstrap_write_user_wait::<[u8; ITIMERSPEC_BYTES]>(&ctx.aspace, curr_value_ptr, bytes)
+            .await
     {
         return SyscallResult::error_from(errno);
     }
@@ -334,7 +343,9 @@ where
     .await
     {
         Ok(read) => {
-            if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, buf_ptr, &staging[..read]) {
+            if let Err(errno) =
+                bootstrap_copy_to_user_wait(&ctx.aspace, buf_ptr, &staging[..read]).await
+            {
                 return SyscallResult::error_from(errno);
             }
             SyscallResult::Return(read as i64)

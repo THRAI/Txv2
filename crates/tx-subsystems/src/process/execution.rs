@@ -57,6 +57,63 @@ pub(crate) const PROCESS_LOCK_SERVICE_TRACE_NAMES: &[&[u8]] = &[
 /// filesystem or block-I/O code runs.
 static DEFERRED_PAGE_WRITEBACKS: SpinMutex<Vec<Cap<PageContainer>>> = SpinMutex::new(Vec::new());
 
+/// Owns the explicit fd-reference increments taken for a fork snapshot until
+/// the new [`ProcessPayload`] has accepted the fd table.
+///
+/// `Cap<OpenFile>` drops do not change `process_fd_refs`, so every fallible
+/// return between the snapshot and payload publication must explicitly undo
+/// those increments.  The rollback ledger keeps independent Cap pins after
+/// the fd map itself is moved into `sign_process_payload`, which also covers a
+/// late signing failure without reviving or double-decrementing an OpenFile.
+pub(in crate::process) struct ForkFdSnapshot {
+    fds: Option<BTreeMap<u32, Cap<OpenFile>>>,
+    cloexec: Option<BTreeSet<u32>>,
+    rollback_files: Vec<Cap<OpenFile>>,
+    armed: bool,
+}
+
+impl ForkFdSnapshot {
+    pub(in crate::process) fn new(
+        fds: BTreeMap<u32, Cap<OpenFile>>,
+        cloexec: BTreeSet<u32>,
+    ) -> Self {
+        let rollback_files = fds.values().cloned().collect();
+        Self {
+            fds: Some(fds),
+            cloexec: Some(cloexec),
+            rollback_files,
+            armed: true,
+        }
+    }
+
+    pub(in crate::process) fn take_for_payload(
+        &mut self,
+    ) -> (BTreeMap<u32, Cap<OpenFile>>, BTreeSet<u32>) {
+        (
+            self.fds.take().unwrap_or_default(),
+            self.cloexec.take().unwrap_or_default(),
+        )
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+        self.rollback_files.clear();
+    }
+}
+
+impl Drop for ForkFdSnapshot {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        for file in &self.rollback_files {
+            crate::process::structure::decr_pipe_fd_ref(file);
+        }
+        let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
+        let _ = finalize_detached_open_files(self.rollback_files.iter(), &guard);
+    }
+}
+
 #[inline(always)]
 pub(crate) fn measure_process_lock_service<R>(name: &'static [u8], f: impl FnOnce() -> R) -> R {
     let known_names = PROCESS_LOCK_SERVICE_TRACE_NAMES;
@@ -516,8 +573,7 @@ fn step_fork_with_prepared_aspace<P: PmapIf>(
         parent_nsproxy,
         parent_cred,
         parent_cwd,
-        parent_fds,
-        parent_fd_cloexec,
+        mut parent_fd_snapshot,
         parent_rlimit_nofile,
         parent_rlimit_memlock,
         parent_net_namespace,
@@ -536,13 +592,13 @@ fn step_fork_with_prepared_aspace<P: PmapIf>(
             return Err(ForkError::Busy);
         }
         let (parent_fds, parent_fd_cloexec) = payload.clone_fd_state_for_fork();
+        let parent_fd_snapshot = ForkFdSnapshot::new(parent_fds, parent_fd_cloexec);
         (
             parent_aspace,
             payload.nsproxy_cap(),
             payload.cred(),
             payload.cwd_state(),
-            parent_fds,
-            parent_fd_cloexec,
+            parent_fd_snapshot,
             payload.rlimit_nofile(),
             payload.rlimit_memlock(),
             payload.net_namespace(),
@@ -627,6 +683,7 @@ fn step_fork_with_prepared_aspace<P: PmapIf>(
     } else {
         parent_net_namespace
     };
+    let (parent_fds, parent_fd_cloexec) = parent_fd_snapshot.take_for_payload();
     let payload = sign_process_payload(
         child_aspace_cap,
         vec![leader],
@@ -645,6 +702,7 @@ fn step_fork_with_prepared_aspace<P: PmapIf>(
         child_sig_actions,
     )
     .map_err(ForkError::Zone)?;
+    parent_fd_snapshot.disarm();
     *child_proc.payload.lock() = Some(payload);
 
     register_pid(child_pid, child_proc.clone());
@@ -1302,6 +1360,7 @@ impl FinalizeDetachedOpenFileOp {
                 ops.on_last_close(guard);
             }
         }
+        self.file.complete_rnode_last_close();
         self.last_close_completed = true;
     }
 }
@@ -1345,6 +1404,7 @@ pub(crate) fn finalize_detached_open_file_without_retry(
             ops.on_last_close(guard);
         }
     }
+    file.complete_rnode_last_close();
     flush_result
 }
 
@@ -2502,16 +2562,13 @@ impl StepOp<crate::process::ProcessIdentity> for DupOp {
         &mut self,
         _ctx: &mut ScriptCtx<crate::process::ProcessIdentity>,
     ) -> StepOutcome<u32, NoProgress> {
-        let file = match self.process.fd(self.oldfd) {
-            Some(f) => f,
-            None => return StepOutcome::Err(crate::process::adapter::step_engine::Errno::EBADF),
-        };
-        super::structure::incr_pipe_fd_ref(&file);
-        match self.process.install_new_fd(file.clone(), false) {
-            Some(newfd) => StepOutcome::Done(newfd),
-            None => {
-                super::structure::decr_pipe_fd_ref(&file);
-                StepOutcome::Err(crate::process::adapter::step_engine::Errno::EAGAIN)
+        match self.process.duplicate_fd_at_least(self.oldfd, 0, false) {
+            Ok(newfd) => StepOutcome::Done(newfd),
+            Err(super::structure::DuplicateFdError::BadFileDescriptor) => {
+                StepOutcome::Err(crate::process::adapter::step_engine::Errno::EBADF)
+            }
+            Err(super::structure::DuplicateFdError::LimitReached) => {
+                StepOutcome::Err(crate::process::adapter::step_engine::Errno::EMFILE)
             }
         }
     }
@@ -2541,16 +2598,19 @@ impl StepOp<crate::process::ProcessIdentity> for Dup3Op {
         if self.flags & !O_CLOEXEC != 0 {
             return StepOutcome::Err(crate::process::adapter::step_engine::Errno::EINVAL);
         }
-        let file = match self.process.fd(self.oldfd) {
-            Some(f) => f,
-            None => return StepOutcome::Err(crate::process::adapter::step_engine::Errno::EBADF),
-        };
-        super::structure::incr_pipe_fd_ref(&file);
         let want_cloexec = self.flags & O_CLOEXEC != 0;
-        let previous = self
+        match self
             .process
-            .install_fd_with_cloexec(self.newfd, file, want_cloexec);
-        StepOutcome::Done((self.newfd, previous))
+            .duplicate_fd_to(self.oldfd, self.newfd, want_cloexec)
+        {
+            Ok(previous) => StepOutcome::Done((self.newfd, previous)),
+            Err(super::structure::DuplicateFdError::BadFileDescriptor) => {
+                StepOutcome::Err(crate::process::adapter::step_engine::Errno::EBADF)
+            }
+            Err(super::structure::DuplicateFdError::LimitReached) => {
+                StepOutcome::Err(crate::process::adapter::step_engine::Errno::EMFILE)
+            }
+        }
     }
 }
 
@@ -2602,19 +2662,16 @@ impl StepOp<crate::process::ProcessIdentity> for FcntlDupFdOp {
         &mut self,
         _ctx: &mut ScriptCtx<crate::process::ProcessIdentity>,
     ) -> StepOutcome<u32, NoProgress> {
-        if self.process.fd(self.fd).is_none() {
-            return StepOutcome::Err(crate::process::adapter::step_engine::Errno::EBADF);
-        }
-        let file = self.process.fd(self.fd).unwrap();
-        super::structure::incr_pipe_fd_ref(&file);
         match self
             .process
-            .install_new_fd_at_least(self.min, file.clone(), self.cloexec)
+            .duplicate_fd_at_least(self.fd, self.min, self.cloexec)
         {
-            Some(new_fd) => StepOutcome::Done(new_fd),
-            None => {
-                super::structure::decr_pipe_fd_ref(&file);
-                StepOutcome::Err(crate::process::adapter::step_engine::Errno::EAGAIN)
+            Ok(newfd) => StepOutcome::Done(newfd),
+            Err(super::structure::DuplicateFdError::BadFileDescriptor) => {
+                StepOutcome::Err(crate::process::adapter::step_engine::Errno::EBADF)
+            }
+            Err(super::structure::DuplicateFdError::LimitReached) => {
+                StepOutcome::Err(crate::process::adapter::step_engine::Errno::EMFILE)
             }
         }
     }

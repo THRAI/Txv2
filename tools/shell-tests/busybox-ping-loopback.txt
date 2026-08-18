@@ -5,16 +5,18 @@
 #   cargo xtask image cpio --profile busybox --target rv64-qemu
 #   cargo xtask shell-test --target rv64-qemu --script tools/shell-tests/busybox-ping-loopback.txt
 #
-# This defends the first shell-facing ping target: BusyBox can invoke
-# the `ping` applet, create a raw/dgram ICMP socket, send one Echo
-# Request to loopback, receive the Echo Reply, and return to the prompt.
+# This defends the shell-facing periodic ping target: BusyBox can invoke
+# the `ping` applet, create a raw/dgram ICMP socket, install its SIGALRM
+# handler, deliver multiple timer-driven Echo Requests, receive their Echo
+# Replies, and return to the prompt. A single packet does not exercise the
+# caught-SIGALRM frame/materialization path.
 
 wait "/ # " within 30000
 
 sleep 500
-send "ping -c 1 127.0.0.1\n"
+send "/bin/busybox ping -i 0.05 -c 3 127.0.0.1\n"
 expect "PING 127.0.0.1" within 8000
-expect "1 packets transmitted" within 12000
+expect "3 packets transmitted" within 12000
 expect "/ # " within 8000
 
 sleep 500

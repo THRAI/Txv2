@@ -10,8 +10,9 @@
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::hash::{BuildHasher, Hash, Hasher};
-use core::sync::atomic::{AtomicI8, AtomicU16, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use hashbrown::HashMap;
 
 use crate::vfs::adapter::step_engine::{
@@ -29,7 +30,7 @@ use crate::eventfd::EventFd;
 use crate::execution::Errno;
 use crate::io_uring::IoUring;
 use crate::ipc::posix_mq::structure::PosixMqInstance;
-use crate::mount::{FsObjectPin, MountApiFile, MountIdentity, MountPayload};
+use crate::mount::{FsObjectDestroyToken, FsObjectPin, MountApiFile, MountIdentity, MountPayload};
 use crate::net::{NetNamespacePayload, SocketIdentity};
 use crate::page_backed::PageContainer;
 use crate::process::{ProcessGroup, ProcessIdentity};
@@ -625,6 +626,12 @@ pub struct RNode {
     /// turns long LTP runs into unbounded registry pressure. The endpoints
     /// are still available to future callers, but only once requested.
     wait_points: SpinMutex<Option<notification::RNodeWaitPoints>>,
+    /// Number of logically closed `OpenFile` objects whose Zone slots have
+    /// not yet reached their EBR `drop_in_place` callback.  These retains are
+    /// lifetime debris, not live open-file descriptions, so unlink/rename
+    /// settlement may discount them without guessing an architecture-timing
+    /// dependent retain-count threshold.
+    ebr_closed_open_file_retains: AtomicU32,
 }
 
 impl RNode {
@@ -637,6 +644,7 @@ impl RNode {
             containing_mount: None,
             object_pin: None,
             wait_points: SpinMutex::new(None),
+            ebr_closed_open_file_retains: AtomicU32::new(0),
         }
     }
 
@@ -768,6 +776,10 @@ impl RNode {
         self
     }
 
+    pub fn fs_object_destroy_token(&self) -> Option<FsObjectDestroyToken> {
+        self.object_pin.as_ref().map(FsObjectPin::destroy_token)
+    }
+
     /// Snapshot the containing-mount `Weak<MountPayload>`. Used by the
     /// VFS walker (`crate::vfs::walker::step_walk`) to resolve the
     /// in-scope `FsOps` for a dentry's RNode, and by the page cache
@@ -779,6 +791,31 @@ impl RNode {
     /// hint at mount-publication time).
     pub fn containing_mount_weak(&self) -> Option<Weak<MountPayload>> {
         self.containing_mount
+    }
+
+    pub(crate) fn note_ebr_closed_open_file_retain(&self) {
+        let previous = self
+            .ebr_closed_open_file_retains
+            .fetch_add(1, Ordering::AcqRel);
+        assert_ne!(
+            previous,
+            u32::MAX,
+            "RNode closed OpenFile EBR-retain count overflow"
+        );
+    }
+
+    pub(crate) fn release_ebr_closed_open_file_retain(&self) {
+        let previous = self
+            .ebr_closed_open_file_retains
+            .fetch_sub(1, Ordering::AcqRel);
+        assert_ne!(
+            previous, 0,
+            "RNode closed OpenFile EBR-retain count underflow"
+        );
+    }
+
+    pub(crate) fn ebr_closed_open_file_retain_count(&self) -> u32 {
+        self.ebr_closed_open_file_retains.load(Ordering::Acquire)
     }
 
     fn with_wait_points<R>(&self, f: impl FnOnce(&notification::RNodeWaitPoints) -> R) -> R {
@@ -901,6 +938,10 @@ impl core::fmt::Debug for RNode {
             .field("containing_mount", &self.containing_mount)
             .field("object_pin", &self.object_pin)
             .field("wait_points_allocated", &self.wait_points.lock().is_some())
+            .field(
+                "ebr_closed_open_file_retains",
+                &self.ebr_closed_open_file_retain_count(),
+            )
             .finish()
     }
 }
@@ -912,6 +953,47 @@ pub struct DEntry {
     rnode: Cap<RNode>,
     mounted: Option<Weak<MountIdentity>>,
     children: SpinMutex<HashMap<InlineName, CachedChild, VfsNameHashBuilder>>,
+    // Keep this field after `rnode`: observers are marked only after the EBR
+    // callback has released the DEntry-owned RNode capability.
+    retire_notifier: DEntryRetireNotifier,
+}
+
+#[derive(Clone, Debug)]
+pub struct DEntryRetireToken {
+    retired: Arc<AtomicBool>,
+}
+
+impl DEntryRetireToken {
+    pub(crate) fn retired(&self) -> bool {
+        self.retired.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Debug)]
+struct DEntryRetireNotifier {
+    observers: SpinMutex<Vec<Arc<AtomicBool>>>,
+}
+
+impl DEntryRetireNotifier {
+    const fn new() -> Self {
+        Self {
+            observers: SpinMutex::new(Vec::new()),
+        }
+    }
+
+    fn token(&self) -> DEntryRetireToken {
+        let retired = Arc::new(AtomicBool::new(false));
+        self.observers.lock().push(retired.clone());
+        DEntryRetireToken { retired }
+    }
+}
+
+impl Drop for DEntryRetireNotifier {
+    fn drop(&mut self) {
+        for observer in self.observers.lock().drain(..) {
+            observer.store(true, Ordering::Release);
+        }
+    }
 }
 
 /// Fast deterministic hasher for bounded VFS component names.
@@ -966,6 +1048,7 @@ impl DEntry {
             rnode,
             mounted: None,
             children: SpinMutex::new(HashMap::with_hasher(VfsNameHashBuilder)),
+            retire_notifier: DEntryRetireNotifier::new(),
         }
     }
 
@@ -979,6 +1062,10 @@ impl DEntry {
 
     pub fn rnode(&self) -> &Cap<RNode> {
         &self.rnode
+    }
+
+    pub fn retire_token(&self) -> DEntryRetireToken {
+        self.retire_notifier.token()
     }
 
     pub fn set_parent_hint(&mut self, parent: &Cap<DEntry>) {
@@ -1339,9 +1426,18 @@ pub struct OpenFile {
     nonblocking_override: AtomicI8,
     /// Runtime pipe packet-mode override set via `fcntl(F_SETFL)`.
     packet_override: AtomicI8,
+    /// User-visible fd-table entries referring to this open-file
+    /// description.  Transient `Cap<OpenFile>` clones are lifetime pins and
+    /// must not delay or advance last-close semantics.
+    process_fd_refs: AtomicU32,
+    /// Set after the final fd has completed close-time flush/on-last-close.
+    /// While the Zone slot awaits EBR reclamation, the backing RNode uses this
+    /// marker's accounting to distinguish a closed OpenFile retain from a
+    /// genuinely live owner.
+    rnode_last_close_finalized: AtomicBool,
     /// Best-effort DEntry hint set by `step_open`. `None` for
     /// non-VFS shapes (ufd, aio, etc.). Used by `fchdir`.
-    opendir_dentry: Option<Cap<DEntry>>,
+    opendir_dentry: SpinMutex<Option<Cap<DEntry>>>,
 }
 
 impl OpenFile {
@@ -1352,8 +1448,10 @@ impl OpenFile {
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
             packet_override: AtomicI8::new(-1),
+            process_fd_refs: AtomicU32::new(1),
+            rnode_last_close_finalized: AtomicBool::new(false),
             flags,
-            opendir_dentry: None,
+            opendir_dentry: SpinMutex::new(None),
         }
     }
 
@@ -1368,8 +1466,8 @@ impl OpenFile {
         flags: OpenFileFlags,
         dentry: Cap<DEntry>,
     ) -> Result<Cap<Self>, ZoneError> {
-        let mut file = Self::new(rnode, flags);
-        file.opendir_dentry = Some(dentry);
+        let file = Self::new(rnode, flags);
+        *file.opendir_dentry.lock() = Some(dentry);
         step_engine::sign(file)
     }
 
@@ -1386,8 +1484,10 @@ impl OpenFile {
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
             packet_override: AtomicI8::new(-1),
+            process_fd_refs: AtomicU32::new(1),
+            rnode_last_close_finalized: AtomicBool::new(false),
             flags,
-            opendir_dentry: None,
+            opendir_dentry: SpinMutex::new(None),
         }
     }
 
@@ -1416,8 +1516,10 @@ impl OpenFile {
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
             packet_override: AtomicI8::new(-1),
+            process_fd_refs: AtomicU32::new(1),
+            rnode_last_close_finalized: AtomicBool::new(false),
             flags,
-            opendir_dentry: None,
+            opendir_dentry: SpinMutex::new(None),
         }
     }
 
@@ -1442,8 +1544,10 @@ impl OpenFile {
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
             packet_override: AtomicI8::new(-1),
+            process_fd_refs: AtomicU32::new(1),
+            rnode_last_close_finalized: AtomicBool::new(false),
             flags,
-            opendir_dentry: None,
+            opendir_dentry: SpinMutex::new(None),
         }
     }
 
@@ -1465,8 +1569,10 @@ impl OpenFile {
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
             packet_override: AtomicI8::new(-1),
+            process_fd_refs: AtomicU32::new(1),
+            rnode_last_close_finalized: AtomicBool::new(false),
             flags,
-            opendir_dentry: None,
+            opendir_dentry: SpinMutex::new(None),
         }
     }
 
@@ -1485,8 +1591,10 @@ impl OpenFile {
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
             packet_override: AtomicI8::new(-1),
+            process_fd_refs: AtomicU32::new(1),
+            rnode_last_close_finalized: AtomicBool::new(false),
             flags,
-            opendir_dentry: None,
+            opendir_dentry: SpinMutex::new(None),
         }
     }
 
@@ -1508,8 +1616,10 @@ impl OpenFile {
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
             packet_override: AtomicI8::new(-1),
+            process_fd_refs: AtomicU32::new(1),
+            rnode_last_close_finalized: AtomicBool::new(false),
             flags,
-            opendir_dentry: None,
+            opendir_dentry: SpinMutex::new(None),
         }
     }
 
@@ -1529,8 +1639,10 @@ impl OpenFile {
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
             packet_override: AtomicI8::new(-1),
+            process_fd_refs: AtomicU32::new(1),
+            rnode_last_close_finalized: AtomicBool::new(false),
             flags,
-            opendir_dentry: None,
+            opendir_dentry: SpinMutex::new(None),
         }
     }
 
@@ -1550,8 +1662,10 @@ impl OpenFile {
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
             packet_override: AtomicI8::new(-1),
+            process_fd_refs: AtomicU32::new(1),
+            rnode_last_close_finalized: AtomicBool::new(false),
             flags,
-            opendir_dentry: None,
+            opendir_dentry: SpinMutex::new(None),
         }
     }
 
@@ -1571,8 +1685,10 @@ impl OpenFile {
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
             packet_override: AtomicI8::new(-1),
+            process_fd_refs: AtomicU32::new(1),
+            rnode_last_close_finalized: AtomicBool::new(false),
             flags,
-            opendir_dentry: None,
+            opendir_dentry: SpinMutex::new(None),
         }
     }
 
@@ -1592,8 +1708,10 @@ impl OpenFile {
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
             packet_override: AtomicI8::new(-1),
+            process_fd_refs: AtomicU32::new(1),
+            rnode_last_close_finalized: AtomicBool::new(false),
             flags,
-            opendir_dentry: None,
+            opendir_dentry: SpinMutex::new(None),
         }
     }
 
@@ -1617,8 +1735,10 @@ impl OpenFile {
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
             packet_override: AtomicI8::new(-1),
+            process_fd_refs: AtomicU32::new(1),
+            rnode_last_close_finalized: AtomicBool::new(false),
             flags,
-            opendir_dentry: None,
+            opendir_dentry: SpinMutex::new(None),
         }
     }
 
@@ -1644,8 +1764,10 @@ impl OpenFile {
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
             packet_override: AtomicI8::new(-1),
+            process_fd_refs: AtomicU32::new(1),
+            rnode_last_close_finalized: AtomicBool::new(false),
             flags,
-            opendir_dentry: None,
+            opendir_dentry: SpinMutex::new(None),
         }
     }
 
@@ -1699,20 +1821,62 @@ impl OpenFile {
     /// Adjust the fd-table-visible endpoint count without cloning any `Cap`.
     /// Exec's post-PoNR CLOEXEC commit uses the decrement form, so this method
     /// must remain allocation-free and infallible.
-    pub(crate) fn adjust_process_fd_reference(&self, increment: bool) {
+    pub(crate) fn adjust_process_fd_reference(&self, increment: bool) -> bool {
         self.adjust_process_fd_reference_with_post(increment, &mut |mailbox, event| {
             mailbox.post(event)
-        });
+        })
     }
 
     /// Adjust fd-table-visible endpoint counts while routing any last-close
     /// wake through the caller. This is required for exit-time pipe EOF: the
     /// reader may be parked on a different scheduler hart from the exiting
     /// writer.
-    pub(crate) fn adjust_process_fd_reference_with_post<F>(&self, increment: bool, post: &mut F)
+    pub(crate) fn adjust_process_fd_reference_with_post<F>(
+        &self,
+        increment: bool,
+        post: &mut F,
+    ) -> bool
     where
         F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
     {
+        let adjusted = if increment {
+            let mut current = self.process_fd_refs.load(Ordering::Acquire);
+            loop {
+                if current == 0 {
+                    break false;
+                }
+                assert_ne!(current, u32::MAX, "OpenFile fd-ref count overflow");
+                match self.process_fd_refs.compare_exchange_weak(
+                    current,
+                    current + 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break true,
+                    Err(observed) => current = observed,
+                }
+            }
+        } else {
+            let mut current = self.process_fd_refs.load(Ordering::Acquire);
+            loop {
+                if current == 0 {
+                    break false;
+                }
+                match self.process_fd_refs.compare_exchange_weak(
+                    current,
+                    current - 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break true,
+                    Err(observed) => current = observed,
+                }
+            }
+        };
+        if !adjusted {
+            return false;
+        }
+
         // final-smp tracks descriptor ownership explicitly for network
         // sockets. Cap clones are lifetime pins and cannot be used to decide
         // when close(2) must publish FIN/EOF.
@@ -1729,7 +1893,7 @@ impl OpenFile {
                     payload: StructPayload::Pipe { payload, side },
                 } = rnode.backing()
                 else {
-                    return;
+                    return true;
                 };
                 match (*side, increment) {
                     (crate::pipe::PipeSide::Reader, true) => payload.incr_reader(),
@@ -1752,6 +1916,30 @@ impl OpenFile {
                 }
             }
             _ => {}
+        }
+        true
+    }
+
+    /// Publish that the final fd-table reference has completed close-time
+    /// settlement.  The `OpenFile` itself can remain in a Retiring Zone slot
+    /// for an arbitrary EBR grace period; its RNode retain is no longer a live
+    /// open-file owner during that interval.
+    pub(crate) fn complete_rnode_last_close(&self) {
+        if self.process_fd_refs.load(Ordering::Acquire) != 0
+            || self
+                .rnode_last_close_finalized
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return;
+        }
+        // The path hint exists only to service operations reached through a
+        // live fd (fchdir/openat/fstatat).  Once the final fd has settled, drop
+        // it logically now instead of letting the Retiring OpenFile keep both
+        // a direct RNode Cap and an indirect DEntry-owned RNode Cap until EBR.
+        drop(self.opendir_dentry.lock().take());
+        if let OpenFileBacking::Rnode { rnode } = &self.backing {
+            rnode.note_ebr_closed_open_file_retain();
         }
     }
 
@@ -1843,7 +2031,7 @@ impl OpenFile {
 
     /// Return the DEntry hint set by step_open.  Used by fchdir.
     pub fn opendir_dentry(&self) -> Option<Cap<DEntry>> {
-        self.opendir_dentry.clone()
+        self.opendir_dentry.lock().clone()
     }
 
     /// Acquire an advisory file lock (POSIX flock).
@@ -2180,6 +2368,17 @@ impl OpenFile {
     pub fn set_readdir_cursor(&self, cursor: DirCursor) {
         self.readdir_cursor
             .store(cursor.as_u64(), Ordering::Release);
+    }
+}
+
+impl Drop for OpenFile {
+    fn drop(&mut self) {
+        if !self.rnode_last_close_finalized.load(Ordering::Acquire) {
+            return;
+        }
+        if let OpenFileBacking::Rnode { rnode } = &self.backing {
+            rnode.release_ebr_closed_open_file_retain();
+        }
     }
 }
 

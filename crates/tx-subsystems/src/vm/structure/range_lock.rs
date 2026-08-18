@@ -66,6 +66,19 @@ impl<'a> WouldBlock<'a> {
         )
     }
 
+    /// Await a release observed after this failed acquisition.
+    ///
+    /// The subscription/recheck protocol is owned by `RangeLock`, so callers
+    /// in other crates do not need access to the token's private generation
+    /// field and cannot introduce a subscribe-after-release race.
+    pub async fn wait_for_release(mut self) {
+        let observed = self.observed_release;
+        if let Some(pending) = self.pending_writer.take() {
+            pending.cancel_without_notify();
+        }
+        self.lock.wait_for_release_since(observed).await;
+    }
+
     /// Convert a one-shot failed acquisition into its wait token without
     /// publishing a release for the transient pending-writer row. Publishing
     /// here would wake this same caller and turn an async retry loop into a
@@ -83,6 +96,18 @@ pub struct RangeGuard<'a> {
     lock: &'a RangeLock,
     id: u64,
     range: UserRange,
+}
+
+impl RangeGuard<'_> {
+    /// Whether this guard belongs to `lock` and covers `range` completely.
+    ///
+    /// This is used by resident user-copy operations that must compose a
+    /// larger transaction (for example clone TID writeback) without taking a
+    /// nested RangeLock reservation after a writer has queued behind the
+    /// caller.
+    pub(crate) fn covers(&self, lock: &RangeLock, range: UserRange) -> bool {
+        core::ptr::eq(self.lock, lock) && self.range.contains_range(range)
+    }
 }
 
 impl Drop for RangeGuard<'_> {

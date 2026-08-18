@@ -6,7 +6,8 @@ use tx_ext4::journal::{
 };
 use tx_ext4::planner::{Ext4FsyncPlanSource, Ext4WritePlanSource};
 use tx_ext4_format::journal::{
-    Jbd2MetadataUpdate, Jbd2Revoke, Jbd2Superblock, Jbd2TransactionImage, JBD2_BLOCK_SIZE,
+    Jbd2Features, Jbd2MetadataUpdate, Jbd2Revoke, Jbd2Superblock, Jbd2TransactionImage,
+    JBD2_BLOCK_SIZE,
 };
 use tx_ext4_format::mutation::{
     Ext4MutationPlan, FsyncStamp, MetaRole, MetadataBlock, MutationOrigin, RevokeRecord,
@@ -379,6 +380,7 @@ fn journal_source_commits_only_after_data_graph_completion() {
                     start: 0,
                     uuid: [1; 16],
                 },
+                features: Jbd2Features::REVOKE,
                 blocks: vec![9, 10, 11, 12, 13, 14, 15, 16],
                 superblock_page: None,
             },

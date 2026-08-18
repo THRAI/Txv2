@@ -5,6 +5,8 @@ use std::os::unix::fs::{self as unix_fs, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use object::{Object, ObjectSymbol};
+
 use crate::target::{Profile, TxTarget};
 use crate::util::{
     command_exists, option_value, optional_option_value, run_cmd_owned, run_shell, shell_escape,
@@ -14,14 +16,21 @@ use crate::Result;
 pub(crate) fn image(root: &Path, args: Vec<String>) -> Result<()> {
     let Some(kind) = args.first() else {
         return Err(
-            "image command needs a kind: cpio, initramfs, ext4, vf2-uimage, or la-uimage".into(),
+            "image command needs a kind: cpio, initramfs, ext4, vf2-uimage, or la2k1000-uimage"
+                .into(),
         );
     };
     if kind.as_str() == "vf2-uimage" {
         return image_vf2_uimage(root, &args[1..]);
     }
     if kind.as_str() == "la-uimage" {
-        return image_la_uimage(root, &args[1..]);
+        return Err("la-uimage is retired because it mixed the LA QEMU ELF with 2K1000 addresses; use la2k1000-uimage".into());
+    }
+    if kind.as_str() == "la2k1000-uimage" {
+        return image_la2k1000_uimage(root, &args[1..]);
+    }
+    if args.iter().any(|arg| arg == "--kernel-only") {
+        return Err("--kernel-only is supported only for image la2k1000-uimage".into());
     }
     let profile = Profile::parse(&option_value(&args[1..], "--profile")?)?;
     let target = image_target(&args[1..])?;
@@ -179,31 +188,89 @@ fn image_vf2_uimage(root: &Path, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// LS2K1000 U-Boot load/entry address, via the cached DMW window —
-/// NPUcore-BLOSSOM's board-proven `mkimage -a/-e` value (their
-/// `os/make/la_board/la64board.mk`). Physical base 0x9000_0000 equals
-/// our unified `KERNEL_LOAD_BASE`, so the same kernel binary boots
-/// QEMU 9.2.1 (whose high RAM covers it) and the board.
-const LA_LOAD_ADDR: &str = "0x9000000090000000";
+/// The legacy uImage header stores a 32-bit physical address. Place the
+/// 64-byte header immediately before that address. The vendor U-Boot still
+/// enters its relocation path because it compares the low load address with
+/// the high DMW transport address, but both map to the same cached pointer so
+/// the copy is in place.
+const LEGACY_UIMAGE_HEADER_SIZE: u64 = 64;
+const LA64_PHYS_ADDR_MASK: u64 = (1 << 48) - 1;
+const LA2K1000_LOAD_ADDR: u64 = 0x9800_0000;
+const LA2K1000_UIMAGE_HEADER_ADDR: u64 = 0x9000_0000_97ff_ffc0;
+const LA2K1000_INITRD_HEADER_ADDR: u64 = 0x9000_0000_9880_0000;
+const LA2K1000_FDT_ADDR: u64 = 0x9000_0000_0a00_0000;
+const LA2K1000_RAM1_END: u64 = 0xc000_0000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum La2k1000ImageMode {
+    Initramfs,
+    KernelOnly,
+}
+
+impl La2k1000ImageMode {
+    fn from_args(args: &[String]) -> Self {
+        if args.iter().any(|arg| arg == "--kernel-only") {
+            Self::KernelOnly
+        } else {
+            Self::Initramfs
+        }
+    }
+
+    fn payload_limit(self) -> u64 {
+        match self {
+            Self::Initramfs => LA2K1000_INITRD_HEADER_ADDR & LA64_PHYS_ADDR_MASK,
+            Self::KernelOnly => LA2K1000_RAM1_END,
+        }
+    }
+
+    fn linker_mode_value(self) -> u64 {
+        match self {
+            Self::Initramfs => 0,
+            Self::KernelOnly => 1,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Initramfs => "initramfs",
+            Self::KernelOnly => "kernel-only",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct La2k1000ElfLayout {
+    kernel_only_mode: u64,
+    kernel_end_phys: u64,
+    payload_limit: u64,
+}
 
 /// Package the la64 kernel ELF as an LS2K1000 boot artifact: strip to
 /// a raw binary, then wrap as a U-Boot uImage (mkimage -T kernel).
 ///
-///   cargo xtask build --target la64-qemu [--release]
-///   cargo xtask image la-uimage [--release]
-///   cp target/images/txv2-la.uimage /srv/tftp/
-///   # U-Boot:  tftpboot txv2-la.uimage   (default $loadaddr)
-///   #          bootm                     (relocates to -a and jumps)
-fn image_la_uimage(root: &Path, args: &[String]) -> Result<()> {
+///   cargo xtask build --target la64-2k1000 [--kernel-only] [--release]
+///   cargo xtask image la2k1000-uimage [--kernel-only] [--release]
+///   cp target/images/txv2-la2k1000.uimage /srv/tftp/
+///   # U-Boot loads the transport images at the validated second-bank
+///   # addresses, copies its control FDT into writable low RAM, then bootm
+///   # strips both legacy headers and publishes the raw CPIO range in /chosen.
+fn image_la2k1000_uimage(root: &Path, args: &[String]) -> Result<()> {
     let release = args.iter().any(|arg| arg == "--release");
-    let kernel = TxTarget::La64Qemu.kernel_path_for_profile(root, release);
+    let mode = La2k1000ImageMode::from_args(args);
+    let kernel = TxTarget::La64Ls2k1000.kernel_path_for_profile(root, release);
     if !kernel.exists() {
         return Err(format!(
-            "kernel ELF not found at {}; run `cargo xtask build --target la64-qemu{}` first",
+            "kernel ELF not found at {}; run `cargo xtask build --target la64-2k1000{}{}` first",
             kernel.display(),
+            if mode == La2k1000ImageMode::KernelOnly {
+                " --kernel-only"
+            } else {
+                ""
+            },
             if release { " --release" } else { "" }
         ));
     }
+    validate_la2k1000_elf(&kernel, mode)?;
 
     let objcopy = [
         "rust-objcopy",
@@ -227,8 +294,8 @@ fn image_la_uimage(root: &Path, args: &[String]) -> Result<()> {
 
     let out_dir = root.join("target").join("images");
     fs::create_dir_all(&out_dir).map_err(|err| err.to_string())?;
-    let bin = out_dir.join("txv2-la.bin");
-    let uimage = out_dir.join("txv2-la.uimage");
+    let bin = out_dir.join("txv2-la2k1000.bin");
+    let uimage = out_dir.join("txv2-la2k1000.uimage");
 
     run_cmd_owned(
         root,
@@ -240,6 +307,13 @@ fn image_la_uimage(root: &Path, args: &[String]) -> Result<()> {
             kernel.display().to_string(),
             bin.display().to_string(),
         ],
+    )?;
+    let raw_len = fs::metadata(&bin).map_err(|err| err.to_string())?.len();
+    validate_la2k1000_payload_range(
+        LA2K1000_LOAD_ADDR,
+        raw_len,
+        mode.payload_limit(),
+        "raw payload",
     )?;
     run_cmd_owned(
         root,
@@ -254,20 +328,20 @@ fn image_la_uimage(root: &Path, args: &[String]) -> Result<()> {
             "-C".to_string(),
             "none".to_string(),
             "-a".to_string(),
-            LA_LOAD_ADDR.to_string(),
+            format!("{LA2K1000_LOAD_ADDR:#x}"),
             "-e".to_string(),
-            LA_LOAD_ADDR.to_string(),
+            format!("{LA2K1000_LOAD_ADDR:#x}"),
             "-n".to_string(),
-            "Txv2-la".to_string(),
+            "Txv2-la2k1000".to_string(),
             "-d".to_string(),
             bin.display().to_string(),
             uimage.display().to_string(),
         ],
     )?;
 
-    let initramfs = out_dir.join(busybox_initramfs_name(TxTarget::La64Qemu));
-    let initrd_uimage = out_dir.join("txv2-la-initrd.uimage");
-    let have_initrd = initramfs.exists();
+    let initramfs = out_dir.join(busybox_initramfs_name(TxTarget::La64Ls2k1000));
+    let initrd_uimage = out_dir.join("txv2-la2k1000-initrd.uimage");
+    let have_initrd = should_package_la2k1000_initramfs(mode, initramfs.exists());
     if have_initrd {
         run_cmd_owned(
             root,
@@ -290,13 +364,133 @@ fn image_la_uimage(root: &Path, args: &[String]) -> Result<()> {
         )?;
     }
 
-    println!("la uimage ready: {}", uimage.display());
+    println!("2k1000 uimage ready: {}", uimage.display());
     if have_initrd {
         println!("la initrd ready: {}", initrd_uimage.display());
     }
-    println!("next: cp target/images/txv2-la*.uimage /srv/tftp/");
-    println!("U-Boot> tftpboot txv2-la.uimage");
-    println!("U-Boot> bootm    # relocates payload to {LA_LOAD_ADDR} and jumps");
+    if mode == La2k1000ImageMode::KernelOnly {
+        println!("next: cp target/images/txv2-la2k1000.uimage /srv/tftp/txv2/");
+    } else {
+        println!("next: cp target/images/txv2-la2k1000*.uimage /srv/tftp/txv2/");
+    }
+    println!("U-Boot> tftpboot {LA2K1000_UIMAGE_HEADER_ADDR:#x} txv2/txv2-la2k1000.uimage");
+    if have_initrd {
+        let initrd_file_size = fs::metadata(&initrd_uimage)
+            .map_err(|err| err.to_string())?
+            .len();
+        let initrd_header_phys = LA2K1000_INITRD_HEADER_ADDR & LA64_PHYS_ADDR_MASK;
+        let initrd_start = initrd_header_phys + LEGACY_UIMAGE_HEADER_SIZE;
+        let initrd_size = initrd_file_size
+            .checked_sub(LEGACY_UIMAGE_HEADER_SIZE)
+            .ok_or("2K1000 initrd uImage is smaller than its legacy header")?;
+        let initrd_end = initrd_start
+            .checked_add(initrd_size)
+            .ok_or("2K1000 initrd range overflow")?;
+        if initrd_end > LA2K1000_RAM1_END {
+            return Err(format!(
+                "2K1000 initrd ends at {initrd_end:#x}, beyond RAM1 end {LA2K1000_RAM1_END:#x}"
+            ));
+        }
+
+        println!(
+            "U-Boot> tftpboot {LA2K1000_INITRD_HEADER_ADDR:#x} txv2/txv2-la2k1000-initrd.uimage"
+        );
+        println!("U-Boot> fdt addr ${{fdtcontroladdr}}");
+        println!("U-Boot> fdt move ${{fdtcontroladdr}} {LA2K1000_FDT_ADDR:#x} 10000");
+        println!("U-Boot> fdt addr {LA2K1000_FDT_ADDR:#x}");
+        println!("U-Boot> fdt set /chosen linux,initrd-start <0x0 {initrd_start:#x}>");
+        println!("U-Boot> fdt set /chosen linux,initrd-end <0x0 {initrd_end:#x}>");
+        println!("U-Boot> setenv fdt_addr {LA2K1000_FDT_ADDR:#x}");
+        println!("U-Boot> setenv fdt_high 0xffffffffffffffff");
+        println!("U-Boot> setenv initrd_high 0xffffffffffffffff");
+        println!(
+            "U-Boot> setenv bootargs tx.profile=busybox tx.board=ls2k1000 console=ttyS0 rd_start={initrd_start:#x} rd_size={initrd_size:#x}"
+        );
+        println!("U-Boot> bootm {LA2K1000_UIMAGE_HEADER_ADDR:#x} {LA2K1000_INITRD_HEADER_ADDR:#x}");
+    } else {
+        println!("U-Boot> bootm {LA2K1000_UIMAGE_HEADER_ADDR:#x}");
+    }
+    Ok(())
+}
+
+fn should_package_la2k1000_initramfs(mode: La2k1000ImageMode, exists: bool) -> bool {
+    mode == La2k1000ImageMode::Initramfs && exists
+}
+
+fn validate_la2k1000_elf(path: &Path, mode: La2k1000ImageMode) -> Result<()> {
+    let bytes = fs::read(path).map_err(|err| format!("read {}: {err}", path.display()))?;
+    let file = object::File::parse(bytes.as_slice())
+        .map_err(|err| format!("parse {} as ELF: {err}", path.display()))?;
+    let symbol = |name: &str| -> Result<u64> {
+        file.symbol_by_name(name)
+            .map(|symbol| symbol.address())
+            .ok_or_else(|| {
+                format!(
+                    "{} is missing linker symbol {name}; rebuild with `cargo xtask build --target la64-2k1000{}{}`",
+                    path.display(),
+                    if mode == La2k1000ImageMode::KernelOnly {
+                        " --kernel-only"
+                    } else {
+                        ""
+                    },
+                    if path.to_string_lossy().contains("/release/") {
+                        " --release"
+                    } else {
+                        ""
+                    }
+                )
+            })
+    };
+    let layout = La2k1000ElfLayout {
+        kernel_only_mode: symbol("__kernel_only_mode")?,
+        kernel_end_phys: symbol("__kernel_end_phys")?,
+        payload_limit: symbol("__kernel_payload_limit")?,
+    };
+    if layout.kernel_only_mode != mode.linker_mode_value()
+        || layout.payload_limit != mode.payload_limit()
+    {
+        return Err(format!(
+            "{} was linked in {} mode with payload limit {:#x}, but image requested {} mode with limit {:#x}; rebuild the same mode first",
+            path.display(),
+            if layout.kernel_only_mode == 1 {
+                "kernel-only"
+            } else {
+                "initramfs"
+            },
+            layout.payload_limit,
+            mode.label(),
+            mode.payload_limit()
+        ));
+    }
+    if layout.kernel_end_phys < LA2K1000_LOAD_ADDR {
+        return Err(format!(
+            "{} has invalid physical kernel end {:#x} below load address {LA2K1000_LOAD_ADDR:#x}",
+            path.display(),
+            layout.kernel_end_phys
+        ));
+    }
+    validate_la2k1000_payload_range(
+        LA2K1000_LOAD_ADDR,
+        layout.kernel_end_phys - LA2K1000_LOAD_ADDR,
+        mode.payload_limit(),
+        "ELF image",
+    )
+}
+
+fn validate_la2k1000_payload_range(
+    load_addr: u64,
+    payload_len: u64,
+    end_exclusive: u64,
+    label: &str,
+) -> Result<()> {
+    let end = load_addr
+        .checked_add(payload_len)
+        .ok_or_else(|| format!("2K1000 {label} range overflow"))?;
+    if end > end_exclusive {
+        return Err(format!(
+            "2K1000 {label} ends at {end:#x}, beyond selected payload limit {end_exclusive:#x}"
+        ));
+    }
     Ok(())
 }
 
@@ -515,7 +709,7 @@ pub(crate) const VENDORED_LA64_BUSYBOX_RELPATH: &str =
 pub(crate) fn vendored_busybox_relpath(target: TxTarget) -> &'static str {
     match target {
         TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock => VENDORED_BUSYBOX_RELPATH,
-        TxTarget::La64Qemu => VENDORED_LA64_BUSYBOX_RELPATH,
+        TxTarget::La64Qemu | TxTarget::La64Ls2k1000 => VENDORED_LA64_BUSYBOX_RELPATH,
     }
 }
 
@@ -539,7 +733,9 @@ fn resolve_busybox(root: &Path, target: TxTarget) -> Result<PathBuf> {
         TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock => {
             "run `tools/images/fetch-busybox.sh` or set TX_BUSYBOX"
         }
-        TxTarget::La64Qemu => "run `tools/images/build-busybox-loongarch64.sh` or set TX_BUSYBOX",
+        TxTarget::La64Qemu | TxTarget::La64Ls2k1000 => {
+            "run `tools/images/build-busybox-loongarch64.sh` or set TX_BUSYBOX"
+        }
     };
     Err(format!(
         "TX_BUSYBOX is not set and vendored busybox for {} is missing at {}; {help}",
@@ -558,7 +754,9 @@ fn prepare_busybox_rootfs(root: &Path, target: TxTarget) -> Result<PathBuf> {
     if layout.exists() {
         fs::remove_dir_all(&layout).map_err(|err| err.to_string())?;
     }
-    for dir in ["bin", "dev", "etc", "lib", "proc", "sys", "tmp", "usr/bin"] {
+    for dir in [
+        "bin", "dev", "etc", "lib", "proc", "sbin", "sys", "tmp", "usr/bin",
+    ] {
         fs::create_dir_all(layout.join(dir)).map_err(|err| err.to_string())?;
     }
     fs::copy(&busybox, layout.join("bin").join("busybox")).map_err(|err| err.to_string())?;
@@ -1002,5 +1200,61 @@ mod tests {
             user_smoke_compiler_candidates().contains(&"riscv64-unknown-elf-gcc"),
             "freestanding helper sources should build with the local bare-metal RISC-V GCC"
         );
+    }
+
+    #[test]
+    fn la2k1000_uimage_uses_legacy_header_physical_address() {
+        assert_eq!(LA2K1000_LOAD_ADDR, 0x9800_0000);
+        assert_eq!(
+            (LA2K1000_UIMAGE_HEADER_ADDR & LA64_PHYS_ADDR_MASK) + LEGACY_UIMAGE_HEADER_SIZE,
+            LA2K1000_LOAD_ADDR
+        );
+        assert_eq!(
+            LA2K1000_INITRD_HEADER_ADDR & LA64_PHYS_ADDR_MASK,
+            0x9880_0000
+        );
+        assert_eq!(LA2K1000_FDT_ADDR & LA64_PHYS_ADDR_MASK, 0x0a00_0000);
+    }
+
+    #[test]
+    fn la2k1000_kernel_only_uses_ram1_end_as_payload_limit() {
+        assert_eq!(
+            La2k1000ImageMode::KernelOnly.payload_limit(),
+            LA2K1000_RAM1_END
+        );
+        assert_eq!(
+            La2k1000ImageMode::Initramfs.payload_limit(),
+            LA2K1000_INITRD_HEADER_ADDR & LA64_PHYS_ADDR_MASK
+        );
+    }
+
+    #[test]
+    fn la2k1000_kernel_only_ignores_stale_initramfs() {
+        assert!(!should_package_la2k1000_initramfs(
+            La2k1000ImageMode::KernelOnly,
+            true
+        ));
+        assert!(should_package_la2k1000_initramfs(
+            La2k1000ImageMode::Initramfs,
+            true
+        ));
+    }
+
+    #[test]
+    fn la2k1000_payload_range_is_end_exclusive() {
+        assert!(validate_la2k1000_payload_range(
+            LA2K1000_LOAD_ADDR,
+            LA2K1000_RAM1_END - LA2K1000_LOAD_ADDR,
+            LA2K1000_RAM1_END,
+            "raw payload"
+        )
+        .is_ok());
+        assert!(validate_la2k1000_payload_range(
+            LA2K1000_LOAD_ADDR,
+            LA2K1000_RAM1_END - LA2K1000_LOAD_ADDR + 1,
+            LA2K1000_RAM1_END,
+            "raw payload"
+        )
+        .is_err());
     }
 }

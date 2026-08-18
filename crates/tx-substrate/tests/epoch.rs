@@ -2,7 +2,7 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
 use static_assertions::assert_not_impl_any;
-use tx_hal::{CpuId, EntropyIf, IpiKind, IrqIf, LocalExecutionGuard, PercpuIf, SmpIf};
+use tx_hal::{CpuId, CpuMask, EntropyIf, IpiKind, IrqIf, LocalExecutionGuard, PercpuIf, SmpIf};
 use tx_substrate::epoch::{self, testing, EpochError};
 
 static EPOCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -52,8 +52,12 @@ impl IrqIf for TestPlatform {
 }
 impl EntropyIf for TestPlatform {}
 impl SmpIf for TestPlatform {
-    fn possible_cpu_count() -> usize {
-        2
+    fn possible_cpus() -> CpuMask {
+        CpuMask::from_bits(0b11)
+    }
+
+    fn online_cpus() -> CpuMask {
+        CpuMask::from_bits(0b11)
     }
 
     fn is_cpu_online(cpu: CpuId) -> bool {
@@ -546,6 +550,30 @@ fn epoch_advance_restarts_on_membership_change() {
     assert!(result.advanced);
     assert_eq!(result.scan_attempts, 2);
     assert_eq!(result.version_after, result.version_before + 1);
+}
+
+#[test]
+fn collector_publication_fence_precedes_every_participant_scan() {
+    let _isolation = EPOCH_TEST_LOCK.lock().expect("epoch test lock");
+    reset_epoch();
+
+    let fence_passes = std::cell::Cell::new(0usize);
+    let scanned = std::cell::Cell::new(0usize);
+    let result = testing::try_advance_with_publication_fence_hooks_for_test(
+        || fence_passes.set(fence_passes.get() + 1),
+        |_| {
+            assert!(
+                fence_passes.get() > 0,
+                "participant scan ran before its publication fence"
+            );
+            scanned.set(scanned.get() + 1);
+        },
+    );
+
+    assert!(result.advanced);
+    assert_eq!(result.scan_attempts, 1);
+    assert_eq!(fence_passes.get(), result.scan_attempts);
+    assert_eq!(scanned.get(), 2, "both online participants were scanned");
 }
 
 #[test]

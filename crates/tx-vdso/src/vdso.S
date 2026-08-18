@@ -196,6 +196,7 @@ __vdso_clock_gettime:
     sd      s3, 0(a1)              # ts->tv_sec
     sd      s4, 8(a1)              # ts->tv_nsec
     li      a0, 0
+    j       .Lgt_done
 
 .Lgt_enosys:
     li      a0, -38                # -ENOSYS

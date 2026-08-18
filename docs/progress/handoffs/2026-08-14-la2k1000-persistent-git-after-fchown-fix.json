@@ -1,0 +1,138 @@
+{
+  "schema": "tx.progress.handoff.v1",
+  "id": "2026-08-14-la2k1000-persistent-git-after-fchown-fix",
+  "title": "Resume LA2K1000 persistent ext4 Git validation after fchown StepOp fix",
+  "created": "2026-08-14",
+  "from": "codex",
+  "status": "closed",
+  "plan": null,
+  "current_state": [
+    "The PR worktree is /home/msp/learning/Txv2 on feature/portable-net-vf2-dwmac at base 460152ced with unstaged fixes; /home/msp/learning/Txv2-main-baseline was not edited.",
+    "LA sda1 ext4 RW completed an add-only HTTPS shallow clone under /root/txv2-460152ced-20260815-m; after physical reset, the same artifact mounted sda1 RO and the repository HEAD plus full fsck were intact.",
+    "LA five-stream TCP passed in both directions and five-stream UDP received 8560/8560 datagrams with zero loss while the root remained read-only.",
+    "BusyBox periodic ping exposed both a caught-signal frame VM-Yield bug and a physical-only LoongArch old-world ABI mismatch. Signal-frame materialization now waits asynchronously, and LA signal syscalls accept 8-byte new-world or 16-byte old-world sigsets while RV remains 8-byte-only.",
+    "The final physical artifact /srv/tftp/txv2/txv2-la2k1000-pr-460152ced-oldworldsig-3fd30c0d.uimage (SHA-256 3fd30c0d96dffc9ffcc65b4ec2aa332de467185342c6ee433e5c5f912c535914) booted sda1 read-only; Python SIG_IGN/mask/pending, Bash caught-handler return, and BusyBox periodic ping 3/3 plus 600/600 all passed.",
+    "The partial add-only paths from suffixes -a through -l and the successful -m repository remain untouched."
+  ],
+  "changed_files": [
+    {
+      "path": "crates/tx-subsystems/src/vfs/composite.rs",
+      "reason": "Remove invalid chmod/chown one-shot classification and retain target across Yield."
+    },
+    {
+      "path": "crates/tx-shims/src/linux_syscall/fs_path.rs",
+      "reason": "Drive fchmodat/fchownat through the full Waiting driver."
+    },
+    {
+      "path": "crates/tx-ext4/src/tests_v3.rs",
+      "reason": "Cover chmod/chown metadata-admission Yield and target retention."
+    },
+    {
+      "path": "crates/tx-ext4-format/src/journal_replay.rs",
+      "reason": "Use Linux informational descriptor UUID semantics for production recovery while preserving strict diagnostics and RO preflight."
+    },
+    {
+      "path": "crates/tx-kernel/src/init.rs",
+      "reason": "Expose opt-in RO journal preflight before root mount."
+    },
+    {
+      "path": "crates/tx-kernel/src/thread_future.rs",
+      "reason": "Wait asynchronously for caught-signal stack materialization and replay the immutable frame after VM Yield."
+    },
+    {
+      "path": "crates/tx-shims/src/linux_syscall/signal.rs",
+      "reason": "Support LoongArch 8-byte new-world and 16-byte old-world rt-signal wire ABIs without widening the internal 64-signal model."
+    },
+    {
+      "path": "crates/tx-shims/src/linux_syscall/mod.rs",
+      "reason": "Document the native 8-byte constants and the separate LoongArch old-world compatibility wire."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo fmt --all -- --check && git diff --check",
+      "status": "passed",
+      "notes": "Formatting and whitespace clean."
+    },
+    {
+      "command": "cargo test -p tx-ext4 retains_pre_resolved_target_across_admission_yield",
+      "status": "passed",
+      "notes": "2 passed."
+    },
+    {
+      "command": "cargo test -p tx-ext4-format -- --test-threads=1",
+      "status": "passed",
+      "notes": "116 passed, 1 ignored."
+    },
+    {
+      "command": "CARGO_TARGET_DIR=target/check-kernel-pr-current cargo check -p tx-kernel --lib",
+      "status": "passed",
+      "notes": "Fresh target avoids known stale tx-hal rmeta in the default target directory."
+    },
+    {
+      "command": "cargo xtask build --target la64-2k1000 --kernel-only --release && cargo xtask image la2k1000-uimage --kernel-only --release",
+      "status": "passed",
+      "notes": "TFTP artifact d28e88be... added under a new immutable filename and cmp verified."
+    },
+    {
+      "command": "cargo -q xtask unit",
+      "status": "failed",
+      "notes": "Current main tx-shims dispatch regressions and two existing tx-kernel libctest command assertions remain; tx-ext4 95/95 and tx-scripts 167/167 pass."
+    },
+    {
+      "command": "LA sda1 RW Git clone, physical reset, sda1 RO rev-parse and git fsck --full",
+      "status": "passed",
+      "notes": "HEAD 0c8e312f82c34335d78073334c40c253c70df23c survived reset and full fsck passed."
+    },
+    {
+      "command": "LA iperf3 TCP -P 5 in both directions and UDP -P 5",
+      "status": "passed",
+      "notes": "Inbound TCP 52.6 MiB/29.1 Mbit/s; reverse TCP 98.2 MiB/55.2 Mbit/s/0 retrans; UDP 8560/8560, 0% loss."
+    },
+    {
+      "command": "cargo xtask shell-test --target rv64-qemu|la64-qemu --script tools/shell-tests/busybox-ping-loopback.txt",
+      "status": "passed",
+      "notes": "Both architectures delivered periodic caught SIGALRM and returned 3/3 replies with 0% loss."
+    },
+    {
+      "command": "cargo test -p tx-shims --lib rt_sigaction_wire_abi_tests; cargo test -p tx-shims --lib rt_sigprocmask",
+      "status": "passed",
+      "notes": "LoongArch old-world/new-world classifier and codecs passed 6/6; existing rt_sigprocmask dispatch tests passed 4/4. LA and RV target checks also passed."
+    },
+    {
+      "command": "LA sda1 RO Python/Bash signal probes and BusyBox ping -i 0.05 -c 3|-c 600",
+      "status": "passed",
+      "notes": "Python SIG_IGN plus mask/pending and Bash handler/return passed; ping returned 3/3 and 600/600 with 0% loss."
+    },
+    {
+      "command": "TXKERNEL=<current debug ELF> bash tools/verify-git-net.sh; bash tools/verify-git-net-la64.sh",
+      "status": "passed",
+      "notes": "RV64 and LA64 QEMU each passed the 9/9 HTTP/HTTPS Git, push/pull, DHCP/FIB, and DNS matrix."
+    }
+  ],
+  "next_actions": [
+    {
+      "id": "next-2",
+      "title": "Run post-merge RV real-board persistent ext4 validation",
+      "paths": [],
+      "notes": "The earlier final VF2 clone was RAM-only. Use an identified ext4 target, add-only path, reset, and RO rev-parse/fsck; do not claim persistence from tmpfs."
+    },
+    {
+      "id": "next-3",
+      "title": "Classify or repair the remaining main unit regressions before PR submission",
+      "paths": [],
+      "notes": "Do not stage, commit, push, or rewrite history without user confirmation."
+    }
+  ],
+  "caveats": [
+    "Never issue dd, mkfs, partitioning, repair fsck, raw block writes, U-Boot saveenv, flash writes, or media write commands.",
+    "QEMU verify-git clones under /home tmpfs and is a network/Git functional witness, not a persistent ext4 witness.",
+    "Two interactive attempts missed the zero-second U-Boot window and let factory Linux mount sda1 RW; no agent command ran there, but systemd wrote its own journals. Future boots must use the 5 ms atomic UART interceptor.",
+    "Global step/ad-hoc-drive ratchets plus tx-shims and two tx-kernel unit groups have pre-existing failures outside the focused fixes."
+  ],
+  "links": [
+    "msp/debug-logs/2026-08-14-la2k1000-tar-fchown-step-panic.md",
+    "msp/debug-logs/2026-08-15-main-merge-la-persistent-git-network-sigalrm.md",
+    "docs/progress/STATUS.md"
+  ]
+}

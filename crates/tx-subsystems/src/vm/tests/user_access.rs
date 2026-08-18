@@ -1,6 +1,7 @@
 use super::*;
 use crate::execution::Errno;
 use crate::vm::adapter::step_engine::StepOutcome;
+use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 use tx_hal::UserPtr;
@@ -121,6 +122,114 @@ fn vm_resident_value_write_declines_cold_and_cross_page_ranges() {
         ),
         None,
         "cross-page values must fall back before writing any byte"
+    );
+}
+
+#[test]
+fn vm_kernel_user_writes_wait_behind_fork_range_writer() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("vm user-access test lock");
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let user_addr = 0x1a_000;
+    let user_range =
+        UserRange::new_aligned(UserVirtAddr(user_addr), USER_PAGE_SIZE).expect("user range");
+    map_private(&aspace, user_addr, USER_PAGE_SIZE, Prot::READ_WRITE);
+    let guard = crate::vm::adapter::step_engine::guard();
+    assert_eq!(
+        aspace.copy_to_user(UserPtr::new(user_addr), &[0; 8], &guard),
+        StepOutcome::Done(8)
+    );
+
+    let _fork_writer = match aspace
+        .range_lock()
+        .acquire_step_rich(user_range, LockMode::ExclusiveWriter)
+    {
+        crate::vm::AcquireResult::Acquired(writer) => writer,
+        crate::vm::AcquireResult::WouldBlock(_) => panic!("fork writer should acquire"),
+    };
+
+    assert_eq!(
+        aspace.write_user_resident(UserPtr::<u64>::new(user_addr), u64::MAX),
+        None,
+        "resident direct write must fall back while fork owns the range"
+    );
+    match aspace.copy_to_user(UserPtr::new(user_addr), &[0xff; 8], &guard) {
+        StepOutcome::Yield { .. } => {}
+        other => panic!("copy_to_user must wait behind fork writer, got {other:?}"),
+    }
+}
+
+#[test]
+fn vm_user_range_wait_sleeps_until_fork_writer_releases() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("vm user-access test lock");
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let user_addr = 0x1b_000;
+    let user_range =
+        UserRange::new_aligned(UserVirtAddr(user_addr), USER_PAGE_SIZE).expect("user range");
+    map_private(&aspace, user_addr, USER_PAGE_SIZE, Prot::READ_WRITE);
+    let guard = crate::vm::adapter::step_engine::guard();
+    assert_eq!(
+        aspace.copy_to_user(UserPtr::new(user_addr), &[0; 8], &guard),
+        StepOutcome::Done(8)
+    );
+
+    let writer = match aspace
+        .range_lock()
+        .acquire_step_rich(user_range, LockMode::ExclusiveWriter)
+    {
+        crate::vm::AcquireResult::Acquired(writer) => writer,
+        crate::vm::AcquireResult::WouldBlock(_) => panic!("fork writer should acquire"),
+    };
+    let mut waiter =
+        Box::pin(aspace.reserve_user_range_for_access_wait(user_range, UserAccessKind::Write));
+    let waker = core::task::Waker::noop();
+    let mut poll_ctx = core::task::Context::from_waker(waker);
+    assert!(matches!(
+        core::future::Future::poll(waiter.as_mut(), &mut poll_ctx),
+        core::task::Poll::Pending
+    ));
+
+    drop(writer);
+    assert_eq!(
+        core::future::Future::poll(waiter.as_mut(), &mut poll_ctx),
+        core::task::Poll::Ready(Ok(()))
+    );
+}
+
+#[test]
+fn vm_read_user_rejects_a_short_cross_page_copy() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("vm user-access test lock");
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let page_addr = 0x1c_000;
+    let user_addr = page_addr + USER_PAGE_SIZE - 4;
+    map_private(&aspace, page_addr, USER_PAGE_SIZE, Prot::READ_WRITE);
+    let guard = crate::vm::adapter::step_engine::guard();
+    assert_eq!(
+        aspace.copy_to_user(UserPtr::new(user_addr), &[1, 2, 3, 4], &guard),
+        StepOutcome::Done(4)
+    );
+
+    assert_eq!(
+        aspace.read_user::<[u8; 8]>(UserPtr::new(user_addr), &guard),
+        StepOutcome::Err(Errno::EFAULT.into())
+    );
+}
+
+#[test]
+fn vm_write_user_rejects_a_short_cross_page_copy() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("vm user-access test lock");
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let page_addr = 0x20_000;
+    let user_addr = page_addr + USER_PAGE_SIZE - 4;
+    map_private(&aspace, page_addr, USER_PAGE_SIZE, Prot::READ_WRITE);
+    let guard = crate::vm::adapter::step_engine::guard();
+
+    assert_eq!(
+        aspace.write_user(UserPtr::new(user_addr), [0x5a; 8], &guard),
+        StepOutcome::Err(Errno::EFAULT.into())
     );
 }
 

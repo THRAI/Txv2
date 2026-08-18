@@ -312,10 +312,7 @@ fn bind_udp_maybe_reuseaddr(
             if !socket_reuse_addr(&existing) {
                 return Err(IndexError::Duplicate);
             }
-            table
-                .withdraw_udp_bound(local)
-                .map_err(|_| IndexError::Busy)?;
-            table.bind_udp(local, socket.clone())
+            table.replace_udp_bound_owner(local, socket.clone())
         }
         Err(error) => Err(error),
     }

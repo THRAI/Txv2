@@ -197,6 +197,30 @@ fn raw_queue_take_preserves_a_same_bit_refire_after_claim() {
 }
 
 #[test]
+fn raw_queue_take_consumes_only_selected_bits_and_notifies_a_refire() {
+    let queue = RawQueue::new();
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let mailbox = Arc::new(TaskMailbox::new());
+    mailbox.register_waker(counting_waker(Arc::clone(&wakes)));
+    let generation = mailbox.next_generation();
+    let _subscription = queue.subscribe(0x3, Arc::downgrade(&mailbox), generation);
+
+    assert_eq!(queue.fire(0x3), 1);
+    assert_eq!(wakes.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        mailbox.poll(),
+        Some(MailboxEvent::SourceFired { .. })
+    ));
+    assert_eq!(queue.take(0x1), 0x1);
+    assert_eq!(queue.peek(), 0x2);
+
+    assert_eq!(queue.fire(0x1), 1);
+    assert_eq!(wakes.load(Ordering::SeqCst), 2);
+    assert_eq!(queue.try_take(0x3), Ok(0x3));
+    assert_eq!(queue.peek(), 0);
+}
+
+#[test]
 fn static_raw_port_storage_produces_cloneable_raw_handles_without_arc_allocation() {
     let port = STATIC_TEST_PORT.raw();
     let port_from_static = RawPort::from_static(&STATIC_TEST_PORT);

@@ -1,0 +1,24 @@
+[package]
+name = "tx-kernel-loongarch64-2k1000"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tx-hal = { path = "../../crates/tx-hal" }
+tx-hal-loongarch64-2k1000 = { path = "../tx-hal-loongarch64-2k1000" }
+tx-kernel = { path = "../../crates/tx-kernel" }
+
+[features]
+default = []
+kernel-only = []
+
+[[bin]]
+name = "tx-kernel-loongarch64-2k1000"
+path = "src/main.rs"
+test = false
+doctest = false
+
+[lints]
+workspace = true

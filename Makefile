@@ -263,7 +263,14 @@ OSCOMP_TEST_INIT ?= 1
 OSCOMP_TEST_INITRD_RV ?= target/images/test-init-initramfs-rv64-qemu.cpio
 OSCOMP_TEST_INITRD_LA ?= target/images/test-init-initramfs-la64-qemu.cpio
 OSCOMP_TEST_INIT_CMDLINE = $(if $(filter 1,$(OSCOMP_TEST_INIT)),init=/tx-test-init tx.test_init=1,)
-OSCOMP_CMDLINE = $(strip tx.boot.mode=oscomp $(OSCOMP_TEST_INIT_CMDLINE) $(if $(strip $(OSCOMP_EFFECTIVE_GROUPS)),tx.oscomp.groups=$(OSCOMP_EFFECTIVE_GROUPS),) $(OSCOMP_LTP_MAX_RUNTIME_CMDLINE) $(OSCOMP_LTP_MAX_RUNTIME_CASES_CMDLINE))
+# Keep the current test-init default, while allowing the direct sdcard lane to
+# request the same userspace DHCP prelude with
+# `OSCOMP_TEST_INIT=0 OSCOMP_NET_MODE=dhcp`.
+OSCOMP_NET_MODE ?= $(if $(filter 1,$(OSCOMP_TEST_INIT)),dhcp,)
+OSCOMP_NET_IFACE ?=
+OSCOMP_NET_MODE_CMDLINE = $(if $(strip $(OSCOMP_NET_MODE)),tx.net.mode=$(OSCOMP_NET_MODE),)
+OSCOMP_NET_IFACE_CMDLINE = $(if $(strip $(OSCOMP_NET_IFACE)),tx.net.iface=$(OSCOMP_NET_IFACE),)
+OSCOMP_CMDLINE = $(strip tx.boot.mode=oscomp $(OSCOMP_TEST_INIT_CMDLINE) $(OSCOMP_NET_MODE_CMDLINE) $(OSCOMP_NET_IFACE_CMDLINE) $(if $(strip $(OSCOMP_EFFECTIVE_GROUPS)),tx.oscomp.groups=$(OSCOMP_EFFECTIVE_GROUPS),) $(OSCOMP_LTP_MAX_RUNTIME_CMDLINE) $(OSCOMP_LTP_MAX_RUNTIME_CASES_CMDLINE))
 OSCOMP_APPEND_RV = $(if $(filter 1,$(OSCOMP_TEST_INIT)),-initrd $(OSCOMP_TEST_INITRD_RV),) $(if $(strip $(OSCOMP_CMDLINE)),-append '$(OSCOMP_CMDLINE)',)
 OSCOMP_APPEND_LA = $(if $(filter 1,$(OSCOMP_TEST_INIT)),-initrd $(OSCOMP_TEST_INITRD_LA) -fw_cfg name=opt/tx.initrd$(COMMA)file=$(OSCOMP_TEST_INITRD_LA),) $(if $(strip $(OSCOMP_CMDLINE)),-append '$(OSCOMP_CMDLINE)' -fw_cfg name=opt/tx.cmdline$(COMMA)string='$(OSCOMP_CMDLINE)',)
 OSCOMP_TESTCASE_OUT ?= target/oscomp/testcase
@@ -301,10 +308,10 @@ oscomp-submit-both:
 	CARGO_TARGET_DIR=$(HOST_CARGO_TARGET_DIR) cargo xtask oscomp submit --target all --submit $(OSCOMP_SUBMIT) $(OSCOMP_KERNEL_PROFILE)
 
 oscomp-build-rv64:
-	cargo xtask build --target rv64-qemu $(OSCOMP_KERNEL_PROFILE)
+	CARGO_TARGET_DIR=$(HOST_CARGO_TARGET_DIR) cargo xtask build --target rv64-qemu $(OSCOMP_KERNEL_PROFILE)
 
 oscomp-build-la64:
-	cargo xtask build --target la64-qemu $(OSCOMP_KERNEL_PROFILE)
+	CARGO_TARGET_DIR=$(HOST_CARGO_TARGET_DIR) cargo xtask build --target la64-qemu $(OSCOMP_KERNEL_PROFILE)
 
 oscomp-build-both: oscomp-build-rv64 oscomp-build-la64
 
@@ -365,9 +372,9 @@ oscomp-qemu-la64:
 		-kernel $(OSCOMP_SUBMIT)/kernel-la \
 		-m 1G -nographic -smp 1 \
 		-drive file=$(OSCOMP_DATA)/sdcard-la.img,if=none,format=raw,id=x0,file.locking=off \
-		-device virtio-blk-pci,drive=x0 \
+		-device virtio-blk-pci,drive=x0,addr=1 \
 		-no-reboot \
-		-device virtio-net-pci,netdev=net0 -netdev user,id=net0 \
+		-device virtio-net-pci,netdev=net0,addr=2 -netdev user,id=net0 \
 		-rtc base=utc \
 		$(OSCOMP_APPEND_LA) \
 		2>&1 | $(OSCOMP_SERIAL_NORMALIZE) | tee $(OSCOMP_OUT_LA) | $(OSCOMP_CONSOLE_FILTER)
@@ -380,9 +387,9 @@ oscomp-qemu-la64-smp4:
 		-kernel $(OSCOMP_SUBMIT)/kernel-la \
 		-m 1G -nographic -smp 4 \
 		-drive file=$(OSCOMP_DATA)/sdcard-la.img,if=none,format=raw,id=x0,file.locking=off \
-		-device virtio-blk-pci,drive=x0 \
+		-device virtio-blk-pci,drive=x0,addr=1 \
 		-no-reboot \
-		-device virtio-net-pci,netdev=net0 -netdev user,id=net0 \
+		-device virtio-net-pci,netdev=net0,addr=2 -netdev user,id=net0 \
 		-rtc base=utc \
 		$(OSCOMP_APPEND_LA) \
 		2>&1 | $(OSCOMP_SERIAL_NORMALIZE) | tee $(OSCOMP_OUT_LA_SMP4) | $(OSCOMP_CONSOLE_FILTER)

@@ -8,8 +8,9 @@ use alloc::sync::Arc;
 use crate::adapter::reactor_entry::WaitSource;
 use crate::adapter::step_engine::{InterestMask, StepOutcome, WaitSourceId};
 use crate::linux_syscall::{
-    bootstrap_copy_from_user, bootstrap_copy_to_user, errno_to_i32, SyscallCtx, SyscallResult,
-    EBADF_VALUE, EFAULT_VALUE, EINVAL_VALUE, EMFILE_VALUE, ENOMEM_VALUE, ENOSYS_VALUE,
+    bootstrap_copy_from_user_wait, bootstrap_copy_to_user_wait, errno_to_i32, SyscallCtx,
+    SyscallResult, EBADF_VALUE, EFAULT_VALUE, EINVAL_VALUE, EMFILE_VALUE, ENOMEM_VALUE,
+    ENOSYS_VALUE,
 };
 use tx_services::time::{timekeeper_clock, ClockRead, TimekeeperClock};
 use tx_subsystems::{
@@ -64,12 +65,13 @@ impl UserEpollEvent {
     }
 }
 
-fn read_user_epoll_event(
+async fn read_user_epoll_event(
     ctx: &SyscallCtx<'_>,
     event_ptr: u64,
 ) -> Result<UserEpollEvent, SyscallResult> {
     let mut bytes = [0u8; EPOLL_EVENT_SIZE];
-    bootstrap_copy_from_user(&ctx.aspace, &mut bytes, event_ptr)
+    bootstrap_copy_from_user_wait(&ctx.aspace, &mut bytes, event_ptr)
+        .await
         .map_err(SyscallResult::error_from)?;
     Ok(UserEpollEvent {
         events: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
@@ -232,7 +234,7 @@ where
     ready
 }
 
-fn copy_ready_events(
+async fn copy_ready_events(
     ctx: &SyscallCtx<'_>,
     events_ptr: u64,
     ready: &[UserEpollEvent],
@@ -242,7 +244,7 @@ fn copy_ready_events(
         let start = index * EPOLL_EVENT_SIZE;
         bytes[start..start + EPOLL_EVENT_SIZE].copy_from_slice(&event.to_bytes());
     }
-    if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, events_ptr, &bytes) {
+    if let Err(errno) = bootstrap_copy_to_user_wait(&ctx.aspace, events_ptr, &bytes).await {
         return SyscallResult::error_from(errno);
     }
     SyscallResult::Return(ready.len() as i64)
@@ -292,7 +294,7 @@ where
     )
 }
 
-fn epoll_timeout_timespec_deadline<P>(
+async fn epoll_timeout_timespec_deadline<P>(
     timeout_ptr: u64,
     ctx: &SyscallCtx<'_>,
 ) -> Result<Option<u64>, SyscallResult>
@@ -302,9 +304,9 @@ where
     if timeout_ptr == 0 {
         return Ok(None);
     }
-    let Some(timeout_ns) = super::time::read_timespec_at(&ctx.aspace, timeout_ptr) else {
-        return Err(SyscallResult::Error(EINVAL_VALUE));
-    };
+    let timeout_ns = super::time::read_timespec_at_wait(&ctx.aspace, timeout_ptr)
+        .await
+        .map_err(SyscallResult::error_from)?;
     Ok(Some(
         timekeeper_clock::<P>()
             .monotonic_now_ns()
@@ -355,7 +357,7 @@ pub(super) fn sys_epoll_create1(flags: u32, ctx: &SyscallCtx<'_>) -> SyscallResu
 // sys_epoll_ctl
 // ---------------------------------------------------------------------------
 
-pub(super) fn sys_epoll_ctl(
+pub(super) async fn sys_epoll_ctl(
     epfd: u32,
     op: u32,
     fd: u32,
@@ -372,7 +374,7 @@ pub(super) fn sys_epoll_ctl(
         if event_ptr == 0 {
             return SyscallResult::Error(EFAULT_VALUE);
         }
-        match read_user_epoll_event(ctx, event_ptr) {
+        match read_user_epoll_event(ctx, event_ptr).await {
             Ok(event) => event,
             Err(result) => return result,
         }
@@ -476,7 +478,7 @@ pub(super) async fn sys_epoll_pwait2<P>(
 where
     TimekeeperClock<P>: ClockRead,
 {
-    let deadline_ns = match epoll_timeout_timespec_deadline::<P>(timeout_ptr, ctx) {
+    let deadline_ns = match epoll_timeout_timespec_deadline::<P>(timeout_ptr, ctx).await {
         Ok(deadline) => deadline,
         Err(result) => return result,
     };
@@ -514,7 +516,7 @@ where
         let observed_sequence = super::wait_observation_sequence();
         let ready = collect_ready_events::<P>(ctx, &ep_cap, maxevents as usize);
         if !ready.is_empty() {
-            return copy_ready_events(ctx, events_ptr, &ready);
+            return copy_ready_events(ctx, events_ptr, &ready).await;
         }
 
         if let Some(deadline) = deadline_ns {

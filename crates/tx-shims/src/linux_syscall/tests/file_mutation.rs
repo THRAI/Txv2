@@ -3,6 +3,7 @@
 use super::*;
 use alloc::sync::Arc;
 use alloc::vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::adapter::step_engine::{
     self as step_engine, guard, page_allocator, reserve_for, sign_for, StepOutcome,
@@ -17,7 +18,7 @@ use tx_subsystems::page_backed::FsPageBacking;
 use tx_subsystems::pipe::{step_pipe2, PipeFlags};
 use tx_subsystems::process::{step_chdir, step_set_mount_namespace};
 use tx_subsystems::vfs::structure::{
-    Credential, DEntry, DirCursor, FsObjectId, InlineName, InodeKind, InodeMeta, RNode,
+    Credential, DEntry, DirCursor, DirEntry, FsObjectId, InlineName, InodeKind, InodeMeta, RNode,
     RNodeBacking, S_IFDIR,
 };
 use tx_subsystems::vfs::FsOps;
@@ -28,9 +29,9 @@ use tx_subsystems::vm::{
 
 use crate::linux_syscall::{
     AT_FDCWD, AT_REMOVEDIR, NR_FSTAT, NR_FTRUNCATE, NR_LINKAT, NR_LSEEK, NR_MKDIRAT, NR_MOUNT,
-    NR_NEWFSTATAT, NR_OPENAT, NR_READLINKAT, NR_RENAMEAT, NR_RENAMEAT2, NR_SYMLINKAT, NR_TRUNCATE,
-    NR_UNLINKAT, NR_UTIMENSAT, NR_WRITE, O_RDWR, O_TMPFILE, RENAME_EXCHANGE, RENAME_NOREPLACE,
-    SEEK_SET, UTIME_NOW,
+    NR_NEWFSTATAT, NR_OPENAT, NR_READLINKAT, NR_RENAMEAT, NR_RENAMEAT2, NR_SYMLINKAT, NR_SYNCFS,
+    NR_TRUNCATE, NR_UNLINKAT, NR_UTIMENSAT, NR_WRITE, O_DIRECTORY, O_RDONLY, O_RDWR, O_TMPFILE,
+    RENAME_EXCHANGE, RENAME_NOREPLACE, SEEK_SET, UTIME_NOW,
 };
 
 /// errno magnitudes (positive Linux RV64 generic ABI values).
@@ -83,8 +84,19 @@ fn fm_setup() -> TestSetup {
 
 fn build_tmpfs_root() -> (Cap<DEntry>, Arc<Tmpfs>) {
     let tmpfs = Arc::new(Tmpfs::new());
-    let payload = MountPayload::new_cap(
+    let root_dentry = build_tmpfs_root_with_ops(
+        tmpfs.clone(),
         tmpfs.clone() as Arc<dyn tx_subsystems::vfs::FsOps>,
+    );
+    (root_dentry, tmpfs)
+}
+
+fn build_tmpfs_root_with_ops(
+    tmpfs: Arc<Tmpfs>,
+    fs_ops: Arc<dyn tx_subsystems::vfs::FsOps>,
+) -> Cap<DEntry> {
+    let payload = MountPayload::new_cap(
+        fs_ops,
         tmpfs.clone() as Arc<dyn tx_subsystems::page_backed::FsPageBacking>,
         None,
         DevId::new(411),
@@ -116,7 +128,179 @@ fn build_tmpfs_root() -> (Cap<DEntry>, Arc<Tmpfs>) {
     .expect("mount identity");
 
     let root_dentry = DEntry::new_cap(InlineName::ROOT, root_rnode).expect("root dentry");
-    (root_dentry, tmpfs)
+    root_dentry
+}
+
+/// Test-only filesystem seam that delegates namespace mutation to tmpfs while
+/// allowing rename admission to yield once and orphan cleanup to be unavailable.
+struct RenameTestFs {
+    inner: Arc<Tmpfs>,
+    rename_calls: AtomicUsize,
+    destroy_calls: AtomicUsize,
+    yield_once_source_id: Option<u64>,
+}
+
+impl RenameTestFs {
+    fn new(inner: Arc<Tmpfs>) -> Self {
+        Self {
+            inner,
+            rename_calls: AtomicUsize::new(0),
+            destroy_calls: AtomicUsize::new(0),
+            yield_once_source_id: None,
+        }
+    }
+
+    fn yielding_once(inner: Arc<Tmpfs>, source_id: u64) -> Self {
+        Self {
+            inner,
+            rename_calls: AtomicUsize::new(0),
+            destroy_calls: AtomicUsize::new(0),
+            yield_once_source_id: Some(source_id),
+        }
+    }
+}
+
+impl FsOps for RenameTestFs {
+    fn lookup(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<FsObjectId, step_engine::NoProgress> {
+        <Tmpfs as FsOps>::lookup(&self.inner, parent, name, guard)
+    }
+
+    fn load_inode_meta(
+        &self,
+        fs_object_id: FsObjectId,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<InodeMeta, step_engine::NoProgress> {
+        <Tmpfs as FsOps>::load_inode_meta(&self.inner, fs_object_id, guard)
+    }
+
+    fn serialize_inode_meta(
+        &self,
+        fs_object_id: FsObjectId,
+        meta: &InodeMeta,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        <Tmpfs as FsOps>::serialize_inode_meta(&self.inner, fs_object_id, meta, guard)
+    }
+
+    fn create_inode(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        mode: u16,
+        cred: &Credential,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<(FsObjectId, InodeMeta), step_engine::NoProgress> {
+        <Tmpfs as FsOps>::create_inode(&self.inner, parent, name, mode, cred, guard)
+    }
+
+    fn unlink(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        target: FsObjectId,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        <Tmpfs as FsOps>::unlink(&self.inner, parent, name, target, guard)
+    }
+
+    fn rename(
+        &self,
+        old_parent: FsObjectId,
+        old_name: &[u8],
+        new_parent: FsObjectId,
+        new_name: &[u8],
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        let call = self.rename_calls.fetch_add(1, Ordering::Relaxed);
+        if call == 0 {
+            if let Some(source_id) = self.yield_once_source_id {
+                return StepOutcome::yield_on_wait_source(step_engine::NoProgress, source_id, 1);
+            }
+        }
+        <Tmpfs as FsOps>::rename(
+            &self.inner,
+            old_parent,
+            old_name,
+            new_parent,
+            new_name,
+            guard,
+        )
+    }
+
+    fn link(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        target: FsObjectId,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        <Tmpfs as FsOps>::link(&self.inner, parent, name, target, guard)
+    }
+
+    fn mkdir(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        mode: u16,
+        cred: &Credential,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<(FsObjectId, InodeMeta), step_engine::NoProgress> {
+        <Tmpfs as FsOps>::mkdir(&self.inner, parent, name, mode, cred, guard)
+    }
+
+    fn rmdir(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        target: FsObjectId,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        <Tmpfs as FsOps>::rmdir(&self.inner, parent, name, target, guard)
+    }
+
+    fn symlink(
+        &self,
+        parent: FsObjectId,
+        name: &[u8],
+        link_target: &[u8],
+        cred: &Credential,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<(FsObjectId, InodeMeta), step_engine::NoProgress> {
+        <Tmpfs as FsOps>::symlink(&self.inner, parent, name, link_target, cred, guard)
+    }
+
+    fn readdir(
+        &self,
+        fs_object_id: FsObjectId,
+        cursor: DirCursor,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<Option<(DirEntry, DirCursor)>, step_engine::NoProgress> {
+        <Tmpfs as FsOps>::readdir(&self.inner, fs_object_id, cursor, guard)
+    }
+
+    fn destroy_inode(
+        &self,
+        _fs_object_id: FsObjectId,
+        _guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        self.destroy_calls.fetch_add(1, Ordering::Relaxed);
+        StepOutcome::Err(step_engine::Errno::ENOSYS)
+    }
+
+    fn materialise_rnode(
+        &self,
+        fs_object_id: FsObjectId,
+        meta: InodeMeta,
+        mount: &Cap<MountPayload>,
+        guard: &step_engine::Guard<'_>,
+    ) -> StepOutcome<Cap<RNode>, step_engine::NoProgress> {
+        <Tmpfs as FsOps>::materialise_rnode(&self.inner, fs_object_id, meta, mount, guard)
+    }
 }
 
 fn bootstrap_with_cwd(root_dentry: Cap<DEntry>) -> (Cap<ProcessIdentity>, Cap<ThreadIdentity>) {
@@ -137,6 +321,29 @@ fn nul_terminate(path: &[u8]) -> Vec<u8> {
     v.extend_from_slice(path);
     v.push(0);
     v
+}
+
+fn open_root_for_syncfs(ctx: &SyscallCtx<'_>) -> u64 {
+    let root = nul_terminate(b"/");
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_OPENAT,
+            [
+                AT_FDCWD as i64 as u64,
+                root.as_ptr() as u64,
+                (O_RDONLY | O_DIRECTORY) as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        ctx,
+    ));
+    drop(root);
+    match result {
+        SyscallResult::Return(fd) => fd as u64,
+        other => panic!("open root for syncfs: {other:?}"),
+    }
 }
 
 fn map_user_bytes(ctx: &SyscallCtx<'_>, uaddr: usize, bytes: &[u8]) -> u64 {
@@ -1203,6 +1410,7 @@ fn dispatch_renameat2_over_existing_destroys_displaced_inode() {
 
     let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
     let ctx = make_ctx(proc_cap, thread);
+    let syncfs_fd = open_root_for_syncfs(&ctx);
     let oldpath = nul_terminate(b"/source");
     let newpath = nul_terminate(b"/target");
     let req = SyscallRequest::new(
@@ -1221,12 +1429,100 @@ fn dispatch_renameat2_over_existing_destroys_displaced_inode() {
         SyscallResult::Return(0)
     );
 
-    let guard = guard();
+    let before_sync_guard = guard();
+    let deferred_meta = match tmpfs.load_inode_meta(displaced_id, &before_sync_guard) {
+        StepOutcome::Done(meta) => meta,
+        other => panic!("displaced inode before syncfs: {other:?}"),
+    };
+    assert_eq!(deferred_meta.nlinks, 0);
+    drop(before_sync_guard);
+
     assert_eq!(
-        tmpfs.load_inode_meta(displaced_id, &guard),
-        StepOutcome::Err(step_engine::Errno::ENOENT),
-        "rename-over should destroy the displaced zero-link inode"
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(NR_SYNCFS, [syncfs_fd, 0, 0, 0, 0, 0]),
+            &ctx,
+        )),
+        SyscallResult::Return(0)
     );
+
+    let after_sync_guard = guard();
+    assert_eq!(
+        tmpfs.load_inode_meta(displaced_id, &after_sync_guard),
+        StepOutcome::Err(step_engine::Errno::ENOENT),
+        "syncfs should settle and destroy the displaced zero-link inode"
+    );
+    drop(oldpath);
+    drop(newpath);
+}
+
+/// Once rename-over has committed the namespace change, deferred cleanup must
+/// not rewrite syscall success; the following syncfs reports cleanup ENOSYS.
+#[test]
+fn dispatch_renameat2_over_existing_ignores_post_commit_destroy_enosys() {
+    let _setup = fm_setup();
+    let tmpfs = Arc::new(Tmpfs::new());
+    create_regular(&tmpfs, b"source");
+    create_regular(&tmpfs, b"target");
+
+    let first_guard = guard();
+    let displaced_id = match tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"target", &first_guard) {
+        StepOutcome::Done(id) => id,
+        other => panic!("lookup target before rename: {other:?}"),
+    };
+    drop(first_guard);
+
+    let cleanup_fs = Arc::new(RenameTestFs::new(tmpfs.clone()));
+    let root_dentry = build_tmpfs_root_with_ops(
+        tmpfs.clone(),
+        cleanup_fs.clone() as Arc<dyn tx_subsystems::vfs::FsOps>,
+    );
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap, thread);
+    let syncfs_fd = open_root_for_syncfs(&ctx);
+    let oldpath = nul_terminate(b"/source");
+    let newpath = nul_terminate(b"/target");
+    let req = SyscallRequest::new(
+        NR_RENAMEAT2,
+        [
+            AT_FDCWD as i64 as u64,
+            oldpath.as_ptr() as u64,
+            AT_FDCWD as i64 as u64,
+            newpath.as_ptr() as u64,
+            0,
+            0,
+        ],
+    );
+
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(req, &ctx)),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(cleanup_fs.destroy_calls.load(Ordering::Relaxed), 0);
+    assert!(!lookup_exists(&tmpfs, b"source"));
+    assert!(lookup_exists(&tmpfs, b"target"));
+    let before_sync_guard = guard();
+    assert!(
+        matches!(
+            tmpfs.load_inode_meta(displaced_id, &before_sync_guard),
+            StepOutcome::Done(_)
+        ),
+        "rename defers zero-link inode cleanup to mount settlement"
+    );
+    drop(before_sync_guard);
+
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(NR_SYNCFS, [syncfs_fd, 0, 0, 0, 0, 0]),
+            &ctx,
+        )),
+        SyscallResult::Error(E_NOSYS)
+    );
+    assert_eq!(cleanup_fs.destroy_calls.load(Ordering::Relaxed), 1);
+    let after_sync_guard = guard();
+    assert!(matches!(
+        tmpfs.load_inode_meta(displaced_id, &after_sync_guard),
+        StepOutcome::Done(_)
+    ));
     drop(oldpath);
     drop(newpath);
 }

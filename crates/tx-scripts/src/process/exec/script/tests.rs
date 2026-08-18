@@ -1102,6 +1102,28 @@ fn exec_step_preserves_wait_source_yield_instead_of_returning_ebusy() {
 }
 
 #[test]
+fn exec_wait_retention_keeps_each_page_container_cap_once() {
+    let _setup = setup();
+    let container = PageContainer::new_cap(
+        PageContainerKind::Anon {
+            swap_policy: AnonSwapPolicy::Reclaimable,
+        },
+        1,
+    )
+    .expect("exec retention page container");
+    let weak = container.downgrade();
+    let mut retained = Vec::new();
+
+    super::retain_exec_page_container(&mut retained, &container);
+    super::retain_exec_page_container(&mut retained, &container);
+    assert_eq!(retained.len(), 1);
+
+    drop(container);
+    let guard = guard();
+    assert!(weak.upgrade(&guard).is_some());
+}
+
+#[test]
 fn real_page_container_eagain_makes_exec_script_op_continue_but_eio_stays_eio() {
     for (errno, expected) in [
         (
@@ -1601,6 +1623,68 @@ fn exec_script_loads_minimal_elf_seeds_saved_user_context() {
     let auxv = read_initial_auxv(&process, &thread);
     assert_eq!(read_user_cstring(&process, auxv[&15]), b"riscv64");
     assert_eq!(read_user_cstring(&process, auxv[&31]), b"/init");
+}
+
+#[test]
+fn exec_script_stack_keeps_readable_zero_word_above_final_env_cstring() {
+    let _setup = setup();
+    let bytes = minimal_elf_bytes();
+    let (process, thread, _fs) = bootstrap_with_file(b"init", &bytes);
+    let envp: [&[u8]; 1] = [b"PATH=/bin"];
+
+    assert_eq!(
+        block_on(exec_script::<ScriptsTestPmap>(
+            &process,
+            &thread,
+            b"/init",
+            &[b"/init"],
+            &envp,
+            &Credential::root(),
+        )),
+        Ok(())
+    );
+
+    let sp = thread
+        .payload_cap()
+        .and_then(|payload| payload.saved_user_context())
+        .expect("saved user context")
+        .regs[2] as usize;
+    let aspace = process.aspace_cap().expect("post-exec aspace");
+    let stack_end = aspace
+        .lookup(UserVirtAddr(sp))
+        .expect("initial stack recipe")
+        .range
+        .end()
+        .as_usize();
+
+    let mut prefix = [0u8; 40];
+    let prefix_guard = guard();
+    assert_eq!(
+        aspace.copy_from_user(&mut prefix, UserPtr::new(sp), &prefix_guard),
+        StepOutcome::Done(prefix.len())
+    );
+    drop(prefix_guard);
+    let word = |offset: usize| {
+        u64::from_le_bytes(prefix[offset..offset + 8].try_into().expect("stack word"))
+    };
+    assert_eq!(word(0), 1);
+    let envp0 = word(24) as usize;
+    assert_eq!(read_user_cstring(&process, envp0 as u64), envp[0]);
+
+    let probe = envp0 + envp[0].len() + 1;
+    assert_eq!(stack_end - probe, 8);
+    let mut top_word = [0xa5; 8];
+    let top_word_guard = guard();
+    assert_eq!(
+        aspace.copy_from_user(&mut top_word, UserPtr::new(probe), &top_word_guard),
+        StepOutcome::Done(top_word.len())
+    );
+    drop(top_word_guard);
+    assert_eq!(top_word, [0; 8]);
+    assert!(
+        aspace.lookup(UserVirtAddr(stack_end)).is_none(),
+        "the exclusive stack boundary must remain unmapped"
+    );
 }
 
 #[test]

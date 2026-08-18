@@ -1687,10 +1687,11 @@ pub(super) fn make_ioctl_caller(ctx: &SyscallCtx<'_>) -> IoctlCaller {
 ///
 /// All eight TTY step functions are non-blocking (they operate on
 /// `AtomicSlot` / `SpinMutex` state inside the TTY identity), so the
-/// arm itself is non-async; `Blocked` / `AdvancedThenBlocked` outcomes
+/// TTY state transitions themselves are synchronous; user-memory transfers
+/// use the wait-capable VM lane. `Blocked` / `AdvancedThenBlocked` outcomes
 /// are unreachable in practice and surface as `-EIO` for symmetry with
 /// the other fd arms.
-pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let fd = args[0] as i32;
     let request = args[1] as u32;
     let argp = args[2];
@@ -1725,7 +1726,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             return SyscallResult::Return(0);
         }
         FIONBIO => {
-            let requested: u32 = match bootstrap_read_user::<u32>(&ctx.aspace, argp) {
+            let requested: u32 = match bootstrap_read_user_wait::<u32>(&ctx.aspace, argp).await {
                 Ok(v) => v,
                 Err(errno) => return SyscallResult::error_from(errno),
             };
@@ -1754,7 +1755,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             // Bytes immediately readable. A best-effort 0 keeps callers
             // that only check for success (and then read/poll) working;
             // pipes/sockets that want a precise count use poll/read.
-            return match bootstrap_write_user::<u32>(&ctx.aspace, argp, 0) {
+            return match bootstrap_write_user_wait::<u32>(&ctx.aspace, argp, 0).await {
                 Ok(()) => SyscallResult::Return(0),
                 Err(errno) => SyscallResult::error_from(errno),
             };
@@ -1799,7 +1800,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             .ops
             .total_blocks()
             .saturating_mul(reg.ops.block_size() as u64);
-        return match bootstrap_write_user::<u64>(&ctx.aspace, argp, bytes) {
+        return match bootstrap_write_user_wait::<u64>(&ctx.aspace, argp, bytes).await {
             Ok(()) => SyscallResult::Return(0),
             Err(errno) => SyscallResult::error_from(errno),
         };
@@ -1821,7 +1822,9 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                         return SyscallResult::Error(EFAULT_VALUE);
                     }
                     let rtc_time = RtcTime::fixed_oscomp_time();
-                    return match bootstrap_write_user::<RtcTime>(&ctx.aspace, argp, rtc_time) {
+                    return match bootstrap_write_user_wait::<RtcTime>(&ctx.aspace, argp, rtc_time)
+                        .await
+                    {
                         Ok(()) => SyscallResult::Return(0),
                         Err(errno) => SyscallResult::error_from(errno),
                     };
@@ -1864,7 +1867,8 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                     if argp == 0 {
                         return SyscallResult::Error(EFAULT_VALUE);
                     }
-                    if let Err(errno) = bootstrap_write_user::<Termios>(&ctx.aspace, argp, termios)
+                    if let Err(errno) =
+                        bootstrap_write_user_wait::<Termios>(&ctx.aspace, argp, termios).await
                     {
                         return SyscallResult::error_from(errno);
                     }
@@ -1882,10 +1886,11 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             // semantics aren't implemented yet. Treating all three as
             // immediate-install matches Linux's behaviour for an empty
             // output queue.
-            let new_termios: Termios = match bootstrap_read_user::<Termios>(&ctx.aspace, argp) {
-                Ok(v) => v,
-                Err(errno) => return SyscallResult::error_from(errno),
-            };
+            let new_termios: Termios =
+                match bootstrap_read_user_wait::<Termios>(&ctx.aspace, argp).await {
+                    Ok(v) => v,
+                    Err(errno) => return SyscallResult::error_from(errno),
+                };
             let outcome = {
                 let guard = step_engine::guard();
                 step_ioctl_tcsets(&tty, new_termios, &guard)
@@ -1905,7 +1910,9 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                     if argp == 0 {
                         return SyscallResult::Error(EFAULT_VALUE);
                     }
-                    if let Err(errno) = bootstrap_write_user::<u32>(&ctx.aspace, argp, pgid) {
+                    if let Err(errno) =
+                        bootstrap_write_user_wait::<u32>(&ctx.aspace, argp, pgid).await
+                    {
                         return SyscallResult::error_from(errno);
                     }
                     SyscallResult::Return(0)
@@ -1917,14 +1924,21 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             if argp == 0 {
                 return SyscallResult::Error(EFAULT_VALUE);
             }
-            let new_pgrp: u32 = match bootstrap_read_user::<u32>(&ctx.aspace, argp) {
+            let new_pgrp: u32 = match bootstrap_read_user_wait::<u32>(&ctx.aspace, argp).await {
                 Ok(v) => v,
                 Err(errno) => return SyscallResult::error_from(errno),
             };
-            let caller = make_ioctl_caller(ctx);
+            // TTY signal dispatch retains a typed Weak<ProcessGroup>, not just
+            // the user-visible pgid. Resolve the canonical group before the
+            // mutation so tcsetpgrp updates both views atomically; otherwise
+            // VINTR would continue delivering SIGINT to the stale foreground
+            // group even though TIOCGPGRP reported the new numeric pgid.
+            let Some(new_pgrp) = process_group_by_pgid(Pgid(new_pgrp)) else {
+                return SyscallResult::Error(ESRCH_VALUE);
+            };
             let outcome = {
                 let guard = step_engine::guard();
-                step_ioctl_tiocspgrp(&tty, caller, new_pgrp, &guard)
+                step_ioctl_tiocspgrp_for_process(&tty, &ctx.process, &new_pgrp, &guard)
             };
             match unwrap_v3(outcome) {
                 Ok(_) => SyscallResult::Return(0),
@@ -1941,7 +1955,9 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                     if argp == 0 {
                         return SyscallResult::Error(EFAULT_VALUE);
                     }
-                    if let Err(errno) = bootstrap_write_user::<Winsize>(&ctx.aspace, argp, ws) {
+                    if let Err(errno) =
+                        bootstrap_write_user_wait::<Winsize>(&ctx.aspace, argp, ws).await
+                    {
                         return SyscallResult::error_from(errno);
                     }
                     SyscallResult::Return(0)
@@ -1953,7 +1969,7 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             if argp == 0 {
                 return SyscallResult::Error(EFAULT_VALUE);
             }
-            let ws: Winsize = match bootstrap_read_user::<Winsize>(&ctx.aspace, argp) {
+            let ws: Winsize = match bootstrap_read_user_wait::<Winsize>(&ctx.aspace, argp).await {
                 Ok(v) => v,
                 Err(errno) => return SyscallResult::error_from(errno),
             };
@@ -2687,9 +2703,9 @@ fn stat_meta_for_non_vfs_open_file(file: &OpenFile) -> Option<InodeMeta> {
 /// - Unknown / closed fd → `-EBADF`.
 /// - `statbuf == 0` (NULL) → `-EFAULT`.
 /// - All other paths return `0` after writing the buffer.
-pub(super) fn sys_fstat<'a, P: tx_hal::ConsoleIf>(
+pub(super) async fn sys_fstat<P: tx_hal::ConsoleIf>(
     args: [u64; 6],
-    ctx: &SyscallCtx<'a>,
+    ctx: &SyscallCtx<'_>,
 ) -> SyscallResult {
     let fd = args[0] as i32;
     let statbuf_uaddr = args[1];
@@ -2714,7 +2730,7 @@ pub(super) fn sys_fstat<'a, P: tx_hal::ConsoleIf>(
     };
     let stat = inode_meta_to_stat(&meta, ino, stat_rdev_for_open_file(&file));
 
-    if let Err(errno) = bootstrap_write_user::<StatLayout>(&ctx.aspace, statbuf_uaddr, stat) {
+    if let Err(errno) = bootstrap_write_user_wait(&ctx.aspace, statbuf_uaddr, stat).await {
         return SyscallResult::error_from(errno);
     }
     SyscallResult::Return(0)
@@ -2815,17 +2831,16 @@ fn statx_path_error(error: ReadCStrError) -> SyscallResult {
     }
 }
 
-fn sys_statx_with_path(decoded: StatxArgs, path: &[u8], ctx: &SyscallCtx<'_>) -> SyscallResult {
-    let StatxArgs {
-        dirfd,
-        flags,
-        statxbuf_uaddr,
-        ..
-    } = decoded;
+fn prepare_statx_with_path(
+    decoded: StatxArgs,
+    path: &[u8],
+    ctx: &SyscallCtx<'_>,
+) -> Result<StatxLayout, SyscallResult> {
+    let StatxArgs { dirfd, flags, .. } = decoded;
 
     let cwd = match ctx.cwd() {
         Some(d) => d,
-        None => return SyscallResult::Error(ENOENT_VALUE),
+        None => return Err(SyscallResult::Error(ENOENT_VALUE)),
     };
     // Device nodes carry a (major, minor) rdev that glibc reads back from
     // statx — notably `daemon()` fstat()s /dev/null and rejects it with
@@ -2846,11 +2861,11 @@ fn sys_statx_with_path(decoded: StatxArgs, path: &[u8], ctx: &SyscallCtx<'_>) ->
             } else {
                 let fd = dirfd;
                 if fd < 0 {
-                    return SyscallResult::Error(EBADF_VALUE);
+                    return Err(SyscallResult::Error(EBADF_VALUE));
                 }
                 let file = match ctx.fd(fd as u32) {
                     Some(f) => f,
-                    None => return SyscallResult::Error(EBADF_VALUE),
+                    None => return Err(SyscallResult::Error(EBADF_VALUE)),
                 };
                 let (rmaj, rmin) = rdev_major_minor_for_open_file(&file);
                 let live_meta = stat_meta_for_open_file(&file);
@@ -2876,43 +2891,57 @@ fn sys_statx_with_path(decoded: StatxArgs, path: &[u8], ctx: &SyscallCtx<'_>) ->
             let rooted_at: Cap<DEntry> = if path.starts_with(b"/") || dirfd == AT_FDCWD {
                 cwd.clone()
             } else if dirfd < 0 {
-                return SyscallResult::Error(EBADF_VALUE);
+                return Err(SyscallResult::Error(EBADF_VALUE));
             } else {
                 let open_file = match ctx.fd(dirfd as u32) {
                     Some(file) => file,
-                    None => return SyscallResult::Error(EBADF_VALUE),
+                    None => return Err(SyscallResult::Error(EBADF_VALUE)),
                 };
                 match open_file.opendir_dentry() {
                     Some(dentry) => dentry,
-                    None => return SyscallResult::Error(ENOTDIR_VALUE),
+                    None => return Err(SyscallResult::Error(ENOTDIR_VALUE)),
                 }
             };
             let walker_cred = ctx.walker_cred();
             let result = {
-                // `StatxOp` performs permission checks through the explicit
-                // walker credential and never reads `ScriptCtx::subject()`.
+                // Both statx walkers perform permission checks through the
+                // explicit credential and never read `ScriptCtx::subject()`.
                 // Avoid minting a per-call restriction-stack capability on
-                // Cargo's hottest metadata syscall.
+                // Cargo's hottest metadata syscall, while still honoring
+                // AT_SYMLINK_NOFOLLOW for dangling final symlinks.
                 let mut script_ctx = crate::KernelScriptCtx::new();
-                let mut op = StatxOp {
-                    rooted_at: &rooted_at,
-                    path,
-                    cred: &walker_cred,
-                };
-                step_engine::drive_oneshot(&mut op, &mut script_ctx)
+                if flags & (AT_SYMLINK_NOFOLLOW as u32) != 0 {
+                    let mut op = LstatxOp {
+                        rooted_at: &rooted_at,
+                        path,
+                        cred: &walker_cred,
+                        target: None,
+                    };
+                    step_engine::drive_oneshot(&mut op, &mut script_ctx)
+                } else {
+                    let mut op = StatxOp {
+                        rooted_at: &rooted_at,
+                        path,
+                        cred: &walker_cred,
+                    };
+                    step_engine::drive_oneshot(&mut op, &mut script_ctx)
+                }
             };
             match result {
                 Ok((sr, id)) => (sr, id, 0, 0),
-                Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
+                Err(v3errno) => {
+                    return Err(SyscallResult::error_from(Errno::from(v3errno)));
+                }
             }
         };
 
     apply_stat_meta_override(ino, &mut statx_result.meta);
-    let statx = inode_meta_to_statx(&statx_result.meta, ino.as_u64(), rdev_major, rdev_minor);
-    if let Err(errno) = bootstrap_write_user::<StatxLayout>(&ctx.aspace, statxbuf_uaddr, statx) {
-        return SyscallResult::error_from(errno);
-    }
-    SyscallResult::Return(0)
+    Ok(inode_meta_to_statx(
+        &statx_result.meta,
+        ino.as_u64(),
+        rdev_major,
+        rdev_minor,
+    ))
 }
 
 /// Trap-local `statx` fast path for the compiler's metadata-probe workload.
@@ -3029,7 +3058,20 @@ pub(super) fn sys_statx_post_handoff_oneshot(
         Ok(path) => path,
         Err(error) => return Some(statx_path_error(error)),
     };
-    Some(sys_statx_with_path(decoded, &path, ctx))
+    let statx = match prepare_statx_with_path(decoded, &path, ctx) {
+        Ok(statx) => statx,
+        Err(result) => return Some(result),
+    };
+    // This lane is deliberately synchronous. A cold destination page or an
+    // overlapping VM writer is not an I/O error: decline the one-shot and let
+    // `dispatch_fs_lookup_hot` run the wait-capable statx path.
+    match ctx.aspace.write_user_resident(
+        tx_hal::UserPtr::<StatxLayout>::new(decoded.statxbuf_uaddr as usize),
+        statx,
+    )? {
+        Ok(()) => Some(SyscallResult::Return(0)),
+        Err(errno) => Some(SyscallResult::error_from(errno)),
+    }
 }
 
 /// `statx(dirfd, path, flags, mask, statxbuf)`. Linux generic ABI
@@ -3053,7 +3095,14 @@ pub(super) async fn sys_statx<'a, P: tx_hal::ConsoleIf>(
         Ok(p) => p,
         Err(error) => return statx_path_error(error),
     };
-    sys_statx_with_path(decoded, &path, ctx)
+    let statx = match prepare_statx_with_path(decoded, &path, ctx) {
+        Ok(statx) => statx,
+        Err(result) => return result,
+    };
+    match bootstrap_write_user_wait(&ctx.aspace, decoded.statxbuf_uaddr, statx).await {
+        Ok(()) => SyscallResult::Return(0),
+        Err(errno) => SyscallResult::error_from(errno),
+    }
 }
 
 /// `newfstatat(dirfd, path, statbuf, flags)`. Linux RV64 generic ABI
@@ -3086,8 +3135,8 @@ pub(super) async fn sys_newfstatat<'a, P: tx_hal::ConsoleIf>(
         return SyscallResult::Error(EFAULT_VALUE);
     }
 
-    // Slice 6 honours: AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW (ignored)
-    // | AT_NO_AUTOMOUNT (ignored). Other bits are rejected so a
+    // Slice 6 honours AT_EMPTY_PATH and AT_SYMLINK_NOFOLLOW;
+    // AT_NO_AUTOMOUNT remains accepted as a no-op. Other bits are rejected so a
     // future caller passing an unrecognised flag (`AT_STATX_*`,
     // `AT_RECURSIVE`, etc.) sees `-EINVAL` rather than silent
     // misbehaviour. Note: AT_SYMLINK_NOFOLLOW is `i32` in numbers.rs
@@ -3100,7 +3149,7 @@ pub(super) async fn sys_newfstatat<'a, P: tx_hal::ConsoleIf>(
     let path = match read_user_cstr_wait(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX).await {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
-        Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
+        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
 
     let walker_cred = ctx.walker_cred();
@@ -3116,7 +3165,7 @@ pub(super) async fn sys_newfstatat<'a, P: tx_hal::ConsoleIf>(
         if dirfd == AT_FDCWD {
             (cwd.rnode().meta(), cwd.rnode().fs_object_id())
         } else {
-            return sys_fstat::<P>([dirfd as u64, statbuf_uaddr, 0, 0, 0, 0], ctx);
+            return sys_fstat::<P>([dirfd as u64, statbuf_uaddr, 0, 0, 0, 0], ctx).await;
         }
     } else {
         let rooted_at: Cap<DEntry> = if path.starts_with(b"/") || dirfd == AT_FDCWD {
@@ -3133,7 +3182,16 @@ pub(super) async fn sys_newfstatat<'a, P: tx_hal::ConsoleIf>(
                 None => return SyscallResult::Error(ENOTDIR_VALUE),
             }
         };
-        let result = {
+        let result = if flags & (AT_SYMLINK_NOFOLLOW as u32) != 0 {
+            let mut script_ctx = build_subject_script_ctx(ctx);
+            let mut op = LstatOp {
+                rooted_at: &rooted_at,
+                path: &path,
+                cred: &walker_cred,
+                target: None,
+            };
+            step_engine::drive_oneshot(&mut op, &mut script_ctx)
+        } else {
             let mut script_ctx = build_subject_script_ctx(ctx);
             let mut op = StatOp {
                 rooted_at: &rooted_at,
@@ -3152,7 +3210,9 @@ pub(super) async fn sys_newfstatat<'a, P: tx_hal::ConsoleIf>(
     apply_stat_meta_override(ino, &mut meta);
     let stat = inode_meta_to_stat(&meta, ino.as_u64(), 0);
 
-    if let Err(errno) = bootstrap_write_user::<StatLayout>(&ctx.aspace, statbuf_uaddr, stat) {
+    if let Err(errno) =
+        bootstrap_write_user_wait::<StatLayout>(&ctx.aspace, statbuf_uaddr, stat).await
+    {
         return SyscallResult::error_from(errno);
     }
     SyscallResult::Return(0)

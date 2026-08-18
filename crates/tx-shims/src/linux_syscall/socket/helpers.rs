@@ -829,11 +829,16 @@ pub(super) fn validate_user_range<'a>(
     #[cfg(target_os = "none")]
     {
         let range = covering_user_range(uaddr, len).ok_or(Errno::EFAULT)?;
-        match ctx.aspace.reserve_user_range_for_access(range, access) {
-            StepOutcome::Done(()) | StepOutcome::Continue { .. } => Ok(()),
-            StepOutcome::Err(e) => Err(Errno::from(e)),
-            StepOutcome::Yield { .. } => Err(Errno::EIO),
-        }
+        map_user_range_reservation(ctx.aspace.reserve_user_range_for_access(range, access))
+    }
+}
+
+fn map_user_range_reservation(outcome: StepOutcome<(), NoProgress>) -> Result<(), Errno> {
+    match outcome {
+        StepOutcome::Done(()) => Ok(()),
+        StepOutcome::Continue { .. } => Err(Errno::EAGAIN),
+        StepOutcome::Err(e) => Err(Errno::from(e)),
+        StepOutcome::Yield { .. } => Err(Errno::EIO),
     }
 }
 
@@ -1954,6 +1959,19 @@ pub(super) fn maybe_raise_sigpipe<'a>(ctx: &SyscallCtx<'a>, errno: Errno, flags:
             Signum::SIGPIPE,
             None,
             |mailbox, event| ctx.post_mailbox_event(mailbox, event),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_range_reservation_continue_is_not_success() {
+        assert_eq!(
+            map_user_range_reservation(StepOutcome::continue_with(NoProgress)),
+            Err(Errno::EAGAIN)
         );
     }
 }

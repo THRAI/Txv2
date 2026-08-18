@@ -192,17 +192,26 @@ pub(super) fn read_timespec_at(aspace: &AddressSpace, uaddr: u64) -> Option<u64>
         Ok(v) => v,
         Err(_) => return None,
     };
+    timespec_to_ns(ts)
+}
+
+pub(super) async fn read_timespec_at_wait(aspace: &AddressSpace, uaddr: u64) -> Result<u64, Errno> {
+    let ts: TimespecLayout = bootstrap_read_user_wait(aspace, uaddr).await?;
+    timespec_to_ns(ts).ok_or(Errno::EINVAL)
+}
+
+fn timespec_to_ns(ts: TimespecLayout) -> Option<u64> {
     if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
         return None;
     }
     Some((ts.tv_sec as u64).saturating_mul(1_000_000_000) + (ts.tv_nsec as u64))
 }
 
-fn read_timespec_ns_checked(aspace: &AddressSpace, uaddr: u64) -> Result<u64, SyscallResult> {
+async fn read_timespec_ns_checked(aspace: &AddressSpace, uaddr: u64) -> Result<u64, SyscallResult> {
     if uaddr == 0 {
         return Err(SyscallResult::Error(EFAULT_VALUE));
     }
-    let ts: TimespecLayout = match bootstrap_read_user::<TimespecLayout>(aspace, uaddr) {
+    let ts: TimespecLayout = match bootstrap_read_user_wait::<TimespecLayout>(aspace, uaddr).await {
         Ok(v) => v,
         Err(errno) => return Err(SyscallResult::error_from(errno)),
     };
@@ -212,7 +221,7 @@ fn read_timespec_ns_checked(aspace: &AddressSpace, uaddr: u64) -> Result<u64, Sy
     Ok((ts.tv_sec as u64).saturating_mul(1_000_000_000) + (ts.tv_nsec as u64))
 }
 
-fn write_remaining_timespec(
+async fn write_remaining_timespec(
     aspace: &AddressSpace,
     rem_uaddr: u64,
     remaining_ns: u64,
@@ -221,7 +230,7 @@ fn write_remaining_timespec(
         return SyscallResult::Return(0);
     }
     let rem = ns_to_timespec(remaining_ns);
-    match bootstrap_write_user::<TimespecLayout>(aspace, rem_uaddr, rem) {
+    match bootstrap_write_user_wait::<TimespecLayout>(aspace, rem_uaddr, rem).await {
         Ok(()) => SyscallResult::Return(0),
         Err(errno) => SyscallResult::error_from(errno),
     }
@@ -234,14 +243,14 @@ fn write_remaining_timespec(
 /// PROCESS_CPUTIME / THREAD_CPUTIME plus the *_RAW / *_COARSE /
 /// BOOTTIME aliases) routes through the timekeeper monotonic clock. Unknown
 /// clock ids return `-EINVAL`. Null `tp` returns `-EFAULT`.
-pub(super) fn sys_clock_gettime<'a, P>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
+fn prepare_clock_gettime<P>(args: [u64; 6]) -> Result<(u64, TimespecLayout), SyscallResult>
 where
     TimekeeperClock<P>: ClockRead,
 {
     let clk_id = args[0] as u32;
     let ts_uaddr = args[1];
     if ts_uaddr == 0 {
-        return SyscallResult::Error(EFAULT_VALUE);
+        return Err(SyscallResult::Error(EFAULT_VALUE));
     }
     let ns = match clk_id {
         CLOCK_REALTIME | CLOCK_REALTIME_COARSE | CLOCK_REALTIME_ALARM | CLOCK_TAI => {
@@ -254,10 +263,43 @@ where
         | CLOCK_MONOTONIC_COARSE
         | CLOCK_BOOTTIME
         | CLOCK_BOOTTIME_ALARM => timekeeper_clock::<P>().monotonic_now_ns(),
-        _ => return SyscallResult::Error(EINVAL_VALUE),
+        _ => return Err(SyscallResult::Error(EINVAL_VALUE)),
     };
-    let ts = ns_to_timespec(ns);
-    if let Err(errno) = bootstrap_write_user::<TimespecLayout>(&ctx.aspace, ts_uaddr, ts) {
+    Ok((ts_uaddr, ns_to_timespec(ns)))
+}
+
+/// Non-blocking clock read used by the architecture-trap fast path. A VM
+/// writer collision is not an errno: `None` asks the trap shell to hand the
+/// syscall to the wait-capable thread path.
+pub(super) fn sys_clock_gettime_oneshot<P>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'_>,
+) -> Option<SyscallResult>
+where
+    TimekeeperClock<P>: ClockRead,
+{
+    let (ts_uaddr, ts) = match prepare_clock_gettime::<P>(args) {
+        Ok(prepared) => prepared,
+        Err(result) => return Some(result),
+    };
+    match bootstrap_write_user_oneshot(&ctx.aspace, ts_uaddr, ts)? {
+        Ok(()) => Some(SyscallResult::Return(0)),
+        Err(errno) => Some(SyscallResult::error_from(errno)),
+    }
+}
+
+/// Wait-capable `clock_gettime` path. Kernel-to-user writeback can overlap a
+/// fork/mprotect/munmap transaction and must wait rather than expose the
+/// RangeLock collision as userspace `EIO`.
+pub(super) async fn sys_clock_gettime<P>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult
+where
+    TimekeeperClock<P>: ClockRead,
+{
+    let (ts_uaddr, ts) = match prepare_clock_gettime::<P>(args) {
+        Ok(prepared) => prepared,
+        Err(result) => return result,
+    };
+    if let Err(errno) = bootstrap_write_user_wait(&ctx.aspace, ts_uaddr, ts).await {
         return SyscallResult::error_from(errno);
     }
     SyscallResult::Return(0)
@@ -271,7 +313,7 @@ where
 /// currently millisecond-ish under QEMU. Report that effective resolution so
 /// timer conformance tests do not assume a high-resolution wakeup guarantee we
 /// do not actually provide yet.
-pub(super) fn sys_clock_getres<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_clock_getres(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let clk_id = args[0] as u32;
     let res_uaddr = args[1];
     match clk_id {
@@ -293,7 +335,7 @@ pub(super) fn sys_clock_getres<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
             tv_sec: 0,
             tv_nsec: CLOCK_GETRES_NS,
         };
-        if let Err(errno) = bootstrap_write_user::<TimespecLayout>(&ctx.aspace, res_uaddr, ts) {
+        if let Err(errno) = bootstrap_write_user_wait(&ctx.aspace, res_uaddr, ts).await {
             return SyscallResult::error_from(errno);
         }
     }
@@ -305,17 +347,44 @@ pub(super) fn sys_clock_getres<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
 ///
 /// The `tz` argument (args[1]) is deprecated on Linux and ignored.
 /// Null `tv` returns `-EFAULT`.
-pub(super) fn sys_gettimeofday<'a, P>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
+fn prepare_gettimeofday<P>(args: [u64; 6]) -> Result<(u64, TimevalLayout), SyscallResult>
 where
     TimekeeperClock<P>: ClockRead,
 {
     let tv_uaddr = args[0];
     // args[1] = tz (ignored — deprecated on Linux).
     if tv_uaddr == 0 {
-        return SyscallResult::Error(EFAULT_VALUE);
+        return Err(SyscallResult::Error(EFAULT_VALUE));
     }
-    let tv = ns_to_timeval(realtime_ns::<P>());
-    if let Err(errno) = bootstrap_write_user::<TimevalLayout>(&ctx.aspace, tv_uaddr, tv) {
+    Ok((tv_uaddr, ns_to_timeval(realtime_ns::<P>())))
+}
+
+pub(super) fn sys_gettimeofday_oneshot<P>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'_>,
+) -> Option<SyscallResult>
+where
+    TimekeeperClock<P>: ClockRead,
+{
+    let (tv_uaddr, tv) = match prepare_gettimeofday::<P>(args) {
+        Ok(prepared) => prepared,
+        Err(result) => return Some(result),
+    };
+    match bootstrap_write_user_oneshot(&ctx.aspace, tv_uaddr, tv)? {
+        Ok(()) => Some(SyscallResult::Return(0)),
+        Err(errno) => Some(SyscallResult::error_from(errno)),
+    }
+}
+
+pub(super) async fn sys_gettimeofday<P>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult
+where
+    TimekeeperClock<P>: ClockRead,
+{
+    let (tv_uaddr, tv) = match prepare_gettimeofday::<P>(args) {
+        Ok(prepared) => prepared,
+        Err(result) => return result,
+    };
+    if let Err(errno) = bootstrap_write_user_wait(&ctx.aspace, tv_uaddr, tv).await {
         return SyscallResult::error_from(errno);
     }
     SyscallResult::Return(0)
@@ -344,7 +413,7 @@ where
     }
 }
 
-pub(super) fn sys_clock_settime<'a, P>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
+pub(super) async fn sys_clock_settime<P>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult
 where
     TimekeeperClock<P>: RealtimeControl,
 {
@@ -359,13 +428,17 @@ where
     if !can_set_realtime(ctx) {
         return SyscallResult::Error(EPERM_VALUE);
     }
-    let Some(ns) = read_timespec_at(&ctx.aspace, ts_uaddr) else {
+    let ts = match bootstrap_read_user_wait::<TimespecLayout>(&ctx.aspace, ts_uaddr).await {
+        Ok(ts) => ts,
+        Err(errno) => return SyscallResult::error_from(errno),
+    };
+    let Some(ns) = timespec_to_ns(ts) else {
         return SyscallResult::Error(EINVAL_VALUE);
     };
     set_realtime_from_syscall::<P>(ns, ctx)
 }
 
-pub(super) fn sys_settimeofday<'a, P>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
+pub(super) async fn sys_settimeofday<P>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult
 where
     TimekeeperClock<P>: RealtimeControl,
 {
@@ -376,7 +449,7 @@ where
     if !can_set_realtime(ctx) {
         return SyscallResult::Error(EPERM_VALUE);
     }
-    let tv = match bootstrap_read_user::<TimevalLayout>(&ctx.aspace, tv_uaddr) {
+    let tv = match bootstrap_read_user_wait::<TimevalLayout>(&ctx.aspace, tv_uaddr).await {
         Ok(tv) => tv,
         Err(errno) => return SyscallResult::error_from(errno),
     };
@@ -511,7 +584,7 @@ fn parse_itimerval(value: ItimervalLayout) -> Option<(u64, u64)> {
     Some((interval_ns, value_ns))
 }
 
-pub(super) fn sys_getitimer<'a, P>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
+pub(super) async fn sys_getitimer<P>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult
 where
     TimekeeperClock<P>: ClockRead,
 {
@@ -528,13 +601,13 @@ where
     let value = with_interval_timers(|timers| {
         itimer_to_layout(timers.get(&(ctx.process.pid.0, which)), now_ns)
     });
-    match bootstrap_write_user::<ItimervalLayout>(&ctx.aspace, curr_value_ptr, value) {
+    match bootstrap_write_user_wait(&ctx.aspace, curr_value_ptr, value).await {
         Ok(()) => SyscallResult::Return(0),
         Err(errno) => SyscallResult::error_from(errno),
     }
 }
 
-pub(super) fn sys_setitimer<'a, P>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
+pub(super) async fn sys_setitimer<P>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult
 where
     TimekeeperClock<P>: ClockRead,
 {
@@ -548,10 +621,11 @@ where
         return SyscallResult::Error(EFAULT_VALUE);
     }
 
-    let new_value = match bootstrap_read_user::<ItimervalLayout>(&ctx.aspace, new_value_ptr) {
-        Ok(value) => value,
-        Err(errno) => return SyscallResult::error_from(errno),
-    };
+    let new_value =
+        match bootstrap_read_user_wait::<ItimervalLayout>(&ctx.aspace, new_value_ptr).await {
+            Ok(value) => value,
+            Err(errno) => return SyscallResult::error_from(errno),
+        };
     let Some((interval_ns, value_ns)) = parse_itimerval(new_value) else {
         return SyscallResult::Error(EINVAL_VALUE);
     };
@@ -560,9 +634,7 @@ where
     let key = (ctx.process.pid.0, which);
     let old_value = with_interval_timers(|timers| itimer_to_layout(timers.get(&key), now_ns));
     if old_value_ptr != 0 {
-        if let Err(errno) =
-            bootstrap_write_user::<ItimervalLayout>(&ctx.aspace, old_value_ptr, old_value)
-        {
+        if let Err(errno) = bootstrap_write_user_wait(&ctx.aspace, old_value_ptr, old_value).await {
             return SyscallResult::error_from(errno);
         }
     }
@@ -671,7 +743,7 @@ where
 /// `tms_utime = ticks` and zeros the other three fields when `buf` is
 /// non-null. Null `buf` is permitted per Linux semantics — only the
 /// return value matters in that case (LTP `times02` covers this).
-pub(super) fn sys_times<'a, P>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
+pub(super) async fn sys_times<P>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult
 where
     TimekeeperClock<P>: ClockRead,
 {
@@ -685,7 +757,7 @@ where
             tms_cutime: 0,
             tms_cstime: 0,
         };
-        if let Err(errno) = bootstrap_write_user::<TmsLayout>(&ctx.aspace, buf_uaddr, tms) {
+        if let Err(errno) = bootstrap_write_user_wait(&ctx.aspace, buf_uaddr, tms).await {
             return SyscallResult::error_from(errno);
         }
     }
@@ -777,7 +849,7 @@ where
 {
     let req_uaddr = args[0];
     let rem_uaddr = args[1];
-    let req_ns = match read_timespec_ns_checked(&ctx.aspace, req_uaddr) {
+    let req_ns = match read_timespec_ns_checked(&ctx.aspace, req_uaddr).await {
         Ok(ns) => ns,
         Err(result) => return result,
     };
@@ -791,7 +863,7 @@ where
         SyscallResult::Error(errno) if errno == EINTR_VALUE => {
             let remaining_ns =
                 deadline_ns.saturating_sub(timekeeper_clock::<P>().monotonic_now_ns());
-            match write_remaining_timespec(&ctx.aspace, rem_uaddr, remaining_ns) {
+            match write_remaining_timespec(&ctx.aspace, rem_uaddr, remaining_ns).await {
                 SyscallResult::Return(_) => SyscallResult::Error(EINTR_VALUE),
                 other => other,
             }
@@ -837,7 +909,7 @@ where
     if (flags & !TIMER_ABSTIME) != 0 {
         return SyscallResult::Error(EINVAL_VALUE);
     }
-    let req_ns = match read_timespec_ns_checked(&ctx.aspace, req_uaddr) {
+    let req_ns = match read_timespec_ns_checked(&ctx.aspace, req_uaddr).await {
         Ok(ns) => ns,
         Err(result) => return result,
     };
@@ -868,7 +940,7 @@ where
         SyscallResult::Error(errno) if errno == EINTR_VALUE => {
             let remaining_ns =
                 deadline_ns.saturating_sub(timekeeper_clock::<P>().monotonic_now_ns());
-            match write_remaining_timespec(&ctx.aspace, rem_uaddr, remaining_ns) {
+            match write_remaining_timespec(&ctx.aspace, rem_uaddr, remaining_ns).await {
                 SyscallResult::Return(_) => SyscallResult::Error(EINTR_VALUE),
                 other => other,
             }

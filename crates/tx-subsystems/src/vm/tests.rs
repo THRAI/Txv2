@@ -3,8 +3,10 @@ use crate::page_backed::PageContainer;
 use crate::test_support::EPOCH_TEST_LOCK;
 use crate::vm::adapter::step_engine::StepOp;
 use alloc::collections::BTreeMap;
-use std::sync::{Arc, Barrier, LazyLock, Mutex};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier, Condvar, LazyLock, Mutex};
 use std::thread_local;
+use std::time::Duration;
 use tx_hal::{
     Asid, PhysAddr, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
     PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
@@ -27,6 +29,73 @@ thread_local! {
 }
 
 struct CountingPmap;
+
+/// Test platform for the stage-1 synchronous-shootdown ownership witness.
+///
+/// The mapping operations deliberately delegate to `CountingPmap`; only the
+/// batch shootdown callback is augmented with bounded host-side coordination.
+/// This keeps the exercised teardown path and MapPin lifetime identical to the
+/// production `VmPmap` path without changing production lock semantics.
+struct TeardownWaitWitnessPmap;
+
+static TEARDOWN_WAIT_CALLBACK_ENTERED: AtomicBool = AtomicBool::new(false);
+static TEARDOWN_WAIT_PROBE_STARTED: AtomicBool = AtomicBool::new(false);
+static TEARDOWN_WAIT_PROBE_CONTENDED: AtomicBool = AtomicBool::new(false);
+static TEARDOWN_WAIT_PROBE_ACQUIRED_STATE: AtomicBool = AtomicBool::new(false);
+static TEARDOWN_WAIT_STATE_WAS_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
+static TEARDOWN_WAIT_MAP_REFS: AtomicUsize = AtomicUsize::new(usize::MAX);
+static TEARDOWN_WAIT_SIGNAL: LazyLock<(Mutex<()>, Condvar)> =
+    LazyLock::new(|| (Mutex::new(()), Condvar::new()));
+
+fn reset_teardown_wait_witness() {
+    TEARDOWN_WAIT_CALLBACK_ENTERED.store(false, Ordering::Release);
+    TEARDOWN_WAIT_PROBE_STARTED.store(false, Ordering::Release);
+    TEARDOWN_WAIT_PROBE_CONTENDED.store(false, Ordering::Release);
+    TEARDOWN_WAIT_PROBE_ACQUIRED_STATE.store(false, Ordering::Release);
+    TEARDOWN_WAIT_STATE_WAS_UNAVAILABLE.store(false, Ordering::Release);
+    TEARDOWN_WAIT_MAP_REFS.store(usize::MAX, Ordering::Release);
+}
+
+fn publish_teardown_witness_flag(flag: &AtomicBool) {
+    let (lock, signal) = &*TEARDOWN_WAIT_SIGNAL;
+    let _guard = lock.lock().unwrap_or_else(|error| error.into_inner());
+    flag.store(true, Ordering::Release);
+    signal.notify_all();
+}
+
+fn wait_for_teardown_witness_flag(flag: &AtomicBool, label: &str) {
+    let (lock, signal) = &*TEARDOWN_WAIT_SIGNAL;
+    let guard = lock.lock().unwrap_or_else(|error| error.into_inner());
+    let (_guard, timeout) = signal
+        .wait_timeout_while(guard, Duration::from_secs(2), |_| {
+            !flag.load(Ordering::Acquire)
+        })
+        .unwrap_or_else(|error| error.into_inner());
+    assert!(
+        flag.load(Ordering::Acquire),
+        "timed out waiting for {label}; timed_out={}",
+        timeout.timed_out()
+    );
+}
+
+fn wait_for_teardown_probe_resolution() {
+    let (lock, signal) = &*TEARDOWN_WAIT_SIGNAL;
+    let guard = lock.lock().unwrap_or_else(|error| error.into_inner());
+    let (_guard, timeout) = signal
+        .wait_timeout_while(guard, Duration::from_secs(2), |_| {
+            !TEARDOWN_WAIT_PROBE_CONTENDED.load(Ordering::Acquire)
+                && !TEARDOWN_WAIT_PROBE_ACQUIRED_STATE.load(Ordering::Acquire)
+        })
+        .unwrap_or_else(|error| error.into_inner());
+    assert!(
+        TEARDOWN_WAIT_PROBE_CONTENDED.load(Ordering::Acquire)
+            || TEARDOWN_WAIT_PROBE_ACQUIRED_STATE.load(Ordering::Acquire),
+        "timed out waiting for pmap state probe resolution; timed_out={} callback_entered={} probe_started={}",
+        timeout.timed_out(),
+        TEARDOWN_WAIT_CALLBACK_ENTERED.load(Ordering::Acquire),
+        TEARDOWN_WAIT_PROBE_STARTED.load(Ordering::Acquire),
+    );
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct CountingPmapCounters {
@@ -204,6 +273,66 @@ impl PmapIf for CountingPmap {
         // This mock's shoot counters model invalidation/shootdown caused by
         // replacement or teardown. Invalid-to-valid publication uses a
         // separate local translation barrier on real platforms.
+    }
+}
+
+impl PmapIf for TeardownWaitWitnessPmap {
+    fn create_pmap_root() -> Result<PmapRoot, PmapError> {
+        <CountingPmap as PmapIf>::create_pmap_root()
+    }
+
+    fn destroy_pmap_root(root: PmapRoot) {
+        <CountingPmap as PmapIf>::destroy_pmap_root(root);
+    }
+
+    fn reserve_mapping(
+        root: &PmapRoot,
+        virt: VirtAddr,
+        phys: PhysAddr,
+        kind: PmapReserveKind,
+    ) -> Result<Option<PmapReservation>, PmapError> {
+        <CountingPmap as PmapIf>::reserve_mapping(root, virt, phys, kind)
+    }
+
+    fn commit_mapping(root: &PmapRoot, reservation: PmapReservation, permissions: PmapPermissions) {
+        <CountingPmap as PmapIf>::commit_mapping(root, reservation, permissions);
+    }
+
+    fn unmap_mapping(
+        root: &PmapRoot,
+        virt: VirtAddr,
+        kind: PmapReserveKind,
+    ) -> Result<Option<PmapUnmapResult>, PmapError> {
+        <CountingPmap as PmapIf>::unmap_mapping(root, virt, kind)
+    }
+
+    fn synchronize_new_mappings(_asid: Asid, _invalidations: &[PmapInvalidation]) {
+        // New-leaf publication is not the synchronous remote-completion
+        // boundary this witness models.
+    }
+
+    fn shootdown_mappings(asid: Asid, invalidations: &[PmapInvalidation]) {
+        <CountingPmap as PmapIf>::shootdown_mappings(asid, invalidations);
+        let map_refs = crate::vm::adapter::step_engine::page_allocator::frame_role_diagnostics()
+            .expect("frame-role diagnostics at teardown shootdown")
+            .map_refs;
+        TEARDOWN_WAIT_MAP_REFS.store(map_refs, Ordering::Release);
+        publish_teardown_witness_flag(&TEARDOWN_WAIT_CALLBACK_ENTERED);
+
+        // The callback models entry into the synchronous remote-completion
+        // wait. A failed state-lock CAS invokes `service_pending_tlb_shootdown`,
+        // giving the test a direct contention event instead of inferring lock
+        // ownership from elapsed time. The condition-variable wait is bounded
+        // solely to keep a broken witness from hanging the host suite.
+        wait_for_teardown_probe_resolution();
+        TEARDOWN_WAIT_STATE_WAS_UNAVAILABLE.store(
+            TEARDOWN_WAIT_PROBE_CONTENDED.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+    }
+
+    fn service_pending_tlb_shootdown() {
+        publish_teardown_witness_flag(&TEARDOWN_WAIT_PROBE_CONTENDED);
     }
 }
 
@@ -1356,6 +1485,104 @@ fn vm_address_space_unmap_sparse_large_range_tears_down_resident_pmap_entries() 
             last_asid: Some(Asid(1)),
             ..CountingPmapCounters::default()
         }
+    );
+}
+
+#[test]
+fn vm_pmap_teardown_stage1_witness_holds_state_and_map_pin_during_remote_wait() {
+    let _guard = COUNTING_PMAP_TEST_LOCK.lock().expect("counting test lock");
+    setup_host_substrate();
+    reset_counting_pmap();
+    reset_teardown_wait_witness();
+
+    let baseline_map_refs =
+        crate::vm::adapter::step_engine::page_allocator::frame_role_diagnostics()
+            .expect("baseline frame-role diagnostics")
+            .map_refs;
+    let aspace = Arc::new(
+        AddressSpace::new_for_platform::<TeardownWaitWitnessPmap>()
+            .expect("teardown witness pmap address space"),
+    );
+    let mapped = range(0x2100_0000, 1);
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            mapped,
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("map witness recipe");
+
+    let outcome = aspace
+        .resolve_fault(VmFault::new(mapped.start(), AccessMode::Write))
+        .expect("resolve witness fault");
+    let materialized = outcome
+        .materialize_pagebacked()
+        .expect("materialize witness page");
+    aspace
+        .publish_fault_materialization(outcome, materialized)
+        .expect("publish witness mapping");
+    let mapped_page = mapped.start().containing_page();
+    assert!(aspace.pmap().lookup(mapped_page).is_some());
+
+    let map_refs_before_teardown =
+        crate::vm::adapter::step_engine::page_allocator::frame_role_diagnostics()
+            .expect("mapped frame-role diagnostics")
+            .map_refs;
+    assert_eq!(
+        map_refs_before_teardown,
+        baseline_map_refs + 1,
+        "publishing one resident PTE must retain exactly one MapPin"
+    );
+
+    std::thread::scope(|scope| {
+        let teardown_aspace = Arc::clone(&aspace);
+        let teardown = scope.spawn(move || teardown_aspace.pmap().teardown_range(mapped));
+
+        wait_for_teardown_witness_flag(
+            &TEARDOWN_WAIT_CALLBACK_ENTERED,
+            "remote shootdown callback entry",
+        );
+        publish_teardown_witness_flag(&TEARDOWN_WAIT_PROBE_STARTED);
+        let probe_snapshot = aspace.pmap().lookup(mapped_page);
+        publish_teardown_witness_flag(&TEARDOWN_WAIT_PROBE_ACQUIRED_STATE);
+
+        assert_eq!(teardown.join().expect("teardown witness thread"), Ok(1),);
+        assert_eq!(
+            probe_snapshot, None,
+            "teardown drains the shadow mapping before entering shootdown"
+        );
+    });
+
+    assert!(TEARDOWN_WAIT_CALLBACK_ENTERED.load(Ordering::Acquire));
+    assert!(
+        TEARDOWN_WAIT_PROBE_CONTENDED.load(Ordering::Acquire),
+        "lookup must report a failed state-lock CAS at the remote wait boundary"
+    );
+    assert!(TEARDOWN_WAIT_PROBE_ACQUIRED_STATE.load(Ordering::Acquire));
+    // This records the sender side of the proven cycle: the synchronous
+    // shootdown callback is entered while `VmPmap.state` is still held, so a
+    // real concurrent lookup cannot acquire it. The repair deliberately keeps
+    // this pmap transaction atomic; progress is guaranteed on the target side
+    // by every interrupt-masked contended wait servicing its pending mailbox.
+    assert!(
+        TEARDOWN_WAIT_STATE_WAS_UNAVAILABLE.load(Ordering::Acquire),
+        "stage-1 witness expects VmPmap.state to remain held at remote wait entry"
+    );
+    assert_eq!(
+        TEARDOWN_WAIT_MAP_REFS.load(Ordering::Acquire),
+        map_refs_before_teardown,
+        "MapPin must remain live throughout synchronous remote completion"
+    );
+    assert_eq!(
+        crate::vm::adapter::step_engine::page_allocator::frame_role_diagnostics()
+            .expect("post-teardown frame-role diagnostics")
+            .map_refs,
+        baseline_map_refs,
+        "MapPin must release only after shootdown returns"
     );
 }
 

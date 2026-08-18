@@ -2,8 +2,12 @@ use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 
 use tx_hal::{
-    BootInfo, BootstrapPmapInfo, DeviceInfo, DeviceKind, MemoryRegion, MemoryRegionKind, MmioFlags,
-    MmioRegion, PhysAddr, PhysRange, PlatformConfig, PlatformInfo, VirtAddr, VirtRange,
+    BootInfo, BootstrapPmapInfo, DeviceId, DeviceInfo, DeviceKind, DeviceLocalId, DeviceMatchId,
+    DeviceResource, DeviceResourceGraph, DeviceStatus, DmaCoherency, DmaConstraints, DmaDomain,
+    DmaDomainId, DmaDomainRef, DmaTranslation, IrqPolarity, IrqResource, IrqSharing, IrqTrigger,
+    MemoryRegion, MemoryRegionKind, MmioFlags, MmioRegion, MmioResource, PhysAddr, PhysRange,
+    PlatformConfig, PlatformDevice, PlatformInfo, ResourceOrigin, ResourceOriginKind,
+    ResourceProviderId, ResourceRole, VirtAddr, VirtRange,
 };
 
 use crate::pmap::topology::{
@@ -18,10 +22,14 @@ use crate::Platform;
 pub(crate) const MAX_MEMORY_REGIONS: usize = 16;
 pub(crate) const CMDLINE_CAPACITY: usize = 16384;
 pub(crate) const BOOTSTRAP_PMAP_RESERVED_RANGES: usize = 4;
-// QEMU virt 有 11 个可识别节点(8×virtio-mmio + uart + plic + pci ecam);VF2 更少,留余量
+// QEMU virt 有 12 个可识别节点(8×virtio-mmio + uart + plic + rtc + pci ecam);VF2 更少,留余量
 pub(crate) const MAX_PLATFORM_DEVICES: usize = 24;
 // 每个设备一条 MmioRegion,外加固定的 clint 项(clint 无 DeviceKind 但其 MMIO 必须保持映射)
-const GENERATED_MMIO_REGIONS: usize = MAX_PLATFORM_DEVICES + 2;
+const GENERATED_MMIO_REGIONS: usize = MAX_PLATFORM_DEVICES + 1;
+const MAX_TYPED_PLATFORM_MMIO: usize = MAX_PLATFORM_DEVICES;
+const MAX_TYPED_DEVICE_MATCHES: usize = MAX_PLATFORM_DEVICES * 4;
+const MAX_TYPED_DEVICE_RESOURCES: usize = MAX_PLATFORM_DEVICES * 3;
+const DEVICE_RESOURCE_STRING_CAPACITY: usize = MAX_PLATFORM_DEVICES * 256;
 
 // 生成的 MMIO 区名字表,按各类型在设备树里出现的顺序取用
 const VIRTIO_REGION_NAMES: [&str; 12] = [
@@ -30,6 +38,12 @@ const VIRTIO_REGION_NAMES: [&str; 12] = [
 ];
 const UART_REGION_NAMES: [&str; 6] = ["uart0", "uart1", "uart2", "uart3", "uart4", "uart5"];
 const SDIO_REGION_NAMES: [&str; 4] = ["sdio0", "sdio1", "sdio2", "sdio3"];
+const DWMAC_REGION_NAMES: [&str; 4] = ["dwmac0", "dwmac1", "dwmac2", "dwmac3"];
+const CLOCK_REGION_NAMES: [&str; 5] = ["clock0", "clock1", "clock2", "clock3", "clock4"];
+const CACHE_REGION_NAMES: [&str; 2] = ["cache0", "cache1"];
+
+#[cfg(test)]
+pub(crate) static BOOT_STATIC_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 const EMPTY_DEVICE: DeviceInfo = DeviceInfo {
     kind: DeviceKind::Uart,
@@ -37,6 +51,58 @@ const EMPTY_DEVICE: DeviceInfo = DeviceInfo {
     irq: None,
     reg_shift: 0,
     reg_io_width: 1,
+};
+
+const FDT_RESOURCE_PROVIDER: ResourceProviderId = ResourceProviderId("riscv-fdt");
+const DEFAULT_DMA_DOMAIN_ID: DmaDomainId = DmaDomainId {
+    provider: FDT_RESOURCE_PROVIDER,
+    local: 0,
+};
+const DEFAULT_DMA_ORIGIN: ResourceOrigin = ResourceOrigin {
+    provider: FDT_RESOURCE_PROVIDER,
+    record: "platform-default-dma",
+    kind: ResourceOriginKind::PlatformStatic,
+};
+static DEFAULT_DMA_DOMAINS: [DmaDomain; 1] = [DmaDomain {
+    id: DEFAULT_DMA_DOMAIN_ID,
+    translation: DmaTranslation::Direct { offset: 0 },
+    constraints: DmaConstraints {
+        dma_address_bits: usize::BITS as u8,
+        min_alignment: 1,
+        segment_boundary: None,
+        max_segment_len: usize::MAX,
+        max_segments: u16::MAX,
+    },
+    coherency: if <Platform as PlatformConfig>::DMA_COHERENT {
+        DmaCoherency::Coherent
+    } else {
+        DmaCoherency::NonCoherent
+    },
+    origin: DEFAULT_DMA_ORIGIN,
+}];
+const EMPTY_RESOURCE_ORIGIN: ResourceOrigin = ResourceOrigin {
+    provider: FDT_RESOURCE_PROVIDER,
+    record: "",
+    kind: ResourceOriginKind::Firmware,
+};
+const EMPTY_MMIO_RESOURCE: MmioResource = MmioResource {
+    role: ResourceRole::Index(0),
+    phys: PhysRange::empty(),
+    virt: VirtRange::empty(),
+    flags: MmioFlags::empty(),
+    origin: EMPTY_RESOURCE_ORIGIN,
+};
+const EMPTY_DEVICE_MATCH: DeviceMatchId = DeviceMatchId::FirmwareCompatible("");
+const EMPTY_DEVICE_RESOURCE: DeviceResource = DeviceResource::Mmio(EMPTY_MMIO_RESOURCE);
+const EMPTY_PLATFORM_DEVICE: PlatformDevice = PlatformDevice {
+    id: DeviceId {
+        provider: FDT_RESOURCE_PROVIDER,
+        local: DeviceLocalId::FirmwarePath(""),
+    },
+    status: DeviceStatus::Enabled,
+    matches: &[],
+    resources: &[],
+    origin: EMPTY_RESOURCE_ORIGIN,
 };
 
 pub(crate) struct IdentityLive;
@@ -161,6 +227,12 @@ struct CmdlineCell(UnsafeCell<[u8; CMDLINE_CAPACITY]>);
 struct MemoryRegionsCell(UnsafeCell<[MemoryRegion; MAX_MEMORY_REGIONS]>);
 struct PlatformInfoCell(UnsafeCell<PlatformInfo>);
 struct PlatformMmioRegionsCell(UnsafeCell<[MmioRegion; GENERATED_MMIO_REGIONS]>);
+struct TypedPlatformMmioCell(UnsafeCell<[MmioResource; MAX_TYPED_PLATFORM_MMIO]>);
+struct TypedPlatformDevicesCell(UnsafeCell<[PlatformDevice; MAX_PLATFORM_DEVICES]>);
+struct TypedDeviceMatchesCell(UnsafeCell<[DeviceMatchId; MAX_TYPED_DEVICE_MATCHES]>);
+struct TypedDeviceResourcesCell(UnsafeCell<[DeviceResource; MAX_TYPED_DEVICE_RESOURCES]>);
+struct DeviceResourceStringsCell(UnsafeCell<[u8; DEVICE_RESOURCE_STRING_CAPACITY]>);
+struct DeviceResourceGraphCell(UnsafeCell<DeviceResourceGraph>);
 struct TimebaseFrequencyCell(UnsafeCell<u64>);
 struct PlatformDevicesCell(UnsafeCell<[DeviceInfo; MAX_PLATFORM_DEVICES]>);
 struct PlatformDeviceCountCell(UnsafeCell<usize>);
@@ -180,6 +252,12 @@ unsafe impl Sync for CmdlineCell {}
 unsafe impl Sync for MemoryRegionsCell {}
 unsafe impl Sync for PlatformInfoCell {}
 unsafe impl Sync for PlatformMmioRegionsCell {}
+unsafe impl Sync for TypedPlatformMmioCell {}
+unsafe impl Sync for TypedPlatformDevicesCell {}
+unsafe impl Sync for TypedDeviceMatchesCell {}
+unsafe impl Sync for TypedDeviceResourcesCell {}
+unsafe impl Sync for DeviceResourceStringsCell {}
+unsafe impl Sync for DeviceResourceGraphCell {}
 unsafe impl Sync for TimebaseFrequencyCell {}
 unsafe impl Sync for PlatformDevicesCell {}
 unsafe impl Sync for PlatformDeviceCountCell {}
@@ -202,12 +280,33 @@ static PLATFORM_INFO: PlatformInfoCell = PlatformInfoCell(UnsafeCell::new(Platfo
     board: "",
     spi_sd: None,
     mmio_regions: &[],
+    device_resources: &tx_hal::EMPTY_DEVICE_RESOURCE_GRAPH,
     timebase_frequency_hz: QEMU_VIRT_FALLBACK_TIMEBASE_HZ,
     possible_cpu_count: 1,
 }));
 static PLATFORM_MMIO_REGIONS: PlatformMmioRegionsCell = PlatformMmioRegionsCell(UnsafeCell::new(
     [empty_mmio_region(); GENERATED_MMIO_REGIONS],
 ));
+static TYPED_PLATFORM_MMIO: TypedPlatformMmioCell = TypedPlatformMmioCell(UnsafeCell::new(
+    [EMPTY_MMIO_RESOURCE; MAX_TYPED_PLATFORM_MMIO],
+));
+static TYPED_PLATFORM_DEVICES: TypedPlatformDevicesCell = TypedPlatformDevicesCell(
+    UnsafeCell::new([EMPTY_PLATFORM_DEVICE; MAX_PLATFORM_DEVICES]),
+);
+static TYPED_DEVICE_MATCHES: TypedDeviceMatchesCell = TypedDeviceMatchesCell(UnsafeCell::new(
+    [EMPTY_DEVICE_MATCH; MAX_TYPED_DEVICE_MATCHES],
+));
+static TYPED_DEVICE_RESOURCES: TypedDeviceResourcesCell = TypedDeviceResourcesCell(
+    UnsafeCell::new([EMPTY_DEVICE_RESOURCE; MAX_TYPED_DEVICE_RESOURCES]),
+);
+static DEVICE_RESOURCE_STRINGS: DeviceResourceStringsCell =
+    DeviceResourceStringsCell(UnsafeCell::new([0; DEVICE_RESOURCE_STRING_CAPACITY]));
+static DEVICE_RESOURCE_GRAPH: DeviceResourceGraphCell =
+    DeviceResourceGraphCell(UnsafeCell::new(DeviceResourceGraph {
+        platform_mmio: &[],
+        devices: &[],
+        dma_domains: &[],
+    }));
 static TIMEBASE_FREQUENCY_HZ: TimebaseFrequencyCell =
     TimebaseFrequencyCell(UnsafeCell::new(QEMU_VIRT_FALLBACK_TIMEBASE_HZ));
 static PLATFORM_DEVICES: PlatformDevicesCell =
@@ -276,6 +375,260 @@ unsafe extern "C" {
 #[used]
 static SECONDARY_START_ENTRY: unsafe extern "C" fn() = tx_rv64_qemu_secondary_start;
 
+struct TypedSeedWriter {
+    platform_mmio_count: usize,
+    device_count: usize,
+    match_count: usize,
+    resource_count: usize,
+    string_cursor: usize,
+}
+
+impl TypedSeedWriter {
+    unsafe fn new() -> Self {
+        unsafe {
+            (*TYPED_PLATFORM_MMIO.0.get()).fill(EMPTY_MMIO_RESOURCE);
+            (*TYPED_PLATFORM_DEVICES.0.get()).fill(EMPTY_PLATFORM_DEVICE);
+            (*TYPED_DEVICE_MATCHES.0.get()).fill(EMPTY_DEVICE_MATCH);
+            (*TYPED_DEVICE_RESOURCES.0.get()).fill(EMPTY_DEVICE_RESOURCE);
+            (*DEVICE_RESOURCE_STRINGS.0.get()).fill(0);
+        }
+        Self {
+            platform_mmio_count: 0,
+            device_count: 0,
+            match_count: 0,
+            resource_count: 0,
+            string_cursor: 0,
+        }
+    }
+
+    fn push(
+        &mut self,
+        fact: crate::dtb::DtbDeviceFact<'_>,
+    ) -> Result<(), crate::dtb::DtbDeviceError> {
+        let path = self.copy_path(fact.node_name, fact.unit_address)?;
+        let origin = ResourceOrigin {
+            provider: FDT_RESOURCE_PROVIDER,
+            record: path,
+            kind: ResourceOriginKind::Firmware,
+        };
+        let mmio = mapped_mmio_resource(fact.mmio, origin);
+
+        match fact.class {
+            crate::dtb::DtbDeviceClass::PlatformMmio(_) => self.push_platform_mmio(mmio),
+            crate::dtb::DtbDeviceClass::PlatformDevice(_) => {
+                self.push_platform_device(fact, path, origin, mmio)
+            }
+        }
+    }
+
+    fn push_platform_mmio(&mut self, mmio: MmioResource) -> Result<(), crate::dtb::DtbDeviceError> {
+        if self.platform_mmio_count == MAX_TYPED_PLATFORM_MMIO {
+            return Err(crate::dtb::DtbDeviceError::PlatformMmioCapacityExceeded {
+                capacity: MAX_TYPED_PLATFORM_MMIO,
+                required: self.platform_mmio_count + 1,
+            });
+        }
+        unsafe {
+            (*TYPED_PLATFORM_MMIO.0.get())[self.platform_mmio_count] = mmio;
+        }
+        self.platform_mmio_count += 1;
+        Ok(())
+    }
+
+    fn push_platform_device(
+        &mut self,
+        fact: crate::dtb::DtbDeviceFact<'_>,
+        path: &'static str,
+        origin: ResourceOrigin,
+        mmio: MmioResource,
+    ) -> Result<(), crate::dtb::DtbDeviceError> {
+        if self.device_count == MAX_PLATFORM_DEVICES {
+            return Err(crate::dtb::DtbDeviceError::PlatformDeviceCapacityExceeded {
+                capacity: MAX_PLATFORM_DEVICES,
+                required: self.device_count + 1,
+            });
+        }
+
+        let match_start = self.match_count;
+        for compatible in fact
+            .compatible
+            .split(|&byte| byte == 0)
+            .filter(|entry| !entry.is_empty())
+        {
+            let compatible = core::str::from_utf8(compatible)
+                .map_err(|_| crate::dtb::DtbDeviceError::MalformedCompatible)?;
+            let compatible = self.copy_string_parts(&[compatible])?;
+            self.push_match(DeviceMatchId::FirmwareCompatible(compatible))?;
+        }
+        if self.match_count == match_start {
+            return Err(crate::dtb::DtbDeviceError::MalformedCompatible);
+        }
+
+        let resource_start = self.resource_count;
+        self.push_resource(DeviceResource::Mmio(mmio))?;
+        if let Some(line) = fact.irq {
+            if line == 0 {
+                return Err(crate::dtb::DtbDeviceError::InvalidIrq(line));
+            }
+            self.push_resource(DeviceResource::Irq(IrqResource {
+                role: ResourceRole::Index(0),
+                line,
+                // The RISC-V PLIC binding encodes only a source number. The
+                // platform route supplies its level/high, exclusive defaults.
+                trigger: IrqTrigger::Level,
+                polarity: IrqPolarity::High,
+                sharing: IrqSharing::Exclusive,
+                origin,
+            }))?;
+        }
+        if matches!(
+            fact.class,
+            crate::dtb::DtbDeviceClass::PlatformDevice(DeviceKind::VirtioMmio | DeviceKind::Dwmac)
+        ) {
+            self.push_resource(DeviceResource::DmaDomain(DmaDomainRef {
+                role: ResourceRole::Index(0),
+                domain: DEFAULT_DMA_DOMAIN_ID,
+            }))?;
+        }
+
+        let matches: &'static [DeviceMatchId] = unsafe {
+            let all: &'static [DeviceMatchId; MAX_TYPED_DEVICE_MATCHES] =
+                &*TYPED_DEVICE_MATCHES.0.get();
+            &all[match_start..self.match_count]
+        };
+        let resources: &'static [DeviceResource] = unsafe {
+            let all: &'static [DeviceResource; MAX_TYPED_DEVICE_RESOURCES] =
+                &*TYPED_DEVICE_RESOURCES.0.get();
+            &all[resource_start..self.resource_count]
+        };
+        unsafe {
+            (*TYPED_PLATFORM_DEVICES.0.get())[self.device_count] = PlatformDevice {
+                id: DeviceId {
+                    provider: FDT_RESOURCE_PROVIDER,
+                    local: DeviceLocalId::FirmwarePath(path),
+                },
+                status: DeviceStatus::Enabled,
+                matches,
+                resources,
+                origin,
+            };
+        }
+        self.device_count += 1;
+        Ok(())
+    }
+
+    fn push_match(&mut self, value: DeviceMatchId) -> Result<(), crate::dtb::DtbDeviceError> {
+        if self.match_count == MAX_TYPED_DEVICE_MATCHES {
+            return Err(crate::dtb::DtbDeviceError::DeviceMatchCapacityExceeded {
+                capacity: MAX_TYPED_DEVICE_MATCHES,
+                required: self.match_count + 1,
+            });
+        }
+        unsafe {
+            (*TYPED_DEVICE_MATCHES.0.get())[self.match_count] = value;
+        }
+        self.match_count += 1;
+        Ok(())
+    }
+
+    fn push_resource(&mut self, value: DeviceResource) -> Result<(), crate::dtb::DtbDeviceError> {
+        if self.resource_count == MAX_TYPED_DEVICE_RESOURCES {
+            return Err(crate::dtb::DtbDeviceError::DeviceResourceCapacityExceeded {
+                capacity: MAX_TYPED_DEVICE_RESOURCES,
+                required: self.resource_count + 1,
+            });
+        }
+        unsafe {
+            (*TYPED_DEVICE_RESOURCES.0.get())[self.resource_count] = value;
+        }
+        self.resource_count += 1;
+        Ok(())
+    }
+
+    fn copy_path(
+        &mut self,
+        node_name: &str,
+        unit_address: Option<&str>,
+    ) -> Result<&'static str, crate::dtb::DtbDeviceError> {
+        match unit_address {
+            Some(unit_address) => self.copy_string_parts(&["/soc/", node_name, "@", unit_address]),
+            None => self.copy_string_parts(&["/soc/", node_name]),
+        }
+    }
+
+    fn copy_string_parts(
+        &mut self,
+        parts: &[&str],
+    ) -> Result<&'static str, crate::dtb::DtbDeviceError> {
+        let byte_len = parts
+            .iter()
+            .try_fold(0usize, |len, part| len.checked_add(part.len()))
+            .ok_or(crate::dtb::DtbDeviceError::StringArenaCapacityExceeded {
+                capacity: DEVICE_RESOURCE_STRING_CAPACITY,
+                required: usize::MAX,
+            })?;
+        let end = self.string_cursor.checked_add(byte_len).ok_or(
+            crate::dtb::DtbDeviceError::StringArenaCapacityExceeded {
+                capacity: DEVICE_RESOURCE_STRING_CAPACITY,
+                required: usize::MAX,
+            },
+        )?;
+        if end > DEVICE_RESOURCE_STRING_CAPACITY {
+            return Err(crate::dtb::DtbDeviceError::StringArenaCapacityExceeded {
+                capacity: DEVICE_RESOURCE_STRING_CAPACITY,
+                required: end,
+            });
+        }
+
+        let start = self.string_cursor;
+        let mut cursor = start;
+        unsafe {
+            let storage = core::ptr::addr_of_mut!((*DEVICE_RESOURCE_STRINGS.0.get())[0]);
+            for part in parts {
+                core::ptr::copy_nonoverlapping(part.as_ptr(), storage.add(cursor), part.len());
+                cursor += part.len();
+            }
+            self.string_cursor = end;
+            let bytes: &'static [u8] = core::slice::from_raw_parts(storage.add(start), byte_len);
+            Ok(core::str::from_utf8_unchecked(bytes))
+        }
+    }
+
+    unsafe fn finish(self) -> &'static DeviceResourceGraph {
+        let platform_mmio: &'static [MmioResource] = unsafe {
+            let all: &'static [MmioResource; MAX_TYPED_PLATFORM_MMIO] =
+                &*TYPED_PLATFORM_MMIO.0.get();
+            &all[..self.platform_mmio_count]
+        };
+        let devices: &'static [PlatformDevice] = unsafe {
+            let all: &'static [PlatformDevice; MAX_PLATFORM_DEVICES] =
+                &*TYPED_PLATFORM_DEVICES.0.get();
+            &all[..self.device_count]
+        };
+        unsafe {
+            *DEVICE_RESOURCE_GRAPH.0.get() = DeviceResourceGraph {
+                platform_mmio,
+                devices,
+                dma_domains: &DEFAULT_DMA_DOMAINS,
+            };
+            &*DEVICE_RESOURCE_GRAPH.0.get()
+        }
+    }
+}
+
+fn mapped_mmio_resource(phys: PhysRange, origin: ResourceOrigin) -> MmioResource {
+    MmioResource {
+        role: ResourceRole::Index(0),
+        phys,
+        virt: VirtRange {
+            start: VirtAddr(DIRECT_MAP_BASE + phys.start.0),
+            size: phys.size,
+        },
+        flags: MMIO_RW_DEVICE,
+        origin,
+    }
+}
+
 // ===== MMIO 区构建:把解析出的设备列表翻译成"寄存器窗口 → 虚拟地址"映射表 =====
 const MMIO_RW_DEVICE: MmioFlags = MmioFlags::DEVICE_NGNRNE
     .union(MmioFlags::READ)
@@ -300,44 +653,98 @@ const fn empty_mmio_region() -> MmioRegion {
 fn build_mmio_regions(
     devices: &[DeviceInfo],
     out: &mut [MmioRegion; GENERATED_MMIO_REGIONS],
-) -> usize {
+) -> Result<usize, crate::dtb::DtbDeviceError> {
     *out = [empty_mmio_region(); GENERATED_MMIO_REGIONS];
     if devices.is_empty() {
         let legacy = qemu_mmio_regions();
+        if legacy.len() > out.len() {
+            return Err(crate::dtb::DtbDeviceError::LegacyMmioCapacityExceeded {
+                capacity: out.len(),
+                required: legacy.len(),
+            });
+        }
         out[..legacy.len()].copy_from_slice(&legacy);
-        return legacy.len();
+        return Ok(legacy.len());
     }
 
     out[0] = clint_mmio_region();
-    // The goldfish-rtc has no DeviceKind (same situation as the clint) but
-    // must stay mapped so the boot-time CLOCK_REALTIME seed read from
-    // `rtc@101000` doesn't fault. Add it statically alongside the clint.
-    out[1] = goldfish_rtc_mmio_region();
-    let mut count = 2usize;
+    let mut count = 1usize;
     let mut virtio_index = 0usize;
     let mut uart_index = 0usize;
     let mut sdio_index = 0usize;
+    let mut dwmac_index = 0usize;
+    let mut clock_index = 0usize;
+    let mut cache_index = 0usize;
     for device in devices {
         if count == out.len() {
-            break;
+            return Err(crate::dtb::DtbDeviceError::LegacyMmioCapacityExceeded {
+                capacity: out.len(),
+                required: count + 1,
+            });
         }
         let name = match device.kind {
             DeviceKind::VirtioMmio => {
-                let name = VIRTIO_REGION_NAMES.get(virtio_index);
+                let name = VIRTIO_REGION_NAMES.get(virtio_index).ok_or(
+                    crate::dtb::DtbDeviceError::LegacyMmioNameCapacityExceeded {
+                        kind: device.kind,
+                        required: virtio_index + 1,
+                    },
+                )?;
                 virtio_index += 1;
-                name
+                Some(name)
             }
             DeviceKind::Uart => {
-                let name = UART_REGION_NAMES.get(uart_index);
+                let name = UART_REGION_NAMES.get(uart_index).ok_or(
+                    crate::dtb::DtbDeviceError::LegacyMmioNameCapacityExceeded {
+                        kind: device.kind,
+                        required: uart_index + 1,
+                    },
+                )?;
                 uart_index += 1;
-                name
+                Some(name)
             }
             DeviceKind::SdController => {
-                let name = SDIO_REGION_NAMES.get(sdio_index);
+                let name = SDIO_REGION_NAMES.get(sdio_index).ok_or(
+                    crate::dtb::DtbDeviceError::LegacyMmioNameCapacityExceeded {
+                        kind: device.kind,
+                        required: sdio_index + 1,
+                    },
+                )?;
                 sdio_index += 1;
-                name
+                Some(name)
+            }
+            DeviceKind::Dwmac => {
+                let name = DWMAC_REGION_NAMES.get(dwmac_index).ok_or(
+                    crate::dtb::DtbDeviceError::LegacyMmioNameCapacityExceeded {
+                        kind: device.kind,
+                        required: dwmac_index + 1,
+                    },
+                )?;
+                dwmac_index += 1;
+                Some(name)
+            }
+            DeviceKind::ClockController => {
+                let name = CLOCK_REGION_NAMES.get(clock_index).ok_or(
+                    crate::dtb::DtbDeviceError::LegacyMmioNameCapacityExceeded {
+                        kind: device.kind,
+                        required: clock_index + 1,
+                    },
+                )?;
+                clock_index += 1;
+                Some(name)
+            }
+            DeviceKind::CacheController => {
+                let name = CACHE_REGION_NAMES.get(cache_index).ok_or(
+                    crate::dtb::DtbDeviceError::LegacyMmioNameCapacityExceeded {
+                        kind: device.kind,
+                        required: cache_index + 1,
+                    },
+                )?;
+                cache_index += 1;
+                Some(name)
             }
             DeviceKind::IntController => Some(&"plic"),
+            DeviceKind::GoldfishRtc => Some(&"goldfish-rtc"),
             DeviceKind::PciEcam => Some(&"pcie-ecam"),
         };
         let Some(&name) = name else {
@@ -354,7 +761,7 @@ fn build_mmio_regions(
         };
         count += 1;
     }
-    count
+    Ok(count)
 }
 
 fn clint_mmio_region() -> MmioRegion {
@@ -392,18 +799,7 @@ pub(crate) fn qemu_mmio_regions() -> [MmioRegion; 6] {
         // QEMU virt goldfish-rtc (`rtc@101000`). One page; read once at boot to
         // seed CLOCK_REALTIME from real host time. Without this mapping the
         // boot-time RTC read faults (load page fault at the direct-map VA).
-        MmioRegion {
-            name: "goldfish-rtc",
-            phys: PhysRange {
-                start: PhysAddr(0x0010_1000),
-                size: 0x1000,
-            },
-            virt: VirtRange {
-                start: VirtAddr(DIRECT_MAP_BASE + 0x0010_1000),
-                size: 0x1000,
-            },
-            flags: MMIO_RW_DEVICE,
-        },
+        goldfish_rtc_mmio_region(),
         MmioRegion {
             name: "clint",
             phys: PhysRange {
@@ -626,6 +1022,19 @@ impl BootStaticBag<IdentityLive> {
             *STORED_BOOT_STATIC_BAG.0.get() = StoredBootStaticBag::Uninit;
             *TIMEBASE_FREQUENCY_HZ.0.get() = QEMU_VIRT_FALLBACK_TIMEBASE_HZ;
             *POSSIBLE_CPU_COUNT.0.get() = 1;
+            *PLATFORM_DEVICE_COUNT.0.get() = 0;
+            (*PLATFORM_DEVICES.0.get()).fill(EMPTY_DEVICE);
+            (*PLATFORM_MMIO_REGIONS.0.get()) = [empty_mmio_region(); GENERATED_MMIO_REGIONS];
+            let seed = TypedSeedWriter::new();
+            let _ = seed.finish();
+            *PLATFORM_INFO.0.get() = PlatformInfo {
+                board: "",
+                spi_sd: None,
+                mmio_regions: &[],
+                device_resources: &tx_hal::EMPTY_DEVICE_RESOURCE_GRAPH,
+                timebase_frequency_hz: QEMU_VIRT_FALLBACK_TIMEBASE_HZ,
+                possible_cpu_count: 1,
+            };
         }
     }
 
@@ -778,6 +1187,10 @@ impl BootStaticBag<IdentityDropped> {
 
 // ===== 访问器海:两个阶段共用,取/写全局缓冲区、算各段物理地址,约 30 个三行方法 =====
 impl<State> BootStaticBag<State> {
+    pub(crate) const fn firmware_dtb_parse_addr(&self) -> usize {
+        self.dtb.parse_addr()
+    }
+
     pub(crate) fn current_trap_vector_kernel_alias() -> VirtAddr {
         unsafe {
             match &*STORED_BOOT_STATIC_BAG.0.get() {
@@ -842,29 +1255,55 @@ impl<State> BootStaticBag<State> {
 
     pub(crate) fn platform_devices_ref(&self) -> &'static [DeviceInfo] {
         unsafe {
-            let count = (*PLATFORM_DEVICE_COUNT.0.get()).min(MAX_PLATFORM_DEVICES);
+            let count = *PLATFORM_DEVICE_COUNT.0.get();
+            assert!(
+                count <= MAX_PLATFORM_DEVICES,
+                "published platform DeviceInfo count exceeds boot-static capacity"
+            );
             let devices: &'static [DeviceInfo; MAX_PLATFORM_DEVICES] = &*PLATFORM_DEVICES.0.get();
             &devices[..count]
         }
     }
 
     pub(crate) fn platform_info_ref(&self) -> &'static PlatformInfo {
+        unsafe { &*PLATFORM_INFO.0.get() }
+    }
+
+    pub(crate) unsafe fn publish_device_facts_from_fdt(
+        &self,
+        dtb_addr: usize,
+    ) -> Result<usize, crate::dtb::DtbDeviceError> {
+        let devices = unsafe { self.platform_devices_mut() };
+        devices.fill(EMPTY_DEVICE);
+        let mut seed = unsafe { TypedSeedWriter::new() };
+        let count = unsafe {
+            crate::dtb::parse_devices_from_fdt_with(dtb_addr, devices, |fact| seed.push(fact))
+        }?;
+        unsafe {
+            seed.finish();
+        }
+        self.publish_platform_device_count(count);
+        Ok(count)
+    }
+
+    pub(crate) fn publish_platform_info(&self) -> Result<(), crate::dtb::DtbDeviceError> {
         unsafe {
             let mmio_regions = &mut *PLATFORM_MMIO_REGIONS.0.get();
-            let region_count = build_mmio_regions(self.platform_devices_ref(), mmio_regions);
+            let region_count = build_mmio_regions(self.platform_devices_ref(), mmio_regions)?;
             let mmio_regions: &'static [MmioRegion; GENERATED_MMIO_REGIONS] =
                 &*PLATFORM_MMIO_REGIONS.0.get();
+            let device_resources: &'static DeviceResourceGraph = &*DEVICE_RESOURCE_GRAPH.0.get();
 
-            let platform_info = &mut *PLATFORM_INFO.0.get();
-            *platform_info = PlatformInfo {
+            *PLATFORM_INFO.0.get() = PlatformInfo {
                 board: Platform::BOARD,
                 spi_sd: None,
                 mmio_regions: &mmio_regions[..region_count],
+                device_resources,
                 timebase_frequency_hz: *TIMEBASE_FREQUENCY_HZ.0.get(),
                 possible_cpu_count: *POSSIBLE_CPU_COUNT.0.get(),
             };
-            platform_info
         }
+        Ok(())
     }
 
     pub(crate) unsafe fn platform_devices_mut(
@@ -874,8 +1313,12 @@ impl<State> BootStaticBag<State> {
     }
 
     pub(crate) fn publish_platform_device_count(&self, count: usize) {
+        assert!(
+            count <= MAX_PLATFORM_DEVICES,
+            "platform DeviceInfo capacity exceeded"
+        );
         unsafe {
-            *PLATFORM_DEVICE_COUNT.0.get() = count.min(MAX_PLATFORM_DEVICES);
+            *PLATFORM_DEVICE_COUNT.0.get() = count;
         }
     }
 
@@ -1018,5 +1461,332 @@ pub(crate) const fn reserved_region() -> MemoryRegion {
         base: PhysAddr(0),
         size: 0,
         kind: MemoryRegionKind::Reserved,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::vec::Vec;
+
+    const QEMU_RV64_VIRT_DTB: &[u8] = include_bytes!("../../dtbs/qemu-rv64-virt.dtb");
+    const JH7110_VF2_DTB: &[u8] =
+        include_bytes!("../../dtbs/jh7110-starfive-visionfive-2-v1.3b.dtb");
+
+    fn mmio_regions_from_dtb(dtb: &[u8]) -> ([MmioRegion; GENERATED_MMIO_REGIONS], usize) {
+        let mut devices = [EMPTY_DEVICE; MAX_PLATFORM_DEVICES];
+        let device_count =
+            unsafe { crate::dtb::parse_devices_from_fdt(dtb.as_ptr() as usize, &mut devices) }
+                .expect("fixture device projection should fit");
+        let mut regions = [empty_mmio_region(); GENERATED_MMIO_REGIONS];
+        let region_count = build_mmio_regions(&devices[..device_count], &mut regions)
+            .expect("fixture MMIO projection should fit");
+        (regions, region_count)
+    }
+
+    fn with_fixture_platform_info(dtb: &[u8], check: impl FnOnce(&PlatformInfo, &[DeviceInfo])) {
+        let _serial = BOOT_STATIC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        unsafe {
+            BootStaticBag::<IdentityLive>::reset_global_for_test();
+        }
+        let bag = BootStaticBag::<IdentityLive>::new_for_test(dtb.as_ptr() as usize);
+        unsafe {
+            bag.publish_device_facts_from_fdt(dtb.as_ptr() as usize)
+                .expect("fixture typed seed should fit boot-static storage");
+        }
+        bag.publish_platform_info()
+            .expect("fixture legacy MMIO projection should fit");
+
+        let first = bag.platform_info_ref();
+        let first_graph = first.device_resources as *const DeviceResourceGraph;
+        let second = bag.platform_info_ref();
+        assert!(core::ptr::eq(first, second));
+        assert_eq!(first_graph, second.device_resources as *const _);
+        check(first, bag.platform_devices_ref());
+
+        unsafe {
+            BootStaticBag::<IdentityLive>::reset_global_for_test();
+        }
+    }
+
+    fn device_path(device: &PlatformDevice) -> &'static str {
+        match device.id.local {
+            DeviceLocalId::FirmwarePath(path) => path,
+            _ => panic!("FDT seed must use firmware-path identity"),
+        }
+    }
+
+    fn device_by_path<'a>(graph: &'a DeviceResourceGraph, path: &str) -> &'a PlatformDevice {
+        graph
+            .devices
+            .iter()
+            .find(|device| device_path(device) == path)
+            .unwrap_or_else(|| panic!("missing typed device {path}"))
+    }
+
+    fn device_mmio(device: &PlatformDevice) -> MmioResource {
+        device
+            .resources
+            .iter()
+            .find_map(|resource| match resource {
+                DeviceResource::Mmio(mmio) => Some(*mmio),
+                _ => None,
+            })
+            .expect("typed device MMIO")
+    }
+
+    fn device_irq(device: &PlatformDevice) -> Option<IrqResource> {
+        device.resources.iter().find_map(|resource| match resource {
+            DeviceResource::Irq(irq) => Some(*irq),
+            _ => None,
+        })
+    }
+
+    fn device_dma(device: &PlatformDevice) -> Option<DmaDomainRef> {
+        device.resources.iter().find_map(|resource| match resource {
+            DeviceResource::DmaDomain(domain) => Some(*domain),
+            _ => None,
+        })
+    }
+
+    fn assert_legacy_typed_projection(info: &PlatformInfo, legacy_devices: &[DeviceInfo]) {
+        let graph = info.device_resources;
+        tx_hal::DeviceGraphBuilder::from_seed(graph).expect("fixture seed validates");
+        assert_eq!(graph.dma_domains, &DEFAULT_DMA_DOMAINS);
+        assert!(graph
+            .platform_mmio
+            .iter()
+            .all(|mmio| mmio.origin.kind == ResourceOriginKind::Firmware));
+
+        let mut typed_mmio = Vec::new();
+        typed_mmio.extend(graph.platform_mmio.iter().copied());
+        for device in graph.devices {
+            typed_mmio.extend(
+                device
+                    .resources
+                    .iter()
+                    .filter_map(|resource| match resource {
+                        DeviceResource::Mmio(mmio) => Some(*mmio),
+                        _ => None,
+                    }),
+            );
+        }
+        assert_eq!(typed_mmio.len(), info.mmio_regions.len());
+        for legacy in info.mmio_regions {
+            assert_eq!(
+                typed_mmio
+                    .iter()
+                    .filter(|typed| {
+                        typed.phys == legacy.phys
+                            && typed.virt == legacy.virt
+                            && typed.flags == legacy.flags
+                    })
+                    .count(),
+                1,
+                "legacy MMIO {} must have exactly one typed source",
+                legacy.name,
+            );
+        }
+
+        let tier2_legacy_count = legacy_devices
+            .iter()
+            .filter(|device| {
+                matches!(
+                    device.kind,
+                    DeviceKind::VirtioMmio
+                        | DeviceKind::PciEcam
+                        | DeviceKind::SdController
+                        | DeviceKind::Dwmac
+                )
+            })
+            .count();
+        assert_eq!(graph.devices.len(), tier2_legacy_count);
+        for device in graph.devices {
+            assert_eq!(device.status, DeviceStatus::Enabled);
+            assert_eq!(device.origin.kind, ResourceOriginKind::Firmware);
+            assert_eq!(device.id.provider, FDT_RESOURCE_PROVIDER);
+            assert_eq!(device_mmio(device).role, ResourceRole::Index(0));
+            assert!(device.resources.iter().all(|resource| matches!(
+                resource,
+                DeviceResource::Mmio(_) | DeviceResource::Irq(_) | DeviceResource::DmaDomain(_)
+            )));
+            if device.matches.iter().any(|candidate| {
+                matches!(candidate, DeviceMatchId::FirmwareCompatible(value)
+                    if *value == "virtio,mmio"
+                        || *value == "starfive,dwmac"
+                        || *value == "starfive,jh7110-dwmac")
+            }) {
+                assert_eq!(
+                    device_dma(device),
+                    Some(DmaDomainRef {
+                        role: ResourceRole::Index(0),
+                        domain: DEFAULT_DMA_DOMAIN_ID,
+                    })
+                );
+            } else {
+                assert_eq!(device_dma(device), None);
+            }
+            if let Some(irq) = device_irq(device) {
+                assert_eq!(irq.role, ResourceRole::Index(0));
+                assert_eq!(irq.origin.kind, ResourceOriginKind::Firmware);
+            }
+        }
+    }
+
+    fn assert_string_outside_fixture(value: &str, dtb: &[u8]) {
+        let value_start = value.as_ptr() as usize;
+        let value_end = value_start + value.len();
+        let dtb_start = dtb.as_ptr() as usize;
+        let dtb_end = dtb_start + dtb.len();
+        assert!(value_end <= dtb_start || value_start >= dtb_end);
+    }
+
+    #[test]
+    fn qemu_dtb_maps_discovered_goldfish_rtc_once() {
+        let (regions, count) = mmio_regions_from_dtb(QEMU_RV64_VIRT_DTB);
+        let rtc: std::vec::Vec<_> = regions[..count]
+            .iter()
+            .filter(|region| region.name == "goldfish-rtc")
+            .collect();
+
+        assert_eq!(rtc.len(), 1);
+        assert_eq!(rtc[0].phys.start, PhysAddr(0x0010_1000));
+        assert_eq!(rtc[0].phys.size, 0x1000);
+    }
+
+    #[test]
+    fn visionfive2_dtb_does_not_map_goldfish_rtc() {
+        let (regions, count) = mmio_regions_from_dtb(JH7110_VF2_DTB);
+        assert!(regions[..count].iter().all(|region| {
+            region.name != "goldfish-rtc" && region.phys.start != PhysAddr(0x0010_1000)
+        }));
+    }
+
+    #[test]
+    fn qemu_fixture_publishes_typed_seed_and_matching_legacy_projection() {
+        with_fixture_platform_info(QEMU_RV64_VIRT_DTB, |info, legacy_devices| {
+            assert_legacy_typed_projection(info, legacy_devices);
+            let graph = info.device_resources;
+            assert_eq!(graph.platform_mmio.len(), 4);
+            assert_eq!(graph.devices.len(), 9);
+            for path in [
+                "/soc/rtc@101000",
+                "/soc/serial@10000000",
+                "/soc/plic@c000000",
+                "/soc/clint@2000000",
+            ] {
+                assert!(graph
+                    .platform_mmio
+                    .iter()
+                    .any(|mmio| mmio.origin.record == path));
+                assert!(graph
+                    .devices
+                    .iter()
+                    .all(|device| device_path(device) != path));
+            }
+
+            let uart = graph
+                .platform_mmio
+                .iter()
+                .find(|mmio| mmio.origin.record == "/soc/serial@10000000")
+                .expect("QEMU UART platform MMIO");
+            assert_eq!(uart.phys.start, PhysAddr(0x1000_0000));
+            assert_eq!(uart.virt.start, VirtAddr(DIRECT_MAP_BASE + 0x1000_0000));
+            assert_eq!(uart.flags, MMIO_RW_DEVICE);
+            assert_eq!(uart.origin.kind, ResourceOriginKind::Firmware);
+
+            let virtio = device_by_path(graph, "/soc/virtio_mmio@10001000");
+            assert!(virtio
+                .matches
+                .contains(&DeviceMatchId::FirmwareCompatible("virtio,mmio")));
+            assert_eq!(device_mmio(virtio).phys.start, PhysAddr(0x1000_1000));
+            assert_eq!(device_irq(virtio).map(|irq| irq.line), Some(1));
+            assert_string_outside_fixture(device_path(virtio), QEMU_RV64_VIRT_DTB);
+            let DeviceMatchId::FirmwareCompatible(compatible) = virtio.matches[0] else {
+                panic!("QEMU virtio must use firmware compatible matching")
+            };
+            assert_string_outside_fixture(compatible, QEMU_RV64_VIRT_DTB);
+
+            let pci = device_by_path(graph, "/soc/pci@30000000");
+            assert!(pci
+                .matches
+                .contains(&DeviceMatchId::FirmwareCompatible("pci-host-ecam-generic")));
+            assert_eq!(device_mmio(pci).phys.start, PhysAddr(0x3000_0000));
+            assert_eq!(device_irq(pci), None);
+        });
+    }
+
+    #[test]
+    fn vf2_fixture_publishes_stable_dwmac_paths_and_filters_disabled_uart() {
+        with_fixture_platform_info(JH7110_VF2_DTB, |info, legacy_devices| {
+            assert_legacy_typed_projection(info, legacy_devices);
+            let graph = info.device_resources;
+            assert_eq!(graph.platform_mmio.len(), 7);
+            assert_eq!(graph.devices.len(), 4);
+            for path in [
+                "/soc/serial@10000000",
+                "/soc/plic@c000000",
+                "/soc/clint@2000000",
+                "/soc/cache-controller@2010000",
+            ] {
+                assert!(graph
+                    .platform_mmio
+                    .iter()
+                    .any(|mmio| mmio.origin.record == path));
+            }
+            assert!(graph
+                .platform_mmio
+                .iter()
+                .all(|mmio| mmio.origin.record != "/soc/serial@10010000"));
+            assert_eq!(
+                legacy_devices
+                    .iter()
+                    .filter(|device| device.kind == DeviceKind::Uart)
+                    .count(),
+                1
+            );
+
+            let dwmac = device_by_path(graph, "/soc/ethernet@16030000");
+            assert!(dwmac
+                .matches
+                .contains(&DeviceMatchId::FirmwareCompatible("starfive,dwmac")));
+            assert!(dwmac
+                .matches
+                .contains(&DeviceMatchId::FirmwareCompatible("snps,dwmac-5.10a")));
+            assert_eq!(device_mmio(dwmac).phys.start, PhysAddr(0x1603_0000));
+            assert_eq!(device_mmio(dwmac).phys.size, 0x1_0000);
+            assert_eq!(device_irq(dwmac).map(|irq| irq.line), Some(7));
+            assert_string_outside_fixture(device_path(dwmac), JH7110_VF2_DTB);
+
+            let dwmac1 = device_by_path(graph, "/soc/ethernet@16040000");
+            assert_eq!(device_irq(dwmac1).map(|irq| irq.line), Some(78));
+
+            let sd = device_by_path(graph, "/soc/sdio1@16020000");
+            assert!(sd
+                .matches
+                .contains(&DeviceMatchId::FirmwareCompatible("starfive,jh7110-sdio")));
+            assert_eq!(device_mmio(sd).phys.start, PhysAddr(0x1602_0000));
+            assert_eq!(device_irq(sd).map(|irq| irq.line), Some(75));
+        });
+    }
+
+    #[test]
+    fn typed_seed_string_arena_overflow_is_explicit() {
+        let mut writer = TypedSeedWriter {
+            platform_mmio_count: 0,
+            device_count: 0,
+            match_count: 0,
+            resource_count: 0,
+            string_cursor: DEVICE_RESOURCE_STRING_CAPACITY - 1,
+        };
+        assert_eq!(
+            writer.copy_string_parts(&["xx"]),
+            Err(crate::dtb::DtbDeviceError::StringArenaCapacityExceeded {
+                capacity: DEVICE_RESOURCE_STRING_CAPACITY,
+                required: DEVICE_RESOURCE_STRING_CAPACITY + 1,
+            })
+        );
     }
 }

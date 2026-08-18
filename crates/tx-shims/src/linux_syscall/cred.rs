@@ -382,24 +382,29 @@ pub(super) fn sys_setresgid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
 /// Each uaddr is written through `bootstrap_write_user::<u32>`
 /// (canonical `aspace.write_user` lane with kernel-pointer fallback
 /// for test scaffolding). NULL pointers skip the write.
-pub(super) fn sys_getresuid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_getresuid(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let ruid_uaddr = args[0];
     let euid_uaddr = args[1];
     let suid_uaddr = args[2];
     let cred = ctx.cred();
 
     if ruid_uaddr != 0 {
-        if let Err(errno) = bootstrap_write_user::<u32>(&ctx.aspace, ruid_uaddr, cred.uid.raw()) {
+        if let Err(errno) = bootstrap_write_user_wait(&ctx.aspace, ruid_uaddr, cred.uid.raw()).await
+        {
             return SyscallResult::error_from(errno);
         }
     }
     if euid_uaddr != 0 {
-        if let Err(errno) = bootstrap_write_user::<u32>(&ctx.aspace, euid_uaddr, cred.euid.raw()) {
+        if let Err(errno) =
+            bootstrap_write_user_wait(&ctx.aspace, euid_uaddr, cred.euid.raw()).await
+        {
             return SyscallResult::error_from(errno);
         }
     }
     if suid_uaddr != 0 {
-        if let Err(errno) = bootstrap_write_user::<u32>(&ctx.aspace, suid_uaddr, cred.suid.raw()) {
+        if let Err(errno) =
+            bootstrap_write_user_wait(&ctx.aspace, suid_uaddr, cred.suid.raw()).await
+        {
             return SyscallResult::error_from(errno);
         }
     }
@@ -409,24 +414,29 @@ pub(super) fn sys_getresuid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
 
 /// `getresgid(rgid_uaddr, egid_uaddr, sgid_uaddr)`. Gid analog of
 /// `sys_getresuid`. Same bridging through the user-VA lane applies.
-pub(super) fn sys_getresgid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) async fn sys_getresgid(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let rgid_uaddr = args[0];
     let egid_uaddr = args[1];
     let sgid_uaddr = args[2];
     let cred = ctx.cred();
 
     if rgid_uaddr != 0 {
-        if let Err(errno) = bootstrap_write_user::<u32>(&ctx.aspace, rgid_uaddr, cred.gid.raw()) {
+        if let Err(errno) = bootstrap_write_user_wait(&ctx.aspace, rgid_uaddr, cred.gid.raw()).await
+        {
             return SyscallResult::error_from(errno);
         }
     }
     if egid_uaddr != 0 {
-        if let Err(errno) = bootstrap_write_user::<u32>(&ctx.aspace, egid_uaddr, cred.egid.raw()) {
+        if let Err(errno) =
+            bootstrap_write_user_wait(&ctx.aspace, egid_uaddr, cred.egid.raw()).await
+        {
             return SyscallResult::error_from(errno);
         }
     }
     if sgid_uaddr != 0 {
-        if let Err(errno) = bootstrap_write_user::<u32>(&ctx.aspace, sgid_uaddr, cred.sgid.raw()) {
+        if let Err(errno) =
+            bootstrap_write_user_wait(&ctx.aspace, sgid_uaddr, cred.sgid.raw()).await
+        {
             return SyscallResult::error_from(errno);
         }
     }

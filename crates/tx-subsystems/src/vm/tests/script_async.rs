@@ -913,6 +913,8 @@ fn fork_aspace_preserves_pmap_only_private_page_when_child_copy_to_user_cows() {
     // SAFETY: `frame` owns a full page and `frame_base` is its direct-map
     // address.  Initialising a short prefix lets the assertions below detect
     // whether child CoW copied from the inherited PTE or recreated a zero page.
+    // SAFETY: `frame` owns the complete page and `frame_base` is its
+    // direct-map address; the initialized prefix remains within that page.
     unsafe { core::ptr::write_bytes(frame_base, 0x5a, 64) };
     let map_pin = frame.try_map_pin().expect("map pin");
     parent
@@ -984,6 +986,74 @@ fn fork_aspace_preserves_pmap_only_private_page_when_child_copy_to_user_cows() {
 }
 
 #[test]
+fn fork_aspace_preserves_pmap_only_private_page_on_user_write_fault() {
+    setup_host_substrate();
+    let parent = AddressSpace::new();
+    let private_range = range(0x2b000, 1);
+    map_reserved(parent.reserve_map(
+        VmEntry::new(
+            private_range,
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("private map");
+
+    // Construct the fork edge case directly: the resident PTE contains bytes
+    // which are not represented in the recipe's PrivatePageSet.
+    let frame = crate::vm::adapter::step_engine::page_allocator::reserve_frame(
+        crate::vm::adapter::step_engine::page_allocator::ZeroPolicy::Zeroed,
+    )
+    .expect("reserve frame")
+    .commit();
+    let ppn = frame.ppn();
+    let frame_base = crate::vm::adapter::step_engine::page_allocator::frame_kernel_addr(ppn)
+        .expect("frame direct-map address");
+    unsafe { core::ptr::write_bytes(frame_base, 0x5a, 64) };
+    let map_pin = frame.try_map_pin().expect("map pin");
+    parent
+        .pmap()
+        .publish_page(
+            private_range.start().containing_page(),
+            ppn,
+            Prot::READ_WRITE,
+            crate::page_backed::MaterializedPagePin::Allocated(map_pin),
+        )
+        .expect("publish pmap-only page");
+    drop(frame);
+
+    let child = AddressSpace::fork_aspace::<crate::vm::pmap::TestPmap>(&parent).expect("fork");
+    let fault_addr = private_range.start().as_usize() + 16;
+    let mut fault =
+        Box::pin(child.fault_script(VmFault::new(UserVirtAddr(fault_addr), AccessMode::Write)));
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    match fault.as_mut().poll(&mut cx) {
+        Poll::Ready(Ok(_)) => {}
+        Poll::Ready(Err(error)) => panic!("child user write fault failed: {error:?}"),
+        Poll::Pending => panic!("resident inherited CoW fault should not block"),
+    }
+
+    let guard = crate::vm::adapter::step_engine::guard();
+    let mut child_bytes = [0u8; 64];
+    assert_eq!(
+        child.copy_from_user(
+            &mut child_bytes,
+            tx_hal::UserPtr::new(private_range.start().as_usize()),
+            &guard,
+        ),
+        crate::vm::adapter::step_engine::StepOutcome::Done(child_bytes.len())
+    );
+    assert_eq!(
+        child_bytes, [0x5a; 64],
+        "a user-mode CoW fault must copy the inherited pmap frame"
+    );
+}
+
+#[test]
 fn fork_aspace_wait_retries_after_full_range_writer_release() {
     setup_host_substrate();
     let parent = AddressSpace::new();
@@ -1003,6 +1073,33 @@ fn fork_aspace_wait_retries_after_full_range_writer_release() {
     assert!(matches!(future.as_mut().poll(&mut cx), Poll::Pending));
     drop(holder);
     assert!(matches!(future.as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
+}
+
+#[test]
+fn fork_aspace_builds_more_private_vmas_than_one_retire_pool_without_publication() {
+    setup_host_substrate();
+    tx_test_support::drain_to_quiescence();
+    let parent = AddressSpace::new();
+    let mapping_count = tx_substrate::epoch::LOCAL_RETIRE_RESERVATION_CAPACITY + 4;
+
+    // Keep one unmapped page between entries so coalescing cannot hide the
+    // child-side CoW substitutions exercised by fork.
+    for index in 0..mapping_count {
+        parent
+            .try_mmap(VmMapRequest::fixed(
+                range(0x20_0000 + index * 2 * USER_PAGE_SIZE, 1),
+                MapPlacement::RequireFree,
+                Prot::READ_WRITE,
+                VmEntryFlags::PRIVATE,
+                VmBacking::PrivateAnon,
+            ))
+            .expect("install private parent VMA");
+    }
+
+    let child = AddressSpace::fork_aspace::<crate::vm::pmap::TestPmap>(&parent)
+        .expect("unpublished child construction must not consume retire credits per VMA");
+    assert_eq!(child.stats().recipe_count, mapping_count);
+    tx_test_support::drain_to_quiescence();
 }
 
 #[test]

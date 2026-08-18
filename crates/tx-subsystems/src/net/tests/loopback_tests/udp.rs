@@ -188,6 +188,42 @@ fn udp_loopback_zero_length_datagram_reaches_bound_receiver() {
     assert_eq!(transfer.bytes_moved, 0);
     assert!(transfer.peer_wake_fired);
     assert!(server.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() != 0);
+
+    // UDP readiness is record-based, not byte-count based: a queued empty
+    // datagram remains level-readable even if the edge hint is cleared in the
+    // consumer's clear/recheck window.
+    let io = server
+        .acquire_operational()
+        .expect("server payload")
+        .io_snapshot();
+    assert_eq!(io.recv_len, 0);
+    assert!(io.recv_ready);
+    server.readiness.clear_recv(RecvWireSet::HAS_DATA);
+    let mask = match step_poll_ready(&server, &guard) {
+        StepOutcome::Done(mask) => mask,
+        other => panic!("unexpected UDP poll outcome: {other:?}"),
+    };
+    assert!(mask.contains(PollMask::IN));
+
+    // A later ingress pass must also re-publish the level while the first
+    // empty datagram is still queued; an empty->non-empty-only edge is not
+    // enough once a concurrent consumer has cleared HAS_DATA.
+    assert_eq!(
+        step_send_kernel_bytes(&client, b"", SendRecvFlags::empty(), &guard),
+        StepOutcome::Done(0)
+    );
+    let second = match step_process_loopback_udp_on_iface(&client, 8, &iface, &guard) {
+        StepOutcome::Done(outcome) => outcome,
+        other => panic!("unexpected second zero-length UDP outcome: {other:?}"),
+    };
+    assert_eq!(second.packets_seen, 1);
+    assert!(server.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() != 0);
+
+    assert_eq!(
+        step_recv(&server, 1, SendRecvFlags::empty(), &guard),
+        StepOutcome::Done(0)
+    );
+    assert!(server.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() != 0);
     assert_eq!(
         step_recv(&server, 1, SendRecvFlags::empty(), &guard),
         StepOutcome::Done(0)

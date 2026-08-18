@@ -359,6 +359,10 @@ pub(super) async fn sys_unlinkat<'a, P: tx_hal::ConsoleIf>(
             }
         };
     let target_id = target_dentry.rnode().fs_object_id();
+    let target_dentry_weak = target_dentry.downgrade();
+    let target_rnode = target_dentry.rnode().downgrade();
+    let target_retire_token = target_dentry.retire_token();
+    let target_mount = mount_payload_for_dentry(&target_dentry);
     let child_meta = {
         let guard = step_engine::guard();
         match fs_ops.load_inode_meta(target_id, &guard) {
@@ -416,6 +420,16 @@ pub(super) async fn sys_unlinkat<'a, P: tx_hal::ConsoleIf>(
     {
         Ok(()) => {
             parent_dentry.remove_cached_child_by_name(basename);
+            if (want_rmdir || child_meta.nlinks == 1) && target_mount.is_some() {
+                mount::queue_fs_object_destroy_after_dentry_retire(
+                    target_mount.as_ref().expect("checked target mount"),
+                    target_id,
+                    target_dentry.rnode().fs_object_destroy_token(),
+                    target_dentry_weak,
+                    target_rnode,
+                    target_retire_token,
+                );
+            }
             drop(target_dentry);
             SyscallResult::Return(0)
         }
@@ -540,10 +554,10 @@ pub(super) async fn sys_symlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
 /// `linkat(olddirfd, oldpath, newdirfd, newpath, flags)`. Linux RV64
 /// generic ABI `__NR_linkat = 37`.
 ///
-/// Slice 8: same-filesystem hard link only — the existing tmpfs
-/// `FsOps::link` returns `-ENOSYS` for now (Phase 3b carryover), so
-/// this arm forwards whatever the FsOps surface produces. The
-/// `AT_SYMLINK_FOLLOW` flag bit is silently accepted; default
+/// Same-filesystem hard link. The namespace backend may yield while another
+/// metadata mutation owns admission, so the `FsOps::link` step is driven in
+/// waiting mode rather than translating a valid pending state into an I/O
+/// error. The `AT_SYMLINK_FOLLOW` flag bit is silently accepted; default
 /// (no-flag) Linux behaviour is "do not follow symlinks", but
 /// `step_walk` follows symlinks unconditionally — Slice 8 carries
 /// that limitation forward (deferred under `TODO(phase-linkat-nofollow)`).
@@ -614,7 +628,6 @@ pub(super) async fn sys_linkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
         return SyscallResult::Error(EPERM_VALUE);
     }
     let new_parent_id = new_parent_dentry.rnode().fs_object_id();
-    use StepOutcome as V3;
     let fs_ops = match fs_ops_for_dentry(&new_parent_dentry) {
         Some(o) => o,
         None => return SyscallResult::Error(EROFS_VALUE),
@@ -633,17 +646,32 @@ pub(super) async fn sys_linkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     if let Err(e) = cred_checks::authorize_link(ctx.cred_snapshot(), &new_parent_meta) {
         return SyscallResult::error_from(e);
     }
-    let outcome = {
-        let guard = step_engine::guard();
-        fs_ops.link(new_parent_id, new_basename, source_id, &guard)
+    use tx_scripts::drive;
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    let op = tx_subsystems::vfs::LinkInParentOp {
+        fs_ops: &fs_ops,
+        parent: new_parent_id,
+        name: new_basename,
+        target: source_id,
     };
-    match outcome {
-        V3::Done(()) => {
+    match drive(
+        op,
+        &mut script_ctx,
+        step_engine::DriveMode::Waiting,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
+        timer_registrar_handle.as_ref(),
+    )
+    .await
+    {
+        Ok(()) => {
             new_parent_dentry.remove_cached_child_by_name(new_basename);
             SyscallResult::Return(0)
         }
-        V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        V3::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
+        Err(errno) => SyscallResult::error_from(Errno::from(errno)),
     }
 }
 
@@ -661,7 +689,7 @@ pub(super) async fn sys_truncate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     let path = match read_user_cstr_wait(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX).await {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
-        Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
+        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
     if path.is_empty() {
         return SyscallResult::Error(ENOENT_VALUE);
@@ -1179,7 +1207,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
     let target = match read_user_cstr_wait(&ctx.aspace, target_uaddr, EXECVE_PATH_MAX).await {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
-        Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
+        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
 
     let cwd = match ctx.process.cwd() {
@@ -1225,7 +1253,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
         let source = match read_user_cstr_wait(&ctx.aspace, source_uaddr, EXECVE_PATH_MAX).await {
             Ok(p) => p,
             Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
-            Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
+            Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
         };
         let source_dentry = match walk_from_process(cwd, &source, &cred, &ctx.process) {
             Ok(d) => d,
@@ -1255,7 +1283,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
         let source = match read_user_cstr_wait(&ctx.aspace, source_uaddr, EXECVE_PATH_MAX).await {
             Ok(p) => p,
             Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
-            Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
+            Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
         };
         let source_dentry = match walk_from_process(cwd, &source, &cred, &ctx.process) {
             Ok(d) => d,
@@ -1296,7 +1324,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
     let fstype = match read_user_cstr_wait(&ctx.aspace, fstype_uaddr, 64).await {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
-        Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
+        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
     let fstype_str = match core::str::from_utf8(&fstype) {
         Ok(s) => s,
@@ -1316,7 +1344,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
         let source = match read_user_cstr_wait(&ctx.aspace, source_uaddr, EXECVE_PATH_MAX).await {
             Ok(p) => p,
             Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
-            Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
+            Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
         };
         Some(source)
     } else {
@@ -1401,7 +1429,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
                 Some(r) => r,
                 None => return SyscallResult::Error(ENODEV_VALUE),
             };
-            let image = tx_fs::tx_ext4::BlockDeviceImage::new(reg.ops);
+            let image = tx_fs::tx_ext4::BlockDeviceImage::whole(reg);
             // Linux's `MS_RDONLY = 1`. If set in `flags`, mount
             // through the read-only entry point so every mutating
             // `FsOps` call short-circuits with `EROFS`. The
@@ -1525,7 +1553,7 @@ pub(super) async fn sys_umount2<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>)
     let target = match read_user_cstr_wait(&ctx.aspace, target_uaddr, EXECVE_PATH_MAX).await {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
-        Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
+        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
 
     let cwd = match ctx.process.cwd() {
@@ -2016,18 +2044,27 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     old_parent_dentry.remove_cached_child_by_name(b".tx_rename_exchange_tmp");
     old_parent_dentry.remove_cached_child_by_name(old_basename);
     new_parent_dentry.remove_cached_child_by_name(new_basename);
-    // Namespace commit has already made the rename visible and dropped the
-    // destination's link count. Attempt immediate reclamation so backends
-    // which support the old object's shape (notably tmpfs) release it now,
-    // but do not turn a post-commit cleanup limitation into a false rename
-    // failure. The VFS object-lifetime hook may retry when its final pin falls;
-    // ext4 can meanwhile leave a zero-link shape for later orphan cleanup.
+    // Namespace mutation only drops the destination's link count. Queue a
+    // mount-scoped liveness ticket rather than destroying it immediately: an
+    // open file, mmap, or delayed EBR reclamation may still retain the old
+    // RNode/DEntry. Mount settlement consumes the ticket after those lifetime
+    // pins disappear and reports a backend cleanup error from syncfs rather
+    // than retroactively changing the already-committed rename result.
     if flags & RENAME_EXCHANGE == 0 {
-        if let Some(displaced) = displaced_dentry.as_ref() {
-            let _ = drive_namespace_mutation_yield_retry(|guard| {
-                fs_ops.destroy_inode(displaced.rnode().fs_object_id(), guard)
-            })
-            .await;
+        if let (Some(displaced), Some(meta)) = (displaced_dentry.as_ref(), displaced_meta.as_ref())
+        {
+            if meta.kind() == InodeKind::Directory || meta.nlinks == 1 {
+                if let Some(payload) = mount_payload_for_dentry(displaced) {
+                    mount::queue_fs_object_destroy_after_dentry_retire(
+                        &payload,
+                        displaced.rnode().fs_object_id(),
+                        displaced.rnode().fs_object_destroy_token(),
+                        displaced.downgrade(),
+                        displaced.rnode().downgrade(),
+                        displaced.retire_token(),
+                    );
+                }
+            }
         }
     }
     drop(displaced_dentry);

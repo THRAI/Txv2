@@ -14,6 +14,7 @@ use core::mem::size_of;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
+use std::boxed::Box;
 use std::sync::Mutex;
 
 use crate::adapter::boot_runtime::ast::AstBatch;
@@ -39,7 +40,7 @@ use tx_substrate::step::{
 use tx_substrate::wake::MailboxEvent;
 use tx_subsystems::process::ExitStatus;
 use tx_subsystems::reactor_submit::SubmitChildThreadStatus;
-use tx_subsystems::signal::{SigDisposition, Signum};
+use tx_subsystems::signal::{SigActionEntry, SigDisposition, Signum};
 use tx_subsystems::thread_runtime::{
     clear_current_thread_identity, clear_current_thread_payload, clear_current_userspace_payload,
     clear_current_userspace_thread_identity, current_thread_payload, current_userspace_payload,
@@ -51,11 +52,12 @@ use tx_subsystems::vm::{
 };
 
 use crate::thread_future::{
-    enter_userspace_once, fatal_signal_teardown_with_posts, handle_page_fault_trap,
-    interrupted_syscall_signal_errno, pf_access_to_vm_access, restore_sigreturn_frame, run_thread,
-    siginfo_to_user_abi, signal_frame_source_context, signal_saved_context_with_pending_return,
-    syscall_return_consumes_hot_budget, syscall_return_may_publish_wake_handoff,
-    syscall_return_needs_handoff, userspace_preempt_boundary, PerHartSlotted, ThreadTaskResult,
+    deliver_entry_signal_handler, enter_userspace_once, fatal_signal_teardown_with_posts,
+    handle_page_fault_trap, interrupted_syscall_signal_errno, pf_access_to_vm_access,
+    restore_sigreturn_frame, run_thread, siginfo_to_user_abi, signal_frame_source_context,
+    signal_saved_context_with_pending_return, syscall_return_consumes_hot_budget,
+    syscall_return_may_publish_wake_handoff, syscall_return_needs_handoff,
+    userspace_preempt_boundary, PerHartSlotted, ThreadTaskResult,
 };
 use crate::trap::direct_trap_syscall_needs_wake_handoff;
 
@@ -102,6 +104,7 @@ static TEST_PLATFORM_INFO: PlatformInfo = PlatformInfo {
     board: TestPlatform::BOARD,
     spi_sd: None,
     mmio_regions: &[],
+    device_resources: &tx_hal::EMPTY_DEVICE_RESOURCE_GRAPH,
     timebase_frequency_hz: 0,
     possible_cpu_count: 1,
 };
@@ -160,6 +163,36 @@ impl tx_hal::SignalFrameIf for TestPlatform {
             );
             Ok(frame.assume_init())
         }
+    }
+
+    fn prepare_signal_frame(
+        ctx: &tx_hal::UserTrapContext,
+        setup: &tx_hal::SignalFrameWrite,
+    ) -> Result<(tx_hal::UserTrapContext, tx_hal::SignalFrameBytes), tx_hal::FaultInfo> {
+        let frame = tx_hal::SavedSignalFrame {
+            saved_mask: setup.old_mask,
+            user_context: *ctx,
+        };
+        let frame_bytes = saved_signal_frame_bytes(&frame);
+        let frame_addr = setup
+            .stack_top
+            .addr()
+            .checked_sub(frame_bytes.len())
+            .map(|addr| addr & !0xf)
+            .ok_or(tx_hal::FaultInfo {
+                address: tx_hal::VirtAddr(setup.stack_top.addr()),
+                write: true,
+                instruction: false,
+                from_user: true,
+            })?;
+        let mut handler_ctx = *ctx;
+        handler_ctx.pc = setup.handler_pc.addr();
+        handler_ctx.regs[2] = frame_addr;
+        handler_ctx.regs[10] = setup.sig_no as usize;
+        Ok((
+            handler_ctx,
+            tx_hal::SignalFrameBytes::from_slice(&frame_bytes),
+        ))
     }
 }
 unsafe fn restore_test_local_execution(_saved_state: usize) {}
@@ -602,10 +635,10 @@ fn run_thread_future_stays_within_clone_submit_budget() {
     );
 }
 
-fn post_default_sigterm(thread: &Cap<tx_subsystems::thread_runtime::ThreadIdentity>) {
+fn post_default_signal(thread: &Cap<tx_subsystems::thread_runtime::ThreadIdentity>, sig: Signum) {
     tx_subsystems::thread_runtime::execution::post_signal_with_post(
         thread,
-        Signum::SIGTERM,
+        sig,
         tx_subsystems::signal::adapter::step_engine::SignalRouting::ProcessDirected,
         None,
         |weak, event| {
@@ -614,6 +647,10 @@ fn post_default_sigterm(thread: &Cap<tx_subsystems::thread_runtime::ThreadIdenti
             }
         },
     );
+}
+
+fn post_default_sigterm(thread: &Cap<tx_subsystems::thread_runtime::ThreadIdentity>) {
+    post_default_signal(thread, Signum::SIGTERM);
 }
 
 #[test]
@@ -669,6 +706,27 @@ fn run_thread_completed_fatal_returns_without_extra_yield() {
     assert!(matches!(pinned.as_mut().poll(&mut cx), Poll::Ready(())));
     assert!(init.is_zombie());
     assert_eq!(init.terminating_signal(), Some(Signum::SIGTERM));
+}
+
+#[test]
+fn run_thread_default_sigalrm_still_terminates() {
+    let _g = setup();
+    let payload = bootstrap_payload();
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS populated post-bootstrap");
+    let leader = init.nth_thread(0).expect("leader");
+    let sigalrm = Signum::new(14).expect("SIGALRM");
+    post_default_signal(&leader, sigalrm);
+
+    let future = run_thread::<TestPlatform>(leader.clone(), payload.clone());
+    let mut wrapped = PerHartSlotted::<TestPlatform, _>::new(leader, payload, future);
+    let mut pinned = unsafe { Pin::new_unchecked(&mut wrapped) };
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    assert!(matches!(pinned.as_mut().poll(&mut cx), Poll::Ready(())));
+    assert!(init.is_zombie());
+    assert_eq!(init.terminating_signal(), Some(sigalrm));
 }
 
 #[test]
@@ -1710,6 +1768,99 @@ fn fatal_signal_teardown_retries_while_exec_owns_lifecycle() {
         "retry must not terminate the exec initiator"
     );
     drop(exec_prep);
+}
+
+#[test]
+fn caught_sigalrm_waits_for_signal_stack_materialization() {
+    let _g = setup();
+    ensure_zero_frame_claimed();
+    let payload = bootstrap_payload();
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS populated post-bootstrap");
+    let leader = init.nth_thread(0).expect("leader thread post-bootstrap");
+    let aspace = init.aspace_cap().expect("aspace alive");
+    let stack_page =
+        UserRange::new_aligned(UserVirtAddr(0x7000), TEST_PAGE_SIZE).expect("stack page");
+    aspace
+        .try_mmap(VmMapRequest::fixed(
+            stack_page,
+            MapPlacement::RequireFree,
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ))
+        .expect("seed signal stack mapping");
+
+    let holder = match aspace
+        .range_lock()
+        .acquire_step_rich(stack_page, tx_subsystems::vm::LockMode::ExclusiveWriter)
+    {
+        tx_subsystems::vm::AcquireResult::Acquired(guard) => guard,
+        _ => panic!("exclusive signal-stack holder must acquire"),
+    };
+    let mut original = tx_hal::UserTrapContext::empty();
+    original.pc = 0x1234;
+    original.regs[2] = 0x8000;
+    payload.store_saved_user_context(Some(original));
+
+    let mut delivery = Box::pin(deliver_entry_signal_handler::<TestPlatform>(
+        &leader,
+        &payload,
+        &init,
+        &aspace,
+        Signum::new(14).expect("SIGALRM"),
+        SigActionEntry::handler(0xcafe),
+    ));
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    assert!(
+        matches!(delivery.as_mut().poll(&mut cx), Poll::Pending),
+        "caught SIGALRM must wait while the signal-stack page is reserved"
+    );
+    assert!(
+        !init.is_zombie(),
+        "caught SIGALRM must keep the process live"
+    );
+    drop(holder);
+
+    assert!(matches!(
+        delivery.as_mut().poll(&mut cx),
+        Poll::Ready(super::ThreadLoopControl::Continue)
+    ));
+    assert!(
+        !init.is_zombie(),
+        "caught SIGALRM must keep the process live"
+    );
+    let handler_ctx = payload
+        .saved_user_context()
+        .expect("successful signal delivery stores handler context");
+    assert_eq!(handler_ctx.pc, 0xcafe);
+    assert_eq!(handler_ctx.regs[10], 14);
+    let mut frame_bytes = std::vec![0u8; size_of::<tx_hal::SavedSignalFrame>()];
+    let guard = crate::adapter::step_engine::guard();
+    assert_eq!(
+        aspace.copy_from_user(
+            &mut frame_bytes,
+            tx_hal::UserPtr::new(handler_ctx.regs[2]),
+            &guard,
+        ),
+        crate::adapter::step_engine::StepOutcome::Done(frame_bytes.len())
+    );
+    drop(guard);
+    let frame = <TestPlatform as tx_hal::SignalFrameIf>::decode_signal_frame_bytes(
+        tx_hal::UserPtr::new(handler_ctx.regs[2]),
+        &frame_bytes,
+    )
+    .expect("successful delivery writes a decodable frame");
+    assert_eq!(frame.user_context.pc, original.pc);
+    assert_eq!(frame.user_context.regs[2], original.regs[2]);
+    assert!(
+        payload
+            .signal_mask()
+            .is_blocked(Signum::new(14).expect("SIGALRM")),
+        "caught SIGALRM is masked while its handler runs"
+    );
 }
 
 // ----- ExecCommitted dispatch (Wave 4 / Phase 6 of the ELF-loader plan) -----

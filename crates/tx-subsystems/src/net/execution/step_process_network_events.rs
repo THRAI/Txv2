@@ -525,8 +525,7 @@ fn process_udp_event(
     let socket = table.lookup_udp_ingress(event.src, event.dst, guard)?;
     let payload = socket.acquire_operational()?;
     let mut publish = NetworkPublish::none();
-    if payload.record_recv_payload(event.src, event.dst, event.payload) {
-        publish.recv_has_data = true;
-    }
+    let _became_readable = payload.record_recv_payload(event.src, event.dst, event.payload);
+    publish.recv_has_data = payload.recv_ready();
     Some((socket, publish))
 }

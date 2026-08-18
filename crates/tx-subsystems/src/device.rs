@@ -512,6 +512,14 @@ pub struct BlockDeviceHandle {
     len_lba: u64,
 }
 
+/// Why a requested partition cannot be represented as a bounded device slice.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlockDeviceRangeError {
+    Empty,
+    Overflow,
+    OutOfBounds,
+}
+
 impl BlockDeviceHandle {
     pub fn whole(reg: &'static BlockDeviceRegistration) -> Self {
         Self {
@@ -521,16 +529,25 @@ impl BlockDeviceHandle {
         }
     }
 
-    pub const fn partition(
+    pub fn partition(
         reg: &'static BlockDeviceRegistration,
         start_lba: u64,
         len_lba: u64,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, BlockDeviceRangeError> {
+        if len_lba == 0 {
+            return Err(BlockDeviceRangeError::Empty);
+        }
+        let end_lba = start_lba
+            .checked_add(len_lba)
+            .ok_or(BlockDeviceRangeError::Overflow)?;
+        if end_lba > reg.ops.total_blocks() {
+            return Err(BlockDeviceRangeError::OutOfBounds);
+        }
+        Ok(Self {
             reg,
             start_lba,
             len_lba,
-        }
+        })
     }
 
     pub const fn registration(self) -> &'static BlockDeviceRegistration {
@@ -543,6 +560,16 @@ impl BlockDeviceHandle {
 
     pub const fn len_lba(self) -> u64 {
         self.len_lba
+    }
+
+    /// Number of parent-device blocks covered by one 4 KiB `Frame`.
+    pub fn blocks_per_frame(self) -> Option<u64> {
+        let block_size = u64::from(self.reg.ops.block_size());
+        let frame_size = crate::vm::USER_PAGE_SIZE as u64;
+        if block_size == 0 || !frame_size.is_multiple_of(block_size) {
+            return None;
+        }
+        Some(frame_size / block_size)
     }
 
     pub fn read_blocks(
@@ -637,7 +664,11 @@ impl BlockDeviceHandle {
     }
 
     fn block_id_for(self, lba_offset: u64, count: u64) -> Option<PhysicalBlockNumber> {
-        let end = lba_offset.checked_add(count)?;
+        if count == 0 {
+            return None;
+        }
+        let parent_blocks = count.checked_mul(self.blocks_per_frame()?)?;
+        let end = lba_offset.checked_add(parent_blocks)?;
         if end > self.len_lba {
             return None;
         }
@@ -1038,6 +1069,41 @@ impl FileIoManagerRuntimeClaim {
         let _ = (&self.page_submission, &self.block_submission);
     }
 
+    fn owner_is_live(&self) -> bool {
+        if self.page_submission.owner_retired() {
+            return false;
+        }
+        let guard = tx_substrate::epoch::borrow_current_guard().unwrap_or_else(step_engine::guard);
+        self.container.upgrade(&guard).is_some()
+    }
+
+    fn release_or_requeue(&mut self) {
+        let registration = core::mem::replace(
+            &mut self.registration,
+            FileIoManagerRuntimeRegistrationId(0),
+        );
+        if registration.raw() == 0 {
+            return;
+        }
+
+        if self.owner_is_live()
+            && requeue_file_io_manager_runtime(
+                registration,
+                FileIoManagerRuntimePayload {
+                    page_submission: self.page_submission.clone(),
+                    block_submission: self.block_submission.clone(),
+                    handle: self.handle,
+                },
+            )
+        {
+            let _ =
+                post_file_io_service_kick(&self.wake_source, ServiceKick::new(IoServiceKind::Page));
+            return;
+        }
+
+        let _ = retire_file_io_manager_runtime(registration);
+    }
+
     fn has_immediate_work(&self, include_page_submissions: bool) -> bool {
         self.block_submission.has_immediate_work()
             || self
@@ -1045,10 +1111,13 @@ impl FileIoManagerRuntimeClaim {
                 .has_immediate_work(include_page_submissions)
     }
 
-    /// End this claim's reactor ownership and release its typed manager
-    /// handles. The registration removal is idempotent against test cleanup.
-    pub fn retire(self) -> bool {
-        retire_file_io_manager_runtime(self.registration)
+    /// End this claim's reactor ownership and remove its registry entry.
+    pub fn retire(mut self) -> bool {
+        let registration = core::mem::replace(
+            &mut self.registration,
+            FileIoManagerRuntimeRegistrationId(0),
+        );
+        retire_file_io_manager_runtime(registration)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -1069,11 +1138,16 @@ impl FileIoManagerRuntimeClaim {
     }
 }
 
+impl Drop for FileIoManagerRuntimeClaim {
+    fn drop(&mut self) {
+        self.release_or_requeue();
+    }
+}
+
 struct FileIoManagerRuntimePayload {
     page_submission: PageIoSubmissionHandle,
     block_submission: BlockSubmissionHandle,
     handle: BlockDeviceHandle,
-    wake_source: Arc<ServiceWakeSource>,
 }
 
 enum FileIoManagerRuntimeState {
@@ -1086,6 +1160,7 @@ struct RegisteredFileIoServiceRuntime {
     container: Weak<PageContainer>,
     handle: BlockDeviceHandle,
     source_id: u64,
+    wake_source: Arc<ServiceWakeSource>,
     state: FileIoManagerRuntimeState,
 }
 
@@ -1161,7 +1236,21 @@ pub fn register_page_container_file_io_service(
 ) -> FileIoManagerRuntimeRegistrationId {
     let source_id = NEXT_FILE_IO_SERVICE_SOURCE_ID.fetch_add(1, Ordering::AcqRel);
     let wake_source = Arc::new(ServiceWakeSource::new(source_id));
-    let _ = container.attach_file_io_wake_source(Arc::clone(&wake_source));
+    let container_weak = container.downgrade();
+    if !container.attach_file_io_wake_source(Arc::clone(&wake_source)) {
+        // The PageContainer owns exactly one L4/L6 wake attachment. A second
+        // registration must reuse its existing runtime metadata instead of
+        // spawning a task on an unattached source that can never be kicked.
+        return FILE_IO_SERVICE_RUNTIMES
+            .lock()
+            .iter()
+            .find(|entry| {
+                entry.container.raw() == container_weak.raw()
+                    && entry.container.generation() == container_weak.generation()
+            })
+            .map(|entry| entry.id)
+            .unwrap_or(FileIoManagerRuntimeRegistrationId(0));
+    }
     let (page_submission, block_submission) = container.file_io_runtime_handles();
     let id = FileIoManagerRuntimeRegistrationId(
         NEXT_FILE_IO_SERVICE_RUNTIME_ID.fetch_add(1, Ordering::AcqRel),
@@ -1170,18 +1259,49 @@ pub fn register_page_container_file_io_service(
         .lock()
         .push(RegisteredFileIoServiceRuntime {
             id,
-            container: container.downgrade(),
+            container: container_weak,
             handle,
             source_id,
+            wake_source: Arc::clone(&wake_source),
             state: FileIoManagerRuntimeState::Pending(FileIoManagerRuntimePayload {
                 page_submission,
                 block_submission,
                 handle,
-                wake_source,
             }),
         });
     let _ = submit_pending_file_io_service_runtimes();
     id
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FileIoServiceWait {
+    Ready,
+    OwnerRetired,
+    Failed,
+}
+
+/// Install the edge subscription first, then re-check the manager's latched
+/// owner-retired predicate. This closes both sides of the lost-wake race:
+/// retirement before subscription is observed through the latch, while
+/// retirement after subscription posts the normal wake edge.
+async fn wait_for_file_io_service(
+    claim: &FileIoManagerRuntimeClaim,
+    backend_wait: Option<BackendWaitSourceId>,
+) -> FileIoServiceWait {
+    let wait = wait_for_file_io_service_event(&claim.wake_source, backend_wait);
+    let mut wait = core::pin::pin!(wait);
+    poll_fn(|cx| {
+        let outcome = wait.as_mut().poll(cx);
+        if !claim.owner_is_live() {
+            return Poll::Ready(FileIoServiceWait::OwnerRetired);
+        }
+        match outcome {
+            Poll::Ready(WaitOutcome::Ready) => Poll::Ready(FileIoServiceWait::Ready),
+            Poll::Ready(_) => Poll::Ready(FileIoServiceWait::Failed),
+            Poll::Pending => Poll::Pending,
+        }
+    })
+    .await
 }
 
 /// Install the single kernel-owned spawner and drain every runtime registered
@@ -1239,7 +1359,7 @@ fn claim_pending_file_io_service_runtimes() -> Vec<FileIoManagerRuntimeClaim> {
                     page_submission: payload.page_submission,
                     block_submission: payload.block_submission,
                     handle: payload.handle,
-                    wake_source: payload.wake_source,
+                    wake_source: Arc::clone(&entry.wake_source),
                 });
             }
             true
@@ -1272,6 +1392,38 @@ pub fn page_container_file_io_service_runtime_count() -> usize {
     FILE_IO_SERVICE_RUNTIMES.lock().len()
 }
 
+/// Wake claimed service tasks whose semantic `PageContainer` owner has
+/// crossed the Zone no-upgrade barrier.
+///
+/// `Weak<PageContainer>` becomes stale at the final `Cap` transition, while
+/// the payload destructor runs only after a later EBR grace period. A task
+/// already parked on its service source therefore cannot rely on
+/// `PageContainer::drop` as its only lifetime edge. Reactor idle maintenance
+/// calls this bounded registry scan; the posted Page kick is latched by the
+/// wake source and lets the task observe the stale Weak and retire itself.
+pub fn wake_unowned_file_io_service_runtimes() -> usize {
+    let guard = tx_substrate::epoch::borrow_current_guard().unwrap_or_else(step_engine::guard);
+    let wake_sources = FILE_IO_SERVICE_RUNTIMES
+        .lock()
+        .iter()
+        .filter(|entry| {
+            matches!(entry.state, FileIoManagerRuntimeState::Claimed)
+                && entry.container.upgrade(&guard).is_none()
+        })
+        .map(|entry| Arc::clone(&entry.wake_source))
+        .collect::<Vec<_>>();
+    drop(guard);
+
+    let mut posted = 0;
+    for wake_source in wake_sources {
+        posted += usize::from(post_file_io_service_kick(
+            &wake_source,
+            ServiceKick::new(IoServiceKind::Page),
+        ));
+    }
+    posted
+}
+
 fn retire_file_io_manager_runtime(id: FileIoManagerRuntimeRegistrationId) -> bool {
     if id.raw() == 0 {
         return false;
@@ -1282,13 +1434,29 @@ fn retire_file_io_manager_runtime(id: FileIoManagerRuntimeRegistrationId) -> boo
     runtimes.len() != initial_len
 }
 
+fn requeue_file_io_manager_runtime(
+    id: FileIoManagerRuntimeRegistrationId,
+    payload: FileIoManagerRuntimePayload,
+) -> bool {
+    if id.raw() == 0 {
+        return false;
+    }
+    let mut runtimes = FILE_IO_SERVICE_RUNTIMES.lock();
+    let Some(runtime) = runtimes.iter_mut().find(|entry| entry.id == id) else {
+        return false;
+    };
+    if !matches!(runtime.state, FileIoManagerRuntimeState::Claimed) {
+        return false;
+    }
+    runtime.state = FileIoManagerRuntimeState::Pending(payload);
+    true
+}
+
 pub async fn page_container_file_io_service_task_loop_owned(
     claim: FileIoManagerRuntimeClaim,
     config: PageContainerFileIoServiceTaskConfig,
 ) -> PageContainerFileIoServiceTaskReport {
-    let report = page_container_file_io_service_task_loop_claim(&claim, config).await;
-    let _ = claim.retire();
-    report
+    page_container_file_io_service_task_loop_claim(&claim, config).await
 }
 
 async fn page_container_file_io_service_task_loop_claim(
@@ -1309,15 +1477,17 @@ async fn page_container_file_io_service_task_loop_claim(
         // the current cycle.  Rechecking L6 here prevents that dispatchable
         // queue from sleeping forever after a coalesced/self wake.
         let immediate = turn_remains_runnable || claim.has_immediate_work(backend_wait.is_none());
-        if !immediate
-            && wait_for_file_io_service_event(&claim.wake_source, backend_wait).await
-                != WaitOutcome::Ready
-        {
-            report.waits_failed += 1;
-            break;
+        if !immediate {
+            match wait_for_file_io_service(claim, backend_wait).await {
+                FileIoServiceWait::Ready => report.waits_ready += 1,
+                FileIoServiceWait::OwnerRetired => break,
+                FileIoServiceWait::Failed => {
+                    report.waits_failed += 1;
+                    break;
+                }
+            }
         }
 
-        report.waits_ready += 1;
         report.ready_turns += 1;
         let container = {
             let guard = step_engine::guard();
@@ -1396,7 +1566,6 @@ pub async fn page_container_file_io_service_task_loop(
             break;
         }
 
-        report.waits_ready += 1;
         report.ready_turns += 1;
         let turn = match drive_page_container_file_io_service_once_compact(
             container,
@@ -1680,34 +1849,100 @@ fn step_result_to_result(outcome: StepOutcome<(), NoProgress>) -> Result<(), Err
 }
 
 static BLOCK_REGISTRY_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static BLOCK_REGISTRY_PREPARED: AtomicBool = AtomicBool::new(false);
 static BLOCK_REGISTRY_LEN: AtomicUsize = AtomicUsize::new(0);
 static mut BLOCK_REGISTRY: [Option<&'static BlockDeviceRegistration>; MAX_STATIC_BLOCK_DEVICES] =
     [None; MAX_STATIC_BLOCK_DEVICES];
 
-pub fn register_block_devices(
-    regs: &'static [&'static BlockDeviceRegistration],
-) -> StepOutcome<(), NoProgress> {
-    if BLOCK_REGISTRY_INITIALIZED.swap(true, Ordering::AcqRel) {
-        return StepOutcome::Err(Errno::EEXIST.into());
+/// Validated, unpublished block-device registry proposal.
+///
+/// Only one proposal may be live at a time. Dropping it without committing
+/// releases that boot-time reservation and leaves the registry unchanged.
+#[must_use = "a prepared block-device registry must be committed or dropped"]
+pub struct PreparedBlockDeviceRegistry<'a> {
+    regs: &'a [&'static BlockDeviceRegistration],
+    committed: bool,
+}
+
+impl PreparedBlockDeviceRegistry<'_> {
+    /// Publish the fully validated registry in one infallible boot-time step.
+    ///
+    /// The prepared-token reservation excludes another commit. Entries are
+    /// written first and the length is the final reader-visible publication.
+    pub fn commit(mut self) {
+        debug_assert!(!BLOCK_REGISTRY_INITIALIZED.load(Ordering::Acquire));
+        for (idx, reg) in self.regs.iter().copied().enumerate() {
+            unsafe {
+                BLOCK_REGISTRY[idx] = Some(reg);
+            }
+        }
+        BLOCK_REGISTRY_LEN.store(self.regs.len(), Ordering::Release);
+        BLOCK_REGISTRY_INITIALIZED.store(true, Ordering::Release);
+        self.committed = true;
+        BLOCK_REGISTRY_PREPARED.store(false, Ordering::Release);
+    }
+}
+
+impl Drop for PreparedBlockDeviceRegistry<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            BLOCK_REGISTRY_PREPARED.store(false, Ordering::Release);
+        }
+    }
+}
+
+/// Validate and reserve one fixed block-device registry transaction.
+///
+/// Capacity, duplicate `name`, and duplicate `devt` checks complete before
+/// acquiring the proposal token. Failure never sets `INITIALIZED`, writes an
+/// entry, or publishes a non-zero length, so a later corrected proposal may
+/// retry without a test-only reset.
+pub fn prepare_block_devices<'a>(
+    regs: &'a [&'static BlockDeviceRegistration],
+) -> Result<PreparedBlockDeviceRegistry<'a>, Errno> {
+    if BLOCK_REGISTRY_INITIALIZED.load(Ordering::Acquire) {
+        return Err(Errno::EEXIST);
     }
     if regs.len() > MAX_STATIC_BLOCK_DEVICES {
-        return StepOutcome::Err(Errno::ENOMEM.into());
+        return Err(Errno::ENOMEM);
     }
-
     for (idx, reg) in regs.iter().copied().enumerate() {
         if regs[..idx]
             .iter()
             .copied()
             .any(|seen| seen.devt == reg.devt || seen.name == reg.name)
         {
-            return StepOutcome::Err(Errno::EEXIST.into());
-        }
-        unsafe {
-            BLOCK_REGISTRY[idx] = Some(reg);
+            return Err(Errno::EEXIST);
         }
     }
-    BLOCK_REGISTRY_LEN.store(regs.len(), Ordering::Release);
-    StepOutcome::Done(())
+
+    if BLOCK_REGISTRY_PREPARED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err(Errno::EEXIST);
+    }
+    if BLOCK_REGISTRY_INITIALIZED.load(Ordering::Acquire) {
+        BLOCK_REGISTRY_PREPARED.store(false, Ordering::Release);
+        return Err(Errno::EEXIST);
+    }
+
+    Ok(PreparedBlockDeviceRegistry {
+        regs,
+        committed: false,
+    })
+}
+
+pub fn register_block_devices(
+    regs: &'static [&'static BlockDeviceRegistration],
+) -> StepOutcome<(), NoProgress> {
+    match prepare_block_devices(regs) {
+        Ok(prepared) => {
+            prepared.commit();
+            StepOutcome::Done(())
+        }
+        Err(errno) => StepOutcome::Err(errno.into()),
+    }
 }
 
 pub fn block_device_by_name(name: &[u8]) -> Option<&'static BlockDeviceRegistration> {
@@ -1747,6 +1982,7 @@ pub fn reset_block_registry_for_test() {
     }
     BLOCK_REGISTRY_LEN.store(0, Ordering::Release);
     BLOCK_REGISTRY_INITIALIZED.store(false, Ordering::Release);
+    BLOCK_REGISTRY_PREPARED.store(false, Ordering::Release);
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1918,6 +2154,50 @@ mod tests {
         ops: &BLOCK_OPS,
     };
 
+    struct SectorRecordingBlockDevice;
+
+    impl BlockDeviceOps for SectorRecordingBlockDevice {
+        fn read_blocks(
+            &self,
+            block_id: PhysicalBlockNumber,
+            _target: &mut [Frame],
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<(), NoProgress> {
+            LAST_READ_BLOCK.store(block_id.as_u64(), Ordering::SeqCst);
+            StepOutcome::done(())
+        }
+
+        fn write_blocks(
+            &self,
+            _block_id: PhysicalBlockNumber,
+            _source: &[Frame],
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<(), NoProgress> {
+            StepOutcome::done(())
+        }
+
+        fn barrier(&self, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
+            StepOutcome::done(())
+        }
+    }
+
+    impl BlockDevice for SectorRecordingBlockDevice {
+        fn total_blocks(&self) -> u64 {
+            256
+        }
+
+        fn block_size(&self) -> u32 {
+            512
+        }
+    }
+
+    static SECTOR_BLOCK_OPS: SectorRecordingBlockDevice = SectorRecordingBlockDevice;
+    static SECTOR_BLOCK_REG: BlockDeviceRegistration = BlockDeviceRegistration {
+        devt: DevT::new(8, 2),
+        name: "sda",
+        ops: &SECTOR_BLOCK_OPS,
+    };
+
     #[test]
     fn block_device_handle_translates_partition_relative_lbas() {
         use crate::adapter::step_engine::{guard, StepOutcome as V3};
@@ -1926,7 +2206,8 @@ mod tests {
             .lock()
             .expect("epoch test lock");
         let guard = guard();
-        let handle = BlockDeviceHandle::partition(&BLOCK_REG, 32, 4);
+        let handle = BlockDeviceHandle::partition(&BLOCK_REG, 32, 4)
+            .expect("partition lies within its parent");
         let mut frames = [Frame::new(Ppn(0))];
 
         assert_eq!(handle.read_blocks(2, &mut frames, &guard), V3::Done(()));
@@ -1934,6 +2215,46 @@ mod tests {
         assert_eq!(
             handle.read_blocks(4, &mut frames, &guard),
             V3::err(Errno::EINVAL.into())
+        );
+    }
+
+    #[test]
+    fn block_device_handle_rejects_invalid_partition_geometry() {
+        assert_eq!(
+            BlockDeviceHandle::partition(&BLOCK_REG, 0, 0).unwrap_err(),
+            BlockDeviceRangeError::Empty
+        );
+        assert_eq!(
+            BlockDeviceHandle::partition(&BLOCK_REG, u64::MAX, 2).unwrap_err(),
+            BlockDeviceRangeError::Overflow
+        );
+        assert_eq!(
+            BlockDeviceHandle::partition(&BLOCK_REG, 127, 2).unwrap_err(),
+            BlockDeviceRangeError::OutOfBounds
+        );
+    }
+
+    #[test]
+    fn block_device_handle_counts_every_sector_covered_by_a_frame() {
+        use crate::adapter::step_engine::{guard, StepOutcome as V3};
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        LAST_READ_BLOCK.store(u64::MAX, Ordering::SeqCst);
+        let guard = guard();
+        // Deliberately not 4 KiB aligned: the first frame begins at LBA 33.
+        let handle =
+            BlockDeviceHandle::partition(&SECTOR_BLOCK_REG, 33, 9).expect("nine-sector partition");
+        let mut frames = [Frame::new(Ppn(0))];
+
+        assert_eq!(handle.blocks_per_frame(), Some(8));
+        assert_eq!(handle.read_blocks(1, &mut frames, &guard), V3::Done(()));
+        assert_eq!(LAST_READ_BLOCK.load(Ordering::SeqCst), 34);
+        assert_eq!(
+            handle.read_blocks(2, &mut frames, &guard),
+            V3::err(Errno::EINVAL.into()),
+            "one Frame spans eight sectors, so the partition tail must reject it"
         );
     }
 
@@ -1964,7 +2285,30 @@ mod tests {
     }
 
     #[test]
-    fn static_block_registry_rejects_duplicate_names_or_devts() {
+    fn prepared_block_registry_is_unpublished_and_drop_is_retryable() {
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        reset_block_registry_for_test();
+        let regs: alloc::vec::Vec<&'static BlockDeviceRegistration> = alloc::vec![&BLOCK_REG];
+
+        let prepared = prepare_block_devices(&regs).expect("valid local-slice proposal");
+        assert!(block_device_snapshot().is_empty());
+        assert!(matches!(prepare_block_devices(&regs), Err(Errno::EEXIST)));
+        drop(prepared);
+        assert!(block_device_snapshot().is_empty());
+
+        prepare_block_devices(&regs)
+            .expect("dropped proposal releases reservation")
+            .commit();
+        assert!(core::ptr::eq(
+            block_device_by_name(b"vda1").expect("committed vda1"),
+            &BLOCK_REG
+        ));
+    }
+
+    #[test]
+    fn static_block_registry_validation_failures_are_retryable() {
         let _lock = crate::test_support::EPOCH_TEST_LOCK
             .lock()
             .expect("epoch test lock");
@@ -1974,13 +2318,35 @@ mod tests {
             name: "vda1",
             ops: &BLOCK_OPS,
         };
-        static REGS: &[&BlockDeviceRegistration] = &[&BLOCK_REG, &DUP_NAME];
+        static DUP_DEVT: BlockDeviceRegistration = BlockDeviceRegistration {
+            devt: DevT::new(8, 1),
+            name: "other",
+            ops: &BLOCK_OPS,
+        };
+        static DUP_NAME_REGS: &[&BlockDeviceRegistration] = &[&BLOCK_REG, &DUP_NAME];
+        static DUP_DEVT_REGS: &[&BlockDeviceRegistration] = &[&BLOCK_REG, &DUP_DEVT];
+        static TOO_MANY: [&BlockDeviceRegistration; MAX_STATIC_BLOCK_DEVICES + 1] =
+            [&BLOCK_REG; MAX_STATIC_BLOCK_DEVICES + 1];
+        static VALID: &[&BlockDeviceRegistration] = &[&BLOCK_REG];
 
         assert_eq!(
-            register_block_devices(REGS),
+            register_block_devices(DUP_NAME_REGS),
             StepOutcome::Err(Errno::EEXIST.into())
         );
         assert!(block_device_snapshot().is_empty());
+        assert_eq!(
+            register_block_devices(DUP_DEVT_REGS),
+            StepOutcome::Err(Errno::EEXIST.into())
+        );
+        assert!(block_device_snapshot().is_empty());
+        assert_eq!(
+            register_block_devices(&TOO_MANY),
+            StepOutcome::Err(Errno::ENOMEM.into())
+        );
+        assert!(block_device_snapshot().is_empty());
+
+        assert_eq!(register_block_devices(VALID), StepOutcome::Done(()));
+        assert_eq!(block_device_snapshot().len(), 1);
     }
 
     #[test]
@@ -2046,6 +2412,288 @@ mod tests {
         );
         drop(guard);
         reset_page_container_file_io_service_registry_for_test();
+    }
+
+    #[test]
+    fn page_container_drop_publishes_file_io_owner_retirement_wake() {
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        let container = PageContainer::new(
+            PageContainerKind::Anon {
+                swap_policy: AnonSwapPolicy::Reclaimable,
+            },
+            1,
+        );
+        let wake_source = Arc::new(ServiceWakeSource::new(0x72f0));
+        assert!(container.attach_file_io_wake_source(Arc::clone(&wake_source)));
+        let mailbox = Arc::new(TaskMailbox::new());
+        let generation = mailbox.next_generation();
+        let _subscription =
+            wake_source.subscribe(IoServiceKind::Page, Arc::downgrade(&mailbox), generation);
+
+        drop(container);
+
+        assert!(matches!(
+            mailbox.poll(),
+            Some(MailboxEvent::SourceFired {
+                generation: seen_generation,
+                source,
+                interests,
+            }) if seen_generation == generation
+                && source.raw() == 0x72f0
+                && interests.raw() == IoServiceKind::Page.mask_bits()
+        ));
+    }
+
+    #[test]
+    fn idle_maintenance_wakes_claim_after_final_cap_before_payload_drop() {
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        crate::zones::register_all().expect("kernel zones");
+        reset_page_container_file_io_service_registry_for_test();
+        let pc = PageContainer::new_cap(
+            PageContainerKind::Anon {
+                swap_policy: AnonSwapPolicy::Reclaimable,
+            },
+            1,
+        )
+        .expect("page container cap");
+        register_page_container_file_io_service(pc.clone(), BlockDeviceHandle::whole(&BLOCK_REG));
+        let mut claims = claim_pending_file_io_service_runtimes_for_test();
+        let claim = claims.pop().expect("claimed runtime");
+        let mailbox = Arc::new(TaskMailbox::new());
+        let generation = mailbox.next_generation();
+        let _subscription =
+            claim
+                .wake_source
+                .subscribe(IoServiceKind::Page, Arc::downgrade(&mailbox), generation);
+
+        // Keep an epoch guard live so the PageContainer destructor cannot be
+        // the source of this wake. The final Cap still installs Retiring
+        // immediately, which is the liveness predicate maintenance observes.
+        let guard = step_engine::guard();
+        drop(pc);
+        assert!(!claim.page_submission.owner_retired());
+        assert_eq!(wake_unowned_file_io_service_runtimes(), 1);
+        assert!(matches!(
+            mailbox.poll(),
+            Some(MailboxEvent::SourceFired {
+                generation: seen_generation,
+                interests,
+                ..
+            }) if seen_generation == generation
+                && interests.raw() == IoServiceKind::Page.mask_bits()
+        ));
+        drop(guard);
+        drop(claim);
+        reset_page_container_file_io_service_registry_for_test();
+    }
+
+    #[test]
+    fn repeated_file_io_runtime_registration_reuses_attached_runtime() {
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        crate::zones::register_all().expect("kernel zones");
+        reset_page_container_file_io_service_registry_for_test();
+        let pc = PageContainer::new_cap(
+            PageContainerKind::Anon {
+                swap_policy: AnonSwapPolicy::Reclaimable,
+            },
+            1,
+        )
+        .expect("page container cap");
+
+        let first = register_page_container_file_io_service(
+            pc.clone(),
+            BlockDeviceHandle::whole(&BLOCK_REG),
+        );
+        let first_source = page_container_file_io_service_runtimes_snapshot()[0].source_id();
+        let second = register_page_container_file_io_service(
+            pc.clone(),
+            BlockDeviceHandle::whole(&BLOCK_REG),
+        );
+
+        assert_eq!(second, first);
+        assert_eq!(page_container_file_io_service_runtime_count(), 1);
+        assert_eq!(
+            page_container_file_io_service_runtimes_snapshot()[0].source_id(),
+            first_source,
+            "duplicate attachment must not publish an unreachable wake source",
+        );
+
+        reset_page_container_file_io_service_registry_for_test();
+    }
+
+    #[test]
+    fn dropping_file_io_runtime_claim_requeues_live_registry_entry() {
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        crate::zones::register_all().expect("kernel zones");
+        reset_page_container_file_io_service_registry_for_test();
+        let pc = PageContainer::new_cap(
+            PageContainerKind::Anon {
+                swap_policy: AnonSwapPolicy::Reclaimable,
+            },
+            1,
+        )
+        .expect("page container cap");
+        let registration = register_page_container_file_io_service(
+            pc.clone(),
+            BlockDeviceHandle::whole(&BLOCK_REG),
+        );
+        let mut claims = claim_pending_file_io_service_runtimes_for_test();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(page_container_file_io_service_runtime_count(), 1);
+
+        drop(claims.pop().expect("claimed runtime"));
+
+        assert_eq!(page_container_file_io_service_runtime_count(), 1);
+        let snapshot = page_container_file_io_service_runtimes_snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert!(!snapshot[0].is_claimed());
+        assert_eq!(
+            register_page_container_file_io_service(
+                pc.clone(),
+                BlockDeviceHandle::whole(&BLOCK_REG),
+            ),
+            registration,
+            "a live PageContainer must reuse its attached wake source and runtime",
+        );
+        assert_eq!(page_container_file_io_service_runtime_count(), 1);
+        assert_eq!(claim_pending_file_io_service_runtimes_for_test().len(), 1);
+        reset_page_container_file_io_service_registry_for_test();
+    }
+
+    #[test]
+    fn live_file_io_runtime_claim_drop_resubmits_the_attached_runtime() {
+        struct HoldingSpawner {
+            spawned: AtomicUsize,
+            claim: SpinMutex<Option<FileIoManagerRuntimeClaim>>,
+        }
+
+        impl FileIoServiceRuntimeSpawner for HoldingSpawner {
+            fn spawn_file_io_service(&self, claim: FileIoManagerRuntimeClaim) {
+                self.spawned.fetch_add(1, Ordering::AcqRel);
+                assert!(self.claim.lock().replace(claim).is_none());
+            }
+        }
+
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        crate::zones::register_all().expect("kernel zones");
+        reset_page_container_file_io_service_registry_for_test();
+        let pc = PageContainer::new_cap(
+            PageContainerKind::Anon {
+                swap_policy: AnonSwapPolicy::Reclaimable,
+            },
+            1,
+        )
+        .expect("page container cap");
+        register_page_container_file_io_service(pc.clone(), BlockDeviceHandle::whole(&BLOCK_REG));
+
+        let spawner = Arc::new(HoldingSpawner {
+            spawned: AtomicUsize::new(0),
+            claim: SpinMutex::new(None),
+        });
+        assert_eq!(
+            install_file_io_service_runtime_spawner(spawner.clone()),
+            Some(1)
+        );
+        assert_eq!(spawner.spawned.load(Ordering::Acquire), 1);
+
+        let first = spawner.claim.lock().take().expect("first runtime claim");
+        drop(first);
+
+        assert_eq!(spawner.spawned.load(Ordering::Acquire), 1);
+        assert_eq!(submit_pending_file_io_service_runtimes(), 1);
+        assert_eq!(spawner.spawned.load(Ordering::Acquire), 2);
+        assert_eq!(page_container_file_io_service_runtime_count(), 1);
+        assert!(page_container_file_io_service_runtimes_snapshot()[0].is_claimed());
+        let replacement = spawner
+            .claim
+            .lock()
+            .take()
+            .expect("replacement runtime claim");
+        let mut replacement_task = core::pin::pin!(page_container_file_io_service_task_loop_owned(
+            replacement,
+            PageContainerFileIoServiceTaskConfig::run_turns(
+                1,
+                ServiceBudget::new(1),
+                ServiceBudget::new(1),
+            ),
+        ));
+        let waker = core::task::Waker::noop();
+        let mut cx = core::task::Context::from_waker(waker);
+        let report = match replacement_task.as_mut().poll(&mut cx) {
+            Poll::Ready(report) => report,
+            Poll::Pending => panic!("replacement runtime must consume a recovery wake"),
+        };
+        assert_eq!(report.waits_ready, 1);
+        assert_eq!(report.waits_failed, 0);
+        assert_eq!(report.ready_turns, 1);
+
+        assert_eq!(submit_pending_file_io_service_runtimes(), 1);
+        assert_eq!(spawner.spawned.load(Ordering::Acquire), 3);
+        let final_claim = spawner.claim.lock().take().expect("final runtime claim");
+        assert!(final_claim.retire());
+        assert_eq!(page_container_file_io_service_runtime_count(), 0);
+        reset_page_container_file_io_service_registry_for_test();
+    }
+
+    #[test]
+    fn retired_owner_latch_closes_wake_before_subscription_race() {
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        crate::zones::register_all().expect("kernel zones");
+        let pc = PageContainer::new_cap(
+            PageContainerKind::Anon {
+                swap_policy: AnonSwapPolicy::Reclaimable,
+            },
+            1,
+        )
+        .expect("page container cap");
+        let wake_source = Arc::new(ServiceWakeSource::new(0x72f1));
+        assert!(pc.attach_file_io_wake_source(Arc::clone(&wake_source)));
+        let claim = FileIoManagerRuntimeClaim::detached_for_test(
+            pc.clone(),
+            BlockDeviceHandle::whole(&BLOCK_REG),
+            wake_source,
+        );
+        let page_submission = claim.page_submission.clone();
+
+        // Retirement happens before the task creates its wait subscription, so
+        // there is deliberately no mailbox edge for the first poll to consume.
+        assert!(page_submission.retire_owner());
+        drop(pc);
+        let mut task = core::pin::pin!(page_container_file_io_service_task_loop_owned(
+            claim,
+            PageContainerFileIoServiceTaskConfig::run_forever(
+                ServiceBudget::new(1),
+                ServiceBudget::new(1),
+            ),
+        ));
+        let waker = core::task::Waker::noop();
+        let mut cx = core::task::Context::from_waker(waker);
+
+        let report = match task.as_mut().poll(&mut cx) {
+            Poll::Ready(report) => report,
+            Poll::Pending => panic!("latched owner retirement must stop the parked runtime"),
+        };
+        assert_eq!(report.waits_ready, 0);
+        assert_eq!(report.waits_failed, 0);
+        assert_eq!(report.ready_turns, 0);
     }
 
     #[test]
@@ -2131,7 +2779,8 @@ mod tests {
             .expect("epoch test lock");
         LAST_READ_BLOCK.store(u64::MAX, Ordering::SeqCst);
         let guard = guard();
-        let handle = BlockDeviceHandle::partition(&BLOCK_REG, 32, 16);
+        let handle = BlockDeviceHandle::partition(&BLOCK_REG, 32, 16)
+            .expect("partition lies within its parent");
         let mut adapter = BlockDeviceDispatchAdapter::new(handle, &guard);
         let dispatch = BlockDispatch {
             tag: BlockTag::new(7),
@@ -2166,7 +2815,8 @@ mod tests {
         reset_page_container_file_io_service_registry_for_test();
         LAST_READ_BLOCK.store(u64::MAX, Ordering::SeqCst);
         let guard = guard();
-        let handle = BlockDeviceHandle::partition(&BLOCK_REG, 32, 16);
+        let handle = BlockDeviceHandle::partition(&BLOCK_REG, 32, 16)
+            .expect("test partition lies within the parent device");
         let mut adapter = BlockDeviceDispatchAdapter::new_async(handle, &guard, 41);
         let dispatch = BlockDispatch {
             tag: BlockTag::new(7),
@@ -2416,7 +3066,8 @@ mod tests {
         let mut depth = QueueDepth::new(1);
         let mut tags = crate::io_manager::block::BlockTagTable::new();
         let guard = guard();
-        let handle = BlockDeviceHandle::partition(&BLOCK_REG, 32, 16);
+        let handle = BlockDeviceHandle::partition(&BLOCK_REG, 32, 16)
+            .expect("partition lies within its parent");
 
         let turn = drive_block_device_service_once(
             handle,

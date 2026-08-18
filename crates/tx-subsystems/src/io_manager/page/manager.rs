@@ -9,7 +9,8 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 #[cfg(test)]
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::fs_iface::{IoDataSource, IoDataTarget};
 use crate::io_manager::runtime::{IoServiceKind, ServiceKick, ServiceWakeSource};
@@ -27,19 +28,27 @@ use super::service::{
     PageService, PageServiceBackendOutcome, PageServiceBackendPrepared,
     PageServiceBackendSubmitError, PageServiceBlockCompletionPrepared,
     PageServiceDiagnosticSnapshot, PageServiceL6Applied, PageServiceTaggedBlockCompletionError,
-};
-use super::{
-    PageContainerKey, PageGeneration, PageIoFlags, PageIoOp, PageIoPriority, PageIoRange,
-    PageIoRequest, PageIoRequestId, PageL6Receipt,
+    PageServiceWake,
 };
 #[cfg(test)]
-use super::{PageIoCompletion, PageQueueError};
+use super::PageIoCompletion;
+use super::{
+    PageContainerKey, PageGeneration, PageIoFlags, PageIoOp, PageIoPriority, PageIoRange,
+    PageIoRequest, PageIoRequestId, PageL6Receipt, PageQueueError,
+};
 #[cfg(test)]
 use crate::io_manager::backend::PageCompletion;
 
 #[derive(Debug)]
 pub(crate) struct PageIoSubmissionManager {
     state: SpinMutex<PageIoSubmissionState>,
+    /// Level-triggered lifetime edge for the reactor-owned service task.
+    ///
+    /// A wake notification alone is insufficient because PageContainer
+    /// retirement can race the task's wait-source subscription. Keeping the
+    /// retirement state latched lets the waiter re-check it after installing
+    /// the subscription and close that lost-wake window.
+    owner_retired: AtomicBool,
 }
 
 #[cfg(test)]
@@ -112,6 +121,7 @@ impl PageIoSubmissionHandle {
                 background_graphs: BTreeSet::new(),
                 wake_source: None,
             }),
+            owner_retired: AtomicBool::new(false),
         }))
     }
 
@@ -219,6 +229,21 @@ impl PageIoSubmissionHandle {
         (owner, waiters)
     }
 
+    /// Requeue a popped initial submission only while its retained file owner
+    /// is still live. Cancellation removes the owner and any queued row under
+    /// this same lock, so `Ok(None)` is the cancel-before-requeue
+    /// linearization point.
+    pub(crate) fn requeue_submission_if_file_owner_present(
+        &self,
+        request: PageIoRequest,
+    ) -> Result<Option<PageServiceWake>, PageQueueError> {
+        let mut state = self.0.lock_state();
+        if !state.admitted_file_requests.contains_key(&request.id) {
+            return Ok(None);
+        }
+        state.service.requeue_submission(request).map(Some)
+    }
+
     /// Register a waiter only while the matching request still has an L4
     /// lifetime owner. Completion removes the owner and queue row under this
     /// same manager lock before mutating PageContainer state, so `false` is
@@ -308,11 +333,36 @@ impl PageIoSubmissionHandle {
 
     pub(crate) fn attach_wake_source(&self, wake_source: Arc<ServiceWakeSource>) -> bool {
         let mut state = self.0.lock_state();
-        if state.wake_source.is_some() {
+        if self.0.owner_retired.load(Ordering::Acquire) || state.wake_source.is_some() {
             return false;
         }
         state.wake_source = Some(wake_source);
         true
+    }
+
+    /// Publish PageContainer owner retirement and wake a parked service task.
+    ///
+    /// The atomic flag is the level predicate; the wake-source notification is
+    /// only the scheduling edge. A waiter installs its subscription before
+    /// re-checking this flag, so retirement cannot be lost between observation
+    /// and parking. Repeated retirement is intentionally idempotent.
+    pub(crate) fn retire_owner(&self) -> bool {
+        if self.0.owner_retired.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+
+        let wake_source = self.0.lock_state().wake_source.clone();
+        if let Some(wake_source) = wake_source {
+            let _ = wake_source
+                .kick_with_post(ServiceKick::new(IoServiceKind::Page), |mailbox, event| {
+                    mailbox.post(event)
+                });
+        }
+        true
+    }
+
+    pub(crate) fn owner_retired(&self) -> bool {
+        self.0.owner_retired.load(Ordering::Acquire)
     }
 
     pub(crate) fn kick(&self, service: IoServiceKind) {
@@ -326,6 +376,16 @@ impl PageIoSubmissionHandle {
 
     pub(crate) fn has_wake_source(&self) -> bool {
         self.0.lock_state().wake_source.is_some()
+    }
+
+    /// Bounded, value-only queue state used by kernel stall diagnostics.
+    pub(crate) fn diagnostic_counts(&self) -> (usize, usize, bool) {
+        let state = self.0.lock_state();
+        (
+            state.service.submission_len(),
+            state.admitted_file_requests.len(),
+            state.wake_source.is_some(),
+        )
     }
 
     #[cfg(test)]

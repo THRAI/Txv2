@@ -12,7 +12,7 @@ use tx_subsystems::vfs::OpenFile;
 
 use super::numbers::{EFD_CLOEXEC_FLAG, EFD_NONBLOCK_FLAG, NR_EVENTFD2};
 use super::{
-    bootstrap_copy_to_user, bootstrap_read_user, errno_to_i32, SyscallCtx, SyscallResult,
+    bootstrap_copy_to_user_wait, bootstrap_read_user_wait, errno_to_i32, SyscallCtx, SyscallResult,
     EAGAIN_VALUE, EBADF_VALUE, EINVAL_VALUE, ENOMEM_VALUE,
 };
 use crate::adapter::step_engine::{self as step_engine};
@@ -134,7 +134,9 @@ pub(super) async fn sys_eventfd_read(
     .await
     {
         Ok(n) => {
-            if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, buf_ptr, &staging[..n]) {
+            if let Err(errno) =
+                bootstrap_copy_to_user_wait(&ctx.aspace, buf_ptr, &staging[..n]).await
+            {
                 return SyscallResult::error_from(errno);
             }
             SyscallResult::Return(n as i64)
@@ -168,7 +170,7 @@ pub(super) async fn sys_eventfd_write(
     }
 
     // Read the 8-byte value from userspace.
-    let val: u64 = match bootstrap_read_user::<u64>(&ctx.aspace, buf_ptr) {
+    let val: u64 = match bootstrap_read_user_wait::<u64>(&ctx.aspace, buf_ptr).await {
         Ok(v) => v,
         Err(errno) => return SyscallResult::error_from(errno),
     };

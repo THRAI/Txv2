@@ -46,6 +46,8 @@ pub(crate) fn ci(root: &Path) -> Result<()> {
                 "tx-kernel-riscv64-m1dock-mock",
                 "--exclude",
                 "tx-kernel-loongarch64-qemu-virt",
+                "--exclude",
+                "tx-kernel-loongarch64-2k1000",
                 "--",
                 "-D",
                 "warnings",
@@ -101,6 +103,8 @@ pub(crate) fn ci(root: &Path) -> Result<()> {
                 "tx-kernel-riscv64-m1dock-mock",
                 "--exclude",
                 "tx-kernel-loongarch64-qemu-virt",
+                "--exclude",
+                "tx-kernel-loongarch64-2k1000",
                 // Tests that touch zone-allocated entities serialize on the
                 // shared `test_support::EPOCH_TEST_LOCK` (std::sync::Mutex);
                 // running them in parallel races on zone registration and
@@ -131,6 +135,13 @@ pub(crate) fn ci(root: &Path) -> Result<()> {
             "cargo",
             &["xtask", "lint", "unused"],
             "txdoc:CI-GATE-UNUSED-LINT",
+        ),
+        ci_run(
+            root,
+            "network portability lint",
+            "cargo",
+            &["xtask", "lint", "net-portability"],
+            "txdoc:CI-GATE-NET-PORTABILITY",
         ),
         ci_run(
             root,
@@ -228,6 +239,13 @@ pub(crate) fn ci(root: &Path) -> Result<()> {
         root,
         "la64 qemu target",
         TxTarget::La64Qemu,
+        "txdoc:CI-GATE-LA64",
+        false,
+    ));
+    results.push(ci_target_check(
+        root,
+        "la64 2k1000 target",
+        TxTarget::La64Ls2k1000,
         "txdoc:CI-GATE-LA64",
         false,
     ));

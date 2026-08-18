@@ -9,11 +9,11 @@
 # QEMU user networking's gateway address 10.0.2.2 and the RV64 virtio-net
 # device being registered as eth0 during boot.
 
-wait "txkernel:qemu-riscv64-virt:devices:net:eth0:ok" within 30000
+wait "txkernel:qemu-riscv64-virt:devices:net:bound:ok" within 30000
 wait "/ # " within 30000
 
 sleep 500
-send "ping -c 1 10.0.2.2\n"
+send "/bin/busybox ping -c 1 10.0.2.2\n"
 expect "PING 10.0.2.2" within 8000
 expect "1 packets transmitted" within 12000
 expect "/ # " within 8000

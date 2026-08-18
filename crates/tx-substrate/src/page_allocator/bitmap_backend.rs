@@ -291,7 +291,12 @@ impl<'a> BitmapPageAllocator<'a> {
         }
     }
 
-    fn reserve_contiguous_ppns(&self, count: usize, align: usize) -> Result<Ppn, AllocError> {
+    fn reserve_contiguous_ppns_matching(
+        &self,
+        count: usize,
+        align: usize,
+        mut candidate_matches: impl FnMut(Ppn) -> bool,
+    ) -> Result<Ppn, AllocError> {
         if count == 0 || align == 0 || count > self.total {
             return Err(AllocError::InvalidRequest);
         }
@@ -342,6 +347,13 @@ impl<'a> BitmapPageAllocator<'a> {
                     base = aligned;
                     continue;
                 }
+                if !candidate_matches(Ppn(base)) {
+                    base = match base.checked_add(align) {
+                        Some(next) => next,
+                        None => break,
+                    };
+                    continue;
+                }
                 if self.try_reserve_run_at(Ppn(base), count) {
                     self.free.fetch_sub(count, Ordering::AcqRel);
                     self.hint
@@ -357,6 +369,23 @@ impl<'a> BitmapPageAllocator<'a> {
         }
 
         Err(AllocError::Exhausted)
+    }
+
+    pub(super) fn reserve_run_matching(
+        &self,
+        count: usize,
+        align: usize,
+        policy: ZeroPolicy,
+        candidate_matches: impl FnMut(Ppn) -> bool,
+    ) -> Result<FrameRunReservation<'_, Self>, AllocError> {
+        let base = self.reserve_contiguous_ppns_matching(count, align, candidate_matches)?;
+        for offset in 0..count {
+            if let Err(err) = self.finish_zero_policy(Ppn(base.0 + offset), policy) {
+                self.rollback_reserved_run(base, count);
+                return Err(err);
+            }
+        }
+        Ok(FrameRunReservation::new(self, base, count))
     }
 
     /// Whether `ppn`'s free bit is currently set (candidate for reservation).
@@ -566,14 +595,7 @@ impl PageAllocator for BitmapPageAllocator<'_> {
         align: usize,
         policy: ZeroPolicy,
     ) -> Result<FrameRunReservation<'_, Self>, AllocError> {
-        let base = self.reserve_contiguous_ppns(count, align)?;
-        for offset in 0..count {
-            if let Err(err) = self.finish_zero_policy(Ppn(base.0 + offset), policy) {
-                self.rollback_reserved_run(base, count);
-                return Err(err);
-            }
-        }
-        Ok(FrameRunReservation::new(self, base, count))
+        self.reserve_run_matching(count, align, policy, |_| true)
     }
 
     fn free_count(&self) -> usize {

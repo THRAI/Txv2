@@ -10,13 +10,17 @@ use alloc::{
 
 use tx_subsystems::execution::Errno;
 use tx_subsystems::fs_iface::{
-    BackendBioGraph, BackendPageCompletion, BackendPageRequest, BackendPlan,
+    BackendBioGraph, BackendPageCompletion, BackendPageRequest, BackendPlan, PageCompletion,
+    PageCompletionList,
 };
-use tx_subsystems::io_manager::page::{PageIoOp, PageIoRequestId, PageIoResult};
+use tx_subsystems::io_manager::page::{
+    PageGeneration, PageIoCompletionKind, PageIoOp, PageIoRequestId, PageIoResult,
+};
 use tx_subsystems::mount::MountTransactionFrontier;
 
 use crate::journal::{
-    JournalRing, JournalRingReservation, JournalTransactionStateError, PreparedJournalTransaction,
+    JournalMetadataMutationPermit, JournalRing, JournalRingReservation,
+    JournalTransactionStateError, PreparedJournalTransaction,
 };
 use crate::planner::Ext4FsyncPlanSource;
 use crate::sync::SpinMutex;
@@ -57,6 +61,7 @@ impl JournalExtentToken {
 pub(crate) struct MutationHandle {
     phase: MutationPhase,
     transaction: PreparedJournalTransaction,
+    metadata_admission: Option<JournalMetadataMutationPermit>,
     journal_extent: Option<JournalExtentToken>,
     data_request: Option<PageIoRequestId>,
     commit_request: Option<PageIoRequestId>,
@@ -139,6 +144,17 @@ impl JournalFsyncSource {
         }
         state.mutation = Some(mutation);
         Ok(())
+    }
+
+    pub(crate) fn attach_metadata_admission(
+        &self,
+        permit: JournalMetadataMutationPermit,
+    ) -> Result<(), JournalTransactionStateError> {
+        let mut state = self.state.lock();
+        let Some(mutation) = state.mutation.as_mut() else {
+            return Err(JournalTransactionStateError::Busy);
+        };
+        mutation.attach_metadata_admission(permit)
     }
 
     pub fn bind_settlement_observer(&self, observer: Arc<dyn JournalSettlementObserver>) {
@@ -313,6 +329,7 @@ impl MutationHandle {
         Self {
             phase,
             transaction,
+            metadata_admission: None,
             journal_extent: ring
                 .map(|(ring, reservation)| JournalExtentToken { ring, reservation }),
             data_request: None,
@@ -320,6 +337,23 @@ impl MutationHandle {
             deferred_frees,
             last_error: None,
         }
+    }
+
+    /// Transfer the mount-local metadata owner into the journal lifecycle.
+    ///
+    /// Ordered-data completion is not terminal: commit, checkpoint, cache
+    /// settlement, and tail reclaim still own the same transaction. Keeping
+    /// the permit here makes later metadata operations wait on admission
+    /// instead of entering the retained transaction and observing `EBUSY`.
+    pub(crate) fn attach_metadata_admission(
+        &mut self,
+        permit: JournalMetadataMutationPermit,
+    ) -> Result<(), JournalTransactionStateError> {
+        if self.metadata_admission.is_some() {
+            return Err(JournalTransactionStateError::Busy);
+        }
+        self.metadata_admission = Some(permit);
+        Ok(())
     }
 
     fn transaction_frontier(&self) -> MountTransactionFrontier {
@@ -501,7 +535,15 @@ impl Ext4FsyncPlanSource for JournalFsyncSource {
             return BackendPlan::Err(Errno::EIO);
         }
         let Some(mutation) = state.mutation.as_mut() else {
-            return BackendPlan::Err(Errno::EAGAIN);
+            return BackendPlan::Complete(PageCompletionList::from_vec(alloc::vec![
+                PageCompletion::new(
+                    request.id,
+                    request.range,
+                    PageIoResult::Done,
+                    request.generation_hint.unwrap_or(PageGeneration::new(0)),
+                    PageIoCompletionKind::Noop,
+                ),
+            ]));
         };
         match mutation.prepare_commit(request.id) {
             Ok(graph) => BackendPlan::SubmitGraph(graph),

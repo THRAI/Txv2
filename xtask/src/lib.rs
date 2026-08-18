@@ -30,8 +30,10 @@ mod lint_invariants_time_wake;
 mod lint_invariants_wait;
 mod lint_invariants_witness;
 mod lint_invariants_zone;
+mod lint_net_portability;
 #[path = "lint_step_guard.rs"]
 mod lint_step_guard;
+mod network_scenario;
 mod observe;
 mod observe_discipline;
 mod observe_schema;
@@ -66,11 +68,9 @@ pub fn run() -> Result<()> {
         "build" => {
             let rest: Vec<String> = args.collect();
             let target = util::option_value(&rest, "--target")?;
-            if rest.iter().any(|arg| arg == "--release") {
-                check_build::build_release(&root, &target)
-            } else {
-                check_build::build(&root, &target)
-            }
+            let release = rest.iter().any(|arg| arg == "--release");
+            let kernel_only = rest.iter().any(|arg| arg == "--kernel-only");
+            check_build::build_with_mode(&root, &target, release, kernel_only)
         }
         "qemu" => qemu::qemu(&root, args.collect()),
         "test" => test::test(&root, args.collect()),
@@ -103,19 +103,20 @@ fn print_usage() {
         "txKernel xtask\n\n\
          Commands:\n\
            cargo xtask doctor\n\
-           cargo xtask full-build [--target rv64-qemu|la64-qemu|rv64-m1dock-mock|all] [--skip-doctor] [--no-image]\n\
+           cargo xtask full-build [--target rv64-qemu|la64-qemu|rv64-m1dock-mock|la64-2k1000|all] [--skip-doctor] [--no-image] [--release] [--kernel-only (la64-2k1000 only)]\n\
            cargo xtask ci\n\
            cargo xtask ci-slow\n\
            cargo xtask check\n\
-           cargo xtask build --target rv64-qemu|rv64-m1dock-mock|la64-qemu|all\n\
-           cargo xtask qemu --target rv64-qemu|rv64-m1dock-mock|la64-qemu --profile smoke|busybox|alpine [--boot-mode normal|alpine|contest|busybox|oscomp|ltp|test] [--dry-run] [--expect-sentinel] [--timeout-ms N] [--smp N] [--no-block] [--interactive] [--append-cmdline TEXT] [--extra-rv64-ext4 PATH]\n\
+           cargo xtask build --target rv64-qemu|rv64-m1dock-mock|la64-qemu|la64-2k1000|all [--release] [--kernel-only (la64-2k1000 only)]\n\
+           cargo xtask qemu --target rv64-qemu|rv64-m1dock-mock|la64-qemu --profile smoke|busybox|alpine [--boot-mode normal|alpine|contest|busybox|oscomp|ltp|test] [--net none|user|tap:IFNAME|bridge:BRIDGE | --net-scenario PATH] [--dry-run] [--expect-sentinel] [--timeout-ms N] [--smp N] [--no-block] [--interactive] [--append-cmdline TEXT] [--extra-rv64-ext4 PATH]\n\
            cargo xtask test [smoke|busybox-boot] [--target rv64-qemu] [--timeout-ms N] [--dry-run] [--trap-trace]\n\
            cargo xtask fault-decode --target rv64-qemu [--elf PATH] [--serial PATH [--all] | --scause HEX --sepc HEX --stval HEX | --addr HEX]\n\
            cargo xtask trap-trace --serial PATH [--syscalls | --raw]\n\
-           cargo xtask shell-test --target rv64-qemu --script PATH [--boot-mode normal|alpine|contest|busybox|oscomp|ltp|test] [--group NAME[,NAME...]] [--list-groups] [--keep-going]\n\
-           cargo xtask image cpio --profile busybox [--target rv64-qemu|la64-qemu]\n\
+           cargo xtask shell-test --target rv64-qemu --script PATH [--boot-mode normal|alpine|contest|busybox|oscomp|ltp|test] [--net none|user|tap:IFNAME|bridge:BRIDGE | --net-scenario PATH] [--group NAME[,NAME...]] [--list-groups] [--keep-going]\n\
+           cargo xtask image cpio --profile busybox [--target rv64-qemu|la64-qemu|la64-2k1000]\n\
            cargo xtask image ext4 --profile busybox [--target rv64-qemu|la64-qemu] [--size 64M]\n\
            cargo xtask image m1dock-sd --profile busybox [--target rv64-m1dock-mock] [--size 64M]\n\
+           cargo xtask image la2k1000-uimage [--release] [--kernel-only]\n\
            cargo xtask kernel-user-layouts [--arch riscv64|loongarch64] [--dump]\n\
            cargo xtask oscomp doctor|prepare|submit|run|qemu\n\
            cargo xtask oscomp score [--target rv64-qemu|la64-qemu] [--input FILE] [--suite SUITE] [--data DIR] [--dry-run]\n\
@@ -129,7 +130,7 @@ fn print_usage() {
            cargo xtask progress new plan|handoff|worktree --id ID --title TITLE [...]\n\
            cargo xtask progress claim plan|worktree --id ID --owner NAME --scope PATH [--scope PATH]\n\
            cargo xtask progress close plan|handoff|worktree --id ID --status STATUS\n\
-           cargo xtask lint arch|docs|unused|boundary|invariants [rule|all]|kernel-user-layouts|syscall-status\n\
+           cargo xtask lint arch|docs|unused|boundary|invariants [rule|all]|net-portability|kernel-user-layouts|syscall-status\n\
              invariants rule includes api-language, boot-setup, observe-producer-boundary, time-layering, time-wake-retired, no-adhoc-drive, syscall-no-await, step, and related discipline checks\n\
            cargo xtask boundary-report [--top N] [--json]\n\
            cargo xtask observe-schema check [--schema schema/txobserve.toml]\n\

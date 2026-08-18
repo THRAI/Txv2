@@ -236,8 +236,13 @@ impl OwnedFileIoRequest {
         }
     }
 
-    pub(super) fn take_payload(self) -> FileIoPayload {
-        self.payload
+    pub(super) fn take_payload_and_keepalive(self) -> (FileIoPayload, Option<Cap<PageContainer>>) {
+        let Self {
+            payload,
+            _container_keepalive,
+            ..
+        } = self;
+        (payload, _container_keepalive)
     }
 
     /// A device completion may settle a PageSlot only while the request still

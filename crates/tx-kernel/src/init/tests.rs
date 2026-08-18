@@ -14,9 +14,9 @@
 //! mount slots populate, tmpfs's `/dev` mkdir succeeds, devfs's
 //! console alias resolves, and init's cwd + fds 0/1/2 are bound.
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use std::sync::Mutex;
+use std::{format, sync::Mutex};
 
 use tx_hal::{
     AllocError, Arch, Asid, BootHandoff, BootInfo, BootPlatformIf, BootProtocol, ConsoleIf, CpuId,
@@ -32,6 +32,7 @@ const TEST_PAGE_SIZE: usize = 4096;
 
 use crate::init::{
     console_tty, dev_mount, dev_shm_mount, publish_boot_mountpoint_dentry, root_mount, CoreInit,
+    RootExt4JournalPreflightDecision,
 };
 
 use crate::adapter::step_engine::{self as step_engine, guard, page_allocator, StepOutcome};
@@ -68,6 +69,7 @@ static TEST_PLATFORM_INFO: PlatformInfo = PlatformInfo {
     board: TestPlatform::BOARD,
     spi_sd: None,
     mmio_regions: &[],
+    device_resources: &tx_hal::EMPTY_DEVICE_RESOURCE_GRAPH,
     timebase_frequency_hz: 0,
     possible_cpu_count: 1,
 };
@@ -346,6 +348,7 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
     crate::init::reset_boot_state_for_test();
     crate::irq::reset_dispatch_table_for_test();
     tx_subsystems::device::reset_block_registry_for_test();
+    tx_subsystems::net::device::reset_net_registry_for_test();
     tx_subsystems::device::reset_page_container_file_io_service_registry_for_test();
     CONSOLE_CAPTURED_LEN.store(0, Ordering::Release);
     CONSOLE_CAPTURED_BYTES
@@ -386,6 +389,7 @@ fn drive_boot_wiring() {
     CoreInit::<TestPlatform>::install_irq_handlers();
     CoreInit::<TestPlatform>::init_rtc_device();
     CoreInit::<TestPlatform>::init_block_devices();
+    CoreInit::<TestPlatform>::init_net_devices();
     CoreInit::<TestPlatform>::mount_rootfs_from_boot_media();
     CoreInit::<TestPlatform>::mount_devfs_at_dev();
     CoreInit::<TestPlatform>::register_devfs_console_alias();
@@ -451,6 +455,15 @@ fn reactor_epoch_boundary_replenishes_publication_retire_credit_under_load() {
     tx_test_support::drain_to_quiescence();
 }
 
+#[test]
+fn zero_network_registry_does_not_publish_a_staging_device() {
+    let _setup = setup();
+
+    CoreInit::<TestPlatform>::init_net_devices();
+
+    assert!(tx_subsystems::net::net_device_snapshot().is_empty());
+}
+
 struct FileIoRuntimeTestBlockDevice;
 
 impl tx_subsystems::device::BlockDeviceOps for FileIoRuntimeTestBlockDevice {
@@ -502,6 +515,102 @@ static FILE_IO_RUNTIME_TEST_BLOCK_REG: tx_subsystems::device::BlockDeviceRegistr
         ops: &FILE_IO_RUNTIME_TEST_BLOCK_DEVICE,
     };
 
+struct RootSelectorTestBlockDevice;
+
+static ROOT_SELECTOR_TEST_IMAGE: Mutex<[u8; tx_subsystems::vm::USER_PAGE_SIZE]> =
+    Mutex::new([0; tx_subsystems::vm::USER_PAGE_SIZE]);
+static ROOT_SELECTOR_TEST_LAST_READ_LBA: AtomicU64 = AtomicU64::new(u64::MAX);
+const ROOT_SELECTOR_TEST_TOTAL_LBAS: u64 = 62_533_296;
+
+impl tx_subsystems::device::BlockDeviceOps for RootSelectorTestBlockDevice {
+    fn read_blocks(
+        &self,
+        block_id: tx_subsystems::device::PhysicalBlockNumber,
+        target: &mut [tx_subsystems::page_backed::Frame],
+        _guard: &tx_subsystems::execution::Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        ROOT_SELECTOR_TEST_LAST_READ_LBA.store(block_id.as_u64(), Ordering::Release);
+        let image = ROOT_SELECTOR_TEST_IMAGE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for frame in target {
+            let Ok(dst) = step_engine::page_allocator::frame_kernel_addr(frame.ppn()) else {
+                return StepOutcome::Err(tx_subsystems::execution::Errno::EIO);
+            };
+            // SAFETY: the test page allocator maps every allocated frame to a
+            // writable host page, and `image` is exactly one page long.
+            unsafe {
+                core::ptr::copy_nonoverlapping(image.as_ptr(), dst, image.len());
+            }
+        }
+        StepOutcome::done(())
+    }
+
+    fn write_blocks(
+        &self,
+        _block_id: tx_subsystems::device::PhysicalBlockNumber,
+        _source: &[tx_subsystems::page_backed::Frame],
+        _guard: &tx_subsystems::execution::Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        StepOutcome::done(())
+    }
+
+    fn barrier(
+        &self,
+        _guard: &tx_subsystems::execution::Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        StepOutcome::done(())
+    }
+}
+
+impl tx_subsystems::device::BlockDevice for RootSelectorTestBlockDevice {
+    fn total_blocks(&self) -> u64 {
+        ROOT_SELECTOR_TEST_TOTAL_LBAS
+    }
+
+    fn block_size(&self) -> u32 {
+        512
+    }
+}
+
+static ROOT_SELECTOR_TEST_BLOCK_DEVICE: RootSelectorTestBlockDevice = RootSelectorTestBlockDevice;
+static ROOT_SELECTOR_TEST_SDA_REG: tx_subsystems::device::BlockDeviceRegistration =
+    tx_subsystems::device::BlockDeviceRegistration {
+        devt: tx_subsystems::device::DevT::new(8, 0),
+        name: "sda",
+        ops: &ROOT_SELECTOR_TEST_BLOCK_DEVICE,
+    };
+static ROOT_SELECTOR_TEST_MMC_REG: tx_subsystems::device::BlockDeviceRegistration =
+    tx_subsystems::device::BlockDeviceRegistration {
+        devt: tx_subsystems::device::DevT::new(179, 0),
+        name: "mmcblk0",
+        ops: &ROOT_SELECTOR_TEST_BLOCK_DEVICE,
+    };
+static ROOT_SELECTOR_TEST_REGISTRATIONS: [&tx_subsystems::device::BlockDeviceRegistration; 2] =
+    [&ROOT_SELECTOR_TEST_SDA_REG, &ROOT_SELECTOR_TEST_MMC_REG];
+
+fn install_root_selector_test_mbr(start_lba: u32, len_lba: u32, valid_signature: bool) {
+    let mut image = ROOT_SELECTOR_TEST_IMAGE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    image.fill(0);
+    let entry = &mut image[446..462];
+    entry[4] = 0x83;
+    entry[8..12].copy_from_slice(&start_lba.to_le_bytes());
+    entry[12..16].copy_from_slice(&len_lba.to_le_bytes());
+    if valid_signature {
+        image[510] = 0x55;
+        image[511] = 0xaa;
+    }
+}
+
+fn register_root_selector_test_devices() {
+    assert!(matches!(
+        tx_subsystems::device::register_block_devices(&ROOT_SELECTOR_TEST_REGISTRATIONS),
+        StepOutcome::Done(())
+    ));
+}
+
 #[test]
 fn boot_init_submits_registered_file_io_service_runtimes() {
     let _serial = setup();
@@ -524,7 +633,7 @@ fn boot_init_submits_registered_file_io_service_runtimes() {
 }
 
 #[test]
-fn file_io_runtime_task_submission_owns_one_runtime() {
+fn file_io_runtime_task_submission_is_pinned_fair_work() {
     let _serial = setup();
     let pc = tx_subsystems::page_backed::PageContainer::new_cap(
         tx_subsystems::page_backed::PageContainerKind::Anon {
@@ -602,6 +711,14 @@ fn root_device_policy_defaults_final_qemu_to_vda_and_preserves_compatibility_roo
         Some("mmcblk0")
     );
     assert_eq!(
+        CoreInit::<TestPlatform>::root_device_name_from_boot("tx.root=sda", true),
+        Some("sda")
+    );
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_device_name_from_boot("tx.root=sda1", true),
+        Some("sda1")
+    );
+    assert_eq!(
         CoreInit::<TestPlatform>::root_device_name_from_boot("tx.root=sdcard", false),
         Some("vda")
     );
@@ -614,12 +731,269 @@ fn root_device_policy_defaults_final_qemu_to_vda_and_preserves_compatibility_roo
         None
     );
     assert_eq!(
+        CoreInit::<TestPlatform>::root_device_name_from_boot(
+            "tx.runsh=/musl/tx-run.sh console=ttyS0",
+            false,
+        ),
+        None
+    );
+    for compatibility_mode in [
+        "tx.boot.mode=oscomp",
+        "tx.boot.mode=ltp",
+        "tx.boot.mode=test",
+        "tx.oscomp.groups=netperf-musl",
+    ] {
+        assert_eq!(
+            CoreInit::<TestPlatform>::root_device_name_from_boot(compatibility_mode, false),
+            None,
+            "{compatibility_mode} needs the tmpfs-root shim layout"
+        );
+    }
+    assert_eq!(
         CoreInit::<TestPlatform>::root_device_name_from_boot("", true),
         None
     );
     assert_eq!(
         CoreInit::<TestPlatform>::root_device_name_from_boot("tx.root=vda", true),
         Some("vda")
+    );
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_device_name_from_boot(
+            "tx.boot.mode=oscomp tx.root=vda",
+            false,
+        ),
+        Some("vda")
+    );
+}
+
+#[test]
+fn root_selector_resolves_sda1_to_one_checked_parent_partition_handle() {
+    let _serial = setup();
+    install_root_selector_test_mbr(4_194_367, 58_338_929, true);
+    register_root_selector_test_devices();
+
+    let resolved = CoreInit::<TestPlatform>::resolve_root_block_device("sda1")
+        .expect("valid primary MBR partition");
+    assert_eq!(resolved.name, "sda1");
+    assert_eq!(resolved.handle.registration().name, "sda");
+    assert_eq!(resolved.handle.start_lba(), 4_194_367);
+    assert_eq!(resolved.handle.len_lba(), 58_338_929);
+    assert_eq!(
+        ROOT_SELECTOR_TEST_LAST_READ_LBA.load(Ordering::Acquire),
+        0,
+        "partition selection reads the parent MBR at LBA 0"
+    );
+
+    let image = tx_fs::tx_ext4::BlockDeviceImage::new(resolved.handle);
+    let binder = tx_fs::tx_ext4::Ext4FileIoRuntimeBinder::new(resolved.handle);
+    assert_eq!(image.handle().start_lba(), resolved.handle.start_lba());
+    assert_eq!(image.handle().len_lba(), resolved.handle.len_lba());
+    assert_eq!(binder.handle().start_lba(), resolved.handle.start_lba());
+    assert_eq!(binder.handle().len_lba(), resolved.handle.len_lba());
+    let geometry = image.block_geometry().expect("512-byte sector geometry");
+    assert_eq!(geometry.device.raw(), ROOT_SELECTOR_TEST_SDA_REG.devt.raw());
+    assert_eq!(geometry.sectors_per_block, 8);
+}
+
+#[test]
+fn root_selector_rejects_bad_or_overrunning_sda1_without_whole_disk_fallback() {
+    let _serial = setup();
+    register_root_selector_test_devices();
+
+    install_root_selector_test_mbr(4_194_367, 58_338_929, false);
+    assert!(CoreInit::<TestPlatform>::resolve_root_block_device("sda1").is_err());
+
+    install_root_selector_test_mbr((ROOT_SELECTOR_TEST_TOTAL_LBAS - 4) as u32, 8, true);
+    assert!(CoreInit::<TestPlatform>::resolve_root_block_device("sda1").is_err());
+
+    let whole = CoreInit::<TestPlatform>::resolve_root_block_device("sda")
+        .expect("an explicitly selected whole disk remains compatible");
+    assert_eq!(whole.name, "sda");
+    assert_eq!(whole.handle.start_lba(), 0);
+    assert_eq!(whole.handle.len_lba(), ROOT_SELECTOR_TEST_TOTAL_LBAS);
+}
+
+#[test]
+fn root_selector_keeps_rv_mmcblk0_as_a_whole_device() {
+    let _serial = setup();
+    register_root_selector_test_devices();
+
+    let resolved = CoreInit::<TestPlatform>::resolve_root_block_device("mmcblk0")
+        .expect("registered RV SD device");
+    assert_eq!(resolved.name, "mmcblk0");
+    assert_eq!(resolved.handle.registration().name, "mmcblk0");
+    assert_eq!(resolved.handle.start_lba(), 0);
+    assert_eq!(resolved.handle.len_lba(), ROOT_SELECTOR_TEST_TOTAL_LBAS);
+}
+
+#[test]
+fn root_mount_mode_honors_the_last_standard_ro_or_rw_token() {
+    assert!(!CoreInit::<TestPlatform>::root_mount_is_read_only_from_boot(""));
+    assert!(CoreInit::<TestPlatform>::root_mount_is_read_only_from_boot(
+        "tx.root=sda ro"
+    ));
+    assert!(!CoreInit::<TestPlatform>::root_mount_is_read_only_from_boot("tx.root=sda ro rw"));
+    assert!(CoreInit::<TestPlatform>::root_mount_is_read_only_from_boot(
+        "tx.root=sda rw ro"
+    ));
+}
+
+#[test]
+fn root_ext4_journal_preflight_is_exact_opt_in_and_requires_final_ro() {
+    use RootExt4JournalPreflightDecision as Decision;
+
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_ext4_journal_preflight_decision_from_boot("tx.root=sda1 ro"),
+        Decision::Disabled,
+    );
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_ext4_journal_preflight_decision_from_boot(
+            "tx.root=sda1 tx.ext4.journal-preflight=1 ro"
+        ),
+        Decision::Run,
+    );
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_ext4_journal_preflight_decision_from_boot(
+            "tx.root=sda1 ro rw tx.ext4.journal-preflight=1"
+        ),
+        Decision::RefusedNotReadOnly,
+    );
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_ext4_journal_preflight_decision_from_boot(
+            "tx.root=sda1 tx.ext4.journal-preflight=invalid"
+        ),
+        Decision::RefusedNotReadOnly,
+        "any present token on a non-RO mount reports refused:not-ro first",
+    );
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_ext4_journal_preflight_decision_from_boot(
+            "tx.root=sda1 rw ro tx.ext4.journal-preflight=1"
+        ),
+        Decision::Run,
+    );
+    for invalid in ["", "0", "01", "true", "yes"] {
+        let cmdline = format!("tx.root=sda1 ro tx.ext4.journal-preflight={invalid}");
+        assert_eq!(
+            CoreInit::<TestPlatform>::root_ext4_journal_preflight_decision_from_boot(&cmdline),
+            Decision::RefusedInvalidToken,
+            "value {invalid:?} must be rejected",
+        );
+    }
+}
+
+#[test]
+fn root_ext4_journal_preflight_last_same_name_token_wins() {
+    use RootExt4JournalPreflightDecision as Decision;
+
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_ext4_journal_preflight_decision_from_boot(
+            "ro tx.ext4.journal-preflight=bad tx.ext4.journal-preflight=1"
+        ),
+        Decision::Run,
+    );
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_ext4_journal_preflight_decision_from_boot(
+            "ro tx.ext4.journal-preflight=1 tx.ext4.journal-preflight=0"
+        ),
+        Decision::RefusedInvalidToken,
+    );
+}
+
+#[test]
+fn root_ext4_journal_preflight_error_labels_are_stable_and_exhaustive() {
+    use tx_fs::tx_ext4::Ext4FormatError;
+
+    let cases = [
+        (Ext4FormatError::BadMagic, "bad-magic"),
+        (Ext4FormatError::Corrupt, "corrupt"),
+        (Ext4FormatError::OutOfBounds, "out-of-bounds"),
+        (Ext4FormatError::Truncated, "truncated"),
+        (Ext4FormatError::Unsupported, "unsupported"),
+        (
+            Ext4FormatError::ExtentTreeFull {
+                inode: 1,
+                logical_block: 2,
+                depth: 3,
+                entries: 4,
+            },
+            "extent-tree-full",
+        ),
+        (Ext4FormatError::WouldBlock, "would-block"),
+        (Ext4FormatError::ReadOnly, "read-only"),
+        (Ext4FormatError::Io, "io"),
+        (Ext4FormatError::NotEmpty, "not-empty"),
+        (Ext4FormatError::IsDirectory, "is-directory"),
+        (Ext4FormatError::NotDirectory, "not-directory"),
+        (Ext4FormatError::InvalidInput, "invalid-input"),
+    ];
+
+    for (error, expected) in cases {
+        assert_eq!(
+            CoreInit::<TestPlatform>::ext4_format_error_label(error),
+            expected,
+        );
+    }
+}
+
+#[test]
+fn root_ext4_journal_preflight_unsupported_detail_labels_are_stable() {
+    use tx_fs::tx_ext4::JournalPreflightUnsupported;
+
+    let cases = [
+        (
+            JournalPreflightUnsupported::DescriptorTagFlags,
+            "descriptor-tag-flags",
+        ),
+        (
+            JournalPreflightUnsupported::DescriptorDeletedTag,
+            "descriptor-deleted-tag",
+        ),
+        (
+            JournalPreflightUnsupported::DescriptorUuidMismatch,
+            "descriptor-uuid-mismatch",
+        ),
+        (JournalPreflightUnsupported::RevokeRecord, "revoke-record"),
+        (
+            JournalPreflightUnsupported::CommitChecksum,
+            "commit-checksum",
+        ),
+        (
+            JournalPreflightUnsupported::UnknownBlockType(9),
+            "unknown-block-type-9",
+        ),
+    ];
+
+    for (unsupported, expected) in cases {
+        assert_eq!(
+            CoreInit::<TestPlatform>::root_ext4_journal_preflight_unsupported_label(unsupported),
+            expected,
+        );
+    }
+}
+
+#[test]
+fn root_ext4_rw_profile_is_explicit_and_rejects_unknown_values() {
+    use tx_fs::tx_ext4::RwProfile;
+
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_ext4_rw_profile_from_boot("tx.root=sda1 rw"),
+        Ok(RwProfile::Tier1)
+    );
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_ext4_rw_profile_from_boot(
+            "tx.root=sda1 rw tx.ext4.rw-profile=legacy-nocsum"
+        ),
+        Ok(RwProfile::LegacyNoMetadataCsum)
+    );
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_ext4_rw_profile_from_boot(
+            "tx.ext4.rw-profile=legacy-nocsum tx.ext4.rw-profile=tier1"
+        ),
+        Ok(RwProfile::Tier1)
+    );
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_ext4_rw_profile_from_boot("tx.ext4.rw-profile=automatic"),
+        Err(())
     );
 }
 

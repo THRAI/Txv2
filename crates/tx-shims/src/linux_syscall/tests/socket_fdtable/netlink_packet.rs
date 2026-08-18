@@ -271,27 +271,65 @@ fn dispatch_packet_bind_getsockname_and_ioctl_round_trip_sockaddr_ll() {
 }
 
 #[test]
-fn dispatch_packet_sendto_accepts_sockaddr_ll_loopback_destination() {
+fn dispatch_packet_raw_sendto_transmits_complete_frame_to_selected_veth() {
     let _setup = socket_setup();
-    let (_process, ctx) = socket_ctx();
+    let (process, ctx) = socket_ctx();
+    let local_mac = EthernetAddress::new([0x02, 0, 0, 0x8b, 0, 1]);
+    let remote_mac = EthernetAddress::new([0x02, 0, 0, 0x8b, 0, 2]);
+    let pair = create_veth_pair_for_test_or_bootstrap(VethPairConfig {
+        left: VethEndpointConfig {
+            name: "packet-raw-tx0",
+            devt: DevT::new(119, 3),
+            mac: local_mac,
+        },
+        right: VethEndpointConfig {
+            name: "packet-raw-rx0",
+            devt: DevT::new(119, 4),
+            mac: remote_mac,
+        },
+        mtu: VETH_DEFAULT_MTU,
+    });
+    let netns = process.net_namespace().expect("test net namespace");
+    netns
+        .attach_device_for_test_or_bootstrap(pair.left, None)
+        .expect("attach packet raw TX device");
+    let ifindex = netns
+        .link_snapshot()
+        .into_iter()
+        .find(|link| link.name == pair.left.name)
+        .expect("packet raw TX link")
+        .ifindex;
+
     let fd = socket_packet(&ctx);
-    let addr = sockaddr_ll(ETH_P_ALL, 1);
-    let payload = [0x42u8; 64];
+    let addr = sockaddr_ll(ETH_P_ALL, ifindex as i32);
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&remote_mac.octets());
+    frame.extend_from_slice(&local_mac.octets());
+    frame.extend_from_slice(&ETH_P_ARP.to_be_bytes());
+    frame.extend_from_slice(&[0x42u8; 28]);
 
     assert_eq!(
         socket_req(
             NR_SENDTO,
             [
                 fd as u64,
-                payload.as_ptr() as u64,
-                payload.len() as u64,
+                frame.as_ptr() as u64,
+                frame.len() as u64,
                 0,
                 addr.as_ptr() as u64,
                 SOCKADDR_LL_BYTES as u64,
             ],
             &ctx,
         ),
-        SyscallResult::Return(payload.len() as i64)
+        SyscallResult::Return(frame.len() as i64)
+    );
+    assert_eq!(
+        pair.right
+            .ops
+            .receive()
+            .expect("packet raw peer frame")
+            .as_bytes(),
+        frame.as_slice()
     );
 
     let bad_addr = sockaddr_ll(ETH_P_ALL, 9999);
@@ -300,8 +338,8 @@ fn dispatch_packet_sendto_accepts_sockaddr_ll_loopback_destination() {
             NR_SENDTO,
             [
                 fd as u64,
-                payload.as_ptr() as u64,
-                payload.len() as u64,
+                frame.as_ptr() as u64,
+                frame.len() as u64,
                 0,
                 bad_addr.as_ptr() as u64,
                 SOCKADDR_LL_BYTES as u64,
@@ -313,7 +351,7 @@ fn dispatch_packet_sendto_accepts_sockaddr_ll_loopback_destination() {
 }
 
 #[test]
-fn dispatch_packet_arp_request_queues_cooked_reply() {
+fn dispatch_packet_dgram_sendto_builds_real_ethernet_frame_without_fake_reply() {
     let _setup = socket_setup();
     let (process, ctx) = socket_ctx();
     let local_mac = EthernetAddress::new([0x02, 0, 0, 0x8a, 0, 1]);
@@ -335,54 +373,30 @@ fn dispatch_packet_arp_request_queues_cooked_reply() {
     netns
         .attach_device_for_test_or_bootstrap(pair.left, None)
         .expect("attach arpq0");
-    netns
-        .attach_device_for_test_or_bootstrap(pair.right, None)
-        .expect("attach arpq1");
-    let auth = NetAdminAuthority::for_test_or_bootstrap();
     let local = netns
         .link_snapshot()
         .into_iter()
         .find(|link| link.name == "arpq0")
         .expect("local veth");
-    let remote = netns
-        .link_snapshot()
-        .into_iter()
-        .find(|link| link.name == "arpq1")
-        .expect("remote veth");
-    netns
-        .set_device_ipv4_addr_by_ifindex(
-            auth,
-            local.ifindex,
-            Some(Ipv4Address::new([10, 0, 0, 2])),
-            Some(24),
-        )
-        .expect("set local addr");
-    netns
-        .set_device_ipv4_addr_by_ifindex(
-            auth,
-            remote.ifindex,
-            Some(Ipv4Address::new([10, 0, 0, 1])),
-            Some(24),
-        )
-        .expect("set remote addr");
-
-    let fd = socket_packet(&ctx);
-    let addr = sockaddr_ll(ETH_P_ARP, local.ifindex as i32);
-    assert_eq!(
-        socket_req(
-            NR_BIND,
-            [
-                fd as u64,
-                addr.as_ptr() as u64,
-                SOCKADDR_LL_BYTES as u64,
-                0,
-                0,
-                0
-            ],
-            &ctx,
-        ),
-        SyscallResult::Return(0)
-    );
+    let fd = match socket_req(
+        NR_SOCKET,
+        [
+            AF_PACKET as u64,
+            SOCK_DGRAM | O_CLOEXEC as u64,
+            u16::to_be(ETH_P_ARP) as u64,
+            0,
+            0,
+            0,
+        ],
+        &ctx,
+    ) {
+        SyscallResult::Return(fd) => fd,
+        other => panic!("socket(AF_PACKET, DGRAM, ETH_P_ARP) failed: {other:?}"),
+    };
+    let mut addr = sockaddr_ll(ETH_P_ARP, local.ifindex as i32);
+    addr[8..10].copy_from_slice(&1u16.to_le_bytes());
+    addr[11] = 6;
+    addr[12..18].copy_from_slice(&remote_mac.octets());
 
     let mut request = [0u8; 28];
     request[0..2].copy_from_slice(&1u16.to_be_bytes());
@@ -410,9 +424,16 @@ fn dispatch_packet_arp_request_queues_cooked_reply() {
         SyscallResult::Return(request.len() as i64)
     );
 
+    let frame = pair.right.ops.receive().expect("packet dgram peer frame");
+    assert_eq!(&frame.as_bytes()[..6], &remote_mac.octets());
+    assert_eq!(&frame.as_bytes()[6..12], &local_mac.octets());
+    assert_eq!(
+        u16::from_be_bytes(frame.as_bytes()[12..14].try_into().unwrap()),
+        ETH_P_ARP
+    );
+    assert_eq!(&frame.as_bytes()[14..], &request);
+
     let mut reply = [0u8; 28];
-    let mut from = [0u8; SOCKADDR_LL_BYTES as usize];
-    let mut from_len = SOCKADDR_LL_BYTES;
     assert_eq!(
         socket_req(
             NR_RECVFROM,
@@ -421,28 +442,13 @@ fn dispatch_packet_arp_request_queues_cooked_reply() {
                 reply.as_mut_ptr() as u64,
                 reply.len() as u64,
                 MSG_DONTWAIT,
-                from.as_mut_ptr() as u64,
-                (&mut from_len as *mut u32) as u64,
+                0,
+                0,
             ],
             &ctx,
         ),
-        SyscallResult::Return(reply.len() as i64)
+        SyscallResult::Error(11)
     );
-    assert_eq!(u16::from_be_bytes(reply[6..8].try_into().unwrap()), 2);
-    assert_eq!(&reply[8..14], &remote_mac.octets());
-    assert_eq!(&reply[14..18], &[10, 0, 0, 1]);
-    assert_eq!(&reply[18..24], &local_mac.octets());
-    assert_eq!(&reply[24..28], &[10, 0, 0, 2]);
-    assert_eq!(from_len, SOCKADDR_LL_BYTES);
-    assert_eq!(u16::from_be_bytes([from[2], from[3]]), ETH_P_ARP);
-    assert_eq!(
-        i32::from_le_bytes(from[4..8].try_into().unwrap()),
-        local.ifindex as i32
-    );
-    assert_eq!(u16::from_le_bytes(from[8..10].try_into().unwrap()), 1);
-    assert_eq!(from[10], 0);
-    assert_eq!(from[11], 6);
-    assert_eq!(&from[12..18], &remote_mac.octets());
 }
 
 #[test]
@@ -1149,6 +1155,35 @@ fn dispatch_unix_dgram_socket_ioctl_resolves_loopback_ifindex() {
     let _setup = socket_setup();
     let (_process, ctx) = socket_ctx();
     let fd = socket_unix_dgram(&ctx);
+    let mut ifreq = [0u8; 40];
+    ifreq[0..2].copy_from_slice(b"lo");
+
+    assert_eq!(
+        socket_req(
+            NR_IOCTL,
+            [
+                fd as u64,
+                SIOCGIFINDEX as u64,
+                ifreq.as_mut_ptr() as u64,
+                0,
+                0,
+                0
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(i32::from_le_bytes(ifreq[16..20].try_into().unwrap()), 1);
+}
+
+#[test]
+fn dispatch_ipv4_raw_control_socket_resolves_interface_index() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = match socket_req(NR_SOCKET, [AF_INET as u64, SOCK_RAW, 255, 0, 0, 0], &ctx) {
+        SyscallResult::Return(fd) => fd,
+        other => panic!("socket(AF_INET, SOCK_RAW, IPPROTO_RAW) failed: {other:?}"),
+    };
     let mut ifreq = [0u8; 40];
     ifreq[0..2].copy_from_slice(b"lo");
 

@@ -9,9 +9,9 @@ use crate::{
     asid_residency_mask, asid_tlb_hart_mask, begin_asid_switch_on_current_cpu,
     clear_asid_residency, deactivate_current_user_pmap, dispatch_trap_frame, enter_irq_context,
     finish_asid_switch_on_current_cpu, for_each_console_byte_for_sbi, limit_cpus,
-    mark_asid_resident_on_current_cpu, mark_ipi_ack, percpu_tls_for_cpu, remote_ipi_targets_from,
-    remote_sfence_targets_for_asid_from, remote_sfence_targets_from, trap::classify_rv64_trap,
-    Platform, Rv64TrapFrame, MAX_BOOT_CPUS, RV64_PERCPU_AREAS,
+    mark_asid_resident_on_current_cpu, mark_ipi_ack, outer_cache_line_span, percpu_tls_for_cpu,
+    remote_ipi_targets_from, remote_sfence_targets_for_asid_from, remote_sfence_targets_from,
+    trap::classify_rv64_trap, Platform, Rv64TrapFrame, MAX_BOOT_CPUS, RV64_PERCPU_AREAS,
 };
 
 static RV64_HAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -576,6 +576,51 @@ fn goldfish_persistent_clock_acknowledges_alarm_irq_without_disabling_alarm() {
 }
 
 #[test]
+#[cfg(not(target_arch = "riscv64"))]
+fn absent_goldfish_clock_reports_unsupported_without_mmio() {
+    let _guard = RV64_HAL_TEST_LOCK.lock().expect("rv64 hal test lock");
+    {
+        let mut state = super::HOST_GOLDFISH_RTC_STATE
+            .lock()
+            .expect("host goldfish rtc state");
+        state.reset();
+        state.set_present(false);
+    }
+    super::HOST_PLIC_STATE
+        .lock()
+        .expect("host plic state")
+        .reset();
+
+    assert_eq!(
+        <Platform as PersistentClockIf>::read_realtime_ns(),
+        Err(tx_hal::PersistentClockError::Unsupported)
+    );
+    assert_eq!(
+        <Platform as PersistentClockIf>::set_realtime_ns(1),
+        Err(tx_hal::PersistentClockError::Unsupported)
+    );
+    assert_eq!(
+        <Platform as PersistentClockIf>::set_wake_alarm_ns(2),
+        Err(tx_hal::PersistentClockError::Unsupported)
+    );
+    assert_eq!(
+        <Platform as PersistentClockIf>::clear_wake_alarm(),
+        Err(tx_hal::PersistentClockError::Unsupported)
+    );
+    assert_eq!(
+        <Platform as PersistentClockIf>::acknowledge_wake_alarm_irq(),
+        Err(tx_hal::PersistentClockError::Unsupported)
+    );
+
+    let mut state = super::HOST_GOLDFISH_RTC_STATE
+        .lock()
+        .expect("host goldfish rtc state");
+    assert!(state.read_log().is_empty());
+    assert!(state.write_log().is_empty());
+    state.reset();
+}
+
+#[test]
 fn cache_methods_are_callable_on_qemu_coherent_platform() {
     <Platform as CacheIf>::fence_all();
     <Platform as CacheIf>::fence_i_local();
@@ -584,6 +629,20 @@ fn cache_methods_are_callable_on_qemu_coherent_platform() {
     <Platform as CacheIf>::dcache_clean_range(PhysAddr(0x8020_0000), 4096);
     <Platform as CacheIf>::dcache_invalidate_range(PhysAddr(0x8020_0000), 4096);
     <Platform as CacheIf>::dcache_clean_invalidate_range(PhysAddr(0x8020_0000), 4096);
+}
+
+#[test]
+fn outer_cache_line_span_covers_unaligned_dma_ranges() {
+    assert_eq!(outer_cache_line_span(PhysAddr(0x1003), 0), None);
+    assert_eq!(
+        outer_cache_line_span(PhysAddr(0x1003), 1),
+        Some((0x1000, 0x1004)),
+    );
+    assert_eq!(
+        outer_cache_line_span(PhysAddr(0x103f), 2),
+        Some((0x1000, 0x1041)),
+    );
+    assert_eq!(outer_cache_line_span(PhysAddr(usize::MAX), 2), None);
 }
 
 #[test]

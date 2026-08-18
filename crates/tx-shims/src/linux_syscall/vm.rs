@@ -1260,27 +1260,13 @@ where
                 emit_futex_wait_entry(uaddr, val, op, wait_mask);
             }
 
-            // Validate the user address before probing — the futex
-            // subsystem reads *uaddr via `read_volatile` (bootstrap
-            // exemption), which traps the kernel on an unmapped page.
-            // A pre-check with the safe `read_user` accessor converts
-            // the trap into a graceful -EFAULT.
-            {
-                let guard = step_engine::guard();
-                let user_ptr = UserPtr::<u32>::new(uaddr as usize);
-                if let StepOutcome::Err(_) = ctx.aspace.read_user(user_ptr, &guard) {
-                    let result = SyscallResult::error_from(Errno::EFAULT);
-                    if trace_wait {
-                        emit_futex_result(b"debug.futex.wait.result", &result);
-                    }
-                    return result;
-                }
-            }
             let mut deadline_ns = None;
             if timeout_uaddr != 0 {
-                let Some(timeout_ns) = read_timespec_at(&ctx.aspace, timeout_uaddr) else {
-                    return SyscallResult::Error(EINVAL_VALUE);
-                };
+                let timeout_ns =
+                    match super::time::read_timespec_at_wait(&ctx.aspace, timeout_uaddr).await {
+                        Ok(timeout_ns) => timeout_ns,
+                        Err(errno) => return SyscallResult::error_from(errno),
+                    };
                 let now_ns = timekeeper_clock::<P>().monotonic_now_ns();
                 let next_deadline_ns = if op == FUTEX_WAIT_BITSET {
                     if (op_full & FUTEX_CLOCK_REALTIME) != 0 {
@@ -1292,32 +1278,25 @@ where
                     now_ns.saturating_add(timeout_ns)
                 };
                 if next_deadline_ns <= now_ns {
-                    let guard = step_engine::guard();
-                    let user_ptr = UserPtr::<u32>::new(uaddr as usize);
-                    match ctx.aspace.read_user(user_ptr, &guard) {
-                        StepOutcome::Done(observed) if observed == val => {
+                    match super::user_copy::bootstrap_read_user_wait::<u32>(&ctx.aspace, uaddr)
+                        .await
+                    {
+                        Ok(observed) if observed == val => {
                             let result = SyscallResult::Error(110);
                             if trace_wait {
                                 emit_futex_result(b"debug.futex.wait.result", &result);
                             }
                             return result;
                         }
-                        StepOutcome::Done(_) => {
+                        Ok(_) => {
                             let result = SyscallResult::Error(EAGAIN_VALUE);
                             if trace_wait {
                                 emit_futex_result(b"debug.futex.wait.result", &result);
                             }
                             return result;
                         }
-                        StepOutcome::Err(_) => {
-                            let result = SyscallResult::error_from(Errno::EFAULT);
-                            if trace_wait {
-                                emit_futex_result(b"debug.futex.wait.result", &result);
-                            }
-                            return result;
-                        }
-                        StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
-                            let result = SyscallResult::error_from(Errno::EFAULT);
+                        Err(errno) => {
+                            let result = SyscallResult::error_from(errno);
                             if trace_wait {
                                 emit_futex_result(b"debug.futex.wait.result", &result);
                             }
@@ -1415,15 +1394,10 @@ where
                 return SyscallResult::Error(EINVAL_VALUE);
             }
             if op == FUTEX_CMP_REQUEUE {
-                let guard = step_engine::guard();
-                let user_ptr = UserPtr::<u32>::new(uaddr as usize);
-                match ctx.aspace.read_user(user_ptr, &guard) {
-                    StepOutcome::Done(observed) if observed == bitset => {}
-                    StepOutcome::Done(_) => return SyscallResult::Error(EAGAIN_VALUE),
-                    StepOutcome::Err(_) => return SyscallResult::error_from(Errno::EFAULT),
-                    StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
-                        return SyscallResult::error_from(Errno::EFAULT);
-                    }
+                match super::user_copy::bootstrap_read_user_wait::<u32>(&ctx.aspace, uaddr).await {
+                    Ok(observed) if observed == bitset => {}
+                    Ok(_) => return SyscallResult::Error(EAGAIN_VALUE),
+                    Err(errno) => return SyscallResult::error_from(errno),
                 }
             }
             let mut script_ctx = build_subject_script_ctx(ctx);

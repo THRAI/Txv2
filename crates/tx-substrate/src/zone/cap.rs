@@ -14,7 +14,7 @@ use crate::epoch::{self, Guard};
 
 use super::meta::SlotState;
 use super::policy::IsPayloadPolicy;
-use super::registry::{self, SlotKey};
+use super::registry::{self, RetiredSlot, SlotKey};
 use super::slot::Slot;
 use super::{Dead, ZoneAllocated};
 
@@ -401,12 +401,12 @@ impl<T: 'static> Drop for Cap<T> {
             }
         }
 
-        let mut retired_key = None;
+        let mut retired_slot = None;
         let mut retried_after_drain = false;
         loop {
             let retired = epoch::with_local_retire_guard(|local_guard| {
-                let key = if let Some(key) = retired_key {
-                    key
+                let retired = if let Some(retired) = retired_slot {
+                    retired
                 } else {
                     loop {
                         let cur = meta.load(Ordering::Acquire);
@@ -424,45 +424,36 @@ impl<T: 'static> Drop for Cap<T> {
                             }
                             continue;
                         }
-                        let retiring = cur.with_state(SlotState::Retiring).with_retiring_next(None);
+                        unsafe { slot.as_ref().set_retiring_next(None) };
+                        let retiring = cur.with_retain(0).with_state(SlotState::Retiring);
                         if meta
                             .compare_exchange(cur, retiring, Ordering::AcqRel, Ordering::Acquire)
                             .is_ok()
                         {
-                            break unsafe { slot.as_ref().key() };
+                            break RetiredSlot::new(
+                                unsafe { slot.as_ref().key() },
+                                cur.generation(),
+                            );
                         }
                     }
                 };
 
                 let retire_epoch = local_guard.sample_epoch_after_barrier();
                 unsafe {
-                    local_guard.try_enqueue_slot_after_barrier(key, retire_epoch, |previous| {
-                        loop {
-                            let current = meta.load(Ordering::Acquire);
-                            debug_assert_eq!(current.state(), SlotState::Retiring);
-                            let linked = current.with_retiring_next(previous.map(SlotKey::raw));
-                            if meta
-                                .compare_exchange(
-                                    current,
-                                    linked,
-                                    Ordering::Release,
-                                    Ordering::Relaxed,
-                                )
-                                .is_ok()
-                            {
-                                break;
-                            }
-                        }
-                    })?;
+                    local_guard.try_enqueue_slot_after_barrier(retired, retire_epoch)?;
                 }
-                Ok(Some(key))
+                Ok(Some(retired))
             })
             .expect("final Cap drop requires initialized local epoch retirement");
 
             match retired {
                 Ok(None) | Ok(Some(_)) => return,
                 Err(epoch::EpochError::RetireBagOccupied) if !retried_after_drain => {
-                    retired_key = Some(unsafe { slot.as_ref().key() });
+                    let current = meta.load(Ordering::Acquire);
+                    retired_slot = Some(RetiredSlot::new(
+                        unsafe { slot.as_ref().key() },
+                        current.generation(),
+                    ));
                     retried_after_drain = true;
                     let _ = epoch::drain_with_budget(usize::MAX);
                 }

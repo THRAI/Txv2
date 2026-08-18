@@ -77,6 +77,13 @@ The default CI gate is `cargo xtask ci`. It reports these checks individually:
 
 - `cargo xtask lint unused`
 
+<!-- txdoc:CI-GATE-NET-PORTABILITY -->
+
+- `cargo xtask lint net-portability` — rejects generic-kernel architecture
+  branches, platform-global network IRQs, interface-name hardware selection,
+  first-device fallbacks, deployment literals, fixed QEMU NIC placement, and
+  TLS-verification bypasses outside explicit network fixtures.
+
 <!-- txdoc:CI-GATE-KERNEL-USER-LAYOUTS -->
 
 - `cargo xtask lint kernel-user-layouts` — fails when a kernel/user ABI

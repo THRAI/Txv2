@@ -378,4 +378,16 @@ fn coarse_counter_fallback_uses_vvar_clock_mode_gate() {
 
     assert!(mode < mode_gate && mode_gate < seconds);
     assert!(coarse[..seconds].contains(".Lgt_enosys"));
+
+    let success = coarse
+        .find("li      a0, 0")
+        .expect("coarse vDSO success result");
+    let done = coarse[success..]
+        .find("j       .Lgt_done")
+        .map(|offset| success + offset)
+        .expect("coarse vDSO success must skip the -ENOSYS fallback");
+    let enosys = coarse
+        .find(".Lgt_enosys:")
+        .expect("coarse vDSO fallback label");
+    assert!(success < done && done < enosys);
 }

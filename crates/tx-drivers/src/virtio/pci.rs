@@ -1,6 +1,9 @@
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use tx_hal::{MmioRegion, PlatformInfoIf, TxPlatform};
+use tx_hal::{
+    MmioRegion, PciDeviceMatch, PciFunctionId, PhysAddr, PhysRange, PlatformInfoIf, TxPlatform,
+};
 use virtio_drivers::transport::{
     pci::{
         bus::{
@@ -28,6 +31,20 @@ pub enum VirtioPciError {
     BarTooLarge,
     BarAddressExhausted,
     Transport,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PciBarFact {
+    pub index: u8,
+    pub phys: PhysRange,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PciFunctionFact {
+    pub function: PciFunctionId,
+    pub device_match: PciDeviceMatch,
+    pub bars: Vec<PciBarFact>,
+    pub interrupt_pin: u8,
 }
 
 impl VirtioPciError {
@@ -72,6 +89,86 @@ pub fn find_virtio_net_transport<P: TxPlatform>(
     find_virtio_transport::<P>(ecam_region, mmio32_region, DeviceType::Network)
 }
 
+/// Enumerate and configure every VirtIO network function on bus zero.
+///
+/// BAR allocation happens once here so the resource provider can freeze the
+/// resulting BDF/BAR facts before a concrete driver is constructed.
+pub fn enumerate_virtio_net_functions(
+    ecam_region: MmioRegion,
+    mmio32_region: MmioRegion,
+) -> Result<Vec<PciFunctionFact>, VirtioPciError> {
+    let cam = unsafe { MmioCam::new(ecam_region.virt.start.0 as *mut u8, Cam::Ecam) };
+    let inspect = unsafe { MmioCam::new(ecam_region.virt.start.0 as *mut u8, Cam::Ecam) };
+    let mut root = PciRoot::new(cam);
+    let mut allocator = shared_pci_memory32_allocator(mmio32_region)?;
+    let mut facts = Vec::new();
+
+    for (device_function, info) in root.enumerate_bus(0) {
+        if virtio_device_type(&info) != Some(DeviceType::Network) {
+            continue;
+        }
+        let bars = allocate_bars(&mut root, device_function, &mut allocator)?;
+        root.set_command(
+            device_function,
+            Command::MEMORY_SPACE | Command::BUS_MASTER | Command::IO_SPACE,
+        );
+        let subsystem = inspect.read_word(device_function, 0x2c);
+        let interrupt = inspect.read_word(device_function, 0x3c);
+        facts.push(PciFunctionFact {
+            function: PciFunctionId {
+                segment: 0,
+                bus: device_function.bus,
+                device: device_function.device,
+                function: device_function.function,
+            },
+            device_match: PciDeviceMatch {
+                vendor: info.vendor_id,
+                device: info.device_id,
+                subsystem_vendor: Some(subsystem as u16),
+                subsystem_device: Some((subsystem >> 16) as u16),
+                class: (u32::from(info.class) << 16)
+                    | (u32::from(info.subclass) << 8)
+                    | u32::from(info.prog_if),
+            },
+            bars,
+            interrupt_pin: ((interrupt >> 8) & 0xff) as u8,
+        });
+    }
+    publish_shared_pci_memory32_next(&allocator);
+    Ok(facts)
+}
+
+pub fn open_virtio_net_transport_at<P: TxPlatform>(
+    ecam_region: MmioRegion,
+    function: PciFunctionId,
+) -> Result<PciTransport, VirtioPciError> {
+    if function.segment != 0 {
+        return Err(VirtioPciError::NoNetDevice);
+    }
+    let device_function = DeviceFunction {
+        bus: function.bus,
+        device: function.device,
+        function: function.function,
+    };
+    if !device_function.valid() {
+        return Err(VirtioPciError::NoNetDevice);
+    }
+    let cam = unsafe { MmioCam::new(ecam_region.virt.start.0 as *mut u8, Cam::Ecam) };
+    let mut root = PciRoot::new(cam);
+    let is_network = root.enumerate_bus(function.bus).any(|(candidate, info)| {
+        candidate == device_function && virtio_device_type(&info) == Some(DeviceType::Network)
+    });
+    if !is_network {
+        return Err(VirtioPciError::NoNetDevice);
+    }
+    root.set_command(
+        device_function,
+        Command::MEMORY_SPACE | Command::BUS_MASTER | Command::IO_SPACE,
+    );
+    PciTransport::new::<TxVirtioHal<P>, _>(&mut root, device_function)
+        .map_err(|_| VirtioPciError::Transport)
+}
+
 fn find_virtio_transport<P: TxPlatform>(
     ecam_region: MmioRegion,
     mmio32_region: MmioRegion,
@@ -85,7 +182,7 @@ fn find_virtio_transport<P: TxPlatform>(
         if virtio_device_type(&info) != Some(device_type) {
             continue;
         }
-        allocate_bars(&mut root, device_function, &mut allocator)?;
+        let _ = allocate_bars(&mut root, device_function, &mut allocator)?;
         publish_shared_pci_memory32_next(&allocator);
         root.set_command(
             device_function,
@@ -186,10 +283,11 @@ fn allocate_bars(
     root: &mut PciRoot<impl ConfigurationAccess>,
     device_function: DeviceFunction,
     allocator: &mut PciMemory32Allocator,
-) -> Result<(), VirtioPciError> {
+) -> Result<Vec<PciBarFact>, VirtioPciError> {
     let bars = root
         .bars(device_function)
         .map_err(|_| VirtioPciError::BarProbe)?;
+    let mut facts = Vec::new();
     for (bar_index, bar) in bars.into_iter().enumerate() {
         let Some(BarInfo::Memory {
             address_type, size, ..
@@ -210,8 +308,15 @@ fn allocate_bars(
             }
             MemoryBarType::Below1MiB => return Err(VirtioPciError::BarTooLarge),
         }
+        facts.push(PciBarFact {
+            index: bar_index as u8,
+            phys: PhysRange {
+                start: PhysAddr(address as usize),
+                size: size as usize,
+            },
+        });
     }
-    Ok(())
+    Ok(facts)
 }
 
 #[cfg(test)]

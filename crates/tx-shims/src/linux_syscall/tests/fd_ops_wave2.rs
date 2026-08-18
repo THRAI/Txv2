@@ -30,9 +30,9 @@ use tx_subsystems::vfs::FsOps;
 
 use crate::linux_syscall::{
     AT_FDCWD, EXECVE_PATH_MAX, F_OK, NR_CLOSE, NR_DUP, NR_DUP3, NR_FACCESSAT, NR_MOUNT,
-    NR_NEWFSTATAT, NR_OPENAT, NR_READLINKAT, NR_STATX, NR_UMOUNT2, NR_UNLINKAT, O_CLOEXEC, O_CREAT,
-    O_DIRECT, O_DIRECTORY, O_EXCL, O_NOCTTY, O_NOFOLLOW, O_NONBLOCK, O_RDONLY, O_RDWR, O_TRUNC,
-    R_OK, W_OK,
+    NR_NEWFSTATAT, NR_OPENAT, NR_READLINKAT, NR_STATX, NR_SYNCFS, NR_UMOUNT2, NR_UNLINKAT,
+    O_CLOEXEC, O_CREAT, O_DIRECT, O_DIRECTORY, O_EXCL, O_NOCTTY, O_NOFOLLOW, O_NONBLOCK, O_RDONLY,
+    O_RDWR, O_TRUNC, R_OK, W_OK,
 };
 
 /// errno magnitudes: positive Linux RV64 generic ABI values.
@@ -145,6 +145,133 @@ fn build_tmpfs_root() -> (Cap<DEntry>, Arc<Tmpfs>) {
 #[derive(Default)]
 struct RecordingFsyncBacking {
     fsyncs: AtomicUsize,
+}
+
+#[derive(Default)]
+struct RejectingFilesystemSyncBacking {
+    sync_filesystem_calls: AtomicUsize,
+}
+
+impl FsPageBacking for RejectingFilesystemSyncBacking {
+    fn fetch_page(
+        &self,
+        _fs_object_id: tx_subsystems::vfs::FsObjectId,
+        _offset: u64,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<tx_subsystems::page_backed::Frame, step_engine::NoProgress> {
+        unreachable!("syncfs mount-settlement test has no resident pages")
+    }
+
+    fn flush_page(
+        &self,
+        _fs_object_id: tx_subsystems::vfs::FsObjectId,
+        _offset: u64,
+        _frame: &tx_subsystems::page_backed::Frame,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        StepOutcome::done(())
+    }
+
+    fn truncate(
+        &self,
+        _fs_object_id: tx_subsystems::vfs::FsObjectId,
+        _new_size: u64,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        StepOutcome::done(())
+    }
+
+    fn fsync_file(
+        &self,
+        _fs_object_id: tx_subsystems::vfs::FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        StepOutcome::err(tx_subsystems::execution::Errno::ENOSYS.into())
+    }
+
+    fn sync_filesystem(&self, _guard: &Guard<'_>) -> StepOutcome<(), step_engine::NoProgress> {
+        self.sync_filesystem_calls.fetch_add(1, Ordering::AcqRel);
+        StepOutcome::err(tx_subsystems::execution::Errno::ENOSYS.into())
+    }
+}
+
+fn build_mount_settlement_only_root() -> (
+    Cap<DEntry>,
+    Arc<RejectingFilesystemSyncBacking>,
+    Cap<MountIdentity>,
+) {
+    let tmpfs = Arc::new(Tmpfs::new());
+    let backing = Arc::new(RejectingFilesystemSyncBacking::default());
+    let payload = MountPayload::new_cap(
+        tmpfs as Arc<dyn tx_subsystems::vfs::FsOps>,
+        backing.clone(),
+        None,
+        DevId::new(205),
+        MountOptions::default(),
+        "mount-settlement-only",
+        SourceLabel::Static("mount-settlement-only"),
+    )
+    .expect("mount-settlement-only payload");
+    let root_rnode = {
+        let raw = RNode::new(
+            TMPFS_ROOT_OBJECT_ID,
+            InodeMeta::new(InodeKind::Directory, S_IFDIR | 0o755),
+            RNodeBacking::Directory,
+        )
+        .with_containing_mount(&payload);
+        let reservation = reserve_for::<RNode>().expect("root rnode reservation");
+        sign_for(reservation, raw)
+    };
+    let mount = MountIdentity::new_cap(
+        MountId::new(22),
+        None,
+        root_rnode.clone(),
+        None,
+        payload,
+        MountFlags::empty(),
+    )
+    .expect("mount-settlement-only identity");
+    let root_dentry = DEntry::new_cap(InlineName::ROOT, root_rnode).expect("root dentry");
+    (root_dentry, backing, mount)
+}
+
+#[test]
+fn dispatch_syncfs_uses_mount_settlement_without_legacy_pagebacking_fallback() {
+    let _setup = fd_ops_setup();
+    let (root_dentry, backing, _mount) = build_mount_settlement_only_root();
+    let (process, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(process, thread);
+    let root_path = nul_terminate(b"/");
+    let fd = match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_OPENAT,
+            [
+                AT_FDCWD as i64 as u64,
+                root_path.as_ptr() as u64,
+                (O_RDONLY | O_DIRECTORY) as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    )) {
+        SyscallResult::Return(fd) => fd as u64,
+        other => panic!("open root for syncfs: {other:?}"),
+    };
+
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(NR_SYNCFS, [fd, 0, 0, 0, 0, 0]),
+            &ctx,
+        )),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        backing.sync_filesystem_calls.load(Ordering::Acquire),
+        0,
+        "MountSettlementOp is the canonical syncfs durability boundary"
+    );
 }
 
 impl FsPageBacking for RecordingFsyncBacking {

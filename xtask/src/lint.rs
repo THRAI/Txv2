@@ -42,7 +42,7 @@ const AUTHORED_HOST_PACKAGES: &[&str] = &[
 
 pub(crate) fn lint(root: &Path, args: Vec<String>) -> Result<()> {
     let Some(kind) = args.first() else {
-        return Err("lint command needs `arch`, `docs`, `unused`, `boundary`, `invariants`, `kernel-user-layouts`, or `syscall-status`".into());
+        return Err("lint command needs `arch`, `docs`, `unused`, `boundary`, `invariants`, `net-portability`, `kernel-user-layouts`, or `syscall-status`".into());
     };
     match kind.as_str() {
         "arch" => lint_arch(root),
@@ -53,6 +53,7 @@ pub(crate) fn lint(root: &Path, args: Vec<String>) -> Result<()> {
             let sub = args.get(1).map(|s| s.as_str()).unwrap_or("all");
             lint_invariants(root, sub)
         }
+        "net-portability" => crate::lint_net_portability::lint_net_portability(root),
         "syscall-status" => {
             // The dispatch table at `crates/tx-shims/src/linux_syscall/{numbers,mod}.rs`
             // is the SSoT for syscall progress; this gate fails if the
@@ -65,7 +66,7 @@ pub(crate) fn lint(root: &Path, args: Vec<String>) -> Result<()> {
             args.iter().skip(1).cloned().collect(),
         ),
         other => Err(format!(
-            "unknown lint kind '{other}', expected arch, docs, unused, boundary, invariants, kernel-user-layouts, or syscall-status"
+            "unknown lint kind '{other}', expected arch, docs, unused, boundary, invariants, net-portability, kernel-user-layouts, or syscall-status"
         )),
     }
 }
@@ -970,6 +971,10 @@ fn unused_check_steps(installed: &BTreeSet<String>) -> Vec<UnusedCheckStep> {
                 target_triple(TxTarget::Rv64M1DockMock),
             ),
             (TxTarget::La64Qemu, target_triple(TxTarget::La64Qemu)),
+            (
+                TxTarget::La64Ls2k1000,
+                target_triple(TxTarget::La64Ls2k1000),
+            ),
         ],
     )
 }

@@ -46,9 +46,9 @@ use crate::execution::{Errno, Guard, WaitToken};
 use crate::page_backed::{MaterializeAccess, MaterializedPage, PageIndex};
 
 use super::structure::{
-    AccessMode, AddressSpace, PrivateFrame, PrivateFrameState, PrivatePageError, UserRange,
-    UserVirtAddr, VmEntry, VmEntryBacking, VmFault, VmFaultError, VmFaultMaterializationStep,
-    VmFaultOutcome, USER_PAGE_SIZE,
+    AccessMode, AddressSpace, PrivateFrame, PrivateFrameState, PrivatePageError, RangeGuard,
+    UserRange, UserVirtAddr, VmEntry, VmEntryBacking, VmFault, VmFaultError,
+    VmFaultMaterializationStep, VmFaultOutcome, USER_PAGE_SIZE,
 };
 use crate::vm::adapter::step_engine::{self as step_engine, ByteProgress, NoProgress, StepOutcome};
 use crate::vm::checks::require_fault_recipe;
@@ -186,6 +186,18 @@ impl AddressSpace {
         }
         let within = dst.addr() - page_addr;
         let page = UserVirtAddr(page_addr).containing_page();
+        let page_range = UserRange::containing_page(UserVirtAddr(page_addr)).ok()?;
+        // Direct-map writes bypass the hardware PTE, so they must still join
+        // the VM range protocol.  In particular, a fork writer must not
+        // finish its CoW snapshot while an already-started kernel user write
+        // can continue modifying the old physical frame.
+        let _page_guard = match self
+            .range_lock
+            .acquire_step_rich(page_range, LockMode::Materializer)
+        {
+            crate::vm::AcquireResult::Acquired(guard) => guard,
+            crate::vm::AcquireResult::WouldBlock(_) => return None,
+        };
         let mapping = self.pmap.lookup_pinned(page)?;
         if !mapping
             .snapshot
@@ -208,6 +220,78 @@ impl AddressSpace {
             );
         }
         Some(Ok(()))
+    }
+
+    /// Validate a small user write while the caller owns a covering VM range
+    /// reservation.
+    ///
+    /// Unlike [`Self::write_user_resident`], this does not acquire a nested
+    /// Materializer reservation.  That matters for multi-step transactions:
+    /// once an ExclusiveWriter queues behind the caller, a nested acquisition
+    /// would block behind that writer while the writer is itself waiting for
+    /// the caller's outer guard.
+    pub fn validate_user_write_resident_reserved<T: Copy>(
+        &self,
+        dst: UserPtr<T>,
+        reservation: &RangeGuard<'_>,
+    ) -> Result<(), Errno> {
+        let len = core::mem::size_of::<T>();
+        if dst.addr() == 0 {
+            return Err(Errno::EFAULT);
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        let last = dst.addr().checked_add(len - 1).ok_or(Errno::EFAULT)?;
+        let page_addr = dst.addr() & !(USER_PAGE_SIZE - 1);
+        if last & !(USER_PAGE_SIZE - 1) != page_addr {
+            return Err(Errno::EFAULT);
+        }
+        let page = UserVirtAddr(page_addr).containing_page();
+        let page_range =
+            UserRange::containing_page(UserVirtAddr(page_addr)).map_err(|_| Errno::EFAULT)?;
+        if !reservation.covers(&self.range_lock, page_range) {
+            return Err(Errno::EFAULT);
+        }
+        let mapping = self.pmap.lookup_pinned(page).ok_or(Errno::EFAULT)?;
+        if !mapping
+            .snapshot
+            .prot
+            .permits(UserAccessKind::Write.required_prot())
+        {
+            return Err(Errno::EFAULT);
+        }
+        page_allocator::frame_kernel_addr(mapping.snapshot.ppn)
+            .map(|_| ())
+            .map_err(|_| Errno::EFAULT)
+    }
+
+    /// Write a small value under a covering reservation previously validated
+    /// with [`Self::validate_user_write_resident_reserved`].
+    pub fn write_user_resident_reserved<T: Copy>(
+        &self,
+        dst: UserPtr<T>,
+        value: T,
+        reservation: &RangeGuard<'_>,
+    ) -> Result<(), Errno> {
+        self.validate_user_write_resident_reserved(dst, reservation)?;
+        let page_addr = dst.addr() & !(USER_PAGE_SIZE - 1);
+        let within = dst.addr() - page_addr;
+        let page = UserVirtAddr(page_addr).containing_page();
+        let mapping = self.pmap.lookup_pinned(page).ok_or(Errno::EFAULT)?;
+        let frame_base =
+            page_allocator::frame_kernel_addr(mapping.snapshot.ppn).map_err(|_| Errno::EFAULT)?;
+        // SAFETY: validation above proves that the value is wholly contained
+        // in a writable pinned frame, and `reservation` prevents the mapping
+        // from being replaced until this copy completes.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                core::ptr::addr_of!(value) as *const u8,
+                frame_base.add(within),
+                core::mem::size_of::<T>(),
+            );
+        }
+        Ok(())
     }
 
     /// Copy `dst.len()` bytes from user-space `src` to kernel-side `dst`.
@@ -239,7 +323,8 @@ impl AddressSpace {
     /// inner copy's byte-progress accumulator is summarised away here
     /// because a partial-`T` read is not a meaningful intermediate
     /// state for the caller). The inner v3 `copy_from_user` is bridged
-    /// per-variant: `Done`/`Continue` → `Done(value)`,
+    /// per-variant: a full-length `Done` → `Done(value)`, a short
+    /// `Done` → `Err(EFAULT)`, `Continue` → `Continue { NoProgress }`,
     /// `Yield { shape, .. }` → `Yield { progress: NoProgress, shape }`,
     /// `Err` → `Err(errno)` (errno already in `step_v3::Errno`).
     pub fn read_user<T: Copy>(
@@ -259,12 +344,17 @@ impl AddressSpace {
             )
         };
         let src_bytes = UserPtr::<u8>::new(src.addr());
+        let expected = core::mem::size_of::<T>();
         match self.copy_from_user(dst_bytes, src_bytes, guard) {
-            V3::Done(_) | V3::Continue { .. } => {
+            V3::Done(copied) if copied == expected => {
                 // SAFETY: copy_from_user wrote `size_of::<T>()` bytes
                 // before returning Done.
                 V3::Done(unsafe { value.assume_init() })
             }
+            V3::Done(_) => V3::Err(Errno::EFAULT.into()),
+            V3::Continue { .. } => V3::Continue {
+                progress: NoProgress,
+            },
             V3::Yield { shape, .. } => V3::Yield {
                 progress: NoProgress,
                 shape,
@@ -292,8 +382,13 @@ impl AddressSpace {
             )
         };
         let dst_bytes = UserPtr::<u8>::new(dst.addr());
+        let expected = core::mem::size_of::<T>();
         match self.copy_to_user(dst_bytes, src_bytes, guard) {
-            V3::Done(_) | V3::Continue { .. } => V3::Done(()),
+            V3::Done(copied) if copied == expected => V3::Done(()),
+            V3::Done(_) => V3::Err(Errno::EFAULT.into()),
+            V3::Continue { .. } => V3::Continue {
+                progress: NoProgress,
+            },
             V3::Yield { shape, .. } => V3::Yield {
                 progress: NoProgress,
                 shape,
@@ -325,6 +420,9 @@ impl AddressSpace {
     ///   shapes; the user-VA contract collapses every one to EFAULT).
     /// - `Yield(OnWaitSource)` if a page-cache fetch or RangeLock needs to
     ///   await; the caller awaits the exact wait source and retries.
+    /// - `Continue { .. }` for PageBacked resident-publication pressure that
+    ///   has no wait source yet. The synchronous helper returns that retry to
+    ///   its driver instead of spinning; the async wrapper yields once first.
     ///
     /// Per VM_v1_2 §"No rmap": private anon frames are tracked only
     /// via published PTEs, so the pmap is the canonical authoritative
@@ -343,13 +441,11 @@ impl AddressSpace {
     ) -> StepOutcome<(), NoProgress> {
         for page in range.iter_pages() {
             let mut pending = None;
-            loop {
-                match self.reserve_user_page_for_access_step(page, kind, &mut pending) {
-                    StepOutcome::Done(()) => break,
-                    StepOutcome::Continue { .. } => continue,
-                    wait @ StepOutcome::Yield { .. } => return wait,
-                    error @ StepOutcome::Err(_) => return error,
-                }
+            match self.reserve_user_page_for_access_step(page, kind, &mut pending) {
+                StepOutcome::Done(()) => {}
+                retry @ StepOutcome::Continue { .. } => return retry,
+                wait @ StepOutcome::Yield { .. } => return wait,
+                error @ StepOutcome::Err(_) => return error,
             }
         }
         StepOutcome::Done(())
@@ -368,15 +464,36 @@ impl AddressSpace {
             match self.reserve_user_range_for_access(range, kind) {
                 V3::Done(()) => return Ok(()),
                 V3::Err(error) => return Err(error.into()),
-                V3::Continue { .. } => continue,
+                V3::Continue { .. } => {
+                    tx_reactor::yield_now().await;
+                    continue;
+                }
                 V3::Yield { shape, .. } => {
-                    let token =
-                        crate::vm::notification::wait_token_from_shape(&shape).ok_or(Errno::EIO)?;
-                    let mut wait = crate::wait_source::wait_on_registered_source_id(
+                    let Some(token) = crate::vm::notification::wait_token_from_shape(&shape) else {
+                        // The synchronous VM protocol currently emits only
+                        // wait-source yields.  Keep this async compatibility
+                        // driver resilient to a transient/new yield shape:
+                        // yielding and rechecking preserves the semantic
+                        // operation, whereas exposing EIO to userspace turns
+                        // internal scheduling pressure into a false I/O
+                        // failure.
+                        tx_reactor::yield_now().await;
+                        continue;
+                    };
+                    let Some(mut wait) = crate::wait_source::wait_on_registered_source_id(
                         token.source_id(),
                         token.interest(),
-                    )
-                    .ok_or(Errno::EIO)?;
+                    ) else {
+                        // Page completion can retire its PageReady carrier
+                        // after this step observed Yield but before we resolve
+                        // the source id.  The completed page is the durable
+                        // predicate; a missing edge carrier therefore means
+                        // "recheck", never EIO.  Yield once so a genuinely
+                        // transient publication window cannot become a hot
+                        // retry loop.
+                        tx_reactor::yield_now().await;
+                        continue;
+                    };
 
                     // Publish the subscription before checking the semantic
                     // predicate again. A single pending-mask bit cannot
@@ -404,7 +521,10 @@ impl AddressSpace {
                                         &rechecked_shape,
                                     )
                                 else {
-                                    return Poll::Ready(Some(Err(Errno::EIO)));
+                                    // Re-enter the semantic operation instead
+                                    // of mapping a protocol transition to a
+                                    // userspace-visible I/O error.
+                                    return Poll::Ready(None);
                                 };
                                 if rechecked.source_id() == token.source_id()
                                     && rechecked.interest() & token.interest() != 0
@@ -489,6 +609,12 @@ impl AddressSpace {
         let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
         let materialization = match outcome.materialize_pagebacked_step(&guard) {
             VmFaultMaterializationStep::Done(materialization) => materialization,
+            VmFaultMaterializationStep::Retry => {
+                drop(guard);
+                return StepOutcome::Continue {
+                    progress: NoProgress,
+                };
+            }
             VmFaultMaterializationStep::Blocked(token) => {
                 drop(guard);
                 return crate::vm::notification::yield_wait_token(NoProgress, token);
@@ -557,6 +683,11 @@ impl AddressSpace {
                 match resolve_user_page_addr(self, page_addr, UserAccessKind::Read, guard) {
                     ResolveOutcome::Done(resolved) => resolved,
                     ResolveOutcome::Err(e) => return V3::Err(e.into()),
+                    ResolveOutcome::Retry => {
+                        return V3::Continue {
+                            progress: NoProgress,
+                        };
+                    }
                     ResolveOutcome::Blocked(t) => {
                         return crate::vm::notification::yield_wait_token(NoProgress, t);
                     }
@@ -650,6 +781,12 @@ fn copy_in(
                 }
                 return V3::Err(e.into());
             }
+            ResolveOutcome::Retry => {
+                emit_vm_user_trace(b"debug.vm.user.copy_in.retry", 1);
+                return V3::Continue {
+                    progress: ByteProgress::new(copied),
+                };
+            }
             ResolveOutcome::Blocked(t) => {
                 emit_vm_user_trace(b"debug.vm.user.copy_in.blocked", 1);
                 return crate::vm::notification::yield_wait_token(ByteProgress::new(copied), t);
@@ -686,6 +823,33 @@ fn copy_out(
         let page_addr = user_addr & !(USER_PAGE_SIZE - 1);
         let within = user_addr - page_addr;
         let chunk = core::cmp::min(total - copied, USER_PAGE_SIZE - within);
+        let page_range = match UserRange::containing_page(UserVirtAddr(page_addr)) {
+            Ok(range) => range,
+            Err(_) => {
+                return if copied > 0 {
+                    V3::Done(copied)
+                } else {
+                    V3::Err(Errno::EFAULT.into())
+                };
+            }
+        };
+        // `copy_out` writes through the kernel direct map rather than through
+        // the user PTE.  Serialize that physical write with fork/mprotect/
+        // unmap writers, otherwise a fork can publish the old frame to its
+        // child and this copy can modify the shared frame after the CoW
+        // snapshot has completed.
+        let _page_guard = match aspace
+            .range_lock
+            .acquire_step_rich(page_range, LockMode::Materializer)
+        {
+            crate::vm::AcquireResult::Acquired(guard) => guard,
+            crate::vm::AcquireResult::WouldBlock(blocked) => {
+                return crate::vm::notification::yield_wait_token(
+                    ByteProgress::new(copied),
+                    blocked.into_wait_token(),
+                );
+            }
+        };
         match resolve_user_page_addr(aspace, page_addr, UserAccessKind::Write, guard) {
             ResolveOutcome::Done(resolved) => {
                 let frame_base = resolved.frame_base;
@@ -708,6 +872,11 @@ fn copy_out(
                 }
                 return V3::Err(e.into());
             }
+            ResolveOutcome::Retry => {
+                return V3::Continue {
+                    progress: ByteProgress::new(copied),
+                };
+            }
             ResolveOutcome::Blocked(t) => {
                 return crate::vm::notification::yield_wait_token(ByteProgress::new(copied), t);
             }
@@ -723,6 +892,7 @@ enum ResolveOutcome {
     /// the synchronous copy/scan performed by the caller.
     Done(ResolvedUserPage),
     Err(Errno),
+    Retry,
     Blocked(WaitToken),
 }
 
@@ -851,6 +1021,10 @@ fn resolve_user_page_addr(
             emit_vm_user_trace(b"debug.vm.user.resolve.err", 4);
             return ResolveOutcome::Err(e);
         }
+        ResolvePageOutcome::Retry => {
+            emit_vm_user_trace(b"debug.vm.user.resolve.retry", 1);
+            return ResolveOutcome::Retry;
+        }
         ResolvePageOutcome::Blocked(t) => {
             emit_vm_user_trace(b"debug.vm.user.resolve.blocked", 1);
             return ResolveOutcome::Blocked(t);
@@ -918,7 +1092,7 @@ fn resolve_user_page_addr(
 /// sole authoritative source of the inherited bytes.  Both syscall prefault
 /// and direct `copy_to_user` must seed the same `SharedCow` source; otherwise
 /// whichever lane runs first can re-create a zero/file backing page.
-fn seed_inherited_private_frame(
+pub(super) fn seed_inherited_private_frame(
     entry: &VmEntry,
     page_addr: usize,
     cached: Option<super::pmap::PmapMappingSnapshot>,
@@ -964,6 +1138,7 @@ fn emit_vm_user_trace(name: &[u8], value: i64) {
 enum ResolvePageOutcome {
     Done(MaterializedPage),
     Err(Errno),
+    Retry,
     Blocked(WaitToken),
 }
 
@@ -1057,9 +1232,9 @@ fn resolve_user_page(
             // (`StepOutcome<MaterializedPage, NoProgress>`); translate
             // per outcome variant onto the v4 `ResolvePageOutcome`:
             // - v3 `Done(m)` → `ResolvePageOutcome::Done(m)`.
-            // - v3 `Continue { .. }` (NoProgress) → `Err(EFAULT)` —
-            //   page allocation rarely emits this; treating it as a
-            //   fault keeps the user-access path conservative.
+            // - v3 `Continue { .. }` (NoProgress) →
+            //   `ResolvePageOutcome::Retry`; this is the resident-root
+            //   publication window and must remain a retry, not EFAULT.
             // - v3 `Yield { OnWaitSource { c, i } }` →
             //   `ResolvePageOutcome::Blocked(WaitToken(c, i))`.
             // - v3 `Yield { OnAgent .. }` → `Err(EFAULT)`.
@@ -1071,8 +1246,8 @@ fn resolve_user_page(
                     ResolvePageOutcome::Done(m)
                 }
                 V3::Continue { .. } => {
-                    emit_vm_user_trace(b"debug.vm.user.pagebacked.err", 1);
-                    ResolvePageOutcome::Err(Errno::EFAULT)
+                    emit_vm_user_trace(b"debug.vm.user.pagebacked.retry", 1);
+                    ResolvePageOutcome::Retry
                 }
                 V3::Yield { shape, .. } => {
                     if let Some(token) = crate::vm::notification::wait_token_from_shape(&shape) {
@@ -1083,9 +1258,9 @@ fn resolve_user_page(
                         ResolvePageOutcome::Err(Errno::EFAULT)
                     }
                 }
-                V3::Err(_) => {
+                V3::Err(errno) => {
                     emit_vm_user_trace(b"debug.vm.user.pagebacked.err", 3);
-                    ResolvePageOutcome::Err(Errno::EFAULT)
+                    ResolvePageOutcome::Err(errno.into())
                 }
             }
         }

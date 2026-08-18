@@ -20,7 +20,7 @@ pub mod register;
 
 use crate::adapter::step_engine::{page_allocator, NoProgress, SpinMutex, StepOutcome};
 use tx_subsystems::{
-    device::{BlockDevice, BlockDeviceOps, PhysicalBlockNumber},
+    device::{BlockDevice, BlockDeviceOps, BlockDurabilityCapabilities, PhysicalBlockNumber},
     execution::{Errno, Guard},
     page_backed::Frame,
 };
@@ -57,6 +57,9 @@ macro_rules! wait_for {
 /// `read_volatile`/`write_volatile` at `base + offset`.
 pub struct Vf2Mmc {
     base: usize,
+    /// Serializes the controller-wide command, FIFO, and interrupt-status
+    /// registers across callers on different harts.
+    io_gate: SpinMutex<()>,
     fifo_offset: SpinMutex<usize>,
     total_blocks: SpinMutex<u64>,
     ready: SpinMutex<bool>,
@@ -71,10 +74,16 @@ impl Vf2Mmc {
     pub const fn new(base: usize) -> Self {
         Self {
             base,
+            io_gate: SpinMutex::new(()),
             fifo_offset: SpinMutex::new(FIFO_OFFSET),
             total_blocks: SpinMutex::new(0),
             ready: SpinMutex::new(false),
         }
+    }
+
+    fn with_io_transaction<R>(&self, operation: impl FnOnce() -> R) -> R {
+        let _gate = self.io_gate.lock();
+        operation()
     }
 
     // ---- raw register access ----
@@ -361,27 +370,36 @@ impl BlockDeviceOps for Vf2Mmc {
         StepOutcome::Done(())
     }
 
+    fn durability_capabilities(&self) -> BlockDurabilityCapabilities {
+        BlockDurabilityCapabilities {
+            fua: false,
+            flush: true,
+        }
+    }
+
     fn read_blocks_bootstrap(
         &self,
         block_id: PhysicalBlockNumber,
         target: &mut [Frame],
     ) -> StepOutcome<(), NoProgress> {
-        if !*self.ready.lock() {
-            return StepOutcome::Err(Errno::ENODEV.into());
-        }
-        for (idx, frame) in target.iter_mut().enumerate() {
-            let Some(words) = frame_words_mut(*frame) else {
-                return StepOutcome::Err(Errno::EIO.into());
-            };
-            for blk in 0..BLOCKS_PER_PAGE {
-                let lba = block_id.as_u64() + (idx * BLOCKS_PER_PAGE + blk) as u64;
-                let chunk = &mut words[blk * WORDS_PER_BLOCK..(blk + 1) * WORDS_PER_BLOCK];
-                if !self.read_one_block(lba as u32, chunk) {
+        self.with_io_transaction(|| {
+            if !*self.ready.lock() {
+                return StepOutcome::Err(Errno::ENODEV.into());
+            }
+            for (idx, frame) in target.iter_mut().enumerate() {
+                let Some(words) = frame_words_mut(*frame) else {
                     return StepOutcome::Err(Errno::EIO.into());
+                };
+                for blk in 0..BLOCKS_PER_PAGE {
+                    let lba = block_id.as_u64() + (idx * BLOCKS_PER_PAGE + blk) as u64;
+                    let chunk = &mut words[blk * WORDS_PER_BLOCK..(blk + 1) * WORDS_PER_BLOCK];
+                    if !self.read_one_block(lba as u32, chunk) {
+                        return StepOutcome::Err(Errno::EIO.into());
+                    }
                 }
             }
-        }
-        StepOutcome::Done(())
+            StepOutcome::Done(())
+        })
     }
 
     fn write_blocks_bootstrap(
@@ -389,22 +407,24 @@ impl BlockDeviceOps for Vf2Mmc {
         block_id: PhysicalBlockNumber,
         source: &[Frame],
     ) -> StepOutcome<(), NoProgress> {
-        if !*self.ready.lock() {
-            return StepOutcome::Err(Errno::ENODEV.into());
-        }
-        for (idx, frame) in source.iter().enumerate() {
-            let Some(words) = frame_words_mut(*frame) else {
-                return StepOutcome::Err(Errno::EIO.into());
-            };
-            for blk in 0..BLOCKS_PER_PAGE {
-                let lba = block_id.as_u64() + (idx * BLOCKS_PER_PAGE + blk) as u64;
-                let chunk = &mut words[blk * WORDS_PER_BLOCK..(blk + 1) * WORDS_PER_BLOCK];
-                if !self.write_one_block(lba as u32, chunk) {
+        self.with_io_transaction(|| {
+            if !*self.ready.lock() {
+                return StepOutcome::Err(Errno::ENODEV.into());
+            }
+            for (idx, frame) in source.iter().enumerate() {
+                let Some(words) = frame_words_mut(*frame) else {
                     return StepOutcome::Err(Errno::EIO.into());
+                };
+                for blk in 0..BLOCKS_PER_PAGE {
+                    let lba = block_id.as_u64() + (idx * BLOCKS_PER_PAGE + blk) as u64;
+                    let chunk = &mut words[blk * WORDS_PER_BLOCK..(blk + 1) * WORDS_PER_BLOCK];
+                    if !self.write_one_block(lba as u32, chunk) {
+                        return StepOutcome::Err(Errno::EIO.into());
+                    }
                 }
             }
-        }
-        StepOutcome::Done(())
+            StepOutcome::Done(())
+        })
     }
 
     fn barrier_bootstrap(&self) -> StepOutcome<(), NoProgress> {
@@ -419,5 +439,61 @@ impl BlockDevice for Vf2Mmc {
 
     fn block_size(&self) -> u32 {
         SD_BLOCK_SIZE as u32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        sync::{mpsc, Arc},
+        time::Duration,
+    };
+
+    #[test]
+    fn vf2_mmc_controller_transactions_are_exclusive() {
+        let mmc = Arc::new(Vf2Mmc::new(0));
+        let (first_entered_tx, first_entered_rx) = mpsc::channel();
+        let (release_first_tx, release_first_rx) = mpsc::channel();
+        let first_mmc = Arc::clone(&mmc);
+        let first = std::thread::spawn(move || {
+            first_mmc.with_io_transaction(|| {
+                first_entered_tx.send(()).unwrap();
+                release_first_rx.recv().unwrap();
+            });
+        });
+        first_entered_rx.recv().unwrap();
+
+        let (second_entered_tx, second_entered_rx) = mpsc::channel();
+        let second_mmc = Arc::clone(&mmc);
+        let second = std::thread::spawn(move || {
+            second_mmc.with_io_transaction(|| second_entered_tx.send(()).unwrap());
+        });
+
+        let overlapped = second_entered_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_ok();
+        release_first_tx.send(()).unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
+
+        assert!(!overlapped, "MMC controller transactions must not overlap");
+    }
+
+    #[test]
+    fn vf2_mmc_reports_successful_barrier_as_flush_without_fua() {
+        let mmc = Vf2Mmc::new(0);
+
+        assert!(matches!(
+            BlockDeviceOps::barrier_bootstrap(&mmc),
+            StepOutcome::Done(())
+        ));
+        assert_eq!(
+            BlockDeviceOps::durability_capabilities(&mmc),
+            BlockDurabilityCapabilities {
+                fua: false,
+                flush: true,
+            }
+        );
     }
 }

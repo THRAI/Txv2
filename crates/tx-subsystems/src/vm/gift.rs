@@ -224,6 +224,17 @@ impl GiftBatch {
 
 pub type UserPageGiftStep = StepOutcome<GiftBatch, NoProgress>;
 
+enum GiftOnePageFailure {
+    Retry,
+    Terminal(UserPageGiftError),
+}
+
+impl From<UserPageGiftError> for GiftOnePageFailure {
+    fn from(error: UserPageGiftError) -> Self {
+        Self::Terminal(error)
+    }
+}
+
 impl AddressSpace {
     pub fn gift_user_pages_step(
         &self,
@@ -269,10 +280,17 @@ impl AddressSpace {
             let gift = match self.gift_one_page(&source_aspace, page_range) {
                 Ok(Some(gift)) => gift,
                 Ok(None) => return StepOutcome::Done(GiftBatch::new(Vec::new(), 0)),
-                Err(UserPageGiftError::Blocked(token)) => {
+                Err(GiftOnePageFailure::Retry) => {
+                    return StepOutcome::Continue {
+                        progress: NoProgress,
+                    };
+                }
+                Err(GiftOnePageFailure::Terminal(UserPageGiftError::Blocked(token))) => {
                     return crate::vm::notification::yield_wait_token(NoProgress, token);
                 }
-                Err(error) => return StepOutcome::Err(gift_error_to_errno(error)),
+                Err(GiftOnePageFailure::Terminal(error)) => {
+                    return StepOutcome::Err(gift_error_to_errno(error));
+                }
             };
             gifts.push(gift);
         }
@@ -285,7 +303,7 @@ impl AddressSpace {
         &self,
         source_aspace: &Cap<AddressSpace>,
         page_range: UserRange,
-    ) -> Result<Option<UserPageGift>, UserPageGiftError> {
+    ) -> Result<Option<UserPageGift>, GiftOnePageFailure> {
         let outcome = crate::vm::checks::require_fault_recipe(
             self,
             VmFault::new(page_range.start(), AccessMode::Write),
@@ -299,10 +317,15 @@ impl AddressSpace {
         let guard = step_engine::guard();
         let materialization = match outcome.materialize_pagebacked_step(&guard) {
             VmFaultMaterializationStep::Done(materialization) => materialization,
-            VmFaultMaterializationStep::Blocked(token) => {
-                return Err(UserPageGiftError::Blocked(token));
+            VmFaultMaterializationStep::Retry => {
+                return Err(GiftOnePageFailure::Retry);
             }
-            VmFaultMaterializationStep::Err(error) => return Err(UserPageGiftError::Fault(error)),
+            VmFaultMaterializationStep::Blocked(token) => {
+                return Err(UserPageGiftError::Blocked(token).into());
+            }
+            VmFaultMaterializationStep::Err(error) => {
+                return Err(UserPageGiftError::Fault(error).into());
+            }
         };
         drop(guard);
         let ppn = materialization.page.ppn;
@@ -316,7 +339,7 @@ impl AddressSpace {
             .and_then(|set| set.lookup(private_off));
         if let Some(snapshot) = private_identity {
             if snapshot.ppn != ppn {
-                return Err(UserPageGiftError::Fault(VmFaultError::StaleRecipe));
+                return Err(UserPageGiftError::Fault(VmFaultError::StaleRecipe).into());
             }
         }
 
@@ -324,10 +347,10 @@ impl AddressSpace {
         match freeze {
             UserPageGiftFreeze::DetachedPrivate => {
                 let Some(set) = outcome.entry.private() else {
-                    return Err(UserPageGiftError::Fault(VmFaultError::BackingMismatch));
+                    return Err(UserPageGiftError::Fault(VmFaultError::BackingMismatch).into());
                 };
                 let Some(snapshot) = private_identity else {
-                    return Err(UserPageGiftError::Private(PrivatePageError::Missing));
+                    return Err(UserPageGiftError::Private(PrivatePageError::Missing).into());
                 };
                 self.pmap
                     .remove_page_for_gift(page, ppn)

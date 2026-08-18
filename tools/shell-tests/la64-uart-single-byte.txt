@@ -1,0 +1,51 @@
+# LA64 16550 console RX single-owner regression.
+#
+# Send the command byte and newline separately so an RX IRQ can interleave with
+# the reactor polling fallback.  Every iteration must reach BusyBox as exactly
+# one `w`; duplicate or stale RBR reads change the command name and fail the
+# exact diagnostic match.
+
+wait "/ # " within 60000
+
+sleep 500
+send "w"
+sleep 200
+send "\n"
+expect "sh: w: not found" within 5000
+expect "/ # " within 5000
+
+sleep 500
+send "w"
+sleep 200
+send "\n"
+expect "sh: w: not found" within 5000
+expect "/ # " within 5000
+
+sleep 500
+send "w"
+sleep 200
+send "\n"
+expect "sh: w: not found" within 5000
+expect "/ # " within 5000
+
+sleep 500
+send "w"
+sleep 200
+send "\n"
+expect "sh: w: not found" within 5000
+expect "/ # " within 5000
+
+sleep 500
+send "w"
+sleep 200
+send "\n"
+expect "sh: w: not found" within 5000
+expect "/ # " within 5000
+
+sleep 500
+send "echo LA_UART_RX_SINGLE_OK\n"
+expect "LA_UART_RX_SINGLE_OK" within 5000
+expect "/ # " within 5000
+
+sleep 500
+quit

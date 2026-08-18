@@ -1,6 +1,6 @@
 //! Build script for `tx-vdso`.
 //!
-//! 1. Assembles `src/vdso.S` via the RISC-V musl cross-assembler.
+//! 1. Assembles `src/vdso.S` via an available RISC-V cross-assembler.
 //! 2. Extracts `.text` section bytes with objcopy.
 //! 3. Parses symbol offsets from `objdump -t`.
 //! 4. Builds a minimal ET_DYN ELF around the `.text` bytes.
@@ -148,7 +148,11 @@ fn find_assembler(explicit: Option<std::ffi::OsString>) -> Option<PathBuf> {
         );
         return Some(path);
     }
-    find_tool("riscv64-linux-musl-as")
+    // The vDSO is freestanding assembly and has no libc ABI dependency.
+    // Distribution packages commonly provide the GNU-targeted binutils
+    // prefix but not a musl-prefixed assembler; accepting either avoids
+    // silently replacing a valid RV64 vDSO with the syscall-only stub.
+    find_tool("riscv64-linux-musl-as").or_else(|| find_tool("riscv64-linux-gnu-as"))
 }
 
 fn find_tool(name: &str) -> Option<PathBuf> {

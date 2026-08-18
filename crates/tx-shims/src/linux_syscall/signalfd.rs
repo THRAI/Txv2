@@ -29,8 +29,8 @@ use tx_subsystems::vfs::OpenFile;
 
 use super::numbers::{O_CLOEXEC, O_NONBLOCK, SFD_CLOEXEC, SFD_NONBLOCK};
 use super::{
-    bootstrap_read_user, errno_to_i32, SyscallCtx, SyscallResult, EBADF_VALUE, EINVAL_VALUE,
-    ENOMEM_VALUE,
+    bootstrap_copy_to_user_wait, bootstrap_read_user_wait, errno_to_i32, SyscallCtx, SyscallResult,
+    EBADF_VALUE, EINVAL_VALUE, ENOMEM_VALUE,
 };
 use crate::adapter::step_engine::{self as step_engine};
 
@@ -55,7 +55,7 @@ const SIGSET_SIZE: usize = 8;
 /// - `Error(EBADF)` if `fd >= 0` and does not name a signalfd.
 /// - `Error(ENOMEM)` if zone allocation fails when minting a fresh
 ///   signalfd.
-pub(super) fn sys_signalfd4<'a>(
+pub(super) async fn sys_signalfd4<'a>(
     fd: i32,
     mask_ptr: u64,
     sizemask: u64,
@@ -79,7 +79,7 @@ pub(super) fn sys_signalfd4<'a>(
     }
 
     // Read the sigset_t from userspace as a u64.
-    let mask: u64 = match bootstrap_read_user::<u64>(&ctx.aspace, mask_ptr) {
+    let mask: u64 = match bootstrap_read_user_wait::<u64>(&ctx.aspace, mask_ptr).await {
         Ok(v) => v,
         Err(errno) => return SyscallResult::error_from(errno),
     };
@@ -134,8 +134,8 @@ pub(super) fn sys_signalfd4<'a>(
 /// Historical `signalfd(fd, mask, sizemask)` wrapper. Linux generic
 /// userspace normally reaches `signalfd4`, but some LTP binaries still
 /// probe the old three-argument shape.
-pub(super) fn sys_signalfd<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
-    sys_signalfd4(args[0] as i32, args[1], args[2], 0, ctx)
+pub(super) async fn sys_signalfd<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    sys_signalfd4(args[0] as i32, args[1], args[2], 0, ctx).await
 }
 
 /// signalfd-shaped `read(2)` arm. Drains one
@@ -196,7 +196,7 @@ pub(super) async fn sys_signalfd_read(
     {
         Ok(read) => {
             if let Err(errno) =
-                super::bootstrap_copy_to_user(&ctx.aspace, buf_ptr, &staging[..read])
+                bootstrap_copy_to_user_wait(&ctx.aspace, buf_ptr, &staging[..read]).await
             {
                 return SyscallResult::error_from(errno);
             }

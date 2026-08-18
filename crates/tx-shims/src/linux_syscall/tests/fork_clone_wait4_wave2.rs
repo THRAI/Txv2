@@ -155,6 +155,86 @@ fn dispatch_clone_thread_returns_eagain_while_exec_owns_lifecycle() {
     drop(exec_prep);
 }
 
+#[test]
+fn clone_thread_tid_writeback_defers_before_child_publication_on_vm_contention() {
+    let _setup = setup();
+    install_capturing_seam_and_reset();
+
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let _ = seed_parent_trap_context(&thread);
+    let aspace = proc_cap.aspace_cap().expect("bootstrap process has aspace");
+    let output_page = tx_subsystems::vm::UserRange::new_aligned(
+        tx_subsystems::vm::UserVirtAddr(0x1_0000),
+        tx_subsystems::vm::USER_PAGE_SIZE,
+    )
+    .expect("clone TID output page");
+    aspace
+        .try_mmap(tx_subsystems::vm::VmMapRequest::fixed(
+            output_page,
+            tx_subsystems::vm::MapPlacement::RequireFree,
+            tx_subsystems::vm::Prot::READ_WRITE,
+            tx_subsystems::vm::VmEntryFlags::PRIVATE,
+            tx_subsystems::vm::VmBacking::PrivateAnon,
+        ))
+        .expect("map clone TID output page");
+    assert!(matches!(
+        aspace
+            .reserve_user_range_for_access(output_page, tx_subsystems::vm::UserAccessKind::Write,),
+        step_engine::StepOutcome::Done(())
+    ));
+
+    let holder = match aspace
+        .range_lock()
+        .acquire_step_rich(output_page, tx_subsystems::vm::LockMode::ExclusiveWriter)
+    {
+        tx_subsystems::vm::AcquireResult::Acquired(guard) => guard,
+        _ => panic!("exclusive clone output holder must acquire"),
+    };
+    const CLONE_VM: u64 = 0x0000_0100;
+    const CLONE_SIGHAND: u64 = 0x0000_0800;
+    const CLONE_THREAD: u64 = 0x0001_0000;
+    const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
+    const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+    let request = SyscallRequest::new(
+        NR_CLONE,
+        [
+            CLONE_VM | CLONE_SIGHAND | CLONE_THREAD | CLONE_PARENT_SETTID | CLONE_CHILD_SETTID,
+            0,
+            0x1_0000,
+            0,
+            0x1_0008,
+            0,
+        ],
+    );
+
+    assert_eq!(
+        dispatch_clone_oneshot::<ShimsTestPmap>(&request, &proc_cap, &thread, &aspace),
+        None,
+        "RangeLock contention must defer clone before it creates a thread"
+    );
+    assert_eq!(proc_cap.live_thread_count(), 1);
+    assert_eq!(SUBMIT_CHILD_THREAD_CALLS.load(AtomicOrdering::SeqCst), 0);
+
+    drop(holder);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+    let child_tid = expect_clone_return_value(block_on(dispatch::<ShimsTestPmap>(request, &ctx)));
+    assert_eq!(proc_cap.live_thread_count(), 2);
+    assert_eq!(SUBMIT_CHILD_THREAD_CALLS.load(AtomicOrdering::SeqCst), 1);
+
+    let guard = step_engine::guard();
+    assert_eq!(
+        aspace.read_user(tx_hal::UserPtr::<i32>::new(0x1_0000), &guard),
+        step_engine::StepOutcome::Done(child_tid as i32)
+    );
+    drop(guard);
+    let guard = step_engine::guard();
+    assert_eq!(
+        aspace.read_user(tx_hal::UserPtr::<i32>::new(0x1_0008), &guard),
+        step_engine::StepOutcome::Done(child_tid as i32)
+    );
+}
+
 /// flags = `SIGCHLD | CLONE_NEWIPC` creates a child process in a
 /// fresh IPC namespace while the rest of the namespace bundle remains
 /// shared.

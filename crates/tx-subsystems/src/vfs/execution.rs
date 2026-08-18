@@ -1058,12 +1058,21 @@ impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileWriteFromUserOp<'a> {
         match self.file.rnode().backing() {
             RNodeBacking::PageBacked { pc } => {
                 emit_vfs_trace(b"debug.vfs.write_from_user_op.phase", 0);
-                let outcome = crate::page_backed::step_write_from_user(
+                // Direct-user writes bypass `OpenFile::step_write`. Select
+                // O_APPEND's EOF locally so zero-progress faults or waits do
+                // not mutate the shared file offset.
+                let start = if self.file.flags().append {
+                    pc.size_bytes()
+                } else {
+                    self.file.offset()
+                };
+                let outcome = crate::page_backed::step_write_from_user_at(
                     pc,
                     self.file,
                     self.aspace,
                     UserPtr::<u8>::new(self.src.addr() + self.cursor),
                     remaining,
+                    start,
                     &guard,
                 );
                 match &outcome {
@@ -2095,9 +2104,7 @@ impl<I: SubjectIdentity> StepOp<I> for FileFsyncOp {
                 Ok(
                     crate::page_backed::FileFsyncFrontierAdvance::Submitted { .. }
                     | crate::page_backed::FileFsyncFrontierAdvance::Waiting,
-                ) => V3::Continue {
-                    progress: NoProgress,
-                },
+                ) => self.state.pending_outcome(NoProgress),
                 Ok(crate::page_backed::FileFsyncFrontierAdvance::Error(errno)) => {
                     V3::Err(errno.into())
                 }
@@ -2107,20 +2114,24 @@ impl<I: SubjectIdentity> StepOp<I> for FileFsyncOp {
                     }
                     let guard = step_engine::guard();
                     match self.page_backing.fsync_file(self.fs_object_id, &guard) {
-                        V3::Done(()) => V3::Done(()),
+                        V3::Done(()) => {
+                            self.state.finish_wait(container);
+                            V3::Done(())
+                        }
                         V3::Err(e)
                             if e == step_engine::Errno::ENOSYS
                                 && mount.payload().backend_planner().is_some() =>
                         {
                             drop(guard);
                             match self.state.submit_backend_fsync(container) {
-                                Ok(()) => V3::Continue {
-                                    progress: NoProgress,
-                                },
+                                Ok(()) => self.state.pending_outcome(NoProgress),
                                 Err(errno) => V3::Err(errno.into()),
                             }
                         }
-                        V3::Err(e) => V3::Err(e),
+                        V3::Err(e) => {
+                            self.state.finish_wait(container);
+                            V3::Err(e)
+                        }
                         V3::Continue { .. } => V3::Continue {
                             progress: NoProgress,
                         },

@@ -708,6 +708,11 @@ pub struct ExecScriptOp<'a, P: PmapIf + EntropyIf + tx_hal::AuxvIf> {
     argv: &'a [&'a [u8]],
     envp: &'a [&'a [u8]],
     cred: &'a Credential,
+    /// Pre-PoNR executable page containers whose PageReady endpoints may be
+    /// named by a yielded step. The synchronous step facade recreates the
+    /// reversible exec future after every wake, so it must retain these
+    /// semantic owners until that retry observes completion.
+    retained_page_containers: Vec<Cap<PageContainer>>,
     _platform: core::marker::PhantomData<fn() -> P>,
 }
 
@@ -727,6 +732,7 @@ impl<'a, P: PmapIf + EntropyIf + tx_hal::AuxvIf> ExecScriptOp<'a, P> {
             argv,
             envp,
             cred,
+            retained_page_containers: Vec::new(),
             _platform: core::marker::PhantomData,
         }
     }
@@ -737,15 +743,20 @@ impl<'a, P: PmapIf + EntropyIf + tx_hal::AuxvIf> StepOp<ProcessIdentity> for Exe
     type Progress = NoProgress;
 
     fn step(&mut self, _ctx: &mut ScriptCtx<ProcessIdentity>) -> StepOutcome<(), NoProgress> {
-        let future = exec_script::<P>(
+        let future = exec_script_with_retention::<P>(
             self.process,
             self.thread,
             self.path,
             self.argv,
             self.envp,
             self.cred,
+            &mut self.retained_page_containers,
         );
-        exec_result_to_step_outcome(poll_ready_synchronously(future))
+        let outcome = exec_result_to_step_outcome(poll_ready_synchronously(future));
+        if matches!(outcome, StepOutcome::Done(_) | StepOutcome::Err(_)) {
+            self.retained_page_containers.clear();
+        }
+        outcome
     }
 }
 
@@ -795,6 +806,28 @@ pub async fn exec_script<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     envp: &[&[u8]],
     cred: &Credential,
 ) -> Result<(), ExecError> {
+    let mut retained_page_containers = Vec::new();
+    exec_script_with_retention::<P>(
+        process,
+        thread,
+        path,
+        argv,
+        envp,
+        cred,
+        &mut retained_page_containers,
+    )
+    .await
+}
+
+async fn exec_script_with_retention<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
+    process: &Cap<ProcessIdentity>,
+    thread: &Cap<ThreadIdentity>,
+    path: &[u8],
+    argv: &[&[u8]],
+    envp: &[&[u8]],
+    cred: &Credential,
+    retained_page_containers: &mut Vec<Cap<PageContainer>>,
+) -> Result<(), ExecError> {
     let mount_namespace = process
         .mount_namespace_cap()
         .ok_or(ExecError::PathNotFound)?;
@@ -823,6 +856,7 @@ pub async fn exec_script<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
             &mount_namespace,
             ExecutableCandidateRole::Main,
         )?;
+        retain_exec_page_container(retained_page_containers, &candidate.pc);
         let read_len = usize::try_from(candidate.pc.size_bytes().min(BINPRM_BUF_SIZE as u64))
             .map_err(|_| ExecError::NotExecutable)?;
         if read_len == 0 {
@@ -874,6 +908,7 @@ pub async fn exec_script<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
             &argv_refs,
             &envp_refs,
             cred,
+            retained_page_containers,
         )
         .await;
     }
@@ -897,6 +932,7 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     argv: &[&[u8]],
     envp: &[&[u8]],
     cred: &Credential,
+    retained_page_containers: &mut Vec<Cap<PageContainer>>,
 ) -> Result<(), ExecError> {
     // Shebang recursion guard (Linux limit: 4).
     if depth > SHEBANG_MAX_DEPTH {
@@ -945,6 +981,7 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     )?;
     let openfile = main_candidate.file;
     let file_pc = main_candidate.pc;
+    retain_exec_page_container(retained_page_containers, &file_pc);
     let file_size = file_pc.size_bytes();
 
     // ----- Phase 1 (cont) — execute-bit authorisation ----------------
@@ -1022,6 +1059,7 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
                 ExecutableCandidateRole::Interpreter,
             )?;
             let interp_pc = interp_candidate.pc;
+            retain_exec_page_container(retained_page_containers, &interp_pc);
             let interp_parsed = read_elf_image::<P>(&interp_pc, ImageRole::Interpreter)
                 .map_err(ExecError::from_interpreter_image_read_error)?;
             Some((interp_parsed, interp_pc))
@@ -1484,6 +1522,18 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     // `Ok(())` as "exec committed; do NOT write a syscall return for
     // this thread."
     Ok(())
+}
+
+fn retain_exec_page_container(
+    retained: &mut Vec<Cap<PageContainer>>,
+    container: &Cap<PageContainer>,
+) {
+    if retained
+        .iter()
+        .all(|current| current.key() != container.key())
+    {
+        retained.push(container.clone());
+    }
 }
 
 fn drive_exec_post_commit_ops(process: &Cap<ProcessIdentity>, new_brk_base: u64) {

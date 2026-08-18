@@ -746,7 +746,8 @@ pub async fn run_thread<P: TxPlatform>(
                 if matches!(
                     deliver_entry_signal_handler::<P>(
                         &thread, &payload, &process, &aspace, sig, action,
-                    ),
+                    )
+                    .await,
                     ThreadLoopControl::Exit
                 ) {
                     return state.take_task_result();
@@ -963,7 +964,7 @@ fn drain_signal_timer_events(mailbox: &boot_runtime::TaskMailbox) {
     {}
 }
 
-fn deliver_entry_signal_handler<P: TxPlatform>(
+async fn deliver_entry_signal_handler<P: TxPlatform>(
     thread: &Cap<ThreadIdentity>,
     payload: &PayloadCap<ThreadPayload>,
     process: &Cap<ProcessIdentity>,
@@ -1053,10 +1054,11 @@ fn deliver_entry_signal_handler<P: TxPlatform>(
     match prepared {
         Ok((handler_ctx, frame_bytes)) => {
             let frame_addr = user_sp_from_context::<P>(&handler_ctx);
-            if !reserve_signal_frame_storage(aspace, frame_addr, frame_bytes.as_slice().len()) {
+            if !reserve_signal_frame_storage(aspace, frame_addr, frame_bytes.as_slice().len()).await
+            {
                 return fatal_signal_teardown_from_current_hart::<P>(&process, thread, sig);
             }
-            if !copy_signal_frame_to_user(aspace, frame_addr, frame_bytes.as_slice()) {
+            if !copy_signal_frame_to_user(aspace, frame_addr, frame_bytes.as_slice()).await {
                 return fatal_signal_teardown_from_current_hart::<P>(&process, thread, sig);
             }
             if restorer_pc == 0 {
@@ -1084,16 +1086,33 @@ fn deliver_entry_signal_handler<P: TxPlatform>(
     }
 }
 
-fn copy_signal_frame_to_user(aspace: &Cap<AddressSpace>, frame_addr: usize, bytes: &[u8]) -> bool {
+async fn copy_signal_frame_to_user(
+    aspace: &Cap<AddressSpace>,
+    frame_addr: usize,
+    bytes: &[u8],
+) -> bool {
     use crate::adapter::step_engine::StepOutcome as V3;
 
-    let copy_outcome = {
-        let guard = crate::adapter::step_engine::guard();
-        aspace.copy_to_user(tx_hal::UserPtr::<u8>::new(frame_addr), bytes, &guard)
-    };
-    match copy_outcome {
-        V3::Done(n) => n == bytes.len(),
-        _ => false,
+    loop {
+        let copy_outcome = {
+            let guard = crate::adapter::step_engine::guard();
+            aspace.copy_to_user(tx_hal::UserPtr::<u8>::new(frame_addr), bytes, &guard)
+        };
+        match copy_outcome {
+            V3::Done(n) => return n == bytes.len(),
+            V3::Err(_) => return false,
+            V3::Continue { .. } | V3::Yield { .. } => {
+                // The immutable frame buffer makes replaying an already-copied
+                // prefix safe. The copy guard was scoped to `copy_outcome` and
+                // is gone here: yield cooperatively, then re-prefault the whole
+                // declared range before replaying. This keeps `Continue` from
+                // becoming an in-place busy loop and lets publication complete.
+                tx_reactor::yield_now().await;
+                if !reserve_signal_frame_storage(aspace, frame_addr, bytes.len()).await {
+                    return false;
+                }
+            }
+        }
     }
 }
 
@@ -2299,7 +2318,7 @@ fn make_signal_frame_executable(aspace: &AddressSpace, frame_addr: usize, frame_
     let _ = aspace.try_mprotect(range, Prot::new(true, true, true));
 }
 
-fn reserve_signal_frame_storage(
+async fn reserve_signal_frame_storage(
     aspace: &AddressSpace,
     frame_addr: usize,
     frame_len: usize,
@@ -2317,11 +2336,10 @@ fn reserve_signal_frame_storage(
     let Ok(range) = UserRange::new_aligned(UserVirtAddr(start), len) else {
         return false;
     };
-    use crate::adapter::step_engine::StepOutcome as V3;
-    !matches!(
-        aspace.reserve_user_range_for_access(range, UserAccessKind::Write),
-        V3::Err(_) | V3::Yield { .. }
-    )
+    aspace
+        .reserve_user_range_for_access_wait(range, UserAccessKind::Write)
+        .await
+        .is_ok()
 }
 
 /// PROBE(proxy-push segv hunt): dump the last syscalls (nr=ret, hex) recorded

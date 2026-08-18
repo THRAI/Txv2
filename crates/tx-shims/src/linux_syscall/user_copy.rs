@@ -20,7 +20,8 @@ use alloc::vec::Vec;
 use tx_hal::UserPtr;
 use tx_subsystems::execution::Errno;
 use tx_subsystems::vm::{
-    AddressSpace, UserAccessKind, UserPage, UserRange, FULL_USER_V1_TOP, USER_PAGE_SIZE,
+    AcquireResult, AddressSpace, LockMode, RangeGuard, UserAccessKind, UserPage, UserRange,
+    UserVirtAddr, FULL_USER_V1_TOP, USER_PAGE_SIZE,
 };
 
 /// Outcome of `read_user_cstr` — distinguishes "no NUL within budget"
@@ -90,30 +91,36 @@ pub(super) fn try_reserve_user_copy_items<T>(
     items.try_reserve_exact(additional).map_err(|_| ())
 }
 
+/// Convert the byte count from a completed VM copy into the all-or-error
+/// contract used by syscall argument/result copying.
+pub(super) fn complete_user_copy(copied: usize, expected: usize) -> Result<(), Errno> {
+    if copied == expected {
+        Ok(())
+    } else {
+        Err(Errno::EFAULT)
+    }
+}
+
 fn user_access_guard() -> step_engine::Guard<'static> {
     step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard)
 }
 
-/// Prefault a user range without depending on a registered wait source.
+/// Prefault a user range through the VM's registered wait source.
 ///
-/// Range materialisation is short and its owner is another runnable syscall
-/// task.  Dropping all guards, yielding the current task, and retrying the
-/// complete reservation avoids both exposing transient contention as `EIO`
-/// and sleeping forever when a one-shot range-lock notification races with
-/// registration.
-async fn reserve_user_range_yield_retry(
+/// Older code retried `Continue` in place and converted `Yield` into repeated
+/// `yield_now()` calls. Under Cargo's fork/statx workload that becomes a
+/// high-CPU livelock: every waiter immediately races the full-address-space
+/// fork writer again. The VM wait driver subscribes before rechecking the
+/// predicate, so it cannot miss a range-release edge and does not poll while
+/// the writer owns the range.
+async fn reserve_user_range_wait(
     aspace: &AddressSpace,
     range: UserRange,
     access: UserAccessKind,
 ) -> Result<(), Errno> {
-    loop {
-        match aspace.reserve_user_range_for_access(range, access) {
-            StepOutcome::Done(()) => return Ok(()),
-            StepOutcome::Err(error) => return Err(error.into()),
-            StepOutcome::Continue { .. } => continue,
-            StepOutcome::Yield { .. } => tx_reactor::yield_now().await,
-        }
-    }
+    aspace
+        .reserve_user_range_for_access_wait(range, access)
+        .await
 }
 
 pub(super) async fn validate_user_range_yield_retry(
@@ -123,7 +130,52 @@ pub(super) async fn validate_user_range_yield_retry(
     access: UserAccessKind,
 ) -> Result<(), Errno> {
     let range = covering_user_range(uaddr, len).ok_or(Errno::EFAULT)?;
-    reserve_user_range_yield_retry(aspace, range, access).await
+    reserve_user_range_wait(aspace, range, access).await
+}
+
+/// Materialise a set of small output ranges and retain one covering
+/// Materializer reservation for a multi-step syscall commit.
+///
+/// The individual ranges are materialised separately so two distant pointers
+/// do not fault in every page between them.  The final covering reservation is
+/// only RangeLock metadata; it prevents fork/munmap/mprotect from changing
+/// either mapping while the caller validates state, commits kernel objects,
+/// and performs resident writes.
+pub(super) async fn reserve_user_write_transaction<'a>(
+    aspace: &'a AddressSpace,
+    ranges: &[UserRange],
+) -> Result<RangeGuard<'a>, Errno> {
+    let Some(first) = ranges.first().copied() else {
+        return Err(Errno::EINVAL);
+    };
+    for range in ranges.iter().copied() {
+        reserve_user_range_wait(aspace, range, UserAccessKind::Write).await?;
+    }
+
+    let start = ranges
+        .iter()
+        .map(|range| range.start().as_usize())
+        .min()
+        .unwrap_or(first.start().as_usize());
+    let end = ranges
+        .iter()
+        .map(|range| range.end().as_usize())
+        .max()
+        .unwrap_or(first.end().as_usize());
+    let covering =
+        UserRange::new_aligned(UserVirtAddr(start), end - start).map_err(|_| Errno::EFAULT)?;
+
+    loop {
+        match aspace
+            .range_lock()
+            .acquire_step_rich(covering, LockMode::Materializer)
+        {
+            AcquireResult::Acquired(guard) => return Ok(guard),
+            AcquireResult::WouldBlock(blocked) => {
+                blocked.wait_for_release().await;
+            }
+        }
+    }
 }
 
 /// Bounded copy of a NUL-terminated user string into a kernel-owned
@@ -353,11 +405,14 @@ fn read_user_exec_cstr(
 /// Read a `T: Copy` value from `uaddr` through the canonical
 /// `aspace.read_user` lane, falling back to the bootstrap
 /// kernel-pointer dance on `EFAULT`.
-pub(super) fn bootstrap_read_user<T: Copy>(aspace: &AddressSpace, uaddr: u64) -> Result<T, Errno> {
-    use step_engine::{Errno as V3Errno, StepOutcome as V3};
+pub(super) fn bootstrap_read_user_oneshot<T: Copy>(
+    aspace: &AddressSpace,
+    uaddr: u64,
+) -> Option<Result<T, Errno>> {
+    use step_engine::StepOutcome as V3;
     let guard = user_access_guard();
     match aspace.read_user(UserPtr::<T>::new(uaddr as usize), &guard) {
-        V3::Done(v) => Ok(v),
+        V3::Done(v) => Some(Ok(v)),
         V3::Err(_first_err) => {
             drop(guard);
             // fork narrow-copy leaves the child's inherited stack/anon pages
@@ -373,12 +428,12 @@ pub(super) fn bootstrap_read_user<T: Copy>(aspace: &AddressSpace, uaddr: u64) ->
                 if let V3::Done(v) =
                     aspace.read_user(UserPtr::<T>::new(uaddr as usize), &retry_guard)
                 {
-                    return Ok(v);
+                    return Some(Ok(v));
                 }
             }
             #[cfg(target_os = "none")]
             {
-                Err(Errno::EFAULT)
+                Some(Err(Errno::EFAULT))
             }
             #[cfg(not(target_os = "none"))]
             {
@@ -388,33 +443,57 @@ pub(super) fn bootstrap_read_user<T: Copy>(aspace: &AddressSpace, uaddr: u64) ->
                     FULL_USER_V1_TOP as u64
                 };
                 if uaddr < limit {
-                    return Err(Errno::EFAULT);
+                    return Some(Err(Errno::EFAULT));
                 }
-                Ok(unsafe { core::ptr::read_volatile(uaddr as *const T) })
+                Some(Ok(unsafe { core::ptr::read_volatile(uaddr as *const T) }))
             }
         }
-        V3::Err(e) => Err(e.into()),
-        V3::Yield { .. } | V3::Continue { .. } => Err(Errno::EIO),
+        V3::Yield { .. } | V3::Continue { .. } => None,
     }
+}
+
+pub(super) fn bootstrap_read_user<T: Copy>(aspace: &AddressSpace, uaddr: u64) -> Result<T, Errno> {
+    bootstrap_read_user_oneshot(aspace, uaddr).unwrap_or(Err(Errno::EIO))
+}
+
+/// Wait-capable counterpart of [`bootstrap_read_user`].
+///
+/// This is the canonical decoder for fixed-size syscall input structures in
+/// async paths. The destination remains uninitialised until every byte has
+/// been copied successfully, so a VM wait never exposes a partial Rust value.
+pub(super) async fn bootstrap_read_user_wait<T: Copy>(
+    aspace: &AddressSpace,
+    uaddr: u64,
+) -> Result<T, Errno> {
+    let mut value = core::mem::MaybeUninit::<T>::uninit();
+    // SAFETY: the byte slice covers the complete storage of `value`; the
+    // value is assumed initialised only after the all-or-error copy succeeds.
+    let bytes = unsafe {
+        core::slice::from_raw_parts_mut(value.as_mut_ptr() as *mut u8, core::mem::size_of::<T>())
+    };
+    bootstrap_copy_from_user_wait(aspace, bytes, uaddr).await?;
+    // SAFETY: `bootstrap_copy_from_user_wait` copied exactly `size_of::<T>()`
+    // bytes on success.
+    Ok(unsafe { value.assume_init() })
 }
 
 /// Write a `T: Copy` value to `uaddr` through the canonical
 /// `aspace.write_user` lane, falling back to the bootstrap
 /// kernel-pointer dance on `EFAULT`.
-pub(super) fn bootstrap_write_user<T: Copy>(
+pub(super) fn bootstrap_write_user_oneshot<T: Copy>(
     aspace: &AddressSpace,
     uaddr: u64,
     value: T,
-) -> Result<(), Errno> {
+) -> Option<Result<(), Errno>> {
     use StepOutcome as V3;
     let guard = user_access_guard();
     match aspace.write_user(UserPtr::<T>::new(uaddr as usize), value, &guard) {
-        V3::Done(()) | V3::Continue { .. } => Ok(()),
+        V3::Done(()) => Some(Ok(())),
         V3::Err(e) if Errno::from(e) == Errno::EFAULT => {
             drop(guard);
             #[cfg(target_os = "none")]
             {
-                Err(Errno::EFAULT)
+                Some(Err(Errno::EFAULT))
             }
             #[cfg(not(target_os = "none"))]
             {
@@ -424,17 +503,55 @@ pub(super) fn bootstrap_write_user<T: Copy>(
                     FULL_USER_V1_TOP as u64
                 };
                 if uaddr < limit {
-                    return Err(Errno::EFAULT);
+                    return Some(Err(Errno::EFAULT));
                 }
                 unsafe {
                     core::ptr::write_volatile(uaddr as *mut T, value);
                 }
-                Ok(())
+                Some(Ok(()))
             }
         }
-        V3::Err(e) => Err(Errno::from(e)),
-        V3::Yield { .. } => Err(Errno::EIO),
+        V3::Err(e) => Some(Err(Errno::from(e))),
+        V3::Yield { .. } | V3::Continue { .. } => None,
     }
+}
+
+/// Synchronous compatibility wrapper for syscall implementations that have
+/// not yet been split into one-shot and wait-capable lanes.
+///
+/// New hot paths must call [`bootstrap_write_user_oneshot`] and return `None`
+/// on contention, while their async fallback calls
+/// [`bootstrap_write_user_wait`]. Keeping the legacy mapping here makes the
+/// remaining migration sites visible without changing their external errno
+/// contract in one unreviewable sweep.
+pub(super) fn bootstrap_write_user<T: Copy>(
+    aspace: &AddressSpace,
+    uaddr: u64,
+    value: T,
+) -> Result<(), Errno> {
+    bootstrap_write_user_oneshot(aspace, uaddr, value).unwrap_or(Err(Errno::EIO))
+}
+
+/// Wait-capable counterpart of [`bootstrap_write_user`].
+///
+/// A kernel-to-user result copy can race with `fork`, `mprotect`, or `munmap`.
+/// That contention is an internal scheduling event, not userspace `EIO`.
+/// Keep the value alive across retries and delegate to the byte-copy driver,
+/// which waits for the VM range transaction before retrying the same bytes.
+pub(super) async fn bootstrap_write_user_wait<T: Copy>(
+    aspace: &AddressSpace,
+    uaddr: u64,
+    value: T,
+) -> Result<(), Errno> {
+    // SAFETY: `value` remains owned by this future until the awaited copy
+    // completes, and the slice covers exactly its initialized object bytes.
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            core::ptr::addr_of!(value) as *const u8,
+            core::mem::size_of::<T>(),
+        )
+    };
+    bootstrap_copy_to_user_wait(aspace, uaddr, bytes).await
 }
 
 /// Compute the page-aligned `UserRange` covering the byte range
@@ -482,9 +599,9 @@ pub(super) fn bootstrap_copy_from_user(
 
         let guard = user_access_guard();
         match aspace.copy_from_user(dst, UserPtr::<u8>::new(uaddr as usize), &guard) {
-            V3::Done(_) | V3::Continue { .. } => Ok(()),
+            V3::Done(copied) => complete_user_copy(copied, dst.len()),
             V3::Err(e) => Err(Errno::from(e)),
-            V3::Yield { .. } => Err(Errno::EIO),
+            V3::Yield { .. } | V3::Continue { .. } => Err(Errno::EIO),
         }
     }
 
@@ -519,7 +636,7 @@ pub(super) fn bootstrap_copy_from_user(
 
         let guard = user_access_guard();
         match aspace.copy_from_user(dst, UserPtr::<u8>::new(uaddr as usize), &guard) {
-            V3::Done(_) | V3::Continue { .. } => Ok(()),
+            V3::Done(copied) => complete_user_copy(copied, dst.len()),
             V3::Err(e) if Errno::from(e) == Errno::EFAULT => {
                 drop(guard);
                 let limit = if cfg!(any(test, feature = "test-support")) {
@@ -536,7 +653,7 @@ pub(super) fn bootstrap_copy_from_user(
                 Ok(())
             }
             V3::Err(e) => Err(Errno::from(e)),
-            V3::Yield { .. } => Err(Errno::EIO),
+            V3::Yield { .. } | V3::Continue { .. } => Err(Errno::EIO),
         }
     }
 }
@@ -566,7 +683,7 @@ pub(super) async fn bootstrap_copy_from_user_wait(
         let Some(range) = covering_user_range(uaddr, dst.len()) else {
             return Err(Errno::EFAULT);
         };
-        reserve_user_range_yield_retry(aspace, range, UserAccessKind::Read).await?;
+        reserve_user_range_wait(aspace, range, UserAccessKind::Read).await?;
 
         loop {
             let outcome = {
@@ -574,11 +691,11 @@ pub(super) async fn bootstrap_copy_from_user_wait(
                 aspace.copy_from_user(dst, UserPtr::<u8>::new(uaddr as usize), &guard)
             };
             match outcome {
-                V3::Done(_) | V3::Continue { .. } => return Ok(()),
+                V3::Done(copied) => return complete_user_copy(copied, dst.len()),
                 V3::Err(error) => return Err(error.into()),
-                V3::Yield { .. } => {
+                V3::Yield { .. } | V3::Continue { .. } => {
                     tx_reactor::yield_now().await;
-                    reserve_user_range_yield_retry(aspace, range, UserAccessKind::Read).await?;
+                    reserve_user_range_wait(aspace, range, UserAccessKind::Read).await?;
                 }
             }
         }
@@ -588,14 +705,14 @@ pub(super) async fn bootstrap_copy_from_user_wait(
 /// Copy `src.len()` bytes from the kernel-side buffer `src` to
 /// user-space `uaddr`. Bridges through `aspace.copy_to_user`, falling
 /// back to a kernel-pointer memcpy on `EFAULT`.
-pub(super) fn bootstrap_copy_to_user(
+pub(super) fn bootstrap_copy_to_user_oneshot(
     aspace: &AddressSpace,
     uaddr: u64,
     src: &[u8],
-) -> Result<(), Errno> {
+) -> Option<Result<(), Errno>> {
     use StepOutcome as V3;
     if src.is_empty() {
-        return Ok(());
+        return Some(Ok(()));
     }
 
     #[cfg(target_os = "none")]
@@ -603,17 +720,17 @@ pub(super) fn bootstrap_copy_to_user(
         if let Some(range) = covering_user_range(uaddr, src.len()) {
             match aspace.reserve_user_range_for_access(range, UserAccessKind::Write) {
                 V3::Done(()) => {}
-                V3::Err(e) => return Err(Errno::from(e)),
-                V3::Yield { .. } | V3::Continue { .. } => return Err(Errno::EIO),
+                V3::Err(e) => return Some(Err(Errno::from(e))),
+                V3::Yield { .. } | V3::Continue { .. } => return None,
             }
         }
 
         let guard = user_access_guard();
-        match aspace.copy_to_user(UserPtr::<u8>::new(uaddr as usize), src, &guard) {
-            V3::Done(_) | V3::Continue { .. } => Ok(()),
-            V3::Err(e) => Err(Errno::from(e)),
-            V3::Yield { .. } => Err(Errno::EIO),
-        }
+        return match aspace.copy_to_user(UserPtr::<u8>::new(uaddr as usize), src, &guard) {
+            V3::Done(copied) => Some(complete_user_copy(copied, src.len())),
+            V3::Err(e) => Some(Err(Errno::from(e))),
+            V3::Yield { .. } | V3::Continue { .. } => None,
+        };
     }
 
     #[cfg(not(target_os = "none"))]
@@ -629,12 +746,12 @@ pub(super) fn bootstrap_copy_to_user(
                         FULL_USER_V1_TOP as u64
                     };
                     if uaddr < limit {
-                        return Err(Errno::EFAULT);
+                        return Some(Err(Errno::EFAULT));
                     }
                     prefault_failed_with_efault = true;
                 }
-                V3::Err(e) => return Err(Errno::from(e)),
-                V3::Yield { .. } | V3::Continue { .. } => return Err(Errno::EIO),
+                V3::Err(e) => return Some(Err(Errno::from(e))),
+                V3::Yield { .. } | V3::Continue { .. } => return None,
             }
         }
 
@@ -642,12 +759,12 @@ pub(super) fn bootstrap_copy_to_user(
             unsafe {
                 core::ptr::copy_nonoverlapping(src.as_ptr(), uaddr as *mut u8, src.len());
             }
-            return Ok(());
+            return Some(Ok(()));
         }
 
         let guard = user_access_guard();
         match aspace.copy_to_user(UserPtr::<u8>::new(uaddr as usize), src, &guard) {
-            V3::Done(_) | V3::Continue { .. } => Ok(()),
+            V3::Done(copied) => Some(complete_user_copy(copied, src.len())),
             V3::Err(e) if Errno::from(e) == Errno::EFAULT => {
                 drop(guard);
                 let limit = if cfg!(any(test, feature = "test-support")) {
@@ -656,17 +773,25 @@ pub(super) fn bootstrap_copy_to_user(
                     FULL_USER_V1_TOP as u64
                 };
                 if uaddr < limit {
-                    return Err(Errno::EFAULT);
+                    return Some(Err(Errno::EFAULT));
                 }
                 unsafe {
                     core::ptr::copy_nonoverlapping(src.as_ptr(), uaddr as *mut u8, src.len());
                 }
-                Ok(())
+                Some(Ok(()))
             }
-            V3::Err(e) => Err(Errno::from(e)),
-            V3::Yield { .. } => Err(Errno::EIO),
+            V3::Err(e) => Some(Err(Errno::from(e))),
+            V3::Yield { .. } | V3::Continue { .. } => None,
         }
     }
+}
+
+pub(super) fn bootstrap_copy_to_user(
+    aspace: &AddressSpace,
+    uaddr: u64,
+    src: &[u8],
+) -> Result<(), Errno> {
+    bootstrap_copy_to_user_oneshot(aspace, uaddr, src).unwrap_or(Err(Errno::EIO))
 }
 
 /// Wait-capable runtime counterpart of [`bootstrap_copy_to_user`].
@@ -732,9 +857,7 @@ pub(super) async fn bootstrap_copy_to_user_wait_diagnosed(
                 retries: 0,
             });
         };
-        if let Err(errno) =
-            reserve_user_range_yield_retry(aspace, range, UserAccessKind::Write).await
-        {
+        if let Err(errno) = reserve_user_range_wait(aspace, range, UserAccessKind::Write).await {
             return Err(UserCopyWaitFailure {
                 errno,
                 stage: UserCopyWaitStage::Reserve,
@@ -749,7 +872,15 @@ pub(super) async fn bootstrap_copy_to_user_wait_diagnosed(
                 aspace.copy_to_user(UserPtr::<u8>::new(uaddr as usize), src, &guard)
             };
             match outcome {
-                V3::Done(_) | V3::Continue { .. } => return Ok(()),
+                V3::Done(copied) => {
+                    return complete_user_copy(copied, src.len()).map_err(|errno| {
+                        UserCopyWaitFailure {
+                            errno,
+                            stage: UserCopyWaitStage::Copy,
+                            retries,
+                        }
+                    });
+                }
                 V3::Err(error) => {
                     return Err(UserCopyWaitFailure {
                         errno: error.into(),
@@ -757,11 +888,11 @@ pub(super) async fn bootstrap_copy_to_user_wait_diagnosed(
                         retries,
                     });
                 }
-                V3::Yield { .. } => {
+                V3::Yield { .. } | V3::Continue { .. } => {
                     retries = retries.saturating_add(1);
                     tx_reactor::yield_now().await;
                     if let Err(errno) =
-                        reserve_user_range_yield_retry(aspace, range, UserAccessKind::Write).await
+                        reserve_user_range_wait(aspace, range, UserAccessKind::Write).await
                     {
                         return Err(UserCopyWaitFailure {
                             errno,

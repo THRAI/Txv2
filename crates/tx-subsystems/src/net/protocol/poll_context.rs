@@ -366,9 +366,13 @@ impl PollContext {
             };
 
             let mut publish = NetworkPublish::none();
-            if target_payload.record_recv_payload(datagram.src, datagram.dst, datagram.payload) {
-                publish.recv_has_data = true;
-            }
+            let _became_readable =
+                target_payload.record_recv_payload(datagram.src, datagram.dst, datagram.payload);
+            // Re-publish the authoritative UDP record level even when the
+            // queue was already non-empty. In particular, an empty datagram
+            // has recv_len == 0, and a concurrent reader may have cleared the
+            // edge hint while this ingress pass was running.
+            publish.recv_has_data = target_payload.recv_ready();
             self.sockets_touched += 1;
             bytes_moved += payload_len;
             if publish.has_any() {

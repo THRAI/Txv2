@@ -381,7 +381,8 @@ fn pager_rejects_non_4k_images_and_hole_writeback() {
 
 #[test]
 fn pager_plans_mapped_write_without_mutating_home_block() {
-    let image = mock_image();
+    let mut image = mock_image();
+    set_inode_unknown_sentinel(&mut image, 12, 0xA1);
     let original = *image.block(21);
     let mut pager = Ext4Pager::open(image).unwrap();
     let page = filled_page(0xEE);
@@ -404,6 +405,7 @@ fn pager_plans_mapped_write_without_mutating_home_block() {
     assert_eq!(plan.data[0].logical_page, 1);
     assert_eq!(plan.data[0].physical_block, 21);
     assert_eq!(plan.data[0].bytes, page);
+    assert_inode_unknown_sentinel(&plan, 12, 0xA1);
     assert_eq!(pager.image().block(21), &original);
 }
 
@@ -2794,6 +2796,29 @@ fn destroy_plan_removes_head_orphan_from_superblock_chain() {
 }
 
 #[test]
+fn destroy_plan_defers_zero_link_inode_behind_orphan_head() {
+    let mut image = mock_image();
+    let mut superblock = Superblock::parse(&image.block(0)[1024..2048]).unwrap();
+    superblock.last_orphan = 14;
+    superblock
+        .encode(&mut image.block_mut(0)[1024..2048])
+        .unwrap();
+    mark_block_bitmap_used(&mut image, 31);
+    mark_inode_bitmap_used(&mut image, 13);
+    let mut victim = Inode::parse(&image.block(4)[11 * 256..12 * 256]).unwrap();
+    victim.links_count = 0;
+    victim.dtime = 0;
+    write_inode(&mut image, 12, &victim);
+    let mut pager = Ext4Pager::open(image).unwrap();
+
+    assert_eq!(
+        pager.plan_destroy_inode(InodeNo::new(12), FsyncStamp::new(44)),
+        Err(Ext4FormatError::WouldBlock),
+        "a non-head orphan is valid but cannot be removed by the bounded head-only plan"
+    );
+}
+
+#[test]
 fn destroy_plan_removes_singleton_orphan_head_from_superblock_chain() {
     let mut image = mock_image();
     let mut superblock = Superblock::parse(&image.block(0)[1024..2048]).unwrap();
@@ -4938,6 +4963,7 @@ fn pager_derives_journal_ring_from_journal_inode_mapping() {
     assert_eq!(geometry.superblock.first, 1);
     assert_eq!(geometry.superblock.sequence, 24);
     assert_eq!(geometry.superblock.start, 3);
+    assert_eq!(geometry.features, Jbd2Features::NONE);
     assert_eq!(
         geometry.blocks.as_slice(),
         &[40, 41, 42, 50, 51, 52, 53, 54]
@@ -5001,6 +5027,33 @@ fn write_inode_at_table(image: &mut MemImage, inode_table_block: u64, ino: u32, 
     inode
         .encode(&mut image.block_mut(block as u64)[in_block..in_block + 256])
         .unwrap();
+}
+
+const INODE256_UNKNOWN_SENTINEL_OFFSET: usize = 200;
+
+fn set_inode_unknown_sentinel(image: &mut MemImage, ino: u32, value: u8) {
+    let index = (ino - 1) as usize;
+    let offset = index * 256;
+    let block = 4 + offset / BLOCK_SIZE;
+    let in_block = offset % BLOCK_SIZE;
+    image.block_mut(block as u64)[in_block + INODE256_UNKNOWN_SENTINEL_OFFSET] = value;
+}
+
+fn assert_inode_unknown_sentinel(
+    plan: &tx_ext4_format::mutation::Ext4MutationPlan,
+    ino: u32,
+    expected: u8,
+) {
+    let inode_table = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::InodeTable)
+        .expect("inode-table after-image");
+    let inode_offset = (ino as usize - 1) * 256 % BLOCK_SIZE;
+    assert_eq!(
+        inode_table.after[inode_offset + INODE256_UNKNOWN_SENTINEL_OFFSET],
+        expected
+    );
 }
 
 fn filled_page(byte: u8) -> [u8; BLOCK_SIZE] {
