@@ -689,11 +689,7 @@ impl IrqIf for Platform {
     }
 
     fn claim() -> u32 {
-        let irq = la2k1000_liointc::claim();
-        if irq == Self::UART_IRQ && !LA2K1000_UART_IRQ_OBSERVED.swap(true, Ordering::AcqRel) {
-            early_console_write(b"txkernel:loongson-2k1000:irq:uart-rx:ok\n");
-        }
-        irq
+        la2k1000_liointc::claim()
     }
 
     fn complete(irq: u32) {

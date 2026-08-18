@@ -245,7 +245,6 @@ static LA64_CPU_PIN_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static LA64_CPU_PIN_TRACE_EVENTS: [AtomicU64; LA64_CPU_PIN_TRACE_CAPACITY] =
     [const { AtomicU64::new(0) }; LA64_CPU_PIN_TRACE_CAPACITY];
 static LA64_IRQ_DISPATCH_TABLE: AtomicUsize = AtomicUsize::new(0);
-static LA2K1000_UART_IRQ_OBSERVED: AtomicBool = AtomicBool::new(false);
 static LA2K1000_UART_PORT_OWNED: AtomicBool = AtomicBool::new(false);
 /// LA64 supports a 10-bit ASID space (`ASID_BITS = 10`, `LA64_ASID_MASK =
 /// 0x3ff`), i.e. 1024 ASIDs. The allocator must cover that whole space so that
