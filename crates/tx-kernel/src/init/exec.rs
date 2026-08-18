@@ -898,6 +898,7 @@ impl<P: TxPlatform> CoreInit<P> {
             // boundaries so shootdown progress never depends only on IRQ
             // delivery. This is a no-op on platforms that do not need it.
             P::service_pending_tlb_shootdown();
+            let _ = crate::trap::dispatch_pending_ipis::<P>();
             // Complete any outstanding controller transaction even if init
             // became a zombie in the preceding reactor poll.
             Self::drain_device_irq_bottom_halves();
@@ -1053,9 +1054,7 @@ impl<P: TxPlatform> CoreInit<P> {
                 P::wait_for_interrupt_prepared(wait_state);
                 Self::note_reactor_hart_active(loop_cpu);
                 P::service_pending_tlb_shootdown();
-                if P::pending_ipi(IpiKind::Reschedule) {
-                    P::ack_ipi(IpiKind::Reschedule);
-                }
+                let _ = crate::trap::dispatch_pending_ipis::<P>();
                 // Run device bottom halves immediately after wake. Net IRQ
                 // completion must happen on the claimant hart; UART ingestion
                 // likewise requires task context because it may create an

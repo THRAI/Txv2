@@ -502,7 +502,15 @@ pub(crate) fn record_profiled_syscall_duration<P: TxPlatform>(
     }
 }
 
-fn dispatch_pending_ipis<P: SmpIf>() -> TrapAction {
+/// Drain software IPI state from normal reactor context.
+///
+/// Userspace traps hand execution to a reactor task with supervisor
+/// interrupts masked.  A hart whose userspace thread then parks in a syscall
+/// may therefore stay in kernel context long enough that no architectural IPI
+/// trap is taken.  Synchronous senders (notably `membarrier`) must still be
+/// able to observe the remote fence and acknowledgement, so both reactor
+/// loops call this at their normal quiescent boundaries.
+pub(crate) fn dispatch_pending_ipis<P: SmpIf>() -> TrapAction {
     let mut action = TrapAction::Resume;
     if P::pending_ipi(IpiKind::Stop) {
         P::ack_ipi(IpiKind::Stop);

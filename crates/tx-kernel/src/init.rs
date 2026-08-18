@@ -3816,6 +3816,7 @@ impl<P: TxPlatform> CoreInit<P> {
             let cpu_id = <P as tx_hal::SmpIf>::current_cpu_id();
             let _ = step_engine::drain_requested_with_budget(64);
             P::service_pending_tlb_shootdown();
+            let _ = crate::trap::dispatch_pending_ipis::<P>();
             if AP_REACTOR_STOP_REQUESTED.load(core::sync::atomic::Ordering::Acquire) {
                 P::cancel_deadline();
                 if P::pending_ipi(IpiKind::Stop) {
@@ -3861,9 +3862,7 @@ impl<P: TxPlatform> CoreInit<P> {
             P::wait_for_interrupt_prepared(wait_state);
             Self::note_reactor_hart_active(cpu_id);
             P::service_pending_tlb_shootdown();
-            if P::pending_ipi(IpiKind::Reschedule) {
-                P::ack_ipi(IpiKind::Reschedule);
-            }
+            let _ = crate::trap::dispatch_pending_ipis::<P>();
         }
     }
 
